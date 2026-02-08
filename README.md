@@ -208,7 +208,7 @@ const win3 = new ServoWindow({ title: "Window 3" });
 
 ## 🤝 Contributing
 
-PRs are welcome. If you break the `winit` or `glutin` version requirements, I will close your PR with extreme prejudice. We need specific embedding traits.
+PRs are welcome. If you break the `winit` or `glutin` version requirements, I will close your PR with extreme prejudice. We need specific embedding traits and im already sitting on the edge with winit 0.30.2, dont push me off the edge it has already mentally put me on.
 
 1.  Fork it.
 2.  Branch it (`git checkout -b feature/cool-stuff`).
@@ -219,3 +219,12 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 ---
 **License:** MIT. Do whatever you want, just don't blame me if your computer takes flight.
 
+
+
+**P.S.**
+
+The entire framework (node gui lib) core is 1,781 lines of code.
+
+If that feels suspiciously light, it's because it is. We didn't try to build an OS inside your OS; we just gave Node a window and cut the fat until there was nothing left but speed.
+
+Electron carries the weight of the world. Lotus just carries the pixels.
