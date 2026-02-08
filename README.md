@@ -83,6 +83,9 @@ npm run build:debug
 npm run build
 ```
 
+**Note and Warning:**
+This IS going to take FOREVER to do the first build. i know, but you have to clone the whole servo repo and build it from source and then build the whole n-api and stuffs. after the first build it does get a lot faster. I plan to eventually integrate a ci/cd system that node will just be able to pull the pre-compiled platform .node files from github releases. let me get it somewhat stable first. I know, the compile times suck ass, but we have all been there, im working on it <3
+
 ### Running the Test App
 
 The best way to see Lotus in action is to run the included test application. This app demonstrates the hybrid runtime, IPC communication, and multi-window capabilities.
