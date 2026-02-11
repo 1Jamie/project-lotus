@@ -48,6 +48,8 @@ jobs:
               rustup default 1.91.0
               export CC=gcc
               export CXX=g++
+              export CC_x86_64_unknown_linux_gnu=gcc
+              export CXX_x86_64_unknown_linux_gnu=g++
               npm run build -- --target x86_64-unknown-linux-gnu
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
