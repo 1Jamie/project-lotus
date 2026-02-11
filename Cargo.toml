@@ -49,11 +49,11 @@ version = "0.68"
 version = "0.22"
 
 [dependencies.servo_url]
-git = "https://github.com/servo/servo"
+path = "servo/components/url"
 package = "servo_url"
 
 [dependencies.servo]
-git = "https://github.com/servo/servo"
+path = "servo/components/servo"
 package = "libservo"
 
 [profile.release]
