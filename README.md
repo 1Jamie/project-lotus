@@ -242,7 +242,7 @@ const win = new ServoWindow({
 *   **No ID?** We generate a random UUID. New session, new window, default size.
 *   **With ID?** We check `~/.config/app-name/window-state.json`. If we've seen "main-window" before, we put it back exactly where you left it.
 *   It snaps back to the last known position faster than you can say "Electron is bloat."
-```
+
 
 ## 📂 Project Structure (For the curious)
 
