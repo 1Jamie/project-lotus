@@ -40,9 +40,7 @@ dark-light = "1.0"
 
 
 
-[dependencies.embedder_traits]
-git = "https://github.com/servo/servo"
-package = "embedder_traits"
+
 
 [dependencies.webrender]
 version = "0.68"

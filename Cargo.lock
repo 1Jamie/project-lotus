@@ -7495,7 +7495,6 @@ dependencies = [
  "dark-light",
  "dirs 5.0.1",
  "dpi",
- "embedder_traits",
  "env_logger",
  "euclid",
  "glutin",

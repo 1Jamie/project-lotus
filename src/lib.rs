@@ -46,7 +46,7 @@ use servo::{
 };
 use euclid::{Point2D, Scale};
 use servo::{DeviceIndependentPixel, DevicePixel};
-use embedder_traits::WebResourceResponse;
+use servo::WebResourceResponse;
 use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 
 use http::StatusCode;
@@ -597,8 +597,8 @@ impl WebViewDelegate for LotusWebViewDelegate {
 #[derive(Clone)]
 struct LotusWaker(EventLoopProxy<EngineCommand>);
 
-impl embedder_traits::EventLoopWaker for LotusWaker {
-    fn clone_box(&self) -> Box<dyn embedder_traits::EventLoopWaker> {
+impl servo::EventLoopWaker for LotusWaker {
+    fn clone_box(&self) -> Box<dyn servo::EventLoopWaker> {
         Box::new(self.clone())
     }
     fn wake(&self) {
