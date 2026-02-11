@@ -50,6 +50,7 @@ jobs:
               export CXX=g++
               export CC_x86_64_unknown_linux_gnu=gcc
               export CXX_x86_64_unknown_linux_gnu=g++
+              export CXXFLAGS="${CXXFLAGS} -D_GLIBCXX_USE_C99_MATH_TR1=0"
               npm run build -- --target x86_64-unknown-linux-gnu
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
