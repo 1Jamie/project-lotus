@@ -50,15 +50,16 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
     *   **MsgPack Batching:** We pack small messages together like sardines. Efficient, tasty sardines.
     *   **Zero-Copy:** We try not to copy data. Copying data is for people who like waiting.
 
-*   **Window State Persistence:**
-    *   It remembers where you put the window. Groundbreaking technology, I know.
+    *   **Window State Persistence:**
+    *   It remembers where you put the window (if you give it an ID). Groundbreaking technology, I know.
     *   Handles maximized state, size, position. You're welcome.
     
 *   **Script Injection:**
     *   Execute arbitrary JS in the renderer from the main process. God mode unlocked.
 
 *   **Native Look & Feel:**
-    *   Customizable frames, transparency, and actual working cursors. We don't just emulate a window; we *are* a window.
+    *   Customizable frames, **true OS transparency**, and actual working cursors. We don't just emulate a window; we *are* a window.
+    *   **No White Flash:** We paint transparently. Your users won't be blinded by a white box while your 5MB of JS loads.
 
 *   **Multi-Window Support:**
     *   Spawn multiple independent windows from a single Node process.
@@ -184,6 +185,38 @@ ipcMain.on('channel', (data) => {
 });
 ```
 
+### Native Transparency: "Ghost Mode"
+Want a window that keeps the OS vibe? We bridge OS transparency directly to your CSS.
+
+```javascript
+const win = new ServoWindow({
+    transparent: true, // The magic switch
+    title: "Ghost Window"
+});
+```
+
+**How it works:**
+1.  We set the Servo shell background to `0x00000000` (fully transparent).
+2.  We tell the OS to make the window transparent.
+3.  **Result:** The window is invisible. The *only* thing visible is what **you** paint.
+
+**In your CSS:**
+```css
+/* This makes the whole app see-through to the desktop */
+body {
+    background: transparent; 
+}
+
+/* This adds a semi-transparent glass effect */
+.container {
+    background: rgba(0, 0, 0, 0.8); 
+    color: white;
+}
+```
+
+**The "White Flash" Killer:**
+Because the default backbone is transparent, there is **zero white flash** on startup. If your app takes 10ms to load, the user sees their wallpaper for 10ms, not a blinding white rectangle. You're welcome.
+
 ### Multi-Window Support
 Creating specific windows? Easy. They share the same renderer instance, so it costs ~80MB per extra window instead of ~300MB.
 
@@ -193,6 +226,22 @@ const win2 = new ServoWindow({ title: "Window 2" });
 const win3 = new ServoWindow({ title: "Window 3" });
 // All three windows share the same renderer process.
 // Efficient.
+
+### Window State Persistence: "Total Recall"
+By default, windows are amnesiac. They forget where they were. If you want them to remember, give them a name.
+
+```javascript
+const win = new ServoWindow({
+    id: "main-window", // REQUIRED for state saving
+    title: "I Remember Everything",
+    restoreState: true // Default is true, obviously
+});
+```
+
+**The Logic:**
+*   **No ID?** We generate a random UUID. New session, new window, default size.
+*   **With ID?** We check `~/.config/app-name/window-state.json`. If we've seen "main-window" before, we put it back exactly where you left it.
+*   It snaps back to the last known position faster than you can say "Electron is bloat."
 ```
 
 ## 📂 Project Structure (For the curious)
@@ -208,7 +257,7 @@ const win3 = new ServoWindow({ title: "Window 3" });
 
 ## 🤝 Contributing
 
-PRs are welcome. If you break the `winit` or `glutin` version requirements, I will close your PR with extreme prejudice. We need specific embedding traits and im already sitting on the edge with winit 0.30.2, dont push me off the edge it has already mentally put me on.
+PRs are welcome. If you break the `winit` or `glutin` version requirements, I will close your PR with extreme prejudice. We need specific embedding traits and im already sitting on the edge with winit 0.30.2, dont push me off the edge it has already mentally put me on!
 
 1.  Fork it.
 2.  Branch it (`git checkout -b feature/cool-stuff`).

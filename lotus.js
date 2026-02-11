@@ -115,6 +115,12 @@ function ensureApp() {
                     return;
                 }
 
+                if (msg.event === 'frame-ready') {
+                    const win = windows.get(msg.window_id);
+                    if (win) win.emit('frame-ready');
+                    return;
+                }
+
                 if (msg.event === 'window-closed') {
                     const win = windows.get(msg.window_id);
                     if (win) {
@@ -167,7 +173,9 @@ class ServoWindow extends EventEmitter {
             alwaysOnTop: false,
             restoreState: true,
             root: undefined,
-            index: 'index.html'
+            index: 'index.html',
+            transparent: false,
+            visible: true
         };
 
         const finalOptions = { ...defaultOptions, ...options };
@@ -217,6 +225,14 @@ class ServoWindow extends EventEmitter {
 
     setPosition(x, y) {
         this.handle.setPosition(x, y);
+    }
+
+    show() {
+        this.handle.show();
+    }
+
+    hide() {
+        this.handle.hide();
     }
 }
 

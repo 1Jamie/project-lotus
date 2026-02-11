@@ -12,15 +12,23 @@ console.log("[App] Launching Servo Window in Hybrid Mode...");
 
 // We point Lotus directly at the UI directory
 const win = new ServoWindow({
+    id: 'main-window',
     root: UI_DIR,
     index: 'index.html',
     width: 1024,
     height: 768,
-    title: "Hybrid Lotus App"
+    title: "Hybrid Lotus App",
+    transparent: true,
+    visible: false
 });
 
 win.on('ready', () => {
     console.log("[App] ServoWindow reported READY");
+});
+
+win.once('frame-ready', () => {
+    console.log("[App] First Frame Ready - Showing Window (No Flash guaranteed)");
+    win.show();
 });
 
 win.on('load-status', (status) => {
@@ -89,6 +97,7 @@ ipcMain.on('calculate', (data) => {
 ipcMain.on('open-secondary-window', () => {
     console.log('[ipcMain] Opening secondary window...');
     const win2 = new ServoWindow({
+        id: 'secondary-window',
         root: UI_DIR,
         index: 'secondary.html',
         width: 600,

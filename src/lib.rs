@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, process::Command};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -26,6 +26,10 @@ use winit::window::{Window, WindowId, CursorIcon};
 use winit::dpi::PhysicalSize as WinitPhysicalSize;
 use winit::raw_window_handle::{HasWindowHandle, HasDisplayHandle};
 use dpi::PhysicalSize as ServoPhysicalSize;
+#[cfg(target_os = "macos")]
+use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+#[cfg(target_os = "windows")]
+use window_vibrancy::{apply_blur, apply_mica};
 
 // Servo Imports
 use servo::{
@@ -44,7 +48,9 @@ use euclid::{Point2D, Scale};
 use servo::{DeviceIndependentPixel, DevicePixel};
 use embedder_traits::WebResourceResponse;
 use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+
 use http::StatusCode;
+use dark_light;
 
 
 // IPC Message structure - Removed! process raw bytes.
@@ -54,6 +60,44 @@ static EVENT_LOOP_PROXY: OnceCell<EventLoopProxy<EngineCommand>> = OnceCell::new
 
 // Global app state (thread-safe metadata only, no Rc types)
 static APP_STATE: OnceCell<Arc<Mutex<AppState>>> = OnceCell::new();
+
+#[cfg(target_os = "linux")]
+fn detect_linux_theme_robust() -> dark_light::Mode {
+    // 1. Try standard crate
+    let mode = dark_light::detect();
+    if mode == dark_light::Mode::Dark {
+        return mode;
+    }
+
+    // 2. Try gsettings for color-scheme (Modern GNOME)
+    // gsettings get org.gnome.desktop.interface color-scheme
+    if let Ok(output) = Command::new("gsettings")
+        .args(&["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output() 
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        // Output is usually "'prefer-dark'\n"
+        if stdout.contains("prefer-dark") {
+            return dark_light::Mode::Dark;
+        }
+    }
+
+    // 3. Try gsettings for gtk-theme (Legacy / Fallback)
+    // gsettings get org.gnome.desktop.interface gtk-theme
+    if let Ok(output) = Command::new("gsettings")
+        .args(&["get", "org.gnome.desktop.interface", "gtk-theme"])
+        .output() 
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+        // Check for "-dark" suffix
+        if stdout.contains("-dark") || stdout.contains(":dark") {
+            return dark_light::Mode::Dark;
+        }
+    }
+
+    // Default to what we found initially (Light/Default)
+    mode
+}
 
 struct AppState {
     window_metadata: HashMap<String, WindowMetadata>,
@@ -162,6 +206,9 @@ pub struct WindowOptions {
     pub initial_url: Option<String>,
     pub restore_state: bool,
     pub root: Option<String>,
+    pub transparent: bool,
+    pub visible: bool,
+    pub id: Option<String>,
 }
 
 impl Default for WindowOptions {
@@ -178,6 +225,9 @@ impl Default for WindowOptions {
             initial_url: None,
             restore_state: true,
             root: None,
+            transparent: false,
+            visible: true,
+            id: None,
         }
     }
 }
@@ -202,6 +252,8 @@ pub enum EngineCommand {
     CloseWindow(String), // window_id
     SetDecorations(String, bool), // window_id, decorations
     ExecuteScript(String, String), // window_id, script
+    ShowWindow(String), // window_id
+    HideWindow(String), // window_id
 }
 
 
@@ -258,7 +310,22 @@ impl WindowHandle {
     }
 
     #[napi]
+    pub fn show(&self) {
+         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::ShowWindow(self.id.clone()));
+        }
+    }
+
+    #[napi]
+    pub fn hide(&self) {
+         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::HideWindow(self.id.clone()));
+        }
+    }
+
+    #[napi]
     pub fn set_always_on_top(&self, always_on_top: bool) {
+
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::SetAlwaysOnTop(self.id.clone(), always_on_top));
         }
@@ -397,6 +464,15 @@ impl WebViewDelegate for LotusWebViewDelegate {
     fn notify_new_frame_ready(&self, _webview: servo::WebView) {
         trace!("Rust: NewFrameReady - Requesting Redraw");
         self.window.request_redraw();
+        
+        if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
+            "event": "frame-ready",
+            "window_id": self.window_id
+        })) {
+             if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                let _ = proxy.send_event(EngineCommand::IpcMessage(self.window_id.clone(), msg));
+            }
+        }
     }
     
     fn notify_page_title_changed(&self, _webview: servo::WebView, title: Option<String>) {
@@ -560,9 +636,13 @@ impl LotusApp {
     
     fn ensure_servo(&mut self) -> &servo::Servo {
         if self.servo.is_none() {
+            let mut prefs = servo::prefs::Preferences::default();
+            prefs.shell_background_color_rgba = [0.0, 0.0, 0.0, 0.0]; // Transparent
+
             let waker = LotusWaker(self.proxy.clone());
             let servo = ServoBuilder::default()
                 .event_loop_waker(Box::new(waker))
+                .preferences(prefs)
                 .build();
             servo.setup_logging();
             self.servo = Some(servo);
@@ -594,7 +674,30 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         s.window_start_times.insert(window_id.clone(), creation_start);
                     }
                 }
+
                 
+                // Detect Theme explicitly
+                #[cfg(target_os = "linux")]
+                let mode = detect_linux_theme_robust();
+                #[cfg(not(target_os = "linux"))]
+                let mode = dark_light::detect();
+
+                info!("Rust: Detected system theme mode: {:?}", mode);
+                
+                let theme = match mode {
+                    dark_light::Mode::Dark => Some(winit::window::Theme::Dark),
+                    dark_light::Mode::Light => Some(winit::window::Theme::Light),
+                    dark_light::Mode::Default => None,
+                };
+                
+                if let Some(t) = theme {
+                     info!("Rust: Setting winit window theme to: {:?}", t);
+                } else {
+                     info!("Rust: Winit window theme set to None (Default)");
+                }
+
+                info!("Rust: Creating window with visible=false, transparent={}", options.transparent);
+
                 let mut window_attrs = Window::default_attributes()
                     .with_title(options.title.clone())
                     .with_inner_size(WinitPhysicalSize::new(
@@ -602,7 +705,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         options.height
                     ))
                     .with_decorations(true)
-                    .with_visible(true);
+                    .with_visible(false) // Always start hidden
+                    .with_transparent(options.transparent)
+                    .with_theme(theme);
 
                 if options.restore_state {
                     if let Some(state) = APP_STATE.get() {
@@ -643,6 +748,22 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 };
                 
                 let _ = rendering_context.make_current();
+
+                // Apply Vibrancy/Transparency effects
+                if options.transparent {
+                    #[cfg(target_os = "macos")]
+                    {
+                        // Use HUD window or standard vibrancy
+                        let _ = apply_vibrancy(&window, NSVisualEffectMaterial::HudWindow, None, None);
+                    }
+                    
+                    #[cfg(target_os = "windows")]
+                    {
+                        // Try Mica first, fall back to blur
+                         let _ = apply_mica(&window, None)
+                            .or_else(|_| apply_blur(&window, None));
+                    }
+                }
                 
                 let servo = self.ensure_servo().clone();
                 let delegate = Rc::new(LotusWebViewDelegate {
@@ -673,6 +794,21 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 
                 let port_script = format!("window.lotus.port = {}; window.lotus.token = '{}';", port, token);
                 user_content_manager.add_script(Rc::new(UserScript::from(port_script.as_str())));
+
+                // Inject Theme
+                // Use the explicitly detected theme since we trust it more than winit's initial state on some linux WMs
+                let theme_str = match mode {
+                    dark_light::Mode::Dark => "dark",
+                    dark_light::Mode::Light => "light",
+                    _ => "light",
+                };
+                let theme_script = format!(r#"
+                    window.lotus.theme = '{}';
+                    try {{
+                        document.documentElement.dataset.theme = window.lotus.theme;
+                    }} catch(e) {{}}
+                "#, theme_str);
+                user_content_manager.add_script(Rc::new(UserScript::from(theme_script.as_str())));
 
                 let mut webview_builder = WebViewBuilder::new(&servo, rendering_context.clone())
                     .delegate(delegate)
@@ -708,7 +844,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     }
                 }
 
-                window.set_visible(true);
+                if options.visible {
+                    window.set_visible(true);
+                }
                 window.request_redraw();
 
                 if let Some(state) = APP_STATE.get() {
@@ -787,6 +925,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.webview.evaluate_javascript(&script, |_| {});
                 }
             },
+            EngineCommand::ShowWindow(window_id) => {
+                if let Some(instance) = self.windows.get(&window_id) {
+                    instance.window.set_visible(true);
+                }
+            },
+            EngineCommand::HideWindow(window_id) => {
+                if let Some(instance) = self.windows.get(&window_id) {
+                    instance.window.set_visible(false);
+                }
+            },
         }
         
         if let Some(servo) = &self.servo {
@@ -795,6 +943,30 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::ThemeChanged(theme) => {
+                if let Some(uuid) = self.winit_id_to_uuid.get(&window_id) {
+                     let theme_str = match theme {
+                        winit::window::Theme::Dark => "dark",
+                        winit::window::Theme::Light => "light",
+                    };
+                    info!("Theme changed to {} for window {}", theme_str, uuid);
+                    
+                    if let Some(instance) = self.windows.get(uuid) {
+                         let script = format!(r#"
+                            if (window.lotus) {{
+                                window.lotus.theme = '{}';
+                                window.lotus.emit('theme-changed', '{}');
+                                try {{ document.documentElement.dataset.theme = '{}'; }} catch(e) {{}}
+                            }}
+                        "#, theme_str, theme_str, theme_str);
+                         instance.webview.evaluate_javascript(&script, |_| {});
+                    }
+                }
+            },
+            _ => {}
+        }
+
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
@@ -933,6 +1105,18 @@ impl App {
 
         // Determine app identifier (default to "lotus" if not provided)
         let app_id = app_identifier.unwrap_or_else(|| "lotus".to_string());
+
+        #[cfg(target_os = "linux")]
+        {
+            let mode = detect_linux_theme_robust();
+            eprintln!("[PROFILE] App::new - Linux Theme Detection Result (Robust): {:?}", mode);
+            if mode == dark_light::Mode::Dark {
+               env::set_var("GTK_THEME", "Adwaita:dark");
+               eprintln!("[PROFILE] Set GTK_THEME=Adwaita:dark");
+            } else {
+               eprintln!("[PROFILE] Did NOT set GTK_THEME (mode was not Dark)");
+            }
+        }
 
         // 1. Initialize global app state
         let app_state = Arc::new(Mutex::new(AppState {
@@ -1110,7 +1294,7 @@ impl App {
 
 #[napi]
 pub fn create_window(options: WindowOptions) -> WindowHandle {
-    let window_id = Uuid::new_v4().to_string();
+    let window_id = options.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
     
     if let Some(proxy) = EVENT_LOOP_PROXY.get() {
         let _ = proxy.send_event(EngineCommand::CreateWindow(options, window_id.clone()));
