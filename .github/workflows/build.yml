@@ -43,7 +43,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             build: |
-              apt-get update && apt-get install -y libfontconfig1-dev libgl1-mesa-dev libssl-dev
+              apt-get update && apt-get install -y libfontconfig1-dev libgl1-mesa-dev libssl-dev curl
+              rustup toolchain install 1.91.0
+              rustup default 1.91.0
               npm run build -- --target x86_64-unknown-linux-gnu
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
