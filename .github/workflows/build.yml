@@ -51,13 +51,12 @@ jobs:
               export CXX=g++
               export CC_x86_64_unknown_linux_gnu=gcc
               export CXX_x86_64_unknown_linux_gnu=g++
-              # Unset CXXFLAGS to prevent sysroot-related header conflicts
-              # The sysroot causes g++ to mix host C++ headers with target C headers
-              unset CXXFLAGS
+              # Overwrite CXXFLAGS to remove sysroot (fixing header conflicts) and ensure SSE2 support
+              export CXXFLAGS="-msse2"
               # Force host linker to match host compiler and avoid sysroot's ancient libstdc++
               export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc
-              # Ensure bindgen knows the target architecture to find correct intrinsics
-              export BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-unknown-linux-gnu"
+              # Ensure bindgen knows the target architecture and SSE2 support to find correct intrinsics
+              export BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-unknown-linux-gnu -msse2"
               npm run build -- --target x86_64-unknown-linux-gnu
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
