@@ -70,7 +70,7 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
 If you want to run this, you need to be on an OS that respects you. 
 
 ### Linux (Debian/Ubuntu/Fedora)
-This is where development happens. It works here.
+This is where development happens. It works here. Fully working .node file for linux is in the artifacts tab.
 
 *   **Rust:** Stable toolchain.
     ```bash
@@ -92,12 +92,17 @@ This is where development happens. It works here.
 
 > **Note:** We auto-fix the `GLIBC_TUNABLES` static TLS issue. If you see `ERR_DLOPEN_FAILED` and the app restarts itself, that's just Lotus fixing your environment for you. Don't panic.
 
-### Windows / macOS
-*   **Status:** "Here be dragons." 🐉
-*   It *should* compile. It uses standard crates. I haven't tested it. If it explodes, that's a feature.
-*   (Windows) You probably need Visual Studio Build Tools. Good luck.
+### Windows
+*   **Status:** "It Works!" 🎉
+*   Please note the build just "worked" i havent actually tested it yet, check the gh actions artifacts tab to see the .node file for windows. I will work on testing soon but anyone else doing it is more than welcome! again will probably add it to npm in the next few days. Feel free to open an issue if you run into any issues. Please make sure to mark you issue with "Windows" so i can find it easily.
+*   (Windows) You need Visual Studio Build Tools and `choco install llvm nasm python311`.
+
+### macOS
+*   **Status:** HELP WANTED 🆘
+*   I removed CI support because i honestly just dont know enough about the Mac app lifecycle to do it right. If you are a Mac developer and want to fix this, PRs are welcome. I just dont know and i dont have a system to find out on, so feel more than welcome. I will probably expose the pieces so if you build for mac you can handle the lifecycle yourself in node, like window all closed and telling you what windows are closed and when. It should make it so you can at least use the events to handle it? (not currently supported but definitly on the table if there is demand) "Here be dragons still." 🐉
 
 ## 📦 Building (The Waiting Game)
+> **Pro Tip:** You don't actually have to build this yourself. Check the **Actions** tab on GitHub. Every commit produces working artifacts for Linux and Windows. Download, unzip, dont want to build? use time saved to beat that level of WoW, ESO, Guildwars2 or any other game you have been procrastinating on. (expect npm install support without having to build yourself in the next few days though you can just grab the .node files from the artifacts tab)
 
 Clone it. Install dependencies.
 
