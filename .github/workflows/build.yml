@@ -43,7 +43,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             build: |
-              apt-get update && apt-get install -y libfontconfig1-dev libgl1-mesa-dev libssl-dev curl g++ gcc lld
+              # Added lld for aws-lc-sys support, clang/libclang-dev for mozangle bindgen
+              apt-get update && apt-get install -y libfontconfig1-dev libgl1-mesa-dev libssl-dev curl g++ gcc lld clang libclang-dev
               rustup toolchain install 1.91.0
               rustup default 1.91.0
               export CC=gcc
@@ -55,6 +56,8 @@ jobs:
               unset CXXFLAGS
               # Force host linker to match host compiler and avoid sysroot's ancient libstdc++
               export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc
+              # Ensure bindgen knows the target architecture to find correct intrinsics
+              export BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-unknown-linux-gnu"
               npm run build -- --target x86_64-unknown-linux-gnu
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
