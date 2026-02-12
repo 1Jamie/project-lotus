@@ -32,33 +32,20 @@ jobs:
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             setup: |
-              # Choco works in bash on windows runners
               choco install llvm nasm python311
-              # Use BASH syntax for environment files
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
             build: |
               npm run build
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+            setup: |
+              sudo apt-get update && sudo apt-get install -y \
+                libfontconfig1-dev libgl1-mesa-dev libssl-dev \
+                clang libclang-dev lld
             build: |
-              # Added lld for aws-lc-sys support, clang/libclang-dev for mozangle bindgen
-              apt-get update && apt-get install -y libfontconfig1-dev libgl1-mesa-dev libssl-dev curl g++ gcc lld clang libclang-dev
-              rustup toolchain install 1.91.0
-              rustup default 1.91.0
-              export CC=gcc
-              export CXX=g++
-              export CC_x86_64_unknown_linux_gnu=gcc
-              export CXX_x86_64_unknown_linux_gnu=g++
-              # Overwrite CXXFLAGS to remove sysroot (fixing header conflicts) and ensure SSE2 support
-              export CXXFLAGS="-msse2"
-              # Force host linker to match host compiler and avoid sysroot's ancient libstdc++
-              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc
-              # Ensure bindgen knows the target architecture and SSE2 support to find correct intrinsics
-              export BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-unknown-linux-gnu -msse2"
               npm run build -- --target x86_64-unknown-linux-gnu
-    name: stable - ${{ matrix.settings.target }} - node@20
+    name: stable - ${{ matrix.settings.target }} - node@22
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v4
@@ -66,13 +53,11 @@ jobs:
           submodules: recursive
       - name: Setup node
         uses: actions/setup-node@v4
-        if: ${{ !matrix.settings.docker }}
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
-      - name: Install
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        if: ${{ !matrix.settings.docker }}
         with:
           toolchain: stable
           targets: ${{ matrix.settings.target }}
@@ -86,26 +71,14 @@ jobs:
             .cargo-cache
             target/
           key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}
-      - uses: goto-bus-stop/setup-zig@v2
-        if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' }}
-        with:
-          version: 0.11.0
       - name: Setup toolchain
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
         shell: bash
       - name: Install dependencies
         run: npm install
-      - name: Build in docker
-        uses: addnab/docker-run-action@v3
-        if: ${{ matrix.settings.docker }}
-        with:
-          image: ${{ matrix.settings.docker }}
-          options: '--user 0:0 -v ${{ github.workspace }}/.cargo-cache/git/db:/usr/local/cargo/git/db -v ${{ github.workspace }}/.cargo/registry/cache:/usr/local/cargo/registry/cache -v ${{ github.workspace }}/.cargo/registry/index:/usr/local/cargo/registry/index -v ${{ github.workspace }}:/build -w /build'
-          run: ${{ matrix.settings.build }}
       - name: Build
         run: ${{ matrix.settings.build }}
-        if: ${{ !matrix.settings.docker }}
         shell: bash
       - name: Upload artifact
         uses: actions/upload-artifact@v4
