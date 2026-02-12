@@ -53,6 +53,8 @@ jobs:
               # Unset CXXFLAGS to prevent sysroot-related header conflicts
               # The sysroot causes g++ to mix host C++ headers with target C headers
               unset CXXFLAGS
+              # Force host linker to match host compiler and avoid sysroot's ancient libstdc++
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc
               npm run build -- --target x86_64-unknown-linux-gnu
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
