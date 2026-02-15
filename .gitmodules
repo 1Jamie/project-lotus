@@ -1,3 +1,6 @@
 [submodule "servo"]
 	path = packages/lotus-core/servo
 	url = https://github.com/servo/servo.git
+[submodule "packages/lotus-core/servo"]
+	path = packages/lotus-core/servo
+	url = https://github.com/servo/servo.git

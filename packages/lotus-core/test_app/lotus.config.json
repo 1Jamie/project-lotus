@@ -1,0 +1,17 @@
+{
+    "name": "LotusTestApp",
+    "version": "1.0.0",
+    "license": "ISC",
+    "description": "A test application for the Lotus framework",
+    "main": "main.js",
+    "executableName": "lotus-test",
+    "icon": "./assets/icon.png",
+    "build": {
+        "linux": {
+            "wmClass": "lotus-test-app",
+            "categories": [
+                "Development"
+            ]
+        }
+    }
+}

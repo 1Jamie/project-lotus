@@ -1,0 +1,10 @@
+{
+    "name": "lotus-test-app",
+    "version": "1.0.0",
+    "description": "Test Application for Lotus",
+    "main": "main.js",
+    "license": "ISC",
+    "dependencies": {
+        "@lotus/core": "file:../lotus-core-0.1.0.tgz"
+    }
+}

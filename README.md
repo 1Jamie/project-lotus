@@ -1,16 +1,16 @@
 # 🪷 Lotus (Servo-Node)
 
 **🏆 "ELECTRON IS AN 80s FORD BRONCO."**
-*"Huge. Heavy. Built to survive off-roading, river crossings, and the open internet. Every window spins up a full browser like it’s about to get lost in the wilderness."*
+*"Huge. Heavy. Built to survive off-roading, river crossings, and the open internet. Every window spins up a full browser like it's about to get lost in the wilderness."*
 
 **🏎️ "LOTUS IS... WELL, A LOTUS ELISE."**
-*"If a part doesn’t make it start faster, use less memory, or render pixels, it’s gone. No extra suspension. No spare tires. No browser pretending to be an operating system."*
+*"If a part doesn't make it start faster, use less memory, or render pixels, it's gone. No extra suspension. No spare tires. No browser pretending to be an operating system."*
 
 **🥊 THE ARCHITECTURE (Or: Why It's Fast)**
 *"Most desktop apps are just opening a preferences panel. We didn't think that required a second operating system."*
 
 • **Electron Strategy:** Puts the browser in charge and lets Node ride shotgun.
-  *"It builds a monster truck because it assumes you’re off-roading."*
+  *"It builds a monster truck because it assumes you're off-roading."*
 • **Lotus Strategy:** The opposite.
   *"Node owns the OS. Servo paints the pixels. No magic. No fake sandboxes. No hidden Chromium instances listening to your microphone."*
 
@@ -18,10 +18,10 @@
 • **Node.js** is the track.
 • **Servo** is the car.
 • **IPC** is the steering wheel.
-  *"On a track, you don’t worry about potholes. You worry about lap times."*
+  *"On a track, you don't worry about potholes. You worry about lap times."*
 
 **TL;DR:**
-Electron assumes you're lost. Lotus assumes you know where you're going. And that’s why it’s fast.
+Electron assumes you're lost. Lotus assumes you know where you're going. And that's why it's fast.
 
 ---
 
@@ -33,7 +33,7 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
 *   **Speed that actually matters:**
     *   Cold start to interactive window in **<300ms**. You can't even blink that fast.
     *   A single window stack (Rust + Node + Servo) runs on **~300MB RAM**.
-    *   Adding a second window costs **~80MB**. We share the renderer. We don’t spawn a new universe for every pop-up.
+    *   Adding a second window costs **~80MB**. We share the renderer. We don't spawn a new universe for every pop-up.
 
 *   **Hybrid Runtime:**
     *   **Core:** Rust-based Servo engine. It renders HTML/CSS. That's it.
@@ -50,7 +50,7 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
     *   **MsgPack Batching:** We pack small messages together like sardines. Efficient, tasty sardines.
     *   **Zero-Copy:** We try not to copy data. Copying data is for people who like waiting.
 
-    *   **Window State Persistence:**
+*   **Window State Persistence:**
     *   It remembers where you put the window (if you give it an ID). Groundbreaking technology, I know.
     *   Handles maximized state, size, position. You're welcome.
     
@@ -65,86 +65,208 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
     *   Spawn multiple independent windows from a single Node process.
     *   Shared renderer = ~80MB per extra window. Electron could never.
 
+---
+
+## 📦 Monorepo Structure
+
+Lotus is organized as a monorepo with two packages:
+
+```
+lotus/
+├── packages/
+│   ├── lotus-core/          # @lotus/core — Runtime engine (Servo + Node bindings)
+│   │   ├── src/             # Rust source (N-API bindings, window management)
+│   │   ├── lotus.js         # High-level JS API (ServoWindow, IpcMain, App)
+│   │   ├── index.js         # Native binding loader
+│   │   ├── resources/       # IPC bridge scripts, debugger
+│   │   └── test_app/        # Example application
+│   │
+│   └── lotus-dev/           # @lotus/dev — CLI toolkit for development & packaging
+│       ├── bin/lotus.js      # CLI entry point (lotus dev, build, clean)
+│       └── lib/templates/    # Installer templates (RPM spec, etc.)
+│
+├── package.json             # Monorepo root (npm workspaces)
+└── README.md                # You are here
+```
+
+| Package | npm Name | What It Does |
+|---------|----------|--------------|
+| [lotus-core](./packages/lotus-core/) | `@lotus/core` | The runtime — Servo engine, window management, IPC. This is what your app `require()`s. |
+| [lotus-dev](./packages/lotus-dev/) | `@lotus/dev` | CLI toolkit — dev server with hot-reload, build system, DEB/RPM installer packaging. |
+
 ## 🛠️ Prerequisites
 
 If you want to run this, you need to be on an OS that respects you. 
 
 ### Linux (Debian/Ubuntu/Fedora)
-This is where development happens. It works here. Fully working .node file for linux is in the artifacts tab.
+This is where development happens. It works here. Fully working `.node` file for Linux is in the artifacts tab.
 
-*   **Rust:** Stable toolchain.
-    ```bash
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    ```
-*   **Node.js:** v22+. Don't come at me with no v14, we legit require it, we are using n-api 4.
-*   **System Libraries:** You need these or Rust will scream at you.
+*   **Node.js:** v22+. Don't come at me with v14, we legit require it, we are using N-API 4.
+*   **System Libraries:** You need these or things will scream at you.
 
     **Ubuntu/Debian:**
     ```bash
     sudo apt-get update
     sudo apt-get install libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev
+
+    # Required for building .deb installers with `lotus build`
+    sudo apt-get install dpkg-dev fakeroot
     ```
 
     **Fedora:**
     ```bash
     sudo dnf install mesa-libGL-devel openssl-devel python3 fontconfig-devel
+
+    # Required for building .rpm installers with `lotus build`
+    sudo dnf install rpm-build
     ```
 
 > **Note:** We auto-fix the `GLIBC_TUNABLES` static TLS issue. If you see `ERR_DLOPEN_FAILED` and the app restarts itself, that's just Lotus fixing your environment for you. Don't panic.
 
 ### Windows
 *   **Status:** "It Works!" 🎉
-*   Please note the build just "worked" i havent actually tested it yet, check the gh actions artifacts tab to see the .node file for windows. I will work on testing soon but anyone else doing it is more than welcome! again will probably add it to npm in the next few days. Feel free to open an issue if you run into any issues. Please make sure to mark you issue with "Windows" so i can find it easily.
-*   (Windows) You need Visual Studio Build Tools and `choco install llvm nasm python311`.
+*   The build just "worked" — check the GH Actions artifacts tab to see the `.node` file for Windows. Please make sure to mark your issues with "Windows" so they're easy to find.
+*   You need Visual Studio Build Tools and `choco install llvm nasm python311`.
 
 ### macOS
 *   **Status:** HELP WANTED 🆘
-*   I removed CI support because i honestly just dont know enough about the Mac app lifecycle to do it right. If you are a Mac developer and want to fix this, PRs are welcome. I just dont know and i dont have a system to find out on, so feel more than welcome. I will probably expose the pieces so if you build for mac you can handle the lifecycle yourself in node, like window all closed and telling you what windows are closed and when. It should make it so you can at least use the events to handle it? (not currently supported but definitly on the table if there is demand) "Here be dragons still." 🐉
+*   I removed CI support because I honestly just don't know enough about the Mac app lifecycle to do it right. If you are a Mac developer and want to fix this, PRs are welcome. I just don't have a system to test on. "Here be dragons still." 🐉
 
-## 📦 Building (The Waiting Game)
-> **Pro Tip:** You don't actually have to build this yourself. Check the **Actions** tab on GitHub. Every commit produces working artifacts for Linux and Windows. Download, unzip, dont want to build? use time saved to beat that level of WoW, ESO, Guildwars2 or any other game you have been procrastinating on. (expect npm install support without having to build yourself in the next few days though you can just grab the .node files from the artifacts tab)
+---
 
-Clone it. Install dependencies.
+## 🚀 Quick Start (Using Lotus)
 
-```bash
-git clone https://github.com/1jamie/project-lotus.git
-cd project-lotus
-npm install
-```
+> **Pro Tip:** You don't have to build the engine yourself. Pre-built binaries are available. Check the **Actions** tab on GitHub for artifacts, or `npm install @lotus/core` once it's published.
 
-**Build the Native Addon:**
+### 1. Set up your project
 
 ```bash
-# Debug Build (Faster compilation, still slow)
-npm run build:debug
-
-# Release Build (Optimized, takes eons)
-npm run build
+mkdir my-lotus-app && cd my-lotus-app
+npm init -y
+npm install @lotus/core @lotus/dev
 ```
 
-> **Warning:** The first build takes forever. You are compiling a browser engine and a Node runtime binding. Go make a coffee. Read a book. Learn a new language. (though we all know you are scrolling tiktok or reddit, we all know you aren't being productive while the compile runs, none of us ever are) It gets faster after the first time. I promise.
+### 2. Create `lotus.config.json`
 
-## 🏃 Running It
+This file controls your app's metadata and build settings:
 
-The best way to see if it works (and marvel at the speed) is the test app.
+```json
+{
+    "name": "MyApp",
+    "version": "1.0.0",
+    "license": "MIT",
+    "description": "My desktop app, minus the bloat",
+    "main": "main.js",
+    "executableName": "my-app",
+    "icon": "./assets/icon.png",
+    "build": {
+        "linux": {
+            "wmClass": "my-app",
+            "categories": ["Utility"]
+        }
+    }
+}
+```
+
+### 3. Create `main.js`
+
+```javascript
+const { ServoWindow, ipcMain, app } = require('@lotus/core');
+const path = require('path');
+
+app.warmup(); // Wake up the engine
+
+const win = new ServoWindow({
+    id: 'main-window',
+    root: path.join(__dirname, 'ui'),
+    index: 'index.html',
+    width: 1024,
+    height: 768,
+    title: "My Lotus App",
+    transparent: true,
+    visible: false
+});
+
+// Show only after first frame — no white flash, ever
+win.once('frame-ready', () => win.show());
+
+// IPC: talk to the webpage
+ipcMain.on('hello', (data) => {
+    console.log('Renderer says:', data);
+    ipcMain.send('reply', { message: 'Hello from Node!' });
+});
+```
+
+### 4. Create your UI
 
 ```bash
-# If you didn't build it yet, see above.
-npm start
-
-# For the stats nerds:
-npm start -- --profile
+mkdir ui
 ```
 
-The `--profile` flag prints timing metrics so you can feel superior about your startup times.
+`ui/index.html`:
+```html
+<!DOCTYPE html>
+<html>
+<head><title>My App</title></head>
+<body style="background: transparent;">
+    <div style="background: rgba(0,0,0,0.9); color: white; padding: 2rem; border-radius: 12px;">
+        <h1>Hello from Lotus! 🪷</h1>
+        <button onclick="window.lotus.send('hello', { from: 'renderer' })">
+            Talk to Node.js
+        </button>
+    </div>
+    <script>
+        window.lotus.on('reply', (data) => {
+            console.log('Node says:', data.message);
+        });
+    </script>
+</body>
+</html>
+```
 
-## 🧪 Smoke Tests
-
-To verify the raw native binding without the fancy JS wrapper:
+### 5. Run it
 
 ```bash
-npm test
+npx lotus dev main.js
 ```
+
+---
+
+## ⚙️ `lotus.config.json` Reference
+
+The config file lives in your project root and controls both runtime behavior and build output.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | `string` | Yes | Application display name |
+| `version` | `string` | Yes | Semver version (e.g., `"1.0.0"`) |
+| `license` | `string` | No | SPDX license identifier. Defaults to `"Proprietary"` |
+| `description` | `string` | No | Short description (used in package managers) |
+| `main` | `string` | No | Entry point file. Falls back to `package.json` `main`, then `index.js` |
+| `executableName` | `string` | No | Binary name (e.g., `my-app` → `/usr/bin/my-app`). Defaults to lowercase `name` |
+| `icon` | `string` | No | Path to app icon (relative to project root) |
+| `author` | `string` | No | Maintainer name for package metadata |
+| `homepage` | `string` | No | Project URL |
+| `build.linux.wmClass` | `string` | No | Window manager class (taskbar grouping) |
+| `build.linux.section` | `string` | No | Package section (default: `"utils"`) |
+| `build.linux.categories` | `string[]` | No | Desktop entry categories |
+
+## 🔧 CLI Commands (`@lotus/dev`)
+
+The `@lotus/dev` package provides the `lotus` CLI:
+
+```bash
+# Start dev server with hot-reload (watches for changes, auto-restarts)
+lotus dev [entry]
+
+# Build a distributable installer (DEB or RPM)
+lotus build --platform <linux|win32> --target <deb|rpm>
+
+# Clean build artifacts (removes dist/)
+lotus clean
+```
+
+See the full [@lotus/dev documentation](./packages/lotus-dev/README.md) for details on build output, flags, and project setup.
 
 ## 🎯 Usage (Code Snippets)
 
@@ -152,7 +274,7 @@ npm test
 Stop using Express to serve static files. It's embarrassing.
 
 ```javascript
-const { ServoWindow, app } = require('servo-node');
+const { ServoWindow, app } = require('@lotus/core');
 
 app.warmup(); // Wake up the engine
 
@@ -182,7 +304,7 @@ window.lotus.send('binary-channel', blob);
 
 **Main Process (Node):**
 ```javascript
-const { ipcMain } = require('servo-node');
+const { ipcMain } = require('@lotus/core');
 
 ipcMain.on('channel', (data) => {
     console.log('Renderer said:', data);
@@ -231,6 +353,7 @@ const win2 = new ServoWindow({ title: "Window 2" });
 const win3 = new ServoWindow({ title: "Window 3" });
 // All three windows share the same renderer process.
 // Efficient.
+```
 
 ### Window State Persistence: "Total Recall"
 By default, windows are amnesiac. They forget where they were. If you want them to remember, give them a name.
@@ -248,21 +371,75 @@ const win = new ServoWindow({
 *   **With ID?** We check `~/.config/app-name/window-state.json`. If we've seen "main-window" before, we put it back exactly where you left it.
 *   It snaps back to the last known position faster than you can say "Electron is bloat."
 
+### Building Distributable Packages
+Once your app is ready, build it into a real installer:
+
+```bash
+# Build an RPM (Fedora/RHEL)
+npx lotus build --platform linux --target rpm
+
+# Build a DEB (Ubuntu/Debian)  
+npx lotus build --platform linux --target deb
+
+# Install it
+sudo dnf install ./dist/installers/my-app-1.0.0-1.x86_64.rpm
+# or
+sudo dpkg -i ./dist/installers/my-app_1.0.0_amd64.deb
+```
+
+Your app is now a real installed application with a binary in `/usr/bin/` and everything. Just like a grown-up program.
+
+---
+
+## 🏗️ Building from Source (The Waiting Game)
+
+> **Pro Tip:** You don't actually have to build this yourself. Check the **Actions** tab on GitHub. Every commit produces working artifacts for Linux and Windows. Download, unzip, use the time saved to beat that level you've been procrastinating on. (expect npm install support without having to build yourself soon — you can just grab the `.node` files from the artifacts tab)
+
+```bash
+git clone https://github.com/1jamie/project-lotus.git
+cd project-lotus
+npm install
+```
+
+**Build the Native Addon:**
+
+```bash
+cd packages/lotus-core
+
+# Debug Build (Faster compilation, still slow)
+npm run build:debug
+
+# Release Build (Optimized, takes eons)
+npm run build
+```
+
+**Additional Requirements for Building:**
+*   **Rust:** Stable toolchain.
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    ```
+*   **Windows:** Visual Studio Build Tools + `choco install llvm nasm python311`
+
+> **Warning:** The first build takes forever. You are compiling a browser engine and a Node runtime binding. Go make a coffee. Read a book. Learn a new language. (though we all know you are scrolling TikTok or Reddit, we all know you aren't being productive while the compile runs, none of us ever are) It gets faster after the first time. I promise.
 
 ## 📂 Project Structure (For the curious)
 
-*   `src/lib.rs` - The Brain. Main Rust entry point. Handles N-API, Event Loop, IPC.
-*   `src/window_state.rs` - The Memory. Remembers where you put your windows.
-*   `src/platform.rs` - The Politeness. Proper OS integrations.
-*   `lotus.js` - The Body. High-level Node.js wrapper.
-*   `index.js` - The Glue. Native binding loader.
-*   `example.js` - The Hello World.
-*   `test_app/` - The Real Demo. Full-featured app showing off everything.
-*   `cicd_specification.md` - The Factory Instructions.
+*   `packages/lotus-core/src/lib.rs` - The Brain. Main Rust entry point. Handles N-API, Event Loop, IPC.
+*   `packages/lotus-core/src/window_state.rs` - The Memory. Remembers where you put your windows.
+*   `packages/lotus-core/src/platform.rs` - The Politeness. Proper OS integrations.
+*   `packages/lotus-core/lotus.js` - The Body. High-level Node.js wrapper (`ServoWindow`, `IpcMain`, `App`).
+*   `packages/lotus-core/index.js` - The Glue. Native binding loader.
+*   `packages/lotus-core/test_app/` - The Real Demo. Full-featured test app.
+*   `packages/lotus-dev/bin/lotus.js` - The Toolbox. CLI for dev, build, and clean commands.
+*   `packages/lotus-dev/lib/templates/` - The Factory. Installer templates (RPM spec, etc.).
+
+For detailed API documentation, see:
+*   [@lotus/core README](./packages/lotus-core/README.md) — Full `ServoWindow` API, IPC reference, architecture
+*   [@lotus/dev README](./packages/lotus-dev/README.md) — CLI commands, config reference, build pipeline
 
 ## 🤝 Contributing
 
-PRs are welcome. If you break the `winit` or `glutin` version requirements, I will close your PR with extreme prejudice. We need specific embedding traits and im already sitting on the edge with winit 0.30.2, dont push me off the edge it has already mentally put me on!
+PRs are welcome. If you break the `winit` or `glutin` version requirements, I will close your PR with extreme prejudice. We need specific embedding traits and I'm already sitting on the edge with winit 0.30.2, don't push me off the edge it has already mentally put me on!
 
 1.  Fork it.
 2.  Branch it (`git checkout -b feature/cool-stuff`).
@@ -277,7 +454,7 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 
 **P.S.**
 
-The entire framework (node gui lib) core is 1,781 lines of code.
+The entire framework core is ~1,800 lines of code.
 
 If that feels suspiciously light, it's because it is. We didn't try to build an OS inside your OS; we just gave Node a window and cut the fat until there was nothing left but speed.
 
