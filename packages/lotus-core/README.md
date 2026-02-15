@@ -1,11 +1,11 @@
-# @lotus/core
+# @lotus-gui/core
 
 The runtime engine for Lotus applications. Provides the Servo rendering engine, window management, and IPC system as a Node.js native addon.
 
 ## Installation
 
 ```bash
-npm install @lotus/core
+npm install @lotus-gui/core
 ```
 
 > **Note:** Pre-built binaries are available for Linux (x86_64). For other platforms, you'll need to build from source (see [Building from Source](#building-from-source)).
@@ -15,7 +15,7 @@ npm install @lotus/core
 ### Exports
 
 ```javascript
-const { ServoWindow, ipcMain, app } = require('@lotus/core');
+const { ServoWindow, ipcMain, app } = require('@lotus-gui/core');
 ```
 
 ### `app`
@@ -101,7 +101,7 @@ Handles communication between the main process (Node.js) and renderer (webpage).
 #### Main Process
 
 ```javascript
-const { ipcMain } = require('@lotus/core');
+const { ipcMain } = require('@lotus-gui/core');
 
 // Listen for messages from the renderer
 ipcMain.on('channel-name', (data) => {
@@ -189,7 +189,7 @@ const win2 = new ServoWindow({ id: 'preview', title: 'Preview' });
 ## Architecture
 
 ```
-@lotus/core
+@lotus-gui/core
 ├── src/lib.rs           # Rust N-API bindings, Servo event loop, IPC
 ├── src/window_state.rs  # Window position/size persistence
 ├── src/platform.rs      # OS-specific integrations (themes, cursors)
@@ -240,7 +240,7 @@ npm run build
 |---------|---------|
 | `msgpackr` | MsgPack serialization for IPC (binary message packing) |
 
-These are installed automatically when you `npm install @lotus/core`.
+These are installed automatically when you `npm install @lotus-gui/core`.
 
 ## License
 

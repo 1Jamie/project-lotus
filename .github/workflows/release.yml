@@ -22,7 +22,7 @@ jobs:
         settings:
           - host: windows-latest
             build: |
-              npm run build --workspace=@lotus/core -- --target x86_64-pc-windows-msvc
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc
             target: x86_64-pc-windows-msvc
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -31,7 +31,7 @@ jobs:
               sudo apt-get update
               sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev dpkg-dev fakeroot rpm pkg-config
             build: |
-              npm run build --workspace=@lotus/core -- --target x86_64-unknown-linux-gnu
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -100,7 +100,7 @@ jobs:
           path: artifacts
       - name: Move artifacts
         run: |
-          npm run artifacts --workspace=@lotus/core
+          npm run artifacts --workspace=@lotus-gui/core
         continue-on-error: true # Just in case script missing, but we handle via direct move
       # Manually move artifacts to core
       - name: Distribute artifacts
@@ -111,8 +111,8 @@ jobs:
       - name: Publish to npm
         run: |
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
-          npm publish --workspace=@lotus/core --access public
-          npm publish --workspace=@lotus/dev --access public
+          npm publish --workspace=@lotus-gui/core --access public
+          npm publish --workspace=@lotus-gui/dev --access public
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Create GitHub Release

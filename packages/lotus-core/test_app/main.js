@@ -1,4 +1,4 @@
-const { ServoWindow, ipcMain, app } = require('@lotus/core');
+const { ServoWindow, ipcMain, app } = require('@lotus-gui/core');
 const path = require('path');
 
 // Pre-warm backend

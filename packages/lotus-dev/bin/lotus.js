@@ -143,7 +143,7 @@ program
             fs.writeFileSync(path.join(appDir, 'LICENSE'), `Copyright (c) ${new Date().getFullYear()} ${config.author || 'Lotus App Developer'}. All rights reserved.`);
         }
 
-        // Verify @lotus/core binary
+        // Verify @lotus-gui/core binary
         // ...
 
         if (platform === 'linux') {

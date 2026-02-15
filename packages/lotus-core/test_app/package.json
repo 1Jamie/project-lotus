@@ -5,6 +5,6 @@
     "main": "main.js",
     "license": "ISC",
     "dependencies": {
-        "@lotus/core": "file:../lotus-core-0.1.0.tgz"
+        "@lotus-gui/core": "file:../lotus-core-0.1.0.tgz"
     }
 }

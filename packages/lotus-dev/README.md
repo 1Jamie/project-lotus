@@ -1,11 +1,11 @@
-# @lotus/dev
+# @lotus-gui/dev
 
 CLI toolkit for developing, building, and packaging Lotus applications into distributable installers.
 
 ## Installation
 
 ```bash
-npm install @lotus/dev
+npm install @lotus-gui/dev
 ```
 
 This provides the `lotus` CLI command.
@@ -145,7 +145,7 @@ A minimal Lotus project looks like this:
 ```
 my-lotus-app/
 ├── lotus.config.json    # Build configuration
-├── package.json         # npm dependencies (@lotus/core, @lotus/dev)
+├── package.json         # npm dependencies (@lotus-gui/core, @lotus-gui/dev)
 ├── main.js              # App entry point
 └── ui/
     └── index.html       # Your UI
@@ -158,10 +158,10 @@ my-lotus-app/
     "version": "1.0.0",
     "main": "main.js",
     "dependencies": {
-        "@lotus/core": "^0.1.0"
+        "@lotus-gui/core": "^0.1.0"
     },
     "devDependencies": {
-        "@lotus/dev": "^0.1.0"
+        "@lotus-gui/dev": "^0.1.0"
     }
 }
 ```
@@ -195,7 +195,7 @@ my-app
 ## Architecture
 
 ```
-@lotus/dev
+@lotus-gui/dev
 ├── bin/lotus.js          # CLI entry point (commander-based)
 ├── lib/templates/
 │   └── spec.ejs          # Custom RPM spec template

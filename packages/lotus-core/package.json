@@ -1,5 +1,5 @@
 {
-  "name": "@lotus/core",
+  "name": "@lotus-gui/core",
   "version": "0.1.0",
   "main": "lotus.js",
   "repository": {

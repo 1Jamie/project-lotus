@@ -1,5 +1,5 @@
 {
-    "name": "@lotus/dev",
+    "name": "@lotus-gui/dev",
     "version": "0.1.0",
     "description": "The Lotus Toolkit",
     "main": "index.js",

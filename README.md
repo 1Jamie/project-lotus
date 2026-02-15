@@ -74,14 +74,14 @@ Lotus is organized as a monorepo with two packages:
 ```
 lotus/
 ├── packages/
-│   ├── lotus-core/          # @lotus/core — Runtime engine (Servo + Node bindings)
+│   ├── lotus-core/          # @lotus-gui/core — Runtime engine (Servo + Node bindings)
 │   │   ├── src/             # Rust source (N-API bindings, window management)
 │   │   ├── lotus.js         # High-level JS API (ServoWindow, IpcMain, App)
 │   │   ├── index.js         # Native binding loader
 │   │   ├── resources/       # IPC bridge scripts, debugger
 │   │   └── test_app/        # Example application
 │   │
-│   └── lotus-dev/           # @lotus/dev — CLI toolkit for development & packaging
+│   └── lotus-dev/           # @lotus-gui/dev — CLI toolkit for development & packaging
 │       ├── bin/lotus.js      # CLI entry point (lotus dev, build, clean)
 │       └── lib/templates/    # Installer templates (RPM spec, etc.)
 │
@@ -91,8 +91,8 @@ lotus/
 
 | Package | npm Name | What It Does |
 |---------|----------|--------------|
-| [lotus-core](./packages/lotus-core/) | `@lotus/core` | The runtime — Servo engine, window management, IPC. This is what your app `require()`s. |
-| [lotus-dev](./packages/lotus-dev/) | `@lotus/dev` | CLI toolkit — dev server with hot-reload, build system, DEB/RPM installer packaging. |
+| [lotus-core](./packages/lotus-core/) | `@lotus-gui/core` | The runtime — Servo engine, window management, IPC. This is what your app `require()`s. |
+| [lotus-dev](./packages/lotus-dev/) | `@lotus-gui/dev` | CLI toolkit — dev server with hot-reload, build system, DEB/RPM installer packaging. |
 
 ## 🛠️ Prerequisites
 
@@ -136,14 +136,14 @@ This is where development happens. It works here. Fully working `.node` file for
 
 ## 🚀 Quick Start (Using Lotus)
 
-> **Pro Tip:** You don't have to build the engine yourself. Pre-built binaries are available. Check the **Actions** tab on GitHub for artifacts, or `npm install @lotus/core` once it's published.
+> **Pro Tip:** You don't have to build the engine yourself. Pre-built binaries are available. Check the **Actions** tab on GitHub for artifacts, or `npm install @lotus-gui/core` once it's published.
 
 ### 1. Set up your project
 
 ```bash
 mkdir my-lotus-app && cd my-lotus-app
 npm init -y
-npm install @lotus/core @lotus/dev
+npm install @lotus-gui/core @lotus-gui/dev
 ```
 
 ### 2. Create `lotus.config.json`
@@ -171,7 +171,7 @@ This file controls your app's metadata and build settings:
 ### 3. Create `main.js`
 
 ```javascript
-const { ServoWindow, ipcMain, app } = require('@lotus/core');
+const { ServoWindow, ipcMain, app } = require('@lotus-gui/core');
 const path = require('path');
 
 app.warmup(); // Wake up the engine
@@ -251,9 +251,9 @@ The config file lives in your project root and controls both runtime behavior an
 | `build.linux.section` | `string` | No | Package section (default: `"utils"`) |
 | `build.linux.categories` | `string[]` | No | Desktop entry categories |
 
-## 🔧 CLI Commands (`@lotus/dev`)
+## 🔧 CLI Commands (`@lotus-gui/dev`)
 
-The `@lotus/dev` package provides the `lotus` CLI:
+The `@lotus-gui/dev` package provides the `lotus` CLI:
 
 ```bash
 # Start dev server with hot-reload (watches for changes, auto-restarts)
@@ -266,7 +266,7 @@ lotus build --platform <linux|win32> --target <deb|rpm>
 lotus clean
 ```
 
-See the full [@lotus/dev documentation](./packages/lotus-dev/README.md) for details on build output, flags, and project setup.
+See the full [@lotus-gui/dev documentation](./packages/lotus-dev/README.md) for details on build output, flags, and project setup.
 
 ## 🎯 Usage (Code Snippets)
 
@@ -274,7 +274,7 @@ See the full [@lotus/dev documentation](./packages/lotus-dev/README.md) for deta
 Stop using Express to serve static files. It's embarrassing.
 
 ```javascript
-const { ServoWindow, app } = require('@lotus/core');
+const { ServoWindow, app } = require('@lotus-gui/core');
 
 app.warmup(); // Wake up the engine
 
@@ -304,7 +304,7 @@ window.lotus.send('binary-channel', blob);
 
 **Main Process (Node):**
 ```javascript
-const { ipcMain } = require('@lotus/core');
+const { ipcMain } = require('@lotus-gui/core');
 
 ipcMain.on('channel', (data) => {
     console.log('Renderer said:', data);
@@ -434,8 +434,8 @@ npm run build
 *   `packages/lotus-dev/lib/templates/` - The Factory. Installer templates (RPM spec, etc.).
 
 For detailed API documentation, see:
-*   [@lotus/core README](./packages/lotus-core/README.md) — Full `ServoWindow` API, IPC reference, architecture
-*   [@lotus/dev README](./packages/lotus-dev/README.md) — CLI commands, config reference, build pipeline
+*   [@lotus-gui/core README](./packages/lotus-core/README.md) — Full `ServoWindow` API, IPC reference, architecture
+*   [@lotus-gui/dev README](./packages/lotus-dev/README.md) — CLI commands, config reference, build pipeline
 
 ## 🤝 Contributing
 

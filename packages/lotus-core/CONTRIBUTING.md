@@ -1,4 +1,4 @@
-# Contributing to @lotus/core
+# Contributing to @lotus-gui/core
 
 ## Building Locally
 
@@ -12,7 +12,7 @@ npm run build
 
 To build ONLY the Core (Runtime):
 ```bash
-npm run build --workspace=@lotus/core
+npm run build --workspace=@lotus-gui/core
 ```
 
 ### From `packages/lotus-core`
