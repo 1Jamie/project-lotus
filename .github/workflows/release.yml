@@ -110,7 +110,7 @@ jobs:
           ls -R packages/lotus-core/*.node
       - name: Publish to npm
         run: |
-          npm config set //registry.npmjs.org/:_authToken=$NPM_TOKEN
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
           npm publish --workspace=@lotus/core --access public
           npm publish --workspace=@lotus/dev --access public
         env:

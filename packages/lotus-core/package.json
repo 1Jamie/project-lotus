@@ -2,6 +2,10 @@
   "name": "@lotus/core",
   "version": "0.1.0",
   "main": "lotus.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1Jamie/project-lotus.git"
+  },
   "files": [
     "lotus.js",
     "index.js",
@@ -25,6 +29,7 @@
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
     "clean": "napi clean",
+    "artifacts": "echo 'Artifacts moved by CI workflow'",
     "test": "npm run test:base",
     "test:base": "GLIBC_TUNABLES=glibc.rtld.optional_static_tls=4096 node example.js",
     "postinstall": "node scripts/install.js",
