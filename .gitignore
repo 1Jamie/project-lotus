@@ -20,6 +20,10 @@ yarn-error.log*
 # Binary modules
 *.node
 
-# Generated NAPI artifacts
-index.js
-index.d.ts
+# Generated NAPI artifacts (specific to core)
+packages/lotus-core/index.js
+packages/lotus-core/index.d.ts
+
+# Build outputs
+dist/
+installers/

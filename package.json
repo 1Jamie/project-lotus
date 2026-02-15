@@ -1,32 +1,14 @@
 {
-  "name": "servo-node",
-  "version": "0.1.0",
-  "main": "lotus.js",
-  "napi": {
-    "name": "servo-node",
-    "triples": {
-      "defaults": true,
-      "additional": [
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
-        "x86_64-unknown-linux-gnu",
-        "x86_64-pc-windows-msvc"
-      ]
+    "name": "lotus-monorepo",
+    "private": true,
+    "workspaces": [
+        "packages/*"
+    ],
+    "scripts": {
+        "build": "npm run build --workspaces",
+        "test": "npm run test --workspaces"
+    },
+    "devDependencies": {
+        "lerna": "^8.0.0"
     }
-  },
-  "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
-    "clean": "napi clean",
-    "test": "npm run test:base",
-    "test:base": "GLIBC_TUNABLES=glibc.rtld.optional_static_tls=4096 node example.js",
-    "start": "node test_app/main.js",
-    "test-app": "node test_app/main.js"
-  },
-  "devDependencies": {
-    "@napi-rs/cli": "^2.16.0"
-  },
-  "dependencies": {
-    "msgpackr": "^1.11.8"
-  }
 }
