@@ -1,12 +1,13 @@
 {
   "name": "@lotus-gui/core",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "main": "lotus.js",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/1Jamie/project-lotus.git"
   },
   "files": [
+    "README.md",
     "lotus.js",
     "index.js",
     "index.d.ts",
