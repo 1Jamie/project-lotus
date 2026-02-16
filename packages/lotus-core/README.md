@@ -8,7 +8,7 @@ The runtime engine for Lotus applications. Provides the Servo rendering engine, 
 npm install @lotus-gui/core
 ```
 
-> **Note:** Pre-built binaries are available for Linux (x86_64). For other platforms, you'll need to build from source (see [Building from Source](#building-from-source)).
+> **Note:** Pre-built binaries are available for **Linux (x86_64)** and **Windows (x64)**. You likely do not need to build from source.
 
 ## API Reference
 

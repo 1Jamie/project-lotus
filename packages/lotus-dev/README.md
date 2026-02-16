@@ -27,7 +27,43 @@ lotus dev main.js      # Custom entry point
 - Auto-restarts on any file change
 - Kills the previous process cleanly
 
-### `lotus build`
+- Kills the previous process cleanly
+ 
+ ### `lotus init [projectName]`
+ 
+ Initialize a new Lotus project with interactive prompts.
+ 
+ ```bash
+ lotus init               # Prompts for project name
+ lotus init my-app        # Creates 'my-app' directory
+ ```
+ 
+ **Interactive Prompts:**
+ If flags are not provided, the CLI will ask for:
+ - Project Name (directory)
+ - Application Name
+ - Version
+ - Description
+ - Author
+ - Homepage / Repository URL (Important for Linux packages)
+ - License
+ 
+ **Non-Interactive Flags:**
+ You can skip prompts by providing flags:
+ ```bash
+ lotus init my-app --name "My App" --app-version 1.0.0 --homepage "https://example.com"
+ ```
+ 
+ | Flag | Description |
+ |------|-------------|
+ | `--name` | Application display name |
+ | `--app-version` | Application version (e.g., `1.0.0`) |
+ | `--description` | Short description |
+ | `--author` | Author name |
+ | `--homepage` | Repository or homepage URL |
+ | `--license` | License identifier (default: `MIT`) |
+ 
+ ### `lotus build`
 
 Build your application into a distributable installer package.
 
@@ -38,7 +74,7 @@ lotus build --platform linux --target rpm
 
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
-| `--platform` | `linux`, `win32` | Current OS | Target platform |
+| `--platform` | `linux`, `win32` | Current OS | Target platform (Windows support is experimental/WIP) |
 | `--target` | `deb`, `rpm` | `deb` | Installer format (Linux only) |
 
 **What it does:**

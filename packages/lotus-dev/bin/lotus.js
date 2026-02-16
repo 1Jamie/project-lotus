@@ -5,6 +5,7 @@ const { spawn } = require('child_process');
 const chokidar = require('chokidar');
 const path = require('path');
 const fs = require('fs');
+const prompts = require('prompts');
 
 const program = new Command();
 
@@ -251,6 +252,231 @@ exec node "/usr/lib/${options.name}/resources/app/${entryPoint}" "$@"
             console.log('Packager for this platform not fully implemented yet.');
         }
 
+    });
+
+program
+    .command('init [projectName]')
+    .description('Initialize a new Lotus project')
+    .option('--name <name>', 'Application name')
+    .option('--app-version <version>', 'Application version')
+    .option('--description <description>', 'Application description')
+    .option('--author <author>', 'Author name')
+    .option('--license <license>', 'License (default: MIT)')
+    .option('--homepage <homepage>', 'Project homepage/repository URL')
+    .action(async (projectName, options) => {
+        let targetDir = projectName;
+
+        // 1. Prompt for project directory if not provided
+        if (!targetDir) {
+            const response = await prompts({
+                type: 'text',
+                name: 'value',
+                message: 'Project name (directory):',
+                initial: 'my-lotus-app'
+            });
+            targetDir = response.value;
+        }
+
+        if (!targetDir) {
+            console.log('Operation cancelled.');
+            process.exit(0);
+        }
+
+        const projectPath = path.resolve(targetDir);
+        if (fs.existsSync(projectPath)) {
+            const { overwrite } = await prompts({
+                type: 'confirm',
+                name: 'overwrite',
+                message: `Directory ${targetDir} already exists. Overwrite?`,
+                initial: false
+            });
+            if (!overwrite) {
+                console.log('Aborting.');
+                process.exit(1);
+            }
+        }
+
+        // 2. Gather Metadata (prompts if flags missing)
+        const questions = [
+            {
+                type: options.name ? null : 'text',
+                name: 'name',
+                message: 'Application Name:',
+                initial: targetDir
+            },
+            {
+                type: options.appVersion ? null : 'text',
+                name: 'version',
+                message: 'Version:',
+                initial: '0.1.0'
+            },
+            {
+                type: options.description ? null : 'text',
+                name: 'description',
+                message: 'Description:',
+                initial: 'A Lotus desktop application'
+            },
+            {
+                type: options.author ? null : 'text',
+                name: 'author',
+                message: 'Author:',
+                initial: ''
+            },
+            {
+                type: options.homepage ? null : 'text',
+                name: 'homepage',
+                message: 'Homepage / Repository URL:',
+                initial: ''
+            },
+            {
+                type: options.license ? null : 'text',
+                name: 'license',
+                message: 'License:',
+                initial: 'MIT'
+            }
+        ];
+
+        const answers = await prompts(questions);
+        const metadata = { ...options, ...answers };
+        metadata.version = options.appVersion || answers.version;
+        // Clean up undefined/null
+        Object.keys(metadata).forEach(k => metadata[k] == null && delete metadata[k]);
+
+
+        // 3. Generate Files
+        console.log(`\nCreating project in ${projectPath}...`);
+        fs.mkdirSync(projectPath, { recursive: true });
+
+        // package.json
+        const packageJson = {
+            name: targetDir.toLowerCase().replace(/[^a-z0-9-]/g, '-'), // npm safe name
+            version: metadata.version,
+            description: metadata.description,
+            main: "main.js",
+            scripts: {
+                "start": "lotus dev main.js",
+                "build": "lotus build"
+            },
+            keywords: ["lotus", "desktop", "gui"],
+            author: metadata.author,
+            homepage: metadata.homepage,
+            license: metadata.license,
+            dependencies: {
+                "@lotus-gui/core": "latest"
+            },
+            devDependencies: {
+                "@lotus-gui/dev": "latest"
+            }
+        };
+        fs.writeFileSync(path.join(projectPath, 'package.json'), JSON.stringify(packageJson, null, 2));
+
+        // lotus.config.json
+        const lotusConfig = {
+            name: metadata.name, // Display name
+            version: metadata.version,
+            license: metadata.license,
+            description: metadata.description,
+            main: "main.js",
+            executableName: targetDir.toLowerCase().replace(/[^a-z0-9-]/g, '-'),
+            author: metadata.author,
+            homepage: metadata.homepage || undefined,
+            build: {
+                linux: {
+                    wmClass: metadata.name.toLowerCase().replace(/ /g, '-'),
+                    categories: ["Utility"]
+                }
+            }
+        };
+        // Remove undefined keys
+        Object.keys(lotusConfig).forEach(key => lotusConfig[key] === undefined && delete lotusConfig[key]);
+
+        fs.writeFileSync(path.join(projectPath, 'lotus.config.json'), JSON.stringify(lotusConfig, null, 4));
+
+        // main.js
+        const mainJs = `const { ServoWindow, app, ipcMain } = require('@lotus-gui/core');
+const path = require('path');
+
+app.warmup();
+
+const win = new ServoWindow({
+    id: 'main-window',
+    root: path.join(__dirname, 'ui'),
+    index: 'index.html',
+    width: 1024,
+    height: 768,
+    title: "${metadata.name}",
+    transparent: true,
+    visible: false
+});
+
+win.once('frame-ready', () => win.show());
+
+ipcMain.on('hello', (data) => {
+    console.log('Received from renderer:', data);
+    ipcMain.send('reply', { message: 'Hello from Node.js!' });
+});
+`;
+        fs.writeFileSync(path.join(projectPath, 'main.js'), mainJs);
+
+        // UI Directory
+        const uiDir = path.join(projectPath, 'ui');
+        fs.mkdirSync(uiDir);
+
+        // ui/index.html
+        const indexHtml = `<!DOCTYPE html>
+<html>
+<head>
+    <title>${metadata.name}</title>
+    <style>
+        body { margin: 0; padding: 0; background: transparent; font-family: sans-serif; }
+        .app {
+            background: rgba(30, 30, 30, 0.95);
+            color: white;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border-radius: 8px; /* Optional rounded corners for the view */
+        }
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background: #646cff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+        }
+        button:hover { background: #535bf2; }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <h1>Welcome to ${metadata.name} 🪷</h1>
+        <p>Powered by Lotus (Servo + Node.js)</p>
+        <button onclick="sendMessage()">Ping Node.js</button>
+        <p id="response"></p>
+    </div>
+
+    <script>
+        function sendMessage() {
+            window.lotus.send('hello', { timestamp: Date.now() });
+        }
+
+        window.lotus.on('reply', (data) => {
+            document.getElementById('response').innerText = data.message;
+        });
+    </script>
+</body>
+</html>`;
+        fs.writeFileSync(path.join(uiDir, 'index.html'), indexHtml);
+
+        console.log(`\n✅ Project initialized in ${projectPath}`);
+        console.log(`\nNext steps:`);
+        console.log(`  cd ${targetDir}`);
+        console.log(`  npm install`);
+        console.log(`  npx lotus dev\n`);
     });
 
 program.parse();

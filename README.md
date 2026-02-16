@@ -14,6 +14,10 @@
 • **Lotus Strategy:** The opposite.
   *"Node owns the OS. Servo paints the pixels. No magic. No fake sandboxes. No hidden Chromium instances listening to your microphone."*
 
+**🚨 STATUS: ALPHA (BUT IT WORKS)**
+We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core`).
+Mac support is missing (help wanted). BSD and SUSE support is planned (see Roadmap). Tested support for building fully packaged .rpm installers for Linux but should support .deb and basic windows installers.
+
 **🔧 THE ANALOGY THAT EXPLAINS EVERYTHING:**
 • **Node.js** is the track.
 • **Servo** is the car.
@@ -46,7 +50,7 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
 
 *   **Advanced IPC (The Steering Wheel):**
     *   **Localhost IPC Server:** We use `tiny_http` on `127.0.0.1:0`. It works. It's fast.
-    *   **Auto-Adapting:** JSON? Binary? Blobs? We don't care. We handle it.
+    *   **Auto-Adapting:** JSON? Binary? Blobs? We don't care. We handle it and almost never have to serialize it.
     *   **MsgPack Batching:** We pack small messages together like sardines. Efficient, tasty sardines.
     *   **Zero-Copy:** We try not to copy data. Copying data is for people who like waiting.
 
@@ -124,21 +128,59 @@ This is where development happens. It works here. Fully working `.node` file for
 > **Note:** We auto-fix the `GLIBC_TUNABLES` static TLS issue. If you see `ERR_DLOPEN_FAILED` and the app restarts itself, that's just Lotus fixing your environment for you. Don't panic.
 
 ### Windows
-*   **Status:** "It Works!" 🎉
-*   The build just "worked" — check the GH Actions artifacts tab to see the `.node` file for Windows. Please make sure to mark your issues with "Windows" so they're easy to find.
-*   You need Visual Studio Build Tools and `choco install llvm nasm python311`.
+*   **Status:** Alpha ("It Works!")
+*   **NPM:** ✅ Verified - `@lotus-gui/core` includes the pre-built Windows binary.
+*   **Build Requirements (only if building from source):** Visual Studio Build Tools + `choco install llvm nasm python311`.
+
 
 ### macOS
 *   **Status:** HELP WANTED 🆘
 *   I removed CI support because I honestly just don't know enough about the Mac app lifecycle to do it right. If you are a Mac developer and want to fix this, PRs are welcome. I just don't have a system to test on. "Here be dragons still." 🐉
 
 ---
+ 
+ ## 🛠 Platform Support Matrix
+ 
+ | Platform | Arch | Native Binary (`.node`) | Installer Target | Status |
+ | :--- | :--- | :--- | :--- | :--- |
+ | **Linux (Debian/Ubuntu)** | x64 | ✅ Verified | `.deb` (Stable) | Ready |
+ | **Linux (Fedora/RHEL)** | x64 | ✅ Verified | `.rpm` (Stable) | Ready |
+ | **Linux (openSUSE)** | x64 | 🛠 Testing | `.rpm` (Planned v0.3) | Beta |
+ | **Windows** | x64 | ✅ Verified | `.msi` (Planned v0.3) | Alpha |
+ | **FreeBSD** | x64 | ⏳ Planned | TBD (Planned v0.3) | Roadmap |
+ | **macOS** | arm64 | 🆘 Help Wanted | TBD | On Hold |
 
-## 🚀 Quick Start (Using Lotus)
+> **Note:**
+> *   **Installer Target:** The packaged distribution format (what users download/install)
+> *   **Native Binary:** The `.node` file that powers the runtime (what developers `require()`)
+ 
+ ### **Verification Progress Tracking**
+ For a detailed breakdown of build success, environmental linking, and functional testing per platform, see the master tracking issue: **🚀 Multi-Platform Support & Build Targets**.
+ 
+ * **Build Success:** CI/CD produces artifacts without warnings.
+ * **Functionality:** Core features operational on clean installs.
+ * **Environment:** Proper linking of native dependencies.
+ 
+ ---
 
-> **Pro Tip:** You don't have to build the engine yourself. Pre-built binaries are available. Check the **Actions** tab on GitHub for artifacts, or `npm install @lotus-gui/core` once it's published.
+## 🚀 Quick Start (Usage from NPM)
 
-### 1. Set up your project
+> **The Easy Way:** working Windows and Linux builds are on npm. You don't need to build from source.
+
+### Option 1: Quick Start (Recommended)
+
+The fastest way to get started is with the CLI:
+
+```bash
+npx lotus init my-app
+cd my-app
+npm install
+npx lotus dev
+```
+
+### Option 2: Manual Setup
+
+If you prefer to set things up yourself:
 
 ```bash
 mkdir my-lotus-app && cd my-lotus-app
@@ -146,7 +188,10 @@ npm init -y
 npm install @lotus-gui/core @lotus-gui/dev
 ```
 
-### 2. Create `lotus.config.json`
+> Then see the example code below or check `node_modules/@lotus-gui/core/test_app` for a full reference.
+
+
+### Step 1: Create `lotus.config.json`
 
 This file controls your app's metadata and build settings:
 
@@ -168,7 +213,7 @@ This file controls your app's metadata and build settings:
 }
 ```
 
-### 3. Create `main.js`
+### Step 2: Create `main.js`
 
 ```javascript
 const { ServoWindow, ipcMain, app } = require('@lotus-gui/core');
@@ -197,7 +242,7 @@ ipcMain.on('hello', (data) => {
 });
 ```
 
-### 4. Create your UI
+### Step 3: Create your UI
 
 ```bash
 mkdir ui
@@ -224,7 +269,7 @@ mkdir ui
 </html>
 ```
 
-### 5. Run it
+### Step 4: Run it
 
 ```bash
 npx lotus dev main.js
@@ -446,6 +491,27 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 3.  Commit it (`git commit -m 'Added cool stuff'`).
 4.  Push it.
 5.  PR it.
+
+---
+## 🗺️ Roadmap
+
+### v0.2.0: The Shell & Frame
+*   **Frameless Mode:** Toggle window decorations off.
+*   **CSS Dragging:** Bridge for custom CSS drag areas (so you can build your own top bar).
+*   **Native Menus:** Rust hooks for the OS menu bar (integrated feel, not just a floating box).
+*   **Dev CLI:** Add `lotus init` command to create a new Lotus project.
+
+### v0.3.0: The Support Expansion
+*   **Windows Support:** Full MSI/EXE distribution (moving beyond just the `.node` binary).
+*   **BSD Support:** Bringing the renderer to the BSD community.
+*   **SUSE Support:** Expanding `@lotus-gui/dev` to handle OpenSUSE RPM quirks.
+*   **Mac Support?** (If someone donates a Mac or a contributor steps up).
+*   **Verify/support build for all supported platforms.**: Go through the build process for all supported platforms and verify that it works and fix where it does not.
+
+### v0.4.0: The Future (Community Input Welcome)
+*   **Build optimization:** See what we can do about the electron builder as it does add deps we may not need and may be able to make it install less deps during the install processes.
+*   **Debugger:** Add a debugger to the dev CLI to give access to a dev console for helping with development. Will probably have a seperate package called lotus-core-debug that the dev CLI will use to start the app with a build of lotus with the debug symbols and a developers console in its own window to help with debugging and gui development.
+*   **Open to suggestions:** I'm open to suggestions for the future. If you have an idea, let me know. Right now v0.4.0 is just a rough tenative plan for what I might do in the future.
 
 ---
 **License:** MIT. Do whatever you want, just don't blame me if your computer takes flight.
