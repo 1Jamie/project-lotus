@@ -1,4 +1,4 @@
-# 🪷 Lotus (Servo-Node)
+# 🪷 Lotus (lotus-gui)
 
 **🏆 "ELECTRON IS AN 80s FORD BRONCO."**
 *"Huge. Heavy. Built to survive off-roading, river crossings, and the open internet. Every window spins up a full browser like it's about to get lost in the wilderness."*
@@ -496,10 +496,12 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 ## 🗺️ Roadmap
 
 ### v0.2.0: The Shell & Frame
-*   **Frameless Mode:** Toggle window decorations off.
-*   **CSS Dragging:** Bridge for custom CSS drag areas (so you can build your own top bar).
-*   **Native Menus:** Rust hooks for the OS menu bar (integrated feel, not just a floating box).
+* ~~**Frameless Mode:** Toggle window decorations off.~~ *See Note 1*
+* ~~**CSS Dragging:** Bridge for custom CSS drag areas.~~ *See Note 1*
+*   **Native Menus:** Rust hooks for the OS menu bar.
 *   **Dev CLI:** Add `lotus init` command to create a new Lotus project.
+
+> **Note 1:** I removed these from scope. As I wrote the code, I realized I was reimplementing things the OS (and Winit) already do for free. If we want it to feel "native," using the actual native window frame is the correct choice. We save code, complexity, and bugs. (and of course my sanity)
 
 ### v0.3.0: The Support Expansion
 *   **Windows Support:** Full MSI/EXE distribution (moving beyond just the `.node` binary).

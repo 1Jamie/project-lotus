@@ -34,8 +34,8 @@
     "test": "npm run test:base",
     "test:base": "GLIBC_TUNABLES=glibc.rtld.optional_static_tls=4096 node example.js",
     "postinstall": "node scripts/install.js",
-    "start": "node test_app/main.js",
-    "test-app": "node test_app/main.js"
+    "start": "RUST_LOG=info LOTUS_DEV_REQ=../ node test_app/main.js",
+    "test-app": "RUST_LOG=debug LOTUS_DEV_REQ=../ node test_app/main.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.16.0"

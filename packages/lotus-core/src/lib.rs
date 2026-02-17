@@ -123,10 +123,12 @@ window.lotus = {
     _batchTimeout: null,
     port: null, // Will be set by init script
     token: null, // Will be set by init script
+    id: null,    // Will be set by init script
 
     send: (channel, data) => {
         const port = window.lotus.port;
         const token = window.lotus.token;
+        const windowId = window.lotus.id;
         if (!port) {
             console.error("Lotus IPC port not initialized");
             return;
@@ -138,7 +140,8 @@ window.lotus = {
             fetch(`http://127.0.0.1:${port}/ipc/${encodeURIComponent(channel)}`, {
                 method: 'POST',
                 headers: {
-                    'X-Lotus-Auth': token
+                    'X-Lotus-Auth': token,
+                    'X-Lotus-Window-Id': windowId
                 },
                 body: data
             }).catch(e => console.error("IPC Binary Post Failed", e));
@@ -158,7 +161,8 @@ window.lotus = {
                             fetch(`http://127.0.0.1:${port}/batch`, {
                                 method: 'POST',
                                 headers: {
-                                    'X-Lotus-Auth': token
+                                    'X-Lotus-Auth': token,
+                                    'X-Lotus-Window-Id': windowId
                                 },
                                 body: packed
                             }).catch(e => console.error("IPC Batch Post Failed", e));
@@ -808,7 +812,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 user_content_manager.add_script(Rc::new(UserScript::from(msgpackr_source.as_str())));
                 user_content_manager.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP_BASE)));
                 
-                let port_script = format!("window.lotus.port = {}; window.lotus.token = '{}';", port, token);
+                let port_script = format!("window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}';", port, token, window_id);
                 user_content_manager.add_script(Rc::new(UserScript::from(port_script.as_str())));
 
                 // Inject Theme
@@ -1107,17 +1111,13 @@ pub struct App {
 #[napi]
 impl App {
     #[napi(constructor)]
-    pub fn new(callback: ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>, profiling: bool, app_identifier: Option<String>) -> Self {
+    pub fn new(callback: ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>, profiling: bool, app_identifier: Option<String>, msgpackr_source: String) -> Self {
         let (proxy_tx, proxy_rx) = crossbeam_channel::bounded(1);
         
         let start_time = Instant::now();
         if profiling {
             eprintln!("[PROFILE] Application starting...");
         }
-
-        // Read msgpackr source
-        let msgpackr_source = fs::read_to_string("node_modules/msgpackr/dist/index.min.js")
-            .unwrap_or_else(|_| "// msgpackr not found".to_string());
 
         // Determine app identifier (default to "lotus" if not provided)
         let app_id = app_identifier.unwrap_or_else(|| "lotus".to_string());
@@ -1209,7 +1209,7 @@ impl App {
                     let response = tiny_http::Response::from_string("OK")
                         .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
                         .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]).unwrap())
-                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, X-Lotus-Auth"[..]).unwrap());
+                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, X-Lotus-Auth, X-Lotus-Window-Id"[..]).unwrap());
                     let _ = request.respond(response);
                     continue;
                 }
@@ -1223,6 +1223,11 @@ impl App {
                     continue;
                 }
 
+                let window_id = request.headers().iter()
+                    .find(|h| h.field.as_str().to_ascii_lowercase() == "x-lotus-window-id")
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+
                 let cors_header = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
 
                 if url_str.starts_with("/ipc/") {
@@ -1233,14 +1238,15 @@ impl App {
                     let _ = request.as_reader().read_to_end(&mut content);
                     
                     let mut msg = Vec::new();
-                    if let Ok(_) = rmp_serde::encode::write(&mut msg, &(channel, content)) {
-                        let _ = server_proxy.send_event(EngineCommand::IpcMessage("default".to_string(), msg));
+                    // Wrap single binary message in a list for consistency with batch format: [[channel, content]]
+                    if let Ok(_) = rmp_serde::encode::write(&mut msg, &vec![(channel, content)]) {
+                        let _ = server_proxy.send_event(EngineCommand::IpcMessage(window_id, msg));
                     }
                     let _ = request.respond(tiny_http::Response::from_string("ok").with_header(cors_header));
                 } else if url_str == "/batch" {
                     let mut content = Vec::new();
                     let _ = request.as_reader().read_to_end(&mut content);
-                    let _ = server_proxy.send_event(EngineCommand::IpcMessage("batch".to_string(), content));
+                    let _ = server_proxy.send_event(EngineCommand::IpcMessage(window_id, content));
                     let _ = request.respond(tiny_http::Response::from_string("ok").with_header(cors_header));
                 } else if url_str.starts_with("/resource/") {
                     let path = url_str.trim_start_matches("/resource/");

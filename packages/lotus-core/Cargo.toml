@@ -44,6 +44,11 @@ glutin = "0.32"
 glutin-winit = "0.5"
 raw-window-handle = "0.6"
 
+[profile.dev]
+split-debuginfo = "unpacked"
+incremental = true
+debug = 1
+
 [profile.release]
 strip = true
 lto = true

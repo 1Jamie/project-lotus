@@ -80,24 +80,54 @@ function ensureApp() {
             console.warn('[Lotus] Could not read package.json, using default app identifier');
         }
 
+        // Read msgpackr source from node_modules
+        let msgpackrSource = '// msgpackr not found';
+        try {
+            const fs = require('fs');
+            const path = require('path');
+            
+            let msgpackrPath;
+            try {
+                // Try to resolve it via subpath (might fail due to 'exports' in newer node)
+                msgpackrPath = require.resolve('msgpackr/dist/index.min.js');
+            } catch (e) {
+                // Fallback: use the main entry point to find the directory
+                // msgpackr exports its node version in dist/node.cjs
+                const mainPath = require.resolve('msgpackr');
+                msgpackrPath = path.join(path.dirname(mainPath), 'index.min.js');
+            }
+            
+            if (fs.existsSync(msgpackrPath)) {
+                msgpackrSource = fs.readFileSync(msgpackrPath, 'utf8');
+            } else {
+                console.warn('[Lotus] msgpackr minified source not found at:', msgpackrPath);
+            }
+        } catch (e) {
+            console.warn('[Lotus] Could not load msgpackr source for renderer:', e.message);
+        }
+
         globalApp = new App((data) => {
             try {
                 const buffer = Buffer.from(data);
                 if (!msgpackr) return;
                 const msg = msgpackr.unpack(buffer);
 
+                // Handle app-ready event
                 if (msg.event === 'app-ready') {
                     if (isProfiling) console.log(`[PROFILE] App/IPC Ready event received.`);
                     ipcMain.emit('ready', msg);
                     return;
                 }
 
+                // All other events should have a window_id
+                const windowId = msg.window_id;
+                const win = windows.get(windowId);
+
                 if (msg.event === 'ready') {
                     if (isProfiling) {
                         const time = Date.now() - startTime;
-                        console.log(`[PROFILE] Window ${msg.window_id} READY event received by JS after ${time}ms`);
+                        console.log(`[PROFILE] Window ${windowId} READY event received by JS after ${time}ms`);
                     }
-                    const win = windows.get(msg.window_id);
                     if (win) win.emit('ready');
                     return;
                 }
@@ -105,48 +135,41 @@ function ensureApp() {
                 if (msg.event === 'load-status') {
                     if (isProfiling) {
                         const time = Date.now() - startTime;
-                        console.log(`[PROFILE] Window ${msg.window_id || 'UNKNOWN'} load-status: ${msg.status} after ${time}ms`);
+                        console.log(`[PROFILE] Window ${windowId || 'UNKNOWN'} load-status: ${msg.status} after ${time}ms`);
                         if (msg.status === 'complete') {
-                            console.log(`[PROFILE] Window ${msg.window_id || 'UNKNOWN'} Total Load Time: ${time}ms`);
+                            console.log(`[PROFILE] Window ${windowId || 'UNKNOWN'} Total Load Time: ${time}ms`);
                         }
                     }
-                    const win = windows.get(msg.window_id);
                     if (win) win.emit('load-status', msg.status);
                     return;
                 }
 
                 if (msg.event === 'frame-ready') {
-                    const win = windows.get(msg.window_id);
                     if (win) win.emit('frame-ready');
                     return;
                 }
 
                 if (msg.event === 'window-closed') {
-                    const win = windows.get(msg.window_id);
                     if (win) {
                         win.emit('closed');
-                        windows.delete(msg.window_id);
+                        windows.delete(windowId);
                     }
                     return;
                 }
 
                 // IPC Message routing
                 if (Array.isArray(msg)) {
-                    if (msg.length === 2 && typeof msg[0] === 'string') {
-                        ipcMain.emit(msg[0], msg[1]);
-                    } else {
-                        // Batch
-                        msg.forEach(m => {
-                            if (Array.isArray(m) && m.length === 2) {
-                                ipcMain.emit(m[0], m[1]);
-                            }
-                        });
-                    }
+                    // Check if it's a batch message (array of [channel, data])
+                    msg.forEach(m => {
+                        if (Array.isArray(m) && m.length === 2) {
+                            ipcMain.emit(m[0], m[1]);
+                        }
+                    });
                 }
             } catch (e) {
                 console.error('[lotus] Failed to process event:', e);
             }
-        }, isProfiling, appIdentifier);
+        }, isProfiling, appIdentifier, msgpackrSource);
     }
     return globalApp;
 }
