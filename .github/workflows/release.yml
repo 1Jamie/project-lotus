@@ -77,7 +77,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.settings.target }}
-          path: packages/lotus-core/*.node
+          path: |
+            packages/lotus-core/*.node
+            packages/lotus-core/index.js
+            packages/lotus-core/index.d.ts
           if-no-files-found: error
 
   publish:
@@ -107,7 +110,10 @@ jobs:
         run: |
           ls -R artifacts
           mv artifacts/bindings-*/*.node packages/lotus-core/
-          ls -R packages/lotus-core/*.node
+          # Copy index.js and index.d.ts from one of the artifact folders (they are identical across platforms)
+          cp artifacts/bindings-x86_64-unknown-linux-gnu/index.js packages/lotus-core/
+          cp artifacts/bindings-x86_64-unknown-linux-gnu/index.d.ts packages/lotus-core/
+          ls -la packages/lotus-core/
       - name: Publish to npm
         run: |
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
