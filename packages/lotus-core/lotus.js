@@ -85,7 +85,7 @@ function ensureApp() {
         try {
             const fs = require('fs');
             const path = require('path');
-            
+
             let msgpackrPath;
             try {
                 // Try to resolve it via subpath (might fail due to 'exports' in newer node)
@@ -96,7 +96,7 @@ function ensureApp() {
                 const mainPath = require.resolve('msgpackr');
                 msgpackrPath = path.join(path.dirname(mainPath), 'index.min.js');
             }
-            
+
             if (fs.existsSync(msgpackrPath)) {
                 msgpackrSource = fs.readFileSync(msgpackrPath, 'utf8');
             } else {
@@ -157,12 +157,63 @@ function ensureApp() {
                     return;
                 }
 
-                // IPC Message routing
+                if (msg.event === 'moved') {
+                    if (win) win.emit('moved', { x: msg.x, y: msg.y });
+                    return;
+                }
+
+                if (msg.event === 'focused') {
+                    if (win) win.emit('focus');
+                    return;
+                }
+
+                if (msg.event === 'unfocused') {
+                    if (win) win.emit('blur');
+                    return;
+                }
+
+                if (msg.event === 'resized') {
+                    if (win) win.emit('resize', { width: msg.width, height: msg.height });
+                    return;
+                }
+
+                // IPC Batch message routing (from /batch endpoint)
+                if (msg.event === 'ipc-batch') {
+                    const rawBatch = msg._raw_batch;
+                    const batchWindow = windows.get(msg.window_id);
+                    if (rawBatch instanceof Uint8Array || Buffer.isBuffer(rawBatch)) {
+                        try {
+                            const batch = msgpackr.unpack(Buffer.from(rawBatch));
+                            if (Array.isArray(batch)) {
+                                batch.forEach(m => {
+                                    if (Array.isArray(m) && m.length === 2) {
+                                        if (m[0] === 'lotus:set-drag-regions') {
+                                            if (batchWindow) batchWindow.updateDragRegions(m[1]);
+                                        } else {
+                                            ipcMain.emit(m[0], m[1]);
+                                        }
+                                    }
+                                });
+                            }
+                        } catch (e) {
+                            console.error('[lotus] Failed to decode ipc-batch:', e);
+                        }
+                    }
+                    return;
+                }
+
+                // Legacy IPC Message routing (plain array)
                 if (Array.isArray(msg)) {
                     // Check if it's a batch message (array of [channel, data])
                     msg.forEach(m => {
                         if (Array.isArray(m) && m.length === 2) {
-                            ipcMain.emit(m[0], m[1]);
+                            if (m[0] === 'lotus:set-drag-regions') {
+                                if (win) {
+                                    win.updateDragRegions(m[1]);
+                                }
+                            } else {
+                                ipcMain.emit(m[0], m[1]);
+                            }
                         }
                     });
                 }
@@ -190,8 +241,6 @@ class ServoWindow extends EventEmitter {
             fullscreen: false,
             title: "Lotus",
             resizable: true,
-            frameless: false,
-            alwaysOnTop: false,
             frameless: false,
             alwaysOnTop: false,
             restoreState: true,
@@ -250,12 +299,48 @@ class ServoWindow extends EventEmitter {
         this.handle.setPosition(x, y);
     }
 
+    updateDragRegions(rects) {
+        if (this.handle && this.handle.updateDragRegions) {
+            this.handle.updateDragRegions(JSON.stringify(rects));
+        }
+    }
+
     show() {
         this.handle.show();
     }
 
     hide() {
         this.handle.hide();
+    }
+
+    minimize() {
+        if (this.handle && this.handle.minimize) {
+            this.handle.minimize();
+        }
+    }
+
+    unminimize() {
+        if (this.handle && this.handle.unminimize) {
+            this.handle.unminimize();
+        }
+    }
+
+    maximize() {
+        if (this.handle && this.handle.maximize) {
+            this.handle.maximize();
+        }
+    }
+
+    unmaximize() {
+        if (this.handle && this.handle.unmaximize) {
+            this.handle.unmaximize();
+        }
+    }
+
+    focus() {
+        if (this.handle && this.handle.focus) {
+            this.handle.focus();
+        }
     }
 }
 

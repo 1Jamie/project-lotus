@@ -194,10 +194,10 @@ my-lotus-app/
     "version": "1.0.0",
     "main": "main.js",
     "dependencies": {
-        "@lotus-gui/core": "^0.1.0"
+        "@lotus-gui/core": "^0.2.0"
     },
     "devDependencies": {
-        "@lotus-gui/dev": "^0.1.0"
+        "@lotus-gui/dev": "^0.2.0"
     }
 }
 ```

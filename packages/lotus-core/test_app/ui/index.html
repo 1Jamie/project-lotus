@@ -128,6 +128,21 @@
 
 <body>
     <div class="container">
+        <div data-lotus-drag="true"
+            style="-webkit-app-region: drag; cursor: default; padding: 10px; border-radius: 8px 8px 0 0; background: rgba(118, 185, 0, 0.2); border-bottom: 1px solid rgba(118,185,0,0.4); margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; user-select: none;">
+            <div style="font-weight: bold; color: #76b900; margin-left: 10px;">Hybrid Lotus App</div>
+            <div style="-webkit-app-region: no-drag; display: flex; gap: 8px; margin-right: 5px;">
+                <button onclick="window.lotus.send('window-control', 'minimize')"
+                    style="width: 24px; height: 24px; border-radius: 50%; border: none; background: #ffbd44; cursor: pointer;"
+                    title="Minimize"></button>
+                <button onclick="window.lotus.send('window-control', 'maximize')"
+                    style="width: 24px; height: 24px; border-radius: 50%; border: none; background: #00ca4e; cursor: pointer;"
+                    title="Maximize"></button>
+                <button onclick="window.lotus.send('window-control', 'close')"
+                    style="width: 24px; height: 24px; border-radius: 50%; border: none; background: #ff605c; cursor: pointer;"
+                    title="Close"></button>
+            </div>
+        </div>
         <h1>Lotus Runtime</h1>
         <p>Backend Communication Demo</p>
 

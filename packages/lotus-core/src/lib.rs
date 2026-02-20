@@ -187,6 +187,67 @@ window.lotus = {
 };
 "#;
 
+const DRAG_REGION_SCRIPT: &str = r#"
+(function() {
+    let updateTimeout = null;
+    function updateDragRegions() {
+        if (updateTimeout) clearTimeout(updateTimeout);
+        updateTimeout = setTimeout(() => {
+            const dragElements = document.querySelectorAll('[style*="-webkit-app-region: drag"], [data-lotus-drag="true"]');
+            const noDragElements = document.querySelectorAll('[style*="-webkit-app-region: no-drag"], [data-lotus-drag="false"]');
+            
+            const dragRects = [];
+            const noDragRects = [];
+            const dpr = window.devicePixelRatio || 1;
+            
+            dragElements.forEach(el => {
+                const rect = el.getBoundingClientRect();
+                dragRects.push({
+                    x: rect.x * dpr,
+                    y: rect.y * dpr,
+                    width: rect.width * dpr,
+                    height: rect.height * dpr
+                });
+            });
+            
+            noDragElements.forEach(el => {
+                const rect = el.getBoundingClientRect();
+                noDragRects.push({
+                    x: rect.x * dpr,
+                    y: rect.y * dpr,
+                    width: rect.width * dpr,
+                    height: rect.height * dpr
+                });
+            });
+            
+            if (window.lotus && window.lotus.send) {
+                // console.log("[DRAG] Sending rects to Rust:", { dragRects, noDragRects });
+                window.lotus.send('lotus:set-drag-regions', { drag: dragRects, noDrag: noDragRects });
+            }
+        }, 50); // Debounce for 50ms
+    }
+
+    function initObservers() {
+        if (!document.body) return;
+        const observer = new MutationObserver(updateDragRegions);
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'data-lotus-drag'] });
+
+        const resizeObserver = new ResizeObserver(updateDragRegions);
+        resizeObserver.observe(document.body);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => {
+            updateDragRegions();
+            initObservers();
+        });
+    } else {
+        updateDragRegions();
+        initObservers();
+    }
+})();
+"#;
+
 struct WindowMetadata {
     root_path: Option<PathBuf>,
 }
@@ -196,6 +257,11 @@ struct WindowInstance {
     rendering_context: Rc<WindowRenderingContext>,
     window: Arc<Window>,
     last_mouse_pos: Point2D<f32, servo::DevicePixel>,
+    is_mouse_down: bool,
+    frameless: bool,
+    drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
+    no_drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
+    in_resize_border: bool, // tracks whether cursor is currently in the resize border zone
 }
 
 
@@ -264,6 +330,12 @@ pub enum EngineCommand {
     ExecuteScript(String, String), // window_id, script
     ShowWindow(String), // window_id
     HideWindow(String), // window_id
+    UpdateDragRegions(String, Vec<euclid::Rect<f32, servo::DevicePixel>>, Vec<euclid::Rect<f32, servo::DevicePixel>>), // window_id, drag_regions, no_drag_regions
+    MinimizeWindow(String), // window_id
+    UnminimizeWindow(String), // window_id
+    MaximizeWindow(String), // window_id
+    UnmaximizeWindow(String), // window_id
+    FocusWindow(String), // window_id
 }
 
 
@@ -370,9 +442,89 @@ impl WindowHandle {
     }
 
     #[napi]
+    pub fn update_drag_regions(&self, rects_json: String) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&rects_json) {
+                let mut drag_regions = Vec::new();
+                let mut no_drag_regions = Vec::new();
+                
+                if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
+                    for r in drag_arr {
+                        if let (Some(x), Some(y), Some(w), Some(h)) = (
+                            r.get("x").and_then(|v| v.as_f64()),
+                            r.get("y").and_then(|v| v.as_f64()),
+                            r.get("width").and_then(|v| v.as_f64()),
+                            r.get("height").and_then(|v| v.as_f64())
+                        ) {
+                            drag_regions.push(euclid::Rect::new(
+                                euclid::Point2D::new(x as f32, y as f32),
+                                euclid::Size2D::new(w as f32, h as f32)
+                            ));
+                        }
+                    }
+                }
+                
+                if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
+                    for r in no_drag_arr {
+                        if let (Some(x), Some(y), Some(w), Some(h)) = (
+                            r.get("x").and_then(|v| v.as_f64()),
+                            r.get("y").and_then(|v| v.as_f64()),
+                            r.get("width").and_then(|v| v.as_f64()),
+                            r.get("height").and_then(|v| v.as_f64())
+                        ) {
+                            no_drag_regions.push(euclid::Rect::new(
+                                euclid::Point2D::new(x as f32, y as f32),
+                                euclid::Size2D::new(w as f32, h as f32)
+                            ));
+                        }
+                    }
+                }
+                
+                info!("Rust: Updated drag regions for window {}: drag: {}, no_drag: {}", self.id, drag_regions.len(), no_drag_regions.len());
+                let _ = proxy.send_event(EngineCommand::UpdateDragRegions(self.id.clone(), drag_regions, no_drag_regions));
+            }
+        }
+    }
+
+    #[napi]
     pub fn execute_script(&self, script: String) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::ExecuteScript(self.id.clone(), script));
+        }
+    }
+
+    #[napi]
+    pub fn minimize(&self) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::MinimizeWindow(self.id.clone()));
+        }
+    }
+
+    #[napi]
+    pub fn unminimize(&self) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::UnminimizeWindow(self.id.clone()));
+        }
+    }
+
+    #[napi]
+    pub fn maximize(&self) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::MaximizeWindow(self.id.clone()));
+        }
+    }
+
+    #[napi]
+    pub fn unmaximize(&self) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::UnmaximizeWindow(self.id.clone()));
+        }
+    }
+
+    #[napi]
+    pub fn focus(&self) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::FocusWindow(self.id.clone()));
         }
     }
 }
@@ -714,7 +866,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         options.width,
                         options.height
                     ))
-                    .with_decorations(true)
+                    .with_decorations(!options.frameless)
                     .with_visible(false) // Always start hidden
                     .with_transparent(options.transparent)
                     .with_theme(theme);
@@ -811,6 +963,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 // Inject scripts
                 user_content_manager.add_script(Rc::new(UserScript::from(msgpackr_source.as_str())));
                 user_content_manager.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP_BASE)));
+                user_content_manager.add_script(Rc::new(UserScript::from(DRAG_REGION_SCRIPT)));
                 
                 let port_script = format!("window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}';", port, token, window_id);
                 user_content_manager.add_script(Rc::new(UserScript::from(port_script.as_str())));
@@ -851,6 +1004,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     rendering_context,
                     window: window.clone(),
                     last_mouse_pos: Point2D::new(0.0, 0.0),
+                    is_mouse_down: false,
+                    frameless: options.frameless,
+                    drag_regions: Vec::new(),
+                    no_drag_regions: Vec::new(),
+                    in_resize_border: false,
                 };
 
                 self.windows.insert(window_id.clone(), instance);
@@ -955,6 +1113,37 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.window.set_visible(false);
                 }
             },
+            EngineCommand::UpdateDragRegions(window_id, drag_regions, no_drag_regions) => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    instance.drag_regions = drag_regions;
+                    instance.no_drag_regions = no_drag_regions;
+                }
+            },
+            EngineCommand::MinimizeWindow(window_id) => {
+                if let Some(instance) = self.windows.get(&window_id) {
+                    instance.window.set_minimized(true);
+                }
+            },
+            EngineCommand::UnminimizeWindow(window_id) => {
+                if let Some(instance) = self.windows.get(&window_id) {
+                    instance.window.set_minimized(false);
+                }
+            },
+            EngineCommand::MaximizeWindow(window_id) => {
+                if let Some(instance) = self.windows.get(&window_id) {
+                    instance.window.set_maximized(true);
+                }
+            },
+            EngineCommand::UnmaximizeWindow(window_id) => {
+                if let Some(instance) = self.windows.get(&window_id) {
+                    instance.window.set_maximized(false);
+                }
+            },
+            EngineCommand::FocusWindow(window_id) => {
+                if let Some(instance) = self.windows.get(&window_id) {
+                    instance.window.focus_window();
+                }
+            },
         }
         
         if let Some(servo) = &self.servo {
@@ -1041,15 +1230,92 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 info!("Rust: Resized to {}x{}", size.width, size.height);
                 let servo_size = ServoPhysicalSize::new(size.width, size.height);
                 instance.webview.resize(servo_size);
+                
+                // ALSO resize the surfman/opengl rendering context! 
+                // This fixes the clipping/scroll bounding bug.
+                instance.rendering_context.resize(size);
+
+                let mut msg = Vec::new();
+                if rmp_serde::encode::write(&mut msg, &serde_json::json!({
+                    "event": "resized",
+                    "window_id": uuid,
+                    "width": size.width,
+                    "height": size.height
+                })).is_ok() {
+                    self.callback.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
+                }
             },
                     WindowEvent::CursorMoved { position, .. } => {
                         let point = Point2D::new(position.x as f32, position.y as f32);
                         instance.last_mouse_pos = point;
+                        
+                        // Hit-test resize directions first
+                        if instance.frameless {
+                            let mut hit_no_drag = false;
+                            for no_drag_region in &instance.no_drag_regions {
+                                if no_drag_region.contains(point) {
+                                    hit_no_drag = true;
+                                    break;
+                                }
+                            }
+                            
+                            if hit_no_drag {
+                                if instance.in_resize_border {
+                                    instance.window.set_cursor(CursorIcon::Default);
+                                    instance.in_resize_border = false;
+                                }
+                            } else {
+                                let size = instance.window.inner_size();
+                                let x = position.x;
+                                let y = position.y;
+                                let w = size.width as f64;
+                                let h = size.height as f64;
+                                let border = 8.0;
+                                
+                                // Only override cursor when we're in a resize border zone.
+                                // Otherwise let Servo drive the cursor via notify_cursor_changed.
+                                let resize_cursor = if x < border && y < border {
+                                    Some(CursorIcon::NwResize)
+                                } else if x > w - border && y < border {
+                                    Some(CursorIcon::NeResize)
+                                } else if x < border && y > h - border {
+                                    Some(CursorIcon::SwResize)
+                                } else if x > w - border && y > h - border {
+                                    Some(CursorIcon::SeResize)
+                                } else if x < border {
+                                    Some(CursorIcon::WResize)
+                                } else if x > w - border {
+                                    Some(CursorIcon::EResize)
+                                } else if y < border {
+                                    Some(CursorIcon::NResize)
+                                } else if y > h - border {
+                                    Some(CursorIcon::SResize)
+                                } else {
+                                    None // Let Servo handle the cursor
+                                };
+                                
+                                if let Some(icon) = resize_cursor {
+                                    instance.window.set_cursor(icon);
+                                    instance.in_resize_border = true;
+                                } else {
+                                    // Only reset to Default when TRANSITIONING OUT of the border zone.
+                                    // After that, let Servo drive cursor via notify_cursor_changed.
+                                    if instance.in_resize_border {
+                                        instance.window.set_cursor(CursorIcon::Default);
+                                    }
+                                    instance.in_resize_border = false;
+                                }
+                            }
+                        }
+
                         instance.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
                             servo::WebViewPoint::Device(point)
                         )));
                     },
                     WindowEvent::MouseInput { state, button, .. } => {
+                        let is_pressed = state == winit::event::ElementState::Pressed;
+                        instance.is_mouse_down = is_pressed;
+                        
                         let action = match state {
                             winit::event::ElementState::Pressed => MouseButtonAction::Down,
                             winit::event::ElementState::Released => MouseButtonAction::Up,
@@ -1062,6 +1328,90 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             winit::event::MouseButton::Forward => ServoMouseButton::Forward,
                             winit::event::MouseButton::Other(v) => ServoMouseButton::Other(v),
                         };
+
+                        if is_pressed && button == winit::event::MouseButton::Left && instance.frameless {
+                            let mut hit_no_drag = false;
+                            for no_drag_region in &instance.no_drag_regions {
+                                if no_drag_region.contains(instance.last_mouse_pos) {
+                                    hit_no_drag = true;
+                                    break;
+                                }
+                            }
+                            
+                            if !hit_no_drag {
+                                let size = instance.window.inner_size();
+                                let x = instance.last_mouse_pos.x as f64;
+                                let y = instance.last_mouse_pos.y as f64;
+                                let w = size.width as f64;
+                                let h = size.height as f64;
+                                let border = 8.0;
+                                
+                                let mut resize_dir = None;
+                                if x < border && y < border {
+                                    resize_dir = Some(winit::window::ResizeDirection::NorthWest);
+                                } else if x > w - border && y < border {
+                                    resize_dir = Some(winit::window::ResizeDirection::NorthEast);
+                                } else if x < border && y > h - border {
+                                    resize_dir = Some(winit::window::ResizeDirection::SouthWest);
+                                } else if x > w - border && y > h - border {
+                                    resize_dir = Some(winit::window::ResizeDirection::SouthEast);
+                                } else if x < border {
+                                    resize_dir = Some(winit::window::ResizeDirection::West);
+                                } else if x > w - border {
+                                    resize_dir = Some(winit::window::ResizeDirection::East);
+                                } else if y < border {
+                                    resize_dir = Some(winit::window::ResizeDirection::North);
+                                } else if y > h - border {
+                                    resize_dir = Some(winit::window::ResizeDirection::South);
+                                }
+                                
+                                if let Some(dir) = resize_dir {
+                                    // Important: We inject an Up event before handing control to the OS
+                                    // because the OS block the event loop and eats the MouseUp.
+                                    instance.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                                        MouseButtonAction::Up,
+                                        servo_button,
+                                        servo::WebViewPoint::Device(instance.last_mouse_pos)
+                                    )));
+                                    instance.is_mouse_down = false;
+                                    let _ = instance.window.drag_resize_window(dir);
+                                    return; // Stop processing and don't forward to servo
+                                }
+                            }
+                            
+                            // Check Drag Regions
+                            let mut hit_drag = false;
+                            for region in &instance.drag_regions {
+                                if region.contains(instance.last_mouse_pos) {
+                                    // Check no target regions first!
+                                    let mut hit_no_drag = false;
+                                    for no_drag_region in &instance.no_drag_regions {
+                                        if no_drag_region.contains(instance.last_mouse_pos) {
+                                            hit_no_drag = true;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    if !hit_no_drag {
+                                        hit_drag = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            if hit_drag {
+                                // Inject Up event to clear dragging state in web platform
+                                instance.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                                    MouseButtonAction::Up,
+                                    servo_button,
+                                    servo::WebViewPoint::Device(instance.last_mouse_pos)
+                                )));
+                                instance.is_mouse_down = false;
+                                let _ = instance.window.drag_window();
+                                return;
+                            }
+                        }
+
                         instance.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                             action,
                             servo_button,
@@ -1084,6 +1434,27 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             wheel_delta,
                             servo::WebViewPoint::Device(instance.last_mouse_pos)
                         )));
+                    },
+                    WindowEvent::Moved(position) => {
+                        let mut msg = Vec::new();
+                        if rmp_serde::encode::write(&mut msg, &serde_json::json!({
+                            "event": "moved",
+                            "window_id": uuid,
+                            "x": position.x,
+                            "y": position.y
+                        })).is_ok() {
+                            self.callback.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
+                        }
+                    },
+                    WindowEvent::Focused(focused) => {
+                        let event_name = if focused { "focused" } else { "unfocused" };
+                        let mut msg = Vec::new();
+                        if rmp_serde::encode::write(&mut msg, &serde_json::json!({
+                            "event": event_name,
+                            "window_id": uuid
+                        })).is_ok() {
+                            self.callback.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
+                        }
                     },
                     _ => {}
                 }
@@ -1246,6 +1617,58 @@ impl App {
                 } else if url_str == "/batch" {
                     let mut content = Vec::new();
                     let _ = request.as_reader().read_to_end(&mut content);
+
+                    // Before forwarding to Node.js, intercept internal Lotus IPC channels.
+                    // This avoids a Node.js round-trip for performance-critical messages.
+                    if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&content) {
+                        for (channel, data) in &batch {
+                            if channel == "lotus:set-drag-regions" {
+                                let mut drag_regions = Vec::new();
+                                let mut no_drag_regions = Vec::new();
+
+                                if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
+                                    for r in drag_arr {
+                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
+                                            r.get("x").and_then(|v| v.as_f64()),
+                                            r.get("y").and_then(|v| v.as_f64()),
+                                            r.get("width").and_then(|v| v.as_f64()),
+                                            r.get("height").and_then(|v| v.as_f64())
+                                        ) {
+                                            drag_regions.push(euclid::Rect::new(
+                                                euclid::Point2D::new(x as f32, y as f32),
+                                                euclid::Size2D::new(w as f32, h as f32)
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
+                                    for r in no_drag_arr {
+                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
+                                            r.get("x").and_then(|v| v.as_f64()),
+                                            r.get("y").and_then(|v| v.as_f64()),
+                                            r.get("width").and_then(|v| v.as_f64()),
+                                            r.get("height").and_then(|v| v.as_f64())
+                                        ) {
+                                            no_drag_regions.push(euclid::Rect::new(
+                                                euclid::Point2D::new(x as f32, y as f32),
+                                                euclid::Size2D::new(w as f32, h as f32)
+                                            ));
+                                        }
+                                    }
+                                }
+                                
+                                info!("Rust: Intercepted drag regions from batch for {}: drag: {}, no_drag: {}", window_id, drag_regions.len(), no_drag_regions.len());
+                                let _ = server_proxy.send_event(EngineCommand::UpdateDragRegions(window_id.clone(), drag_regions, no_drag_regions));
+                                
+                                // Don't forward lotus:* internal channels to Node.js
+                                continue;
+                            }
+                        }
+                        // Forward the full batch to Node.js (non-internal messages will still be routed there)
+                    }
+
+                    // Always forward raw bytes to Node.js for normal IPC channels
                     let _ = server_proxy.send_event(EngineCommand::IpcMessage(window_id, content));
                     let _ = request.respond(tiny_http::Response::from_string("ok").with_header(cors_header));
                 } else if url_str.starts_with("/resource/") {

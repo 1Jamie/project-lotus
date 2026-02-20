@@ -7,7 +7,7 @@
 *"If a part doesn't make it start faster, use less memory, or render pixels, it's gone. No extra suspension. No spare tires. No browser pretending to be an operating system."*
 
 **🥊 THE ARCHITECTURE (Or: Why It's Fast)**
-*"Most desktop apps are just opening a preferences panel. We didn't think that required a second operating system."*
+*"Most desktop apps are just opening a preferences panel. I didn't think that required a second operating system."*
 
 • **Electron Strategy:** Puts the browser in charge and lets Node ride shotgun.
   *"It builds a monster truck because it assumes you're off-roading."*
@@ -15,8 +15,8 @@
   *"Node owns the OS. Servo paints the pixels. No magic. No fake sandboxes. No hidden Chromium instances listening to your microphone."*
 
 **🚨 STATUS: ALPHA (BUT IT WORKS)**
-We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core`).
-Mac support is missing (help wanted). BSD and SUSE support is planned (see Roadmap). Tested support for building fully packaged .rpm installers for Linux but should support .deb and basic windows installers.
+We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core@0.2.0`).
+Mac support is missing (because their ecosystem needs an adult, please be its adult!). BSD and SUSE support is planned (because I know the pain points over there, see Roadmap). Tested support for building fully packaged .rpm installers for Linux but should support .deb and basic windows installers.
 
 **🔧 THE ANALOGY THAT EXPLAINS EVERYTHING:**
 • **Node.js** is the track.
@@ -62,8 +62,14 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
     *   Execute arbitrary JS in the renderer from the main process. God mode unlocked.
 
 *   **Native Look & Feel:**
-    *   Customizable frames, **true OS transparency**, and actual working cursors. We don't just emulate a window; we *are* a window.
+    *   **true OS transparency**, and actual working cursors. We don't just emulate a window; we *are* a window.
     *   **No White Flash:** We paint transparently. Your users won't be blinded by a white box while your 5MB of JS loads.
+
+*   **Frameless Windows:**
+    *   Kill the title bar. Remove the frame. Build whatever crap you want.
+    *   **Custom Drag Regions:** Mark any element with `-webkit-app-region: drag` or `data-lotus-drag`. Lotus bridges it to the OS — no JS required.
+    *   **Custom Resize Borders:** 8px invisible resize handles on every edge and corner. They just work.
+    *   **Cursor-Aware:** Resize cursors show up at the borders. Servo drives all other cursors (grab, pointer, text, etc.) — no interference.
 
 *   **Multi-Window Support:**
     *   Spawn multiple independent windows from a single Node process.
@@ -135,7 +141,7 @@ This is where development happens. It works here. Fully working `.node` file for
 
 ### macOS
 *   **Status:** HELP WANTED 🆘
-*   I removed CI support because I honestly just don't know enough about the Mac app lifecycle to do it right. If you are a Mac developer and want to fix this, PRs are welcome. I just don't have a system to test on. "Here be dragons still." 🐉
+*   I removed CI support because I honestly just don't know enough about the Mac app lifecycle to do it right. If you are a Mac developer and want to fix this, PRs are welcome. I just don't have a system to test on. "Here be dragons still." 🐉 (Translation: Please save me from Xcode.)
 
 ---
  
@@ -389,6 +395,50 @@ body {
 **The "White Flash" Killer:**
 Because the default backbone is transparent, there is **zero white flash** on startup. If your app takes 10ms to load, the user sees their wallpaper for 10ms, not a blinding white rectangle. You're welcome.
 
+### Frameless Windows: "Build Your Own Window"
+Tired of the OS telling you what your title bar looks like? Remove it.
+
+```javascript
+const win = new ServoWindow({
+    frameless: true,         // Kill the native frame
+    transparent: true,       // Optional: go fully borderless
+    title: "My Borderless App"
+});
+```
+
+Out of the box you get:
+- **8px resize borders** on every edge/corner — just move the mouse to the edge.
+- **Drag regions** driven by CSS — no JS wiring required.
+
+**In your HTML:**
+```html
+<!-- These two approaches both work -->
+<div style="-webkit-app-region: drag; cursor: grab;">Drag me to move the window</div>
+<div data-lotus-drag="true">Also works</div>
+```
+
+Lotus auto-detects elements with `-webkit-app-region: drag` or `data-lotus-drag` via injected JS and sends their coordinates to Rust. Mouse down on one of those elements → `drag_window()`. Mouse down on the border → `drag_resize_window()`. Everything else → Servo handles it normally.
+
+To exclude an element inside a drag region (like a close button), use `-webkit-app-region: no-drag` or `data-lotus-drag="false"`.
+
+### Window Controls & Lifecycle
+Full control over the OS window manager directly from JavaScript. You don't need to write native code to build a custom title bar.
+
+```javascript
+// Window manipulation
+win.minimize();
+win.unminimize();
+win.maximize();
+win.unmaximize();
+win.focus();
+
+// Listen to OS-level events
+win.on('moved', ({ x, y }) => console.log('Window moved to', x, y));
+win.on('resize', ({ width, height }) => console.log('Resized to', width, height));
+win.on('focus', () => console.log('Window gained focus'));
+win.on('blur', () => console.log('Window lost focus'));
+```
+
 ### Multi-Window Support
 Creating specific windows? Easy. They share the same renderer instance, so it costs ~80MB per extra window instead of ~300MB.
 
@@ -401,7 +451,7 @@ const win3 = new ServoWindow({ title: "Window 3" });
 ```
 
 ### Window State Persistence: "Total Recall"
-By default, windows are amnesiac. They forget where they were. If you want them to remember, give them a name.
+By default, windows have the memory span of a goldfish. They forget where they were. If you want them to remember, give them a name.
 
 ```javascript
 const win = new ServoWindow({
@@ -495,13 +545,13 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 ---
 ## 🗺️ Roadmap
 
-### v0.2.0: The Shell & Frame
-* ~~**Frameless Mode:** Toggle window decorations off.~~ *See Note 1*
-* ~~**CSS Dragging:** Bridge for custom CSS drag areas.~~ *See Note 1*
-*   **Native Menus:** Rust hooks for the OS menu bar.
-*   **Dev CLI:** Add `lotus init` command to create a new Lotus project.
+### v0.2.0: The Shell & Frame (RELEASED)
+* ✅ **Frameless Mode:** Toggle window decorations off.
+* ✅ **CSS Dragging:** Bridge for custom CSS drag areas (`-webkit-app-region: drag`, `data-lotus-drag`).
+* ✅ **Resize Borders:** Custom 8px resize hit-zones on all edges/corners.
+* ✅ **Dev CLI:** `lotus init` command added to create a new Lotus project.
 
-> **Note 1:** I removed these from scope. As I wrote the code, I realized I was reimplementing things the OS (and Winit) already do for free. If we want it to feel "native," using the actual native window frame is the correct choice. We save code, complexity, and bugs. (and of course my sanity)
+> **Note:** Surprise! I changed my mind and gave you frameless support lol. I was just gonna say deal with it and give you native menu support but then i realized the headache.... so here we are! surprise! Now you can do wtf you want with window decorations! 
 
 ### v0.3.0: The Support Expansion
 *   **Windows Support:** Full MSI/EXE distribution (moving beyond just the `.node` binary).
@@ -516,14 +566,14 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 *   **Open to suggestions:** I'm open to suggestions for the future. If you have an idea, let me know. Right now v0.4.0 is just a rough tenative plan for what I might do in the future.
 
 ---
-**License:** MIT. Do whatever you want, just don't blame me if your computer takes flight.
+**License:** MIT. Do whatever you want, just don't blame me if your computer achieves sentience and takes flight.
 
 
 
 **P.S.**
 
-The entire framework core is ~1,800 lines of code.
+The entire framework core is ~2,500 lines of code.
 
-If that feels suspiciously light, it's because it is. We didn't try to build an OS inside your OS; we just gave Node a window and cut the fat until there was nothing left but speed.
+If that feels suspiciously light, it's because it is. I didn't try to build an OS inside your OS; I just gave Node a window and cut the fat until there was nothing left but speed.
 
 Electron carries the weight of the world. Lotus just carries the pixels.

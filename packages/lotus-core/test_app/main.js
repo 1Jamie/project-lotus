@@ -18,6 +18,7 @@ const win = new ServoWindow({
     width: 1024,
     height: 768,
     title: "Hybrid Lotus App",
+    frameless: true,
     transparent: true,
     visible: false
 });
@@ -104,6 +105,33 @@ ipcMain.on('open-secondary-window', () => {
         height: 400,
         title: "Secondary Window"
     });
+});
+
+let isMaximized = false;
+ipcMain.on('window-control', (action) => {
+    switch (action) {
+        case 'minimize':
+            console.log('[ipcMain] Minimizing window');
+            win.minimize();
+            break;
+        case 'maximize':
+            if (isMaximized) {
+                console.log('[ipcMain] Unmaximizing window');
+                win.unmaximize();
+                isMaximized = false;
+            } else {
+                console.log('[ipcMain] Maximizing window');
+                win.maximize();
+                isMaximized = true;
+            }
+            break;
+        case 'close':
+            console.log('[ipcMain] Closing window');
+            win.close();
+            // Automatically close the app since this is the main window
+            setTimeout(() => process.exit(0), 100);
+            break;
+    }
 });
 
 console.log('[App] Servo window initialized');
