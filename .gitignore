@@ -28,4 +28,3 @@ packages/lotus-core/index.d.ts
 dist/
 installers/
 .flatpak-builder
-**/package-lock.json
