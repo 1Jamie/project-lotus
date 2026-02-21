@@ -86,21 +86,33 @@ function ensureApp() {
             const fs = require('fs');
             const path = require('path');
 
-            let msgpackrPath;
-            try {
-                // Try to resolve it via subpath (might fail due to 'exports' in newer node)
-                msgpackrPath = require.resolve('msgpackr/dist/index.min.js');
-            } catch (e) {
-                // Fallback: use the main entry point to find the directory
-                // msgpackr exports its node version in dist/node.cjs
-                const mainPath = require.resolve('msgpackr');
-                msgpackrPath = path.join(path.dirname(mainPath), 'index.min.js');
-            }
+            const execDirMsgpackr = path.join(path.dirname(process.execPath), 'msgpackr-renderer.js');
+            const usrLibMsgpackr = path.join('/usr/lib', path.basename(process.execPath), 'msgpackr-renderer.js');
+            const appLibMsgpackr = path.join('/app/lib', path.basename(process.execPath), 'msgpackr-renderer.js');
 
-            if (fs.existsSync(msgpackrPath)) {
-                msgpackrSource = fs.readFileSync(msgpackrPath, 'utf8');
+            if (fs.existsSync(execDirMsgpackr)) {
+                msgpackrSource = fs.readFileSync(execDirMsgpackr, 'utf8');
+            } else if (fs.existsSync(usrLibMsgpackr)) {
+                msgpackrSource = fs.readFileSync(usrLibMsgpackr, 'utf8');
+            } else if (fs.existsSync(appLibMsgpackr)) {
+                msgpackrSource = fs.readFileSync(appLibMsgpackr, 'utf8');
             } else {
-                console.warn('[Lotus] msgpackr minified source not found at:', msgpackrPath);
+                let msgpackrPath;
+                try {
+                    // Try to resolve it via subpath (might fail due to 'exports' in newer node)
+                    msgpackrPath = require.resolve('msgpackr/dist/index.min.js');
+                } catch (e) {
+                    // Fallback: use the main entry point to find the directory
+                    // msgpackr exports its node version in dist/node.cjs
+                    const mainPath = require.resolve('msgpackr');
+                    msgpackrPath = path.join(path.dirname(mainPath), 'index.min.js');
+                }
+
+                if (fs.existsSync(msgpackrPath)) {
+                    msgpackrSource = fs.readFileSync(msgpackrPath, 'utf8');
+                } else {
+                    console.warn('[Lotus] msgpackr minified source not found at:', msgpackrPath);
+                }
             }
         } catch (e) {
             console.warn('[Lotus] Could not load msgpackr source for renderer:', e.message);

@@ -1,6 +1,6 @@
 {
     "name": "@lotus-gui/dev",
-    "version": "0.2.1",
+    "version": "0.2.2",
     "description": "The Lotus Toolkit",
     "main": "index.js",
     "bin": {
@@ -13,13 +13,12 @@
     "author": "",
     "license": "ISC",
     "dependencies": {
+        "@crabnebula/packager": "^0.11.2",
         "chokidar": "^3.5.3",
         "commander": "^11.1.0",
-        "electron-winstaller": "^5.4.0",
+        "esbuild": "^0.27.3",
+        "jimp": "^1.6.0",
+        "postject": "^1.0.0-alpha.6",
         "prompts": "^2.4.2"
-    },
-    "optionalDependencies": {
-        "electron-installer-debian": "^3.2.0",
-        "electron-installer-redhat": "^3.4.0"
     }
 }

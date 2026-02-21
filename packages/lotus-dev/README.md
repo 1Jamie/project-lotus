@@ -65,36 +65,29 @@ lotus dev main.js      # Custom entry point
  
  ### `lotus build`
 
-Build your application into a distributable installer package.
+Build your application into a native, single-executable distributable installer package using Node SEA and CrabNebula.
 
 ```bash
-lotus build --platform linux --target deb
-lotus build --platform linux --target rpm
+lotus build --target appimage
+lotus build --target deb
+lotus build --target exe
 ```
 
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
-| `--platform` | `linux`, `win32` | Current OS | Target platform (Windows support is experimental/WIP) |
-| `--target` | `deb`, `rpm` | `deb` | Installer format (Linux only) |
+| `--target` | `deb`, `appimage`, `pacman`, `msi`, `exe`, `dmg`, `app` | `deb` | Target installer format. Note: Windows targets (`msi`, `exe`) require building on a Windows host or properly configured cross-compilation environment. |
 
 **What it does:**
-1. Reads `lotus.config.json` from the current directory
-2. Copies your app files into a staging directory (`dist/app/resources/app/`)
-3. Copies `node_modules` (preserving package structure)
-4. Generates a wrapper shell script as the executable
-5. Packages everything into a `.deb` or `.rpm` installer
-6. Output goes to `dist/installers/`
+1. Reads `lotus.config.json` from the current directory.
+2. Recursively bundles your application JS using `esbuild`.
+3. Discovers native `.node` modules and copies them out of the bundle.
+4. Generates a Node Single Executable Application (SEA) blob and injects it into a Node.js binary.
+5. Invokes `@crabnebula/packager` to wrap the executable and native modules into the final OS-specific installer.
+6. Build artifacts go to `dist/app/` and final installers go to `dist/installers/`.
 
 **System Requirements:**
 - `lotus.config.json` in the current directory
-- For RPM targets (Fedora/RHEL):
-  ```bash
-  sudo dnf install rpm-build
-  ```
-- For DEB targets (Ubuntu/Debian):
-  ```bash
-  sudo apt install dpkg-dev fakeroot
-  ```
+- Modern Node.js (v20+ with SEA support)
 
 ### `lotus clean`
 
@@ -159,19 +152,13 @@ After running `lotus build`, the `dist/` directory contains:
 
 ```
 dist/
-├── app/                    # Staged application
-│   ├── resources/app/      # Your app files + node_modules
-│   ├── my-app              # Wrapper shell script
-│   ├── version             # Version file
-│   └── LICENSE             # License file
+├── app/                    # Staged application components
+│   ├── my-app              # Node SEA Single Executable User Binary
+│   ├── lotus.linux-x64-gnu.node # Extracted native bindings
+│   └── msgpackr-renderer.js
 └── installers/
-    └── my-app-1.0.0-1.x86_64.rpm  # (or .deb)
-```
-
-The generated wrapper script runs your app with Node.js:
-```bash
-#!/bin/sh
-exec node "/usr/lib/my-app/resources/app/main.js" "$@"
+    ├── my-app-1.0.0-x86_64.AppImage 
+    └── my-app_1.0.0_amd64.deb
 ```
 
 ## Project Setup Example
@@ -208,8 +195,8 @@ my-lotus-app/
 # Run with hot-reload
 npx lotus dev main.js
 
-# Build an RPM
-npx lotus build --platform linux --target rpm
+# Build an AppImage for Linux
+npx lotus build --target appimage
 
 # Clean build artifacts
 npx lotus clean
@@ -218,23 +205,21 @@ npx lotus clean
 ### Install the Built Package
 
 ```bash
-# RPM (Fedora/RHEL)
-sudo dnf install ./dist/installers/my-app-1.0.0-1.x86_64.rpm
-
 # DEB (Ubuntu/Debian)
-sudo dpkg -i ./dist/installers/my-app_1.0.0_amd64.deb
+sudo apt install ./dist/installers/my-app_1.0.0_amd64.deb
 
 # Run it
 my-app
+
+# Or use the portable AppImage directly!
+./dist/installers/my-app-1.0.0-x86_64.AppImage
 ```
 
 ## Architecture
 
 ```
 @lotus-gui/dev
-├── bin/lotus.js          # CLI entry point (commander-based)
-├── lib/templates/
-│   └── spec.ejs          # Custom RPM spec template
+├── bin/lotus.js          # CLI entry point (commander-based build pipeline)
 ├── index.js              # Package entry (exports CLI path)
 └── package.json
 ```
@@ -245,9 +230,9 @@ my-app
 |---------|---------|
 | `commander` | CLI argument parsing |
 | `chokidar` | File watching for hot-reload |
-| `electron-installer-debian` | `.deb` package generation |
-| `electron-installer-redhat` | `.rpm` package generation |
-| `electron-winstaller` | Windows installer generation (planned) |
+| `esbuild` | Code bundling and __dirname proxying |
+| `@crabnebula/packager` | OS installation package generation (`.deb`, `.msi`, etc.) |
+| `postject` | Injecting payloads into Node.js SEA binaries |
 
 ## License
 

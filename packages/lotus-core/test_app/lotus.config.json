@@ -6,6 +6,12 @@
     "main": "main.js",
     "executableName": "lotus-test",
     "icon": "./assets/icon.png",
+    "resources": [
+        "ui",
+        "assets",
+        "rippy.png",
+        "debugger.js"
+    ],
     "build": {
         "linux": {
             "wmClass": "lotus-test-app",

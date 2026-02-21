@@ -27,3 +27,5 @@ packages/lotus-core/index.d.ts
 # Build outputs
 dist/
 installers/
+.flatpak-builder
+**/package-lock.json

@@ -12,7 +12,7 @@
 • **Electron Strategy:** Puts the browser in charge and lets Node ride shotgun.
   *"It builds a monster truck because it assumes you're off-roading."*
 • **Lotus Strategy:** The opposite.
-  *"Node owns the OS. Servo paints the pixels. No magic. No fake sandboxes. No hidden Chromium instances listening to your microphone."*
+  *"Node owns the OS. Servo paints the pixels. No magic. No fake sandboxes. No hidden Chromium instances listening to how you use each piece of chrome for telemetry."*
 
 **🚨 STATUS: ALPHA (BUT IT WORKS)**
 We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core@0.2.0`).
@@ -73,7 +73,7 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
 
 *   **Multi-Window Support:**
     *   Spawn multiple independent windows from a single Node process.
-    *   Shared renderer = ~80MB per extra window. Electron could never.
+    *   Shared renderer = ~80MB per extra window.
 
 ---
 
@@ -106,7 +106,7 @@ lotus/
 
 ## 🛠️ Prerequisites
 
-If you want to run this, you need to be on an OS that respects you. 
+If you want to run this, you need to be on an OS that respects you. (to be fair the plan is to support all platforms, so this is more of a joke to clarify)
 
 ### Linux (Debian/Ubuntu/Fedora)
 This is where development happens. It works here. Fully working `.node` file for Linux is in the artifacts tab.
@@ -467,20 +467,23 @@ const win = new ServoWindow({
 *   It snaps back to the last known position faster than you can say "Electron is bloat."
 
 ### Building Distributable Packages
-Once your app is ready, build it into a real installer:
+When you're ready to ship your application, Lotus uses a highly optimized Node Single Executable Application (SEA) generation pipeline tied directly into [CrabNebula](https://crabnebula.dev) to spit out installer payloads for every OS.
 
-```bash
-# Build an RPM (Fedora/RHEL)
-npx lotus build --platform linux --target rpm
+1. Ensure your `lotus.config.json` is properly configured with your app name, author, icon paths, and `resources` arrays for extra assets.
 
-# Build a DEB (Ubuntu/Debian)  
-npx lotus build --platform linux --target deb
+2. Run the build command with your target OS installer format:
+   ```bash
+   # Linux Formats
+   npx lotus build --target appimage
+   npx lotus build --target deb
+   npx lotus build --target pacman
+   
+   # Windows Formats
+   npx lotus build --target exe
+   npx lotus build --target msi
+   ```
 
-# Install it
-sudo dnf install ./dist/installers/my-app-1.0.0-1.x86_64.rpm
-# or
-sudo dpkg -i ./dist/installers/my-app_1.0.0_amd64.deb
-```
+Because Lotus relies on native `.node` bindings, you **must build for the OS you are currently on** (e.g., execute `--target exe` inside a Windows CI/CD runner to get Windows binaries).
 
 Your app is now a real installed application with a binary in `/usr/bin/` and everything. Just like a grown-up program.
 

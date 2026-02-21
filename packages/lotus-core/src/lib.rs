@@ -1529,6 +1529,10 @@ impl App {
                 winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
                 winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
             }
+            #[cfg(target_os = "windows")]
+            {
+                winit::platform::windows::EventLoopBuilderExtWindows::with_any_thread(&mut builder, true);
+            }
             
             let event_loop = builder.build().unwrap();
             let proxy = event_loop.create_proxy();
