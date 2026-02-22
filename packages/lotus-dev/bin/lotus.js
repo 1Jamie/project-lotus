@@ -183,6 +183,32 @@ export const __dirname_macro = macroDir;
             console.log(`Copied ${fileName}`);
         }
 
+        if (platform === 'win32' || ['nsis', 'exe', 'msi', 'wix'].includes(target)) {
+            console.log('Extracting ANGLE DLLs for Windows...');
+            const coreWindowsDir = path.join(process.cwd(), 'node_modules', '@lotus-gui', 'core', 'windows');
+            if (fs.existsSync(coreWindowsDir)) {
+                for (const dll of ['libEGL.dll', 'libGLESv2.dll', 'd3dcompiler_47.dll']) {
+                    const dllPath = path.join(coreWindowsDir, dll);
+                    if (fs.existsSync(dllPath)) {
+                        fs.copyFileSync(dllPath, path.join(appDir, dll));
+                        console.log(`Copied ${dll}`);
+                    }
+                }
+            } else {
+                // If packaging from within the monorepo itself (e.g. test_app)
+                const localWindowsDir = path.join(process.cwd(), '..', 'windows');
+                if (fs.existsSync(localWindowsDir)) {
+                    for (const dll of ['libEGL.dll', 'libGLESv2.dll', 'd3dcompiler_47.dll']) {
+                        const dllPath = path.join(localWindowsDir, dll);
+                        if (fs.existsSync(dllPath)) {
+                            fs.copyFileSync(dllPath, path.join(appDir, dll));
+                            console.log(`Copied ${dll}`);
+                        }
+                    }
+                }
+            }
+        }
+
         console.log('Extracting msgpackr renderer script...');
         let msgpackrRendererPath;
         try {
@@ -255,6 +281,7 @@ export const __dirname_macro = macroDir;
             // Instruct packager to copy our native `.node` modules together into the final installation directory
             resources: [
                 path.join(path.relative(distDir, appDir), '*.node'),
+                path.join(path.relative(distDir, appDir), '*.dll'),
                 path.join(path.relative(distDir, appDir), 'msgpackr-renderer.js')
             ],
             deb: {

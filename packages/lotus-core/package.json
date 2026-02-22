@@ -1,6 +1,6 @@
 {
   "name": "@lotus-gui/core",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "main": "lotus.js",
   "repository": {
     "type": "git",
@@ -14,7 +14,8 @@
     "package.json",
     "*.node",
     "resources/",
-    "scripts/"
+    "scripts/",
+    "windows/"
   ],
   "napi": {
     "name": "lotus",

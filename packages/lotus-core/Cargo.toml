@@ -44,6 +44,13 @@ glutin = "0.32"
 glutin-winit = "0.5"
 raw-window-handle = "0.6"
 
+# Windows-only dependencies
+[target.'cfg(target_os = "windows")'.dependencies]
+servo = { path = "servo/components/servo", package = "libservo", features = ["no-wgl"] }
+
+[build-dependencies]
+napi-build = "2"
+
 [profile.dev]
 split-debuginfo = "unpacked"
 incremental = true

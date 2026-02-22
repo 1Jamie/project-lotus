@@ -83,9 +83,6 @@ function ensureApp() {
         // Read msgpackr source from node_modules
         let msgpackrSource = '// msgpackr not found';
         try {
-            const fs = require('fs');
-            const path = require('path');
-
             const execDirMsgpackr = path.join(path.dirname(process.execPath), 'msgpackr-renderer.js');
             const usrLibMsgpackr = path.join('/usr/lib', path.basename(process.execPath), 'msgpackr-renderer.js');
             const appLibMsgpackr = path.join('/app/lib', path.basename(process.execPath), 'msgpackr-renderer.js');
