@@ -1,6 +1,6 @@
 {
     "name": "@lotus-gui/dev",
-    "version": "0.2.2",
+    "version": "0.2.3",
     "description": "The Lotus Toolkit",
     "main": "index.js",
     "bin": {
