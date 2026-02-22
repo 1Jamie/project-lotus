@@ -1532,7 +1532,7 @@ impl App {
             #[cfg(target_os = "windows")]
             {
                 use winit::platform::windows::EventLoopBuilderExtWindows;
-                builder.any_thread(true);
+                builder.with_any_thread(true);
             }
             
             let event_loop = builder.build().unwrap();
