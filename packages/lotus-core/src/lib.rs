@@ -1531,7 +1531,8 @@ impl App {
             }
             #[cfg(target_os = "windows")]
             {
-                winit::platform::windows::EventLoopBuilderExtWindows::any_thread(&mut builder, true);
+                use winit::platform::windows::EventLoopBuilderExtWindows;
+                builder.any_thread(true);
             }
             
             let event_loop = builder.build().unwrap();
