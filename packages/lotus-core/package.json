@@ -1,6 +1,6 @@
 {
   "name": "@lotus-gui/core",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "main": "lotus.js",
   "repository": {
     "type": "git",
@@ -28,8 +28,8 @@
     }
   },
   "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform",
+    "build": "napi build --platform --release && node scripts/extract_angle_dlls.js",
+    "build:debug": "napi build --platform && node scripts/extract_angle_dlls.js",
     "clean": "napi clean",
     "artifacts": "echo 'Artifacts moved by CI workflow'",
     "test": "npm run test:base",
