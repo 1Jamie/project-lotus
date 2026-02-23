@@ -27,6 +27,7 @@ jobs:
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             setup: |
+              git config --global core.longpaths true
               choco install llvm nasm python311
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV

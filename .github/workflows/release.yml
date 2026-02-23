@@ -21,6 +21,8 @@ jobs:
       matrix:
         settings:
           - host: windows-latest
+            setup: |
+              git config --global core.longpaths true
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc
             target: x86_64-pc-windows-msvc
