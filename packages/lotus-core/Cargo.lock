@@ -4579,6 +4579,7 @@ dependencies = [
  "log",
  "mime_guess",
  "napi",
+ "napi-build",
  "napi-derive",
  "once_cell",
  "raw-window-handle",
@@ -4816,6 +4817,8 @@ checksum = "97f4fcc47005b28e642cc098f2048a236fd8c531fc7a11b8b8bf14fb1230f122"
 dependencies = [
  "bindgen",
  "cc",
+ "gl_generator",
+ "libz-sys",
  "walkdir",
 ]
 
@@ -4890,6 +4893,12 @@ dependencies = [
  "napi-sys",
  "once_cell",
 ]
+
+[[package]]
+name = "napi-build"
+version = "2.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d376940fd5b723c6893cd1ee3f33abbfd86acb1cd1ec079f3ab04a2a3bc4d3b1"
 
 [[package]]
 name = "napi-derive"
