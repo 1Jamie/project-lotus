@@ -27,6 +27,23 @@ if (process.platform === 'linux') {
     }
 }
 
+// Windows ANGLE DLL discovery
+// This MUST run BEFORE loading the native module (index.js).
+// Native modules with hardware acceleration on Windows need ANGLE Dlls (libEGL.dll, libGLESv2.dll).
+// By appending our packaged windows/ directory to PATH, the OS loader can find them.
+if (process.platform === 'win32') {
+    const path = require('path');
+    const fs = require('fs');
+    const angleDllDir = path.join(__dirname, 'windows');
+    if (fs.existsSync(angleDllDir)) {
+        // Find the correct casing for the PATH env var
+        const pathKey = Object.keys(process.env).find(k => k.toLowerCase() === 'path') || 'PATH';
+        // Prepend our directory so it takes precedence over system DLLs if any
+        process.env[pathKey] = `${angleDllDir}${path.delimiter}${process.env[pathKey] || ''}`;
+    }
+}
+
+
 const { App, createWindow } = require('./index.js');
 const EventEmitter = require('events');
 let msgpackr;
