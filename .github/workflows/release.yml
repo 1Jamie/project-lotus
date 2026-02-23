@@ -83,6 +83,7 @@ jobs:
             packages/lotus-core/*.node
             packages/lotus-core/index.js
             packages/lotus-core/index.d.ts
+            packages/lotus-core/windows/*.dll
           if-no-files-found: error
 
   publish:
@@ -112,6 +113,9 @@ jobs:
         run: |
           ls -R artifacts
           mv artifacts/bindings-*/*.node packages/lotus-core/
+          # Copy windows DLLs if they exist
+          mkdir -p packages/lotus-core/windows
+          cp artifacts/bindings-x86_64-pc-windows-msvc/windows/*.dll packages/lotus-core/windows/ 2>/dev/null || true
           # Copy index.js and index.d.ts from one of the artifact folders (they are identical across platforms)
           cp artifacts/bindings-x86_64-unknown-linux-gnu/index.js packages/lotus-core/
           cp artifacts/bindings-x86_64-unknown-linux-gnu/index.d.ts packages/lotus-core/
