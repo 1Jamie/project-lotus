@@ -873,16 +873,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     .with_transparent(options.transparent)
                     .with_theme(theme);
 
-                // On Windows, ANGLE (used via no-wgl) renders via an EGL swap chain.
-                // DWM will capture the first presented frame into its own redirection bitmap
-                // and re-display that stale copy, making the window appear frozen.
-                // Setting no_redirection_bitmap=true forces DWM to always composite directly
-                // from our swap chain, so every frame actually shows up.
-                // This must be applied to ALL windows, not just transparent/frameless.
-                #[cfg(target_os = "windows")]
-                {
-                    window_attrs = window_attrs.with_no_redirection_bitmap(true);
-                }
+                // NOTE: We intentionally do NOT set no_redirection_bitmap here.
+                // WS_EX_NOREDIRECTIONBITMAP requires a DirectComposition visual tree to
+                // display content. ANGLE/surfman create a regular DXGI swap chain for the
+                // HWND which is NOT compatible with that flag — the window becomes fully
+                // transparent/invisible rather than showing the rendered content.
 
                 #[cfg(target_os = "linux")]
                 if let Some(class) = &options.wm_class {
@@ -1233,18 +1228,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     },
                     WindowEvent::RedrawRequested => {
                         let size = instance.window.inner_size();
-                        trace!("Rust: RedrawRequested for {}, size={}x{}, scale={}, visible={}", 
-                            uuid, size.width, size.height, instance.window.scale_factor(), instance.window.is_visible().unwrap_or(true));
+                        // Changed to INFO level so we can see this in default logs
+                        info!("Rust: RedrawRequested for {}, size={}x{}, visible={}", 
+                            uuid, size.width, size.height, instance.window.is_visible().unwrap_or(true));
                         
                         // Match servo's own winit_minimal.rs pattern exactly:
-                        // just paint() → present(). Do NOT call make_current() or
-                        // prepare_for_rendering() here — surfman keeps the context current
-                        // between frames, and prepare_for_rendering() rebinds the surfman
-                        // FBO *before* WebRender sets up its own render target. On Windows
-                        // with ANGLE (no-wgl / D3D11 backend) this causes every frame to
-                        // be painted to the wrong framebuffer, producing a frozen/blank window.
+                        // just paint() → present().
                         instance.webview.paint();
+                        info!("Rust: paint() complete, calling present()");
                         instance.rendering_context.present();
+                        info!("Rust: present() complete");
                     },
             WindowEvent::Resized(size) => {
                 info!("Rust: Resized to {}x{}", size.width, size.height);
