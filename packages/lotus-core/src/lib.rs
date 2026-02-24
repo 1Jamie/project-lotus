@@ -874,13 +874,13 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     .with_theme(theme);
 
                 // On Windows, ANGLE (used via no-wgl) renders via an EGL swap chain.
-                // Without this flag, DWM captures the first presented frame into its own
-                // redirection bitmap and re-displays that stale copy on every subsequent
-                // present, making the window appear frozen even though Servo keeps rendering.
+                // DWM will capture the first presented frame into its own redirection bitmap
+                // and re-display that stale copy, making the window appear frozen.
                 // Setting no_redirection_bitmap=true forces DWM to always composite directly
-                // from our swap chain surface, so every frame actually shows up.
+                // from our swap chain, so every frame actually shows up.
+                // This must be applied to ALL windows, not just transparent/frameless.
                 #[cfg(target_os = "windows")]
-                if options.transparent || options.frameless {
+                {
                     window_attrs = window_attrs.with_no_redirection_bitmap(true);
                 }
 
@@ -938,15 +938,20 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 if options.transparent {
                     #[cfg(target_os = "macos")]
                     {
-                        // Use HUD window or standard vibrancy
                         let _ = apply_vibrancy(&window, NSVisualEffectMaterial::HudWindow, None, None);
                     }
                     
+                    // NOTE: On Windows with ANGLE (EGL/D3D11 backend), we intentionally do NOT
+                    // apply window-vibrancy blur/mica effects here. The EGL surface is opaque;
+                    // there is no alpha channel for the vibrancy effect to composite against.
+                    // Applying blur causes DWM to show a blurry desktop square with no content.
+                    // Actual window transparency for the ANGLE backend requires a different
+                    // approach (DComp surface, layered window), which is not yet supported.
+                    // For frameless + transparent on Windows, the window will appear with a
+                    // standard solid background color instead.
                     #[cfg(target_os = "windows")]
                     {
-                        // Try Mica first, fall back to blur
-                         let _ = apply_mica(&window, None)
-                            .or_else(|_| apply_blur(&window, None));
+                        // Nothing: vibrancy with EGL is broken on Windows. Reserved for future.
                     }
                 }
                 
