@@ -30,6 +30,8 @@ use dpi::PhysicalSize as ServoPhysicalSize;
 use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 #[cfg(target_os = "windows")]
 use window_vibrancy::{apply_blur, apply_mica};
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowAttributesExtWindows;
 #[cfg(target_os = "linux")]
 use winit::platform::x11::WindowAttributesExtX11;
 #[cfg(target_os = "linux")]
@@ -871,6 +873,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     .with_transparent(options.transparent)
                     .with_theme(theme);
 
+                // On Windows, ANGLE (used via no-wgl) renders via an EGL swap chain.
+                // Without this flag, DWM captures the first presented frame into its own
+                // redirection bitmap and re-displays that stale copy on every subsequent
+                // present, making the window appear frozen even though Servo keeps rendering.
+                // Setting no_redirection_bitmap=true forces DWM to always composite directly
+                // from our swap chain surface, so every frame actually shows up.
+                #[cfg(target_os = "windows")]
+                if options.transparent || options.frameless {
+                    window_attrs = window_attrs.with_no_redirection_bitmap(true);
+                }
+
                 #[cfg(target_os = "linux")]
                 if let Some(class) = &options.wm_class {
                     // Use the class name for both instance and class for simplicity, or split it if needed.
@@ -1218,11 +1231,13 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         trace!("Rust: RedrawRequested for {}, size={}x{}, scale={}, visible={}", 
                             uuid, size.width, size.height, instance.window.scale_factor(), instance.window.is_visible().unwrap_or(true));
                         
-                        if let Err(e) = instance.rendering_context.make_current() {
-                            error!("Rust: Failed to make context current: {:?}", e);
-                        }
-                        
-                        instance.rendering_context.prepare_for_rendering();
+                        // Match servo's own winit_minimal.rs pattern exactly:
+                        // just paint() → present(). Do NOT call make_current() or
+                        // prepare_for_rendering() here — surfman keeps the context current
+                        // between frames, and prepare_for_rendering() rebinds the surfman
+                        // FBO *before* WebRender sets up its own render target. On Windows
+                        // with ANGLE (no-wgl / D3D11 backend) this causes every frame to
+                        // be painted to the wrong framebuffer, producing a frozen/blank window.
                         instance.webview.paint();
                         instance.rendering_context.present();
                     },
@@ -1585,7 +1600,7 @@ impl App {
                     let response = tiny_http::Response::from_string("OK")
                         .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
                         .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]).unwrap())
-                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, X-Lotus-Auth, X-Lotus-Window-Id"[..]).unwrap());
+                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, X-Lotus-Auth, X-Lotus-Window-Id, Accept, Accept-Language"[..]).unwrap());
                     let _ = request.respond(response);
                     continue;
                 }

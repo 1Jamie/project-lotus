@@ -100,6 +100,8 @@ function ensureApp() {
         // Read msgpackr source from node_modules
         let msgpackrSource = '// msgpackr not found';
         try {
+            const path = require('path');
+            const fs = require('fs');
             const execDirMsgpackr = path.join(path.dirname(process.execPath), 'msgpackr-renderer.js');
             const usrLibMsgpackr = path.join('/usr/lib', path.basename(process.execPath), 'msgpackr-renderer.js');
             const appLibMsgpackr = path.join('/app/lib', path.basename(process.execPath), 'msgpackr-renderer.js');
@@ -285,9 +287,11 @@ class ServoWindow extends EventEmitter {
                 console.warn(`[Lotus] Warning: 'root' path should be absolute: ${finalOptions.root}`);
                 finalOptions.root = path.resolve(finalOptions.root);
             }
+
+            // ADD THIS LINE: Force POSIX-style paths so Servo's Rust URL parser doesn't choke on Windows
+            finalOptions.root = finalOptions.root.replace(/\\/g, '/');
+
             // If using root, initialUrl is automatically set to our custom protocol
-            // We use 'localhost' as authority, but the Rust side will resolve based on window ID if needed,
-            // or just serve relative to the root.
             finalOptions.initialUrl = `lotus-resource://localhost/${finalOptions.index}`;
         }
 
