@@ -20,7 +20,7 @@ mod platform;
 use window_state::WindowStateManager;
 
 use winit::event::{WindowEvent, MouseScrollDelta};
-use winit::event_loop::{EventLoopProxy, ActiveEventLoop};
+use winit::event_loop::{EventLoopProxy, ActiveEventLoop, ControlFlow};
 use winit::application::ApplicationHandler;
 use winit::window::{Window, WindowId, CursorIcon};
 use winit::dpi::PhysicalSize as WinitPhysicalSize;
@@ -822,17 +822,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // This is called by winit right before it sleeps waiting for new events.
-        // Crucially, winit dispatches WindowEvent::RedrawRequested for all windows
-        // that had request_redraw() called AFTER this method returns.
-        // 
-        // Without spinning Servo's event loop here, notify_new_frame_ready → request_redraw()
-        // can be called from a servo worker thread, but the resulting RedrawRequested event
-        // never gets a chance to fire because the main loop is stuck waiting.
-        //
-        // By calling spin_event_loop() in about_to_wait we ensure Servo gets CPU time
-        // to process its internal event queue and trigger the redraw pipeline, which then
-        // causes winit to dispatch RedrawRequested → paint() → present().
+        // Servo needs to process any queued internal events before the event loop sleeps.
+        // This mirrors servoshell's `pump_servo_event_loop` call structure.
+        // Without this, Servo's internal work (like deferred layout/paint) doesn't get
+        // picked up until an external event wakes the loop.
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
@@ -1179,6 +1172,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
+        // Match servoshell's exact pattern: block until the next OS event.
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
@@ -1215,6 +1210,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
+        // Follow servoshell's pattern: after processing a window event, tell winit
+        // to block until the next OS event (ControlFlow::Wait). Without this, winit
+        // defaults to Poll which busy-loops and can cause the RedrawRequested drain
+        // to be skipped or the loop to freeze on Windows.
+        event_loop.set_control_flow(ControlFlow::Wait);
 
         if let Some(uuid) = self.winit_id_to_uuid.get(&window_id).cloned() {
             if let Some(instance) = self.windows.get_mut(&uuid) {
