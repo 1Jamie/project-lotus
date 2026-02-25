@@ -264,6 +264,7 @@ struct WindowInstance {
     drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
     no_drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
     in_resize_border: bool, // tracks whether cursor is currently in the resize border zone
+    animating: bool, // tracks whether Servo reports this webview as animating (CSS/rAF)
 }
 
 
@@ -338,6 +339,7 @@ pub enum EngineCommand {
     MaximizeWindow(String), // window_id
     UnmaximizeWindow(String), // window_id
     FocusWindow(String), // window_id
+    AnimatingChanged(String, bool), // window_id, animating
 }
 
 
@@ -585,6 +587,7 @@ fn init_resources() {
 struct LotusWebViewDelegate {
     window: Arc<Window>,
     window_id: String,
+    proxy: EventLoopProxy<EngineCommand>,
 }
 
 impl WebViewDelegate for LotusWebViewDelegate {
@@ -627,16 +630,15 @@ impl WebViewDelegate for LotusWebViewDelegate {
     
     fn notify_new_frame_ready(&self, _webview: servo::WebView) {
         trace!("Rust: NewFrameReady - Requesting Redraw");
+        // request_redraw() is all that's needed here — Servo's spin_event_loop() already
+        // dispatched this callback after checking needs_repaint. Adding an extra
+        // IpcMessage here was causing unnecessary event loop wakes every frame.
         self.window.request_redraw();
-        
-        if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
-            "event": "frame-ready",
-            "window_id": self.window_id
-        })) {
-             if let Some(proxy) = EVENT_LOOP_PROXY.get() {
-                let _ = proxy.send_event(EngineCommand::IpcMessage(self.window_id.clone(), msg));
-            }
-        }
+    }
+
+    fn notify_animating_changed(&self, _webview: servo::WebView, animating: bool) {
+        trace!("Rust: Animating changed for {} -> {}", self.window_id, animating);
+        let _ = self.proxy.send_event(EngineCommand::AnimatingChanged(self.window_id.clone(), animating));
     }
     
     fn notify_page_title_changed(&self, _webview: servo::WebView, title: Option<String>) {
@@ -802,6 +804,12 @@ impl LotusApp {
         if self.servo.is_none() {
             let mut prefs = servo::prefs::Preferences::default();
             prefs.shell_background_color_rgba = [0.0, 0.0, 0.0, 0.0]; // Transparent
+            // Pre-compile ANGLE (GLSL→HLSL) shaders during init rather than lazily on
+            // the first paint() call. Without this, the first WebRender render blocks
+            // the main thread for 2+ seconds on Windows/ANGLE, during which Servo's
+            // needs_repaint flag is set-then-cleared internally, so notify_new_frame_ready
+            // never fires again after the first frame, freezing the UI.
+            prefs.gfx_precache_shaders = true;
 
             let waker = LotusWaker(self.proxy.clone());
             let servo = ServoBuilder::default()
@@ -946,17 +954,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         let _ = apply_vibrancy(&window, NSVisualEffectMaterial::HudWindow, None, None);
                     }
                     
-                    // NOTE: On Windows with ANGLE (EGL/D3D11 backend), we intentionally do NOT
-                    // apply window-vibrancy blur/mica effects here. The EGL surface is opaque;
-                    // there is no alpha channel for the vibrancy effect to composite against.
-                    // Applying blur causes DWM to show a blurry desktop square with no content.
-                    // Actual window transparency for the ANGLE backend requires a different
-                    // approach (DComp surface, layered window), which is not yet supported.
-                    // For frameless + transparent on Windows, the window will appear with a
-                    // standard solid background color instead.
                     #[cfg(target_os = "windows")]
                     {
-                        // Nothing: vibrancy with EGL is broken on Windows. Reserved for future.
+                        //there might be an issue with the blur on windows through egl/angle so commenting out for now
+                        // Try Mica first, fall back to blur
+                        // let _ = apply_mica(&window, None)
+                        //    .or_else(|_| apply_blur(&window, None));
                     }
                 }
                 
@@ -964,6 +967,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 let delegate = Rc::new(LotusWebViewDelegate {
                     window: window.clone(),
                     window_id: window_id.clone(),
+                    proxy: self.proxy.clone(),
                 });
                 
                 let hidpi_scale_factor_val = window.scale_factor() as f32;
@@ -1032,6 +1036,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     drag_regions: Vec::new(),
                     no_drag_regions: Vec::new(),
                     in_resize_border: false,
+                    animating: false,
                 };
 
                 self.windows.insert(window_id.clone(), instance);
@@ -1167,13 +1172,26 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.window.focus_window();
                 }
             },
+            EngineCommand::AnimatingChanged(window_id, animating) => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    instance.animating = animating;
+                    trace!("Rust: Window {} animating={}", window_id, animating);
+                }
+            },
         }
         
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
-        // Match servoshell's exact pattern: block until the next OS event.
-        event_loop.set_control_flow(ControlFlow::Wait);
+        // Use Poll when any window has active CSS animations/rAF so the
+        // TimerRefreshDriver's 8ms ticks keep flowing. Fall back to Wait
+        // (sleep until next OS event) when everything is idle.
+        let any_animating = self.windows.values().any(|w| w.animating);
+        if any_animating {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
@@ -1210,11 +1228,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
-        // Follow servoshell's pattern: after processing a window event, tell winit
-        // to block until the next OS event (ControlFlow::Wait). Without this, winit
-        // defaults to Poll which busy-loops and can cause the RedrawRequested drain
-        // to be skipped or the loop to freeze on Windows.
-        event_loop.set_control_flow(ControlFlow::Wait);
+        // Use Poll when any window is animating (CSS/rAF), otherwise Wait.
+        // This keeps the TimerRefreshDriver's 8ms ticks flowing during animations
+        // without busy-looping when the UI is idle.
+        let any_animating = self.windows.values().any(|w| w.animating);
+        if any_animating {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
 
         if let Some(uuid) = self.winit_id_to_uuid.get(&window_id).cloned() {
             if let Some(instance) = self.windows.get_mut(&uuid) {
