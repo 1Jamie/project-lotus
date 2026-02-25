@@ -821,6 +821,23 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         info!("Rust: Application Resumed");
     }
 
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // This is called by winit right before it sleeps waiting for new events.
+        // Crucially, winit dispatches WindowEvent::RedrawRequested for all windows
+        // that had request_redraw() called AFTER this method returns.
+        // 
+        // Without spinning Servo's event loop here, notify_new_frame_ready → request_redraw()
+        // can be called from a servo worker thread, but the resulting RedrawRequested event
+        // never gets a chance to fire because the main loop is stuck waiting.
+        //
+        // By calling spin_event_loop() in about_to_wait we ensure Servo gets CPU time
+        // to process its internal event queue and trigger the redraw pipeline, which then
+        // causes winit to dispatch RedrawRequested → paint() → present().
+        if let Some(servo) = &self.servo {
+            servo.spin_event_loop();
+        }
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, cmd: EngineCommand) {
         match cmd {
             EngineCommand::Wake => {
