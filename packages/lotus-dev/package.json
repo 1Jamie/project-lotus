@@ -1,6 +1,6 @@
 {
     "name": "@lotus-gui/dev",
-    "version": "0.2.13",
+    "version": "0.2.14",
     "description": "CLI tool for managing, developing, and packaging Lotus applications.",
     "main": "index.js",
     "bin": {

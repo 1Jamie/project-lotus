@@ -1182,6 +1182,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        // Log every RedrawRequested BEFORE any guard, so we know if winit is dispatching it at all
+        if matches!(event, WindowEvent::RedrawRequested) {
+            info!("Rust: [RAW] RedrawRequested fired for winit id {:?}, known windows: {}", 
+                window_id, self.winit_id_to_uuid.len());
+        }
+
         match event {
             WindowEvent::ThemeChanged(theme) => {
                 if let Some(uuid) = self.winit_id_to_uuid.get(&window_id) {
@@ -1489,12 +1495,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     _ => {}
                 }
             }
-        }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(servo) = &self.servo {
-            servo.spin_event_loop();
         }
     }
 }
