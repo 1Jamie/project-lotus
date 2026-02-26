@@ -804,12 +804,8 @@ impl LotusApp {
         if self.servo.is_none() {
             let mut prefs = servo::prefs::Preferences::default();
             prefs.shell_background_color_rgba = [0.0, 0.0, 0.0, 0.0]; // Transparent
-            // Pre-compile ANGLE (GLSL→HLSL) shaders during init rather than lazily on
-            // the first paint() call. Without this, the first WebRender render blocks
-            // the main thread for 2+ seconds on Windows/ANGLE, during which Servo's
-            // needs_repaint flag is set-then-cleared internally, so notify_new_frame_ready
-            // never fires again after the first frame, freezing the UI.
-            prefs.gfx_precache_shaders = true;
+            // removed prefs.gfx_precache_shaders = true so that shaders compile lazily (Option A)
+            // prefs.gfx_precache_shaders = true;
 
             let waker = LotusWaker(self.proxy.clone());
             let servo = ServoBuilder::default()
@@ -1279,10 +1275,23 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         
                         // Match servo's own winit_minimal.rs pattern exactly:
                         // just paint() → present().
+                        let paint_start = Instant::now();
                         instance.webview.paint();
-                        info!("Rust: paint() complete, calling present()");
+                        let paint_duration = paint_start.elapsed();
+                        info!("Rust: paint() complete in {:?}, calling present()", paint_duration);
                         instance.rendering_context.present();
                         info!("Rust: present() complete");
+
+                        // WORKAROUND: If paint took a huge amount of time (e.g., >200ms),
+                        // it might mean ANGLE was busy compiling shaders blockingly on the first frame.
+                        // Servo's internal event loop might have fired notify_new_frame_ready while we were 
+                        // blocked here inside RedrawRequested, which the OS or our event loop swallowed.
+                        // To prevent the UI from permanently freezing after a lazy compile spike, 
+                        // manually inject a redraw request.
+                        if paint_duration > std::time::Duration::from_millis(200) {
+                            warn!("Rust: Paint took too long ({:?}). Waking event loop to prevent UI freeeze.", paint_duration);
+                            instance.window.request_redraw();
+                        }
                     },
             WindowEvent::Resized(size) => {
                 info!("Rust: Resized to {}x{}", size.width, size.height);
