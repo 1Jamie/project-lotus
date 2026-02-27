@@ -12,7 +12,7 @@ use napi::threadsafe_function::{ThreadsafeFunction, ErrorStrategy, ThreadsafeFun
 use serde::{Deserialize, Serialize};
 use serde_json;
 use uuid::Uuid;
-use log::{info, error, debug, trace};
+use log::{info, error, debug, trace, warn};
 
 mod window_state;
 mod platform;
