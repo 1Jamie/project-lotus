@@ -120,35 +120,99 @@ struct AppState {
 const IPC_BOOTSTRAP_BASE: &str = r#"
 window.lotus = {
     handlers: {},
-    // Buffer for batching
-    _batch: [],
-    _batchTimeout: null,
+    _ws: null,
+    _offlineQueue: [],
     port: null, // Will be set by init script
     token: null, // Will be set by init script
     id: null,    // Will be set by init script
 
+    _connectWs: () => {
+        if (window.lotus._ws || !window.lotus.port) return;
+        
+        const wsUrl = `ws://127.0.0.1:${window.lotus.port}/ws?token=${window.lotus.token}&id=${window.lotus.id}`;
+        window.lotus._ws = new WebSocket(wsUrl);
+        window.lotus._ws.binaryType = 'arraybuffer';
+        
+        window.lotus._ws.onopen = () => {
+            // console.log("Lotus IPC WebSocket connected");
+            const queue = window.lotus._offlineQueue;
+            window.lotus._offlineQueue = [];
+            for (const msg of queue) {
+                window.lotus._ws.send(msg);
+            }
+        };
+
+        window.lotus._ws.onclose = () => {
+            // console.warn("Lotus IPC WebSocket disconnected, reconnecting in 1s...");
+            window.lotus._ws = null;
+            setTimeout(window.lotus._connectWs, 1000);
+        };
+
+        window.lotus._ws.onerror = (e) => {
+            // console.error("Lotus IPC WebSocket error", e);
+        };
+
+        window.lotus._ws.onmessage = async (event) => {
+            try {
+                let data = event.data;
+                // If it's a blob, we must await its arrayBuffer to unpack it
+                if (data instanceof Blob) {
+                    data = await data.arrayBuffer();
+                }
+                
+                if (data instanceof ArrayBuffer && window.msgpackr) {
+                    let decodedMsgs = window.msgpackr.unpack(new Uint8Array(data));
+                    
+                    // Single message unwrapping to match standard IPC emission payload
+                    if (!Array.isArray(decodedMsgs) || decodedMsgs.length === 0) return;
+                    
+                    // Handle Batch format or Array
+                    // If batch [[channel, payload], [channel, payload]]
+                    if (Array.isArray(decodedMsgs[0])) {
+                        for (const [channel, payload] of decodedMsgs) {
+                            window.lotus.emit(channel, payload);
+                        }
+                    } else if (decodedMsgs.length >= 2 && typeof decodedMsgs[0] === 'string') {
+                        // Single message [channel, payload]
+                        const channel = decodedMsgs[0];
+                        const payload = decodedMsgs[1]; // Payload might be undefined if 0 args
+                        window.lotus.emit(channel, payload);
+                    }
+                }
+            } catch (e) {
+                console.error("Lotus IPC message handling error", e);
+            }
+        };
+    },
+
     send: (channel, data) => {
-        const port = window.lotus.port;
-        const token = window.lotus.token;
-        const windowId = window.lotus.id;
-        if (!port) {
+        if (!window.lotus.port) {
             console.error("Lotus IPC port not initialized");
             return;
         }
 
-        // Universal API: Check for binary
-        if (data instanceof Blob || data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
-            // Send binary directly via POST to localhost server
-            fetch(`http://127.0.0.1:${port}/ipc/${encodeURIComponent(channel)}`, {
-                method: 'POST',
-                headers: {
-                    'X-Lotus-Auth': token,
-                    'X-Lotus-Window-Id': windowId
-                },
-                body: data
-            }).catch(e => console.error("IPC Binary Post Failed", e));
+        // Initialize connection lazily on first send, or explicitly elsewhere
+        if (!window.lotus._ws && channel !== "lotus:internal-reconnect") {
+           window.lotus._connectWs();
+        }
+
+        const isBinary = (data instanceof Blob || data instanceof ArrayBuffer || ArrayBuffer.isView(data));
+        
+        let payload;
+        if (isBinary) {
+            // We must wrap binary in the same batch format so the server can route it properly if it needs to,
+            // though the current Rust handling just dumps the raw bytes into the IpcMessage directly.
+            // Wait, actually, the previous implementation did: 
+            // `fetch(/ipc/${channel}, body: data)` ... which the rust side then wrapped in a vec![(channel, content)]
+            // So for WebSockets, we should probably just pack the binary into a msgpack array on JS side to keep parsing unified.
+            if (window.msgpackr) {
+               payload = window.msgpackr.pack([[channel, data]]);
+            } else {
+               console.error("msgpackr not loaded, cannot send binary over WS");
+               return;
+            }
         } else {
-            // JSON/Object -> Batch -> MsgPack
+            // Buffer for batching text/json payloads
             window.lotus._batch.push([channel, data]);
             
             if (!window.lotus._batchTimeout) {
@@ -160,14 +224,11 @@ window.lotus = {
                     if (window.msgpackr) {
                         try {
                             const packed = window.msgpackr.pack(batch);
-                            fetch(`http://127.0.0.1:${port}/batch`, {
-                                method: 'POST',
-                                headers: {
-                                    'X-Lotus-Auth': token,
-                                    'X-Lotus-Window-Id': windowId
-                                },
-                                body: packed
-                            }).catch(e => console.error("IPC Batch Post Failed", e));
+                            if (window.lotus._ws && window.lotus._ws.readyState === WebSocket.OPEN) {
+                                window.lotus._ws.send(packed);
+                            } else {
+                                window.lotus._offlineQueue.push(packed);
+                            }
                         } catch (e) {
                             console.error("Failed to pack batch", e);
                         }
@@ -175,7 +236,17 @@ window.lotus = {
                         console.error("msgpackr not loaded");
                     }
                 });
-                window.lotus._batchTimeout = true; // Any truthy value
+                window.lotus._batchTimeout = true; 
+            }
+            return; // Return here since microtask handles sending
+        }
+
+        // Direct send for binary
+        if (payload) {
+            if (window.lotus._ws && window.lotus._ws.readyState === WebSocket.OPEN) {
+                window.lotus._ws.send(payload);
+            } else {
+                window.lotus._offlineQueue.push(payload);
             }
         }
     },
@@ -323,6 +394,7 @@ pub enum EngineCommand {
     LoadUrl(String, String), // window_id, url
     SendToRenderer(String, String, serde_json::Value), // window_id, channel, data
     IpcMessage(String, Vec<u8>), // window_id, raw_bytes
+    IpcMessages(String, Vec<Vec<u8>>),
     Resize(String, winit::dpi::PhysicalSize<u32>), // window_id, size
     SetPosition(String, winit::dpi::PhysicalPosition<i32>), // window_id, position
     SetAlwaysOnTop(String, bool), // window_id, flag
@@ -941,8 +1013,20 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                 let winit_id = window.id();
                 
-                let display_handle = window.display_handle().expect("Failed to get display handle");
-                let window_handle = window.window_handle().expect("Failed to get window handle");
+                let display_handle = match window.display_handle() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!("Failed to get display handle: {}", e);
+                        return;
+                    }
+                };
+                let window_handle = match window.window_handle() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!("Failed to get window handle: {}", e);
+                        return;
+                    }
+                };
                 let size = window.inner_size();
                 
                 let rendering_context = match WindowRenderingContext::new(
@@ -1089,6 +1173,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             EngineCommand::IpcMessage(_window_id, raw_bytes) => {
                 self.callback.call(raw_bytes, ThreadsafeFunctionCallMode::NonBlocking);
+            },
+            EngineCommand::IpcMessages(_window_id, messages) => {
+                for raw_bytes in messages {
+                    self.callback.call(raw_bytes, ThreadsafeFunctionCallMode::NonBlocking);
+                }
             },
             EngineCommand::LoadUrl(window_id, url) => {
                 if let Some(instance) = self.windows.get(&window_id) {
@@ -1561,7 +1650,7 @@ pub struct App {
 #[napi]
 impl App {
     #[napi(constructor)]
-    pub fn new(callback: ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>, profiling: bool, app_identifier: Option<String>, msgpackr_source: String) -> Self {
+    pub fn new(callback: ThreadsafeFunction<Vec<u8>, ErrorStrategy::Fatal>, profiling: bool, app_identifier: Option<String>, msgpackr_source: String) -> napi::Result<Self> {
         let (proxy_tx, proxy_rx) = crossbeam_channel::bounded(1);
         
         let start_time = Instant::now();
@@ -1597,7 +1686,13 @@ impl App {
         }));
         APP_STATE.set(app_state.clone()).ok();
 
-        let token = app_state.lock().unwrap().ipc_server_token.clone();
+        let token = match app_state.lock() {
+            Ok(s) => s.ipc_server_token.clone(),
+            Err(e) => {
+                error!("AppState lock poisoned during init: {}", e);
+                return Err(napi::Error::from_reason(format!("Internal state lock failed: {}", e)));
+            }
+        };
         
         // 2. Start Event Loop in dedicated thread
         let event_callback = callback.clone();
@@ -1614,7 +1709,13 @@ impl App {
                 builder.with_any_thread(true);
             }
             
-            let event_loop = builder.build().unwrap();
+            let event_loop = match builder.build() {
+                Ok(el) => el,
+                Err(e) => {
+                    error!("Failed to build Winit event loop: {}", e);
+                    return;
+                }
+            };
             let proxy = event_loop.create_proxy();
             
             // Store proxy in global static and signal main thread
@@ -1625,173 +1726,285 @@ impl App {
             let mut lotus_app = LotusApp::new(proxy, event_callback);
             let _ = event_loop.run_app(&mut lotus_app);
             
-            info!("Rust: Event loop successfully stopped. Hard exit via _exit(0) now.");
-            unsafe { libc::_exit(0); }
+            info!("Rust: Event loop stopped. Initiating graceful process exit.");
+            // std::process::exit runs atexit/libc handlers (including Node's process.on('exit')
+            // and any SQLite WAL flushes), unlike libc::_exit which bypasses them entirely.
+            std::process::exit(0);
         });
 
         // 3. Wait for proxy to be ready
-        let proxy = proxy_rx.recv().expect("Failed to receive proxy");
+        let proxy = match proxy_rx.recv() {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Event loop thread failed to start, cannot receive proxy: {}", e);
+                return Err(napi::Error::from_reason(
+                    format!("Winit event loop failed to start: {}", e)
+                ));
+            }
+        };
 
-        // 4. Start IPC Server
+        // 4. Start IPC Server (Tokio + Axum)
         let server_proxy = proxy.clone();
         let server_token = token.clone();
+        
+        // Channel to communicate chosen port back to main thread
+        let (port_tx, port_rx) = std::sync::mpsc::channel();
+        
         thread::spawn(move || {
-            let server = match tiny_http::Server::http("127.0.0.1:0") {
-                Ok(s) => s,
+            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
                 Err(e) => {
-                    error!("Failed to start IPC server: {}", e);
+                    error!("Failed to build tokio runtime: {}", e);
                     return;
                 }
             };
-            let actual_port = match server.server_addr() {
-                tiny_http::ListenAddr::IP(addr) => addr.port(),
-                _ => 0,
-            };
-            info!("Rust: IPC Server listening on port {}", actual_port);
             
-            // Update port in state
-            if let Some(state) = APP_STATE.get() {
-                if let Ok(mut s) = state.lock() {
-                    s.ipc_server_port = actual_port;
-                }
-            }
-
-            // IPC server: handle each request on its own thread so that a slow
-            // read (large binary body, /resource/ file) never blocks the accept
-            // loop and stalls other windows from sending messages.
-            let server = Arc::new(server);
-            loop {
-                let request = match server.recv() {
-                    Ok(r) => r,
+            rt.block_on(async move {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => l,
                     Err(e) => {
-                        error!("IPC server recv error: {}", e);
-                        break;
+                        error!("Failed to bind Tokio TCP Listener: {}", e);
+                        let _ = port_tx.send(0);
+                        return;
                     }
                 };
+                
+                let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+                info!("Rust: Tokio/Axum IPC Server listening on port {}", actual_port);
+                
+                // Update port in state
+                if let Some(state) = APP_STATE.get() {
+                    if let Ok(mut s) = state.lock() {
+                        s.ipc_server_port = actual_port;
+                    }
+                }
+                
+                let _ = port_tx.send(actual_port);
 
-                let thread_proxy = server_proxy.clone();
-                let thread_token = server_token.clone();
-                thread::spawn(move || {
-                    let mut request = request;
-                    let url_str = request.url().to_string();
-                    
-                    // Handle CORS preflight
-                    if request.method() == &tiny_http::Method::Options {
-                        let response = tiny_http::Response::from_string("OK")
-                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
-                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]).unwrap())
-                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, X-Lotus-Auth, X-Lotus-Window-Id, Accept, Accept-Language"[..]).unwrap());
-                        let _ = request.respond(response);
-                        return;
+                use axum::{
+                    routing::{get, post},
+                    Router,
+                    extract::{State, Path, ws::{WebSocketUpgrade, WebSocket, Message as WsMessage}, Query},
+                    response::{IntoResponse, Response},
+                    http::{StatusCode, HeaderValue, header},
+                    body::Body,
+                };
+                use tower_http::cors::{CorsLayer, Any};
+                use tokio::sync::mpsc;
+                use dashmap::DashMap;
+                use futures_util::{StreamExt, SinkExt};
+
+                #[derive(serde::Deserialize)]
+                struct WsQuery {
+                    token: String,
+                    id: String,
+                }
+
+                #[derive(Clone)]
+                struct ServerState {
+                    proxy: winit::event_loop::EventLoopProxy<EngineCommand>,
+                    token: String,
+                    ws_senders: Arc<DashMap<String, mpsc::UnboundedSender<WsMessage>>>,
+                }
+
+                let state = ServerState {
+                    proxy: server_proxy,
+                    token: server_token,
+                    ws_senders: Arc::new(DashMap::new()),
+                };
+
+                let cors = CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(vec![
+                        header::CONTENT_TYPE,
+                        header::ACCEPT,
+                        header::ACCEPT_LANGUAGE,
+                        header::HeaderName::from_static("x-lotus-auth"),
+                        header::HeaderName::from_static("x-lotus-window-id"),
+                    ]);
+
+                let app = Router::new()
+                    .route("/batch", post(handle_batch))
+                    .route("/ipc/:channel", post(handle_ipc))
+                    .route("/resource/*path", get(handle_resource))
+                    .route("/ws", get(handle_ws_upgrade))
+                    .layer(cors)
+                    .with_state(state);
+
+                async fn handle_batch(
+                    State(state): State<ServerState>,
+                    headers: axum::http::HeaderMap,
+                    body: axum::body::Bytes,
+                ) -> impl IntoResponse {
+                    if headers.get("x-lotus-auth").and_then(|h| h.to_str().ok()) != Some(&state.token) {
+                        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
                     }
 
-                    let auth_token = request.headers().iter()
-                        .find(|h| h.field.as_str().to_ascii_lowercase() == "x-lotus-auth")
-                        .map(|h| h.value.as_str().to_string());
-                    
-                    if auth_token != Some(thread_token) {
-                        let _ = request.respond(tiny_http::Response::from_string("Unauthorized").with_status_code(401));
-                        return;
-                    }
+                    let window_id = headers.get("x-lotus-window-id")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("unknown")
+                        .to_string();
 
-                    let window_id = request.headers().iter()
-                        .find(|h| h.field.as_str().to_ascii_lowercase() == "x-lotus-window-id")
-                        .map(|h| h.value.as_str().to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
+                    if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&body) {
+                        for (channel, data) in &batch {
+                            if channel == "lotus:set-drag-regions" {
+                                let mut drag_regions = Vec::new();
+                                let mut no_drag_regions = Vec::new();
 
-                    let cors_header = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
-
-                    if url_str.starts_with("/ipc/") {
-                        let channel = url_str.trim_start_matches("/ipc/");
-                        let channel = urlencoding::decode(channel).unwrap_or(std::borrow::Cow::Borrowed(channel)).to_string();
-
-                        let mut content = Vec::new();
-                        let _ = request.as_reader().read_to_end(&mut content);
-                        
-                        let mut msg = Vec::new();
-                        // Wrap single binary message in a list for consistency with batch format: [[channel, content]]
-                        if let Ok(_) = rmp_serde::encode::write(&mut msg, &vec![(channel, content)]) {
-                            let _ = thread_proxy.send_event(EngineCommand::IpcMessage(window_id, msg));
-                        }
-                        let _ = request.respond(tiny_http::Response::from_string("ok").with_header(cors_header));
-                    } else if url_str == "/batch" {
-                        let mut content = Vec::new();
-                        let _ = request.as_reader().read_to_end(&mut content);
-
-                        // Before forwarding to Node.js, intercept internal Lotus IPC channels.
-                        // This avoids a Node.js round-trip for performance-critical messages.
-                        if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&content) {
-                            for (channel, data) in &batch {
-                                if channel == "lotus:set-drag-regions" {
-                                    let mut drag_regions = Vec::new();
-                                    let mut no_drag_regions = Vec::new();
-
-                                    if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
-                                        for r in drag_arr {
-                                            if let (Some(x), Some(y), Some(w), Some(h)) = (
-                                                r.get("x").and_then(|v| v.as_f64()),
-                                                r.get("y").and_then(|v| v.as_f64()),
-                                                r.get("width").and_then(|v| v.as_f64()),
-                                                r.get("height").and_then(|v| v.as_f64())
-                                            ) {
-                                                drag_regions.push(euclid::Rect::new(
-                                                    euclid::Point2D::new(x as f32, y as f32),
-                                                    euclid::Size2D::new(w as f32, h as f32)
-                                                ));
-                                            }
+                                if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
+                                    for r in drag_arr {
+                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
+                                            r.get("x").and_then(|v| v.as_f64()),
+                                            r.get("y").and_then(|v| v.as_f64()),
+                                            r.get("width").and_then(|v| v.as_f64()),
+                                            r.get("height").and_then(|v| v.as_f64())
+                                        ) {
+                                            drag_regions.push(euclid::Rect::new(
+                                                euclid::Point2D::new(x as f32, y as f32),
+                                                euclid::Size2D::new(w as f32, h as f32)
+                                            ));
                                         }
                                     }
-
-                                    if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
-                                        for r in no_drag_arr {
-                                            if let (Some(x), Some(y), Some(w), Some(h)) = (
-                                                r.get("x").and_then(|v| v.as_f64()),
-                                                r.get("y").and_then(|v| v.as_f64()),
-                                                r.get("width").and_then(|v| v.as_f64()),
-                                                r.get("height").and_then(|v| v.as_f64())
-                                            ) {
-                                                no_drag_regions.push(euclid::Rect::new(
-                                                    euclid::Point2D::new(x as f32, y as f32),
-                                                    euclid::Size2D::new(w as f32, h as f32)
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    
-                                    info!("Rust: Intercepted drag regions from batch for {}: drag: {}, no_drag: {}", window_id, drag_regions.len(), no_drag_regions.len());
-                                    let _ = thread_proxy.send_event(EngineCommand::UpdateDragRegions(window_id.clone(), drag_regions, no_drag_regions));
-                                    
-                                    // Don't forward lotus:* internal channels to Node.js
-                                    continue;
                                 }
-                            }
-                            // Forward the full batch to Node.js (non-internal messages will still be routed there)
-                        }
 
-                        // Always forward raw bytes to Node.js for normal IPC channels
-                        let _ = thread_proxy.send_event(EngineCommand::IpcMessage(window_id, content));
-                        let _ = request.respond(tiny_http::Response::from_string("ok").with_header(cors_header));
-                    } else if url_str.starts_with("/resource/") {
-                        let path = url_str.trim_start_matches("/resource/");
-                        let mut full_path = env::current_dir().unwrap();
-                        full_path.push(path.trim_start_matches('/'));
-                        
-                        if full_path.exists() && full_path.is_file() {
-                            if let Ok(file) = fs::File::open(full_path) {
-                                let mut file_response = tiny_http::Response::from_file(file);
-                                file_response.add_header(cors_header.clone());
-                                let _ = request.respond(file_response);
-                            } else {
-                                let _ = request.respond(tiny_http::Response::from_string("Error reading file").with_status_code(500));
+                                if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
+                                    for r in no_drag_arr {
+                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
+                                            r.get("x").and_then(|v| v.as_f64()),
+                                            r.get("y").and_then(|v| v.as_f64()),
+                                            r.get("width").and_then(|v| v.as_f64()),
+                                            r.get("height").and_then(|v| v.as_f64())
+                                        ) {
+                                            no_drag_regions.push(euclid::Rect::new(
+                                                euclid::Point2D::new(x as f32, y as f32),
+                                                euclid::Size2D::new(w as f32, h as f32)
+                                            ));
+                                        }
+                                    }
+                                }
+                                
+                                info!("Rust: Intercepted drag regions from batch for {}: drag: {}, no_drag: {}", window_id, drag_regions.len(), no_drag_regions.len());
+                                let _ = state.proxy.send_event(EngineCommand::UpdateDragRegions(window_id.clone(), drag_regions, no_drag_regions));
+                                continue;
                             }
+                        }
+                    }
+
+                    let _ = state.proxy.send_event(EngineCommand::IpcMessage(window_id, body.to_vec()));
+                    (StatusCode::OK, "ok").into_response()
+                }
+
+                async fn handle_ipc(
+                    State(state): State<ServerState>,
+                    Path(channel): Path<String>,
+                    headers: axum::http::HeaderMap,
+                    body: axum::body::Bytes,
+                ) -> impl IntoResponse {
+                    if headers.get("x-lotus-auth").and_then(|h| h.to_str().ok()) != Some(&state.token) {
+                        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+                    }
+
+                    let window_id = headers.get("x-lotus-window-id")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    let channel_decoded = urlencoding::decode(&channel).unwrap_or(std::borrow::Cow::Borrowed(&channel)).into_owned();
+                    let mut msg = Vec::new();
+                    if let Ok(_) = rmp_serde::encode::write(&mut msg, &vec![(channel_decoded, body.to_vec())]) {
+                        let _ = state.proxy.send_event(EngineCommand::IpcMessage(window_id, msg));
+                    }
+                    
+                    (StatusCode::OK, "ok").into_response()
+                }
+
+                async fn handle_resource(
+                    Path(path): Path<String>,
+                ) -> impl IntoResponse {
+                    let mut full_path = env::current_dir().unwrap_or_default();
+                    full_path.push(path.trim_start_matches('/'));
+                    
+                    if full_path.exists() && full_path.is_file() {
+                        if let Ok(content) = fs::read(&full_path) {
+                            let mime = mime_guess::from_path(&full_path).first_or_octet_stream();
+                            let mut resp = Response::new(Body::from(content));
+                            resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_str(mime.as_ref()).unwrap_or(HeaderValue::from_static("application/octet-stream")));
+                            resp
                         } else {
-                            let _ = request.respond(tiny_http::Response::from_string("Not Found").with_status_code(404));
+                            (StatusCode::INTERNAL_SERVER_ERROR, "Error reading file").into_response()
                         }
                     } else {
-                        let _ = request.respond(tiny_http::Response::from_string("Not Found").with_status_code(404));
+                        (StatusCode::NOT_FOUND, "Not Found").into_response()
                     }
-                }); // end thread::spawn
-            } // end loop
+                }
+
+                async fn handle_ws_upgrade(
+                    ws: WebSocketUpgrade,
+                    Query(query): Query<WsQuery>,
+                    State(state): State<ServerState>,
+                ) -> impl IntoResponse {
+                    if query.token != state.token {
+                        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+                    }
+
+                    ws.on_upgrade(move |socket| handle_ws_client(socket, query.id, state))
+                }
+
+                async fn handle_ws_client(socket: WebSocket, window_id: String, state: ServerState) {
+                    info!("Rust: WebSocket client connected for window {}", window_id);
+                    let (mut sender, mut receiver) = socket.split();
+                    
+                    let (tx, mut rx) = mpsc::unbounded_channel();
+                    state.ws_senders.insert(window_id.clone(), tx);
+
+                    let send_task = async move {
+                        while let Some(msg) = rx.recv().await {
+                            if sender.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+
+                    let proxy = state.proxy.clone();
+                    let window_id_clone = window_id.clone();
+                    let recv_task = async move {
+                        let mut batch_buffer: Vec<Vec<u8>> = Vec::with_capacity(32);
+                        
+                        while let Some(Ok(msg)) = receiver.next().await {
+                            match msg {
+                                WsMessage::Binary(bin) => {
+                                    batch_buffer.push(bin);
+                                },
+                                WsMessage::Text(txt) => {
+                                    batch_buffer.push(txt.into_bytes());
+                                },
+                                _ => {}
+                            }
+                            
+                            // Flush buffer when it grows or if we drain the visible queue 
+                            // (futures limit blocks true immediate drain so we just flush eagerly for now, batching on tight loops)
+                            if !batch_buffer.is_empty() {
+                               let msgs = std::mem::take(&mut batch_buffer);
+                               let _ = proxy.send_event(EngineCommand::IpcMessages(window_id_clone.clone(), msgs));
+                            }
+                        }
+                    };
+
+                    tokio::select! {
+                        _ = send_task => {},
+                        _ = recv_task => {},
+                    }
+                    
+                    info!("Rust: WebSocket client disconnected for window {}", window_id);
+                    state.ws_senders.remove(&window_id); // Ensure dashmap unregisters this window id
+                }
+
+                if let Err(e) = axum::serve(listener, app).await {
+                    error!("Axum server error: {}", e);
+                }
+            });
         });
 
         // 5. Send Initial ready event to Node.js
@@ -1800,18 +2013,8 @@ impl App {
         thread::spawn(move || {
             init_resources();
             
-            let mut port = 0;
-            for _ in 0..100 {
-                if let Some(state) = APP_STATE.get() {
-                    if let Ok(s) = state.lock() {
-                        if s.ipc_server_port != 0 {
-                            port = s.ipc_server_port;
-                            break;
-                        }
-                    }
-                }
-                thread::sleep(std::time::Duration::from_millis(10));
-            }
+            // Wait up to 1s for port to be assigned from axum
+            let port = port_rx.recv_timeout(std::time::Duration::from_millis(1000)).unwrap_or(0);
 
             let mut ready_msg = Vec::new();
             if rmp_serde::encode::write(&mut ready_msg, &serde_json::json!({
@@ -1823,7 +2026,7 @@ impl App {
             }
         });
 
-        App {}
+        Ok(App {})
     }
 
     #[napi]
