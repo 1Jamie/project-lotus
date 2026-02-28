@@ -122,6 +122,8 @@ window.lotus = {
     handlers: {},
     _ws: null,
     _offlineQueue: [],
+    _batch: [],
+    _batchTimeout: null,
     port: null, // Will be set by init script
     token: null, // Will be set by init script
     id: null,    // Will be set by init script
@@ -1174,8 +1176,59 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             EngineCommand::IpcMessage(_window_id, raw_bytes) => {
                 self.callback.call(raw_bytes, ThreadsafeFunctionCallMode::NonBlocking);
             },
-            EngineCommand::IpcMessages(_window_id, messages) => {
+            EngineCommand::IpcMessages(window_id, messages) => {
                 for raw_bytes in messages {
+                    // Pre-process messages to intercept known internal Lotus commands
+                    // before forwarding to Node.js
+                    if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&raw_bytes) {
+                        for (channel, data) in &batch {
+                            if channel == "lotus:set-drag-regions" {
+                                let mut drag_regions = Vec::new();
+                                let mut no_drag_regions = Vec::new();
+
+                                if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
+                                    for r in drag_arr {
+                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
+                                            r.get("x").and_then(|v| v.as_f64()),
+                                            r.get("y").and_then(|v| v.as_f64()),
+                                            r.get("width").and_then(|v| v.as_f64()),
+                                            r.get("height").and_then(|v| v.as_f64())
+                                        ) {
+                                            drag_regions.push(euclid::Rect::new(
+                                                euclid::Point2D::new(x as f32, y as f32),
+                                                euclid::Size2D::new(w as f32, h as f32)
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
+                                    for r in no_drag_arr {
+                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
+                                            r.get("x").and_then(|v| v.as_f64()),
+                                            r.get("y").and_then(|v| v.as_f64()),
+                                            r.get("width").and_then(|v| v.as_f64()),
+                                            r.get("height").and_then(|v| v.as_f64())
+                                        ) {
+                                            no_drag_regions.push(euclid::Rect::new(
+                                                euclid::Point2D::new(x as f32, y as f32),
+                                                euclid::Size2D::new(w as f32, h as f32)
+                                            ));
+                                        }
+                                    }
+                                }
+                                
+                                if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                                    let _ = proxy.send_event(EngineCommand::UpdateDragRegions(
+                                        window_id.clone(),
+                                        drag_regions,
+                                        no_drag_regions
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     self.callback.call(raw_bytes, ThreadsafeFunctionCallMode::NonBlocking);
                 }
             },
@@ -1848,48 +1901,6 @@ impl App {
                         .to_string();
 
                     if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&body) {
-                        for (channel, data) in &batch {
-                            if channel == "lotus:set-drag-regions" {
-                                let mut drag_regions = Vec::new();
-                                let mut no_drag_regions = Vec::new();
-
-                                if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
-                                    for r in drag_arr {
-                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
-                                            r.get("x").and_then(|v| v.as_f64()),
-                                            r.get("y").and_then(|v| v.as_f64()),
-                                            r.get("width").and_then(|v| v.as_f64()),
-                                            r.get("height").and_then(|v| v.as_f64())
-                                        ) {
-                                            drag_regions.push(euclid::Rect::new(
-                                                euclid::Point2D::new(x as f32, y as f32),
-                                                euclid::Size2D::new(w as f32, h as f32)
-                                            ));
-                                        }
-                                    }
-                                }
-
-                                if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
-                                    for r in no_drag_arr {
-                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
-                                            r.get("x").and_then(|v| v.as_f64()),
-                                            r.get("y").and_then(|v| v.as_f64()),
-                                            r.get("width").and_then(|v| v.as_f64()),
-                                            r.get("height").and_then(|v| v.as_f64())
-                                        ) {
-                                            no_drag_regions.push(euclid::Rect::new(
-                                                euclid::Point2D::new(x as f32, y as f32),
-                                                euclid::Size2D::new(w as f32, h as f32)
-                                            ));
-                                        }
-                                    }
-                                }
-                                
-                                info!("Rust: Intercepted drag regions from batch for {}: drag: {}, no_drag: {}", window_id, drag_regions.len(), no_drag_regions.len());
-                                let _ = state.proxy.send_event(EngineCommand::UpdateDragRegions(window_id.clone(), drag_regions, no_drag_regions));
-                                continue;
-                            }
-                        }
                     }
 
                     let _ = state.proxy.send_event(EngineCommand::IpcMessage(window_id, body.to_vec()));
