@@ -674,38 +674,54 @@ impl WebViewDelegate for LotusWebViewDelegate {
                  // Remove leading slash safely
                  let relative_path = path_in_url.trim_start_matches('/');
                  
-                 // Prevent directory traversal (basic check)
-                 // Start with root
                  let full_path = root.join(relative_path);
                  
-                 debug!("Rust: Loading resource: {:?}", full_path);
-                 
-                 match fs::read(&full_path) {
-                    Ok(data) => {
-                        let mime = mime_guess::from_path(&full_path).first_or_octet_stream();
-                        let mime_str = mime.to_string();
-                        
-                        let mut headers = HeaderMap::new();
-                        if let Ok(val) = HeaderValue::from_str(&mime_str) {
-                             headers.insert(CONTENT_TYPE, val);
-                        }
+                 // Security: Prevent directory traversal attacks.
+                 // Canonicalize both paths and verify full_path stays within root.
+                 match (full_path.canonicalize(), root.canonicalize()) {
+                     (Ok(canonical_full), Ok(canonical_root)) => {
+                         if !canonical_full.starts_with(&canonical_root) {
+                             warn!("Rust: Blocked directory traversal attempt for {:?}", full_path);
+                             let response = WebResourceResponse::new(url)
+                                 .status_code(StatusCode::FORBIDDEN);
+                             load.intercept(response).finish();
+                             return;
+                         }
+                         // Path is safe — serve it
+                         debug!("Rust: Loading resource: {:?}", canonical_full);
+                         match fs::read(&canonical_full) {
+                             Ok(data) => {
+                                 let mime = mime_guess::from_path(&canonical_full).first_or_octet_stream();
+                                 let mime_str = mime.to_string();
+                                 
+                                 let mut headers = HeaderMap::new();
+                                 if let Ok(val) = HeaderValue::from_str(&mime_str) {
+                                      headers.insert(CONTENT_TYPE, val);
+                                 }
 
-                        let response = WebResourceResponse::new(url)
-                            .headers(headers)
-                            .status_code(StatusCode::OK);
+                                 let response = WebResourceResponse::new(url)
+                                     .headers(headers)
+                                     .status_code(StatusCode::OK);
 
-                        let mut intercepted = load.intercept(response);
-                        intercepted.send_body_data(data);
-                        intercepted.finish();
-                    },
-                    Err(e) => {
-                        error!("Failed to read file {:?}: {}", full_path, e);
-                         // Return 404
-                        let response = WebResourceResponse::new(url)
-                            .status_code(StatusCode::NOT_FOUND);
-                        let intercepted = load.intercept(response);
-                        intercepted.finish();
-                    }
+                                 let mut intercepted = load.intercept(response);
+                                 intercepted.send_body_data(data);
+                                 intercepted.finish();
+                             },
+                             Err(e) => {
+                                 error!("Failed to read file {:?}: {}", canonical_full, e);
+                                 let response = WebResourceResponse::new(url)
+                                     .status_code(StatusCode::NOT_FOUND);
+                                 load.intercept(response).finish();
+                             }
+                         }
+                     },
+                     _ => {
+                         // Path doesn't exist or is malformed
+                         debug!("Rust: Resource not found or malformed path: {:?}", full_path);
+                         let response = WebResourceResponse::new(url)
+                             .status_code(StatusCode::NOT_FOUND);
+                         load.intercept(response).finish();
+                     }
                  }
                  return;
              }
@@ -1179,12 +1195,13 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
-        // Use Poll when any window has active CSS animations/rAF so the
-        // TimerRefreshDriver's 8ms ticks keep flowing. Fall back to Wait
-        // (sleep until next OS event) when everything is idle.
+        // Cap animation-driven redraws to ~60 fps using WaitUntil instead of Poll.
+        // ControlFlow::Poll would spin at 100% CPU; WaitUntil yields the core back
+        // to the OS and wakes again no earlier than the next frame deadline.
         let any_animating = self.windows.values().any(|w| w.animating);
         if any_animating {
-            event_loop.set_control_flow(ControlFlow::Poll);
+            let next_frame = std::time::Instant::now() + std::time::Duration::from_millis(16);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next_frame));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -1224,12 +1241,13 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
-        // Use Poll when any window is animating (CSS/rAF), otherwise Wait.
-        // This keeps the TimerRefreshDriver's 8ms ticks flowing during animations
-        // without busy-looping when the UI is idle.
+        // Cap animation-driven redraws to ~60 fps using WaitUntil instead of Poll.
+        // ControlFlow::Poll would spin at 100% CPU; WaitUntil yields the core back
+        // to the OS and wakes again no earlier than the next frame deadline.
         let any_animating = self.windows.values().any(|w| w.animating);
         if any_animating {
-            event_loop.set_control_flow(ControlFlow::Poll);
+            let next_frame = std::time::Instant::now() + std::time::Duration::from_millis(16);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next_frame));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -1638,125 +1656,142 @@ impl App {
                 }
             }
 
-            for mut request in server.incoming_requests() {
-                let url_str = request.url().to_string();
-                
-                // Handle CORS preflight
-                if request.method() == &tiny_http::Method::Options {
-                    let response = tiny_http::Response::from_string("OK")
-                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
-                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]).unwrap())
-                        .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, X-Lotus-Auth, X-Lotus-Window-Id, Accept, Accept-Language"[..]).unwrap());
-                    let _ = request.respond(response);
-                    continue;
-                }
-
-                let auth_token = request.headers().iter()
-                    .find(|h| h.field.as_str().to_ascii_lowercase() == "x-lotus-auth")
-                    .map(|h| h.value.as_str().to_string());
-                
-                if auth_token != Some(server_token.clone()) {
-                    let _ = request.respond(tiny_http::Response::from_string("Unauthorized").with_status_code(401));
-                    continue;
-                }
-
-                let window_id = request.headers().iter()
-                    .find(|h| h.field.as_str().to_ascii_lowercase() == "x-lotus-window-id")
-                    .map(|h| h.value.as_str().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                let cors_header = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
-
-                if url_str.starts_with("/ipc/") {
-                    let channel = url_str.trim_start_matches("/ipc/");
-                    let channel = urlencoding::decode(channel).unwrap_or(std::borrow::Cow::Borrowed(channel)).to_string();
-
-                    let mut content = Vec::new();
-                    let _ = request.as_reader().read_to_end(&mut content);
-                    
-                    let mut msg = Vec::new();
-                    // Wrap single binary message in a list for consistency with batch format: [[channel, content]]
-                    if let Ok(_) = rmp_serde::encode::write(&mut msg, &vec![(channel, content)]) {
-                        let _ = server_proxy.send_event(EngineCommand::IpcMessage(window_id, msg));
+            // IPC server: handle each request on its own thread so that a slow
+            // read (large binary body, /resource/ file) never blocks the accept
+            // loop and stalls other windows from sending messages.
+            let server = Arc::new(server);
+            loop {
+                let request = match server.recv() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("IPC server recv error: {}", e);
+                        break;
                     }
-                    let _ = request.respond(tiny_http::Response::from_string("ok").with_header(cors_header));
-                } else if url_str == "/batch" {
-                    let mut content = Vec::new();
-                    let _ = request.as_reader().read_to_end(&mut content);
+                };
 
-                    // Before forwarding to Node.js, intercept internal Lotus IPC channels.
-                    // This avoids a Node.js round-trip for performance-critical messages.
-                    if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&content) {
-                        for (channel, data) in &batch {
-                            if channel == "lotus:set-drag-regions" {
-                                let mut drag_regions = Vec::new();
-                                let mut no_drag_regions = Vec::new();
+                let thread_proxy = server_proxy.clone();
+                let thread_token = server_token.clone();
+                thread::spawn(move || {
+                    let mut request = request;
+                    let url_str = request.url().to_string();
+                    
+                    // Handle CORS preflight
+                    if request.method() == &tiny_http::Method::Options {
+                        let response = tiny_http::Response::from_string("OK")
+                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap())
+                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, POST, OPTIONS"[..]).unwrap())
+                            .with_header(tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, X-Lotus-Auth, X-Lotus-Window-Id, Accept, Accept-Language"[..]).unwrap());
+                        let _ = request.respond(response);
+                        return;
+                    }
 
-                                if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
-                                    for r in drag_arr {
-                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
-                                            r.get("x").and_then(|v| v.as_f64()),
-                                            r.get("y").and_then(|v| v.as_f64()),
-                                            r.get("width").and_then(|v| v.as_f64()),
-                                            r.get("height").and_then(|v| v.as_f64())
-                                        ) {
-                                            drag_regions.push(euclid::Rect::new(
-                                                euclid::Point2D::new(x as f32, y as f32),
-                                                euclid::Size2D::new(w as f32, h as f32)
-                                            ));
-                                        }
-                                    }
-                                }
+                    let auth_token = request.headers().iter()
+                        .find(|h| h.field.as_str().to_ascii_lowercase() == "x-lotus-auth")
+                        .map(|h| h.value.as_str().to_string());
+                    
+                    if auth_token != Some(thread_token) {
+                        let _ = request.respond(tiny_http::Response::from_string("Unauthorized").with_status_code(401));
+                        return;
+                    }
 
-                                if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
-                                    for r in no_drag_arr {
-                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
-                                            r.get("x").and_then(|v| v.as_f64()),
-                                            r.get("y").and_then(|v| v.as_f64()),
-                                            r.get("width").and_then(|v| v.as_f64()),
-                                            r.get("height").and_then(|v| v.as_f64())
-                                        ) {
-                                            no_drag_regions.push(euclid::Rect::new(
-                                                euclid::Point2D::new(x as f32, y as f32),
-                                                euclid::Size2D::new(w as f32, h as f32)
-                                            ));
-                                        }
-                                    }
-                                }
-                                
-                                info!("Rust: Intercepted drag regions from batch for {}: drag: {}, no_drag: {}", window_id, drag_regions.len(), no_drag_regions.len());
-                                let _ = server_proxy.send_event(EngineCommand::UpdateDragRegions(window_id.clone(), drag_regions, no_drag_regions));
-                                
-                                // Don't forward lotus:* internal channels to Node.js
-                                continue;
-                            }
+                    let window_id = request.headers().iter()
+                        .find(|h| h.field.as_str().to_ascii_lowercase() == "x-lotus-window-id")
+                        .map(|h| h.value.as_str().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    let cors_header = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
+
+                    if url_str.starts_with("/ipc/") {
+                        let channel = url_str.trim_start_matches("/ipc/");
+                        let channel = urlencoding::decode(channel).unwrap_or(std::borrow::Cow::Borrowed(channel)).to_string();
+
+                        let mut content = Vec::new();
+                        let _ = request.as_reader().read_to_end(&mut content);
+                        
+                        let mut msg = Vec::new();
+                        // Wrap single binary message in a list for consistency with batch format: [[channel, content]]
+                        if let Ok(_) = rmp_serde::encode::write(&mut msg, &vec![(channel, content)]) {
+                            let _ = thread_proxy.send_event(EngineCommand::IpcMessage(window_id, msg));
                         }
-                        // Forward the full batch to Node.js (non-internal messages will still be routed there)
-                    }
+                        let _ = request.respond(tiny_http::Response::from_string("ok").with_header(cors_header));
+                    } else if url_str == "/batch" {
+                        let mut content = Vec::new();
+                        let _ = request.as_reader().read_to_end(&mut content);
 
-                    // Always forward raw bytes to Node.js for normal IPC channels
-                    let _ = server_proxy.send_event(EngineCommand::IpcMessage(window_id, content));
-                    let _ = request.respond(tiny_http::Response::from_string("ok").with_header(cors_header));
-                } else if url_str.starts_with("/resource/") {
-                    let path = url_str.trim_start_matches("/resource/");
-                    let mut full_path = env::current_dir().unwrap();
-                    full_path.push(path.trim_start_matches('/'));
-                    
-                    if full_path.exists() && full_path.is_file() {
-                        if let Ok(file) = fs::File::open(full_path) {
-                            let mut file_response = tiny_http::Response::from_file(file);
-                            file_response.add_header(cors_header.clone());
-                            let _ = request.respond(file_response);
+                        // Before forwarding to Node.js, intercept internal Lotus IPC channels.
+                        // This avoids a Node.js round-trip for performance-critical messages.
+                        if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&content) {
+                            for (channel, data) in &batch {
+                                if channel == "lotus:set-drag-regions" {
+                                    let mut drag_regions = Vec::new();
+                                    let mut no_drag_regions = Vec::new();
+
+                                    if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
+                                        for r in drag_arr {
+                                            if let (Some(x), Some(y), Some(w), Some(h)) = (
+                                                r.get("x").and_then(|v| v.as_f64()),
+                                                r.get("y").and_then(|v| v.as_f64()),
+                                                r.get("width").and_then(|v| v.as_f64()),
+                                                r.get("height").and_then(|v| v.as_f64())
+                                            ) {
+                                                drag_regions.push(euclid::Rect::new(
+                                                    euclid::Point2D::new(x as f32, y as f32),
+                                                    euclid::Size2D::new(w as f32, h as f32)
+                                                ));
+                                            }
+                                        }
+                                    }
+
+                                    if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
+                                        for r in no_drag_arr {
+                                            if let (Some(x), Some(y), Some(w), Some(h)) = (
+                                                r.get("x").and_then(|v| v.as_f64()),
+                                                r.get("y").and_then(|v| v.as_f64()),
+                                                r.get("width").and_then(|v| v.as_f64()),
+                                                r.get("height").and_then(|v| v.as_f64())
+                                            ) {
+                                                no_drag_regions.push(euclid::Rect::new(
+                                                    euclid::Point2D::new(x as f32, y as f32),
+                                                    euclid::Size2D::new(w as f32, h as f32)
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    
+                                    info!("Rust: Intercepted drag regions from batch for {}: drag: {}, no_drag: {}", window_id, drag_regions.len(), no_drag_regions.len());
+                                    let _ = thread_proxy.send_event(EngineCommand::UpdateDragRegions(window_id.clone(), drag_regions, no_drag_regions));
+                                    
+                                    // Don't forward lotus:* internal channels to Node.js
+                                    continue;
+                                }
+                            }
+                            // Forward the full batch to Node.js (non-internal messages will still be routed there)
+                        }
+
+                        // Always forward raw bytes to Node.js for normal IPC channels
+                        let _ = thread_proxy.send_event(EngineCommand::IpcMessage(window_id, content));
+                        let _ = request.respond(tiny_http::Response::from_string("ok").with_header(cors_header));
+                    } else if url_str.starts_with("/resource/") {
+                        let path = url_str.trim_start_matches("/resource/");
+                        let mut full_path = env::current_dir().unwrap();
+                        full_path.push(path.trim_start_matches('/'));
+                        
+                        if full_path.exists() && full_path.is_file() {
+                            if let Ok(file) = fs::File::open(full_path) {
+                                let mut file_response = tiny_http::Response::from_file(file);
+                                file_response.add_header(cors_header.clone());
+                                let _ = request.respond(file_response);
+                            } else {
+                                let _ = request.respond(tiny_http::Response::from_string("Error reading file").with_status_code(500));
+                            }
                         } else {
-                            let _ = request.respond(tiny_http::Response::from_string("Error reading file").with_status_code(500));
+                            let _ = request.respond(tiny_http::Response::from_string("Not Found").with_status_code(404));
                         }
                     } else {
                         let _ = request.respond(tiny_http::Response::from_string("Not Found").with_status_code(404));
                     }
-                } else {
-                    let _ = request.respond(tiny_http::Response::from_string("Not Found").with_status_code(404));
-                }
-            }
+                }); // end thread::spawn
+            } // end loop
         });
 
         // 5. Send Initial ready event to Node.js
