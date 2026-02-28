@@ -36,14 +36,17 @@ jobs:
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            docker: opensuse/tumbleweed
             setup: |
-              zypper --non-interactive refresh
-              zypper --non-interactive install npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel python3 git gzip tar dpkg rpm-build zip unzip
+              docker pull opensuse/tumbleweed
             build: |
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
-              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
-              mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-linux-suse 2>/dev/null || true
+              docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
+                zypper --non-interactive refresh && \
+                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel python3 git gzip tar dpkg rpm-build zip unzip && \
+                npm install && \
+                npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu && \
+                mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node && \
+                mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-linux-suse 2>/dev/null || true \
+              "
           - host: ubuntu-latest
             target: x86_64-unknown-freebsd
             setup: |
