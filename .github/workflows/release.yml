@@ -59,7 +59,9 @@ jobs:
               sudo apt-get update
               sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev
             build: |
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd && \
+              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node && \
+              mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-freebsd 2>/dev/null || true
     name: stable - ${{ matrix.settings.build_id }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:
