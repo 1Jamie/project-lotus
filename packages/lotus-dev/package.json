@@ -9,7 +9,16 @@
     "scripts": {
         "test": "echo \"Error: no test specified\" && exit 1"
     },
-    "keywords": [],
+    "keywords": [
+        "gui",
+        "framework",
+        "desktop",
+        "electron-alternative",
+        "cli",
+        "bundler",
+        "packager",
+        "build-tool"
+    ],
     "author": "",
     "license": "ISC",
     "dependencies": {

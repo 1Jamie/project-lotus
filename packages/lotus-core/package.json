@@ -6,6 +6,20 @@
     "type": "git",
     "url": "git+https://github.com/1Jamie/project-lotus.git"
   },
+  "keywords": [
+    "gui",
+    "framework",
+    "desktop",
+    "electron-alternative",
+    "rust",
+    "servo",
+    "html",
+    "css",
+    "js",
+    "napi-rs",
+    "runtime",
+    "engine"
+  ],
   "files": [
     "README.md",
     "lotus.js",
