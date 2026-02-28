@@ -17,7 +17,19 @@ function getPlatform() {
         return `lotus.win32-${arch}-msvc.node`;
     } else if (platform === 'darwin') {
         return `lotus.darwin-${arch}.node`;
+    } else if (platform === 'freebsd') {
+        return `lotus.freebsd-${arch}.node`;
     } else if (platform === 'linux') {
+        // Check for openSUSE
+        try {
+            const osRelease = fs.readFileSync('/etc/os-release', 'utf8').toLowerCase();
+            if (osRelease.includes('opensuse') || osRelease.includes('sles')) {
+                return `lotus.linux-${arch}-suse.node`;
+            }
+        } catch (e) {
+            // Ignore if /etc/os-release is not readable
+        }
+
         const isMusl = () => {
             try {
                 const lddPath = execSync('which ldd').toString().trim();

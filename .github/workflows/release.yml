@@ -34,6 +34,23 @@ jobs:
               sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev dpkg-dev fakeroot rpm pkg-config
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-suse
+            docker: opensuse/tumbleweed
+            setup: |
+              zypper --non-interactive refresh
+              zypper --non-interactive install npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel python3 git gzip tar dpkg rpm-build zip unzip
+            build: |
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
+              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
+              mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-linux-suse 2>/dev/null || true
+          - host: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            setup: |
+              sudo apt-get update
+              sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev
+            build: |
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
     name: stable - ${{ matrix.settings.target }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:

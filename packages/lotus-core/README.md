@@ -260,7 +260,7 @@ const win2 = new ServoWindow({ id: 'preview', title: 'Preview' });
 
 The Rust layer (`src/lib.rs`) handles:
 - Servo lifecycle and rendering
-- Native window creation via `winit`/`glutin`
+- Native window creation via `winit`/`glutin`(`winit`/`surfman`/`mozangle` on Windows)
 - IPC server (`tiny_http` on `127.0.0.1:0`)
 - `lotus-resource://` protocol handler
 - Event dispatch to Node.js via MsgPack

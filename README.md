@@ -151,9 +151,9 @@ This is where development happens. It works here. Fully working `.node` file for
  | :--- | :--- | :--- | :--- | :--- |
  | **Linux (Debian/Ubuntu)** | x64 | ✅ Verified | `.deb` (Stable) | Ready |
  | **Linux (Fedora/RHEL)** | x64 | ✅ Verified | `.rpm` (Stable) | Ready |
- | **Linux (openSUSE)** | x64 | 🛠 Testing | `.rpm` (Planned v0.3) | Beta |
- | **Windows** | x64 | ✅ Verified | `.msi` (Planned v0.3) | Alpha |
- | **FreeBSD** | x64 | ⏳ Planned | TBD (Planned v0.3) | Roadmap |
+ | **Linux (openSUSE)** | x64 | 🛠 Testing | `.rpm` (Planned v0.3) | Alpha |
+ | **Windows** | x64 | ✅ Verified | `.msi` (Planned v0.3) | Beta |
+ | **FreeBSD** | x64 | 🛠 Testing | TBD (Planned v0.3) | Alpha |
  | **macOS** | arm64 | 🆘 Help Wanted | TBD | On Hold |
 
 > **Note:**
