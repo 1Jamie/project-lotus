@@ -46,7 +46,7 @@ jobs:
             setup: |
               docker pull opensuse/tumbleweed
             build: |
-              docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
+              docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
                 zypper --non-interactive refresh && \
                 zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel python3 git gzip tar dpkg rpm-build && \
                 npm install && \
