@@ -26,8 +26,10 @@ jobs:
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc
             target: x86_64-pc-windows-msvc
+            build_id: x86_64-pc-windows-msvc
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            build_id: x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             setup: |
               sudo apt-get update
@@ -36,12 +38,13 @@ jobs:
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            build_id: x86_64-unknown-linux-suse
             setup: |
               docker pull opensuse/tumbleweed
             build: |
               docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
                 zypper --non-interactive refresh && \
-                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel python3 git gzip tar dpkg rpm-build zip unzip curl clang libclang-devel lld && \
+                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel python3 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld && \
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
                 npm install && \
@@ -51,12 +54,13 @@ jobs:
               "
           - host: ubuntu-latest
             target: x86_64-unknown-freebsd
+            build_id: x86_64-unknown-freebsd
             setup: |
               sudo apt-get update
               sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
-    name: stable - ${{ matrix.settings.target }} - node@20
+    name: stable - ${{ matrix.settings.build_id }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +87,7 @@ jobs:
             ~/.cargo/git/db/
             .cargo-cache
             target/
-          key: ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}
+          key: ${{ matrix.settings.build_id }}-cargo-${{ matrix.settings.host }}
       - uses: goto-bus-stop/setup-zig@v2
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' }}
         with:
@@ -100,7 +104,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bindings-${{ matrix.settings.target }}
+          name: bindings-${{ matrix.settings.build_id }}
           path: |
             packages/lotus-core/*.node
             packages/lotus-core/index.js
