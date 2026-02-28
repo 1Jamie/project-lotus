@@ -217,30 +217,36 @@ window.lotus = {
             // Buffer for batching text/json payloads
             window.lotus._batch.push([channel, data]);
             
-            if (!window.lotus._batchTimeout) {
-                queueMicrotask(() => {
-                    const batch = window.lotus._batch;
-                    window.lotus._batch = [];
-                    window.lotus._batchTimeout = null;
-                    
-                    if (window.msgpackr) {
-                        try {
-                            const packed = window.msgpackr.pack(batch);
-                            if (window.lotus._ws && window.lotus._ws.readyState === WebSocket.OPEN) {
-                                window.lotus._ws.send(packed);
-                            } else {
-                                window.lotus._offlineQueue.push(packed);
-                            }
-                        } catch (e) {
-                            console.error("Failed to pack batch", e);
+            const flushBatch = () => {
+                if (window.lotus._batch.length === 0) return;
+                const batch = window.lotus._batch;
+                window.lotus._batch = [];
+                window.lotus._batchTimeout = null;
+                
+                if (window.msgpackr) {
+                    try {
+                        const packed = window.msgpackr.pack(batch);
+                        if (window.lotus._ws && window.lotus._ws.readyState === WebSocket.OPEN) {
+                            window.lotus._ws.send(packed);
+                        } else {
+                            window.lotus._offlineQueue.push(packed);
                         }
-                    } else {
-                        console.error("msgpackr not loaded");
+                    } catch (e) {
+                        console.error("Failed to pack batch", e);
                     }
-                });
+                } else {
+                    console.error("msgpackr not loaded");
+                }
+            };
+
+            // Eager flush to pipeline large bursts instead of packing 100MB at once
+            if (window.lotus._batch.length >= 250) {
+                flushBatch();
+            } else if (!window.lotus._batchTimeout) {
+                queueMicrotask(flushBatch);
                 window.lotus._batchTimeout = true; 
             }
-            return; // Return here since microtask handles sending
+            return; // Return here since microtask/flush handles sending
         }
 
         // Direct send for binary
@@ -299,7 +305,7 @@ const DRAG_REGION_SCRIPT: &str = r#"
                 // console.log("[DRAG] Sending rects to Rust:", { dragRects, noDragRects });
                 window.lotus.send('lotus:set-drag-regions', { drag: dragRects, noDrag: noDragRects });
             }
-        }, 50); // Debounce for 50ms
+        }, 16); // Debounce for 16ms
     }
 
     function initObservers() {
@@ -1179,10 +1185,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             EngineCommand::IpcMessages(window_id, messages) => {
                 for raw_bytes in messages {
                     // Pre-process messages to intercept known internal Lotus commands
-                    // before forwarding to Node.js
-                    if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&raw_bytes) {
-                        for (channel, data) in &batch {
-                            if channel == "lotus:set-drag-regions" {
+                    // before forwarding to Node.js.
+                    // PERF: We do a fast byte-subslice check to avoid allocating and 
+                    // parsing giant `serde_json::Value` structures on the UI thread for every batch.
+                    let needle = b"lotus:set-drag-regions";
+                    let contains_internal_cmd = raw_bytes.windows(needle.len()).any(|w| w == needle);
+
+                    if contains_internal_cmd {
+                        if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&raw_bytes) {
+                            for (channel, data) in &batch {
+                                if channel == "lotus:set-drag-regions" {
                                 let mut drag_regions = Vec::new();
                                 let mut no_drag_regions = Vec::new();
 
@@ -1224,6 +1236,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         drag_regions,
                                         no_drag_regions
                                     ));
+                                }
                                 }
                             }
                         }

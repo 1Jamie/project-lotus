@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lotus IPC Benchmark</title>
+    <style>
+        :root {
+            --bg-base: #121212;
+            --bg-panel: #1e1e1e;
+            --text-main: #ffffff;
+            --text-muted: #a0a0a0;
+            --accent: #007acc;
+            --accent-hover: #0098ff;
+            --danger: #d32f2f;
+            --success: #388e3c;
+            --warning: #fbc02d;
+            --border: #333333;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border-radius: 8px;
+            /* For frameless */
+        }
+
+        /* --- Titlebar --- */
+        .titlebar {
+            -webkit-app-region: drag;
+            height: 32px;
+            background: #181818;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 10px;
+            border-bottom: 1px solid var(--border);
+            user-select: none;
+        }
+
+        .titlebar-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-muted);
+            pointer-events: none;
+        }
+
+        .titlebar-controls {
+            -webkit-app-region: no-drag;
+            display: flex;
+            gap: 8px;
+        }
+
+        .window-btn {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            border: none;
+            cursor: pointer;
+            outline: none;
+        }
+
+        .btn-close {
+            background-color: #ff5f56;
+        }
+
+        .btn-minimize {
+            background-color: #ffbd2e;
+        }
+
+        .btn-maximize {
+            background-color: #27c93f;
+        }
+
+        .window-btn:hover {
+            filter: brightness(1.2);
+        }
+
+        /* --- Layout --- */
+        .container {
+            display: flex;
+            flex: 1;
+            padding: 20px;
+            gap: 20px;
+            overflow: hidden;
+        }
+
+        .sidebar {
+            width: 280px;
+            background: var(--bg-panel);
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            overflow-y: auto;
+        }
+
+        .main-area {
+            flex: 1;
+            background: var(--bg-panel);
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+
+        h2,
+        h3 {
+            margin: 0 0 10px 0;
+            font-size: 16px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 5px;
+        }
+
+        /* --- Controls --- */
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        label {
+            font-size: 12px;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        /* Using buttons for selection avoids select dropdown issues in Servo */
+        .toggle-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            background: var(--bg-base);
+            padding: 4px;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+        }
+
+        .toggle-btn {
+            flex: 1;
+            background: transparent;
+            color: var(--text-muted);
+            border: none;
+            border-radius: 3px;
+            padding: 6px;
+            font-size: 12px;
+            cursor: pointer;
+            min-width: 40px;
+            text-align: center;
+        }
+
+        .toggle-btn.active {
+            background: var(--accent);
+            color: white;
+            font-weight: 600;
+        }
+
+        .action-btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 10px;
+            transition: background 0.2s;
+        }
+
+        .action-btn:hover {
+            background: var(--accent-hover);
+        }
+
+        .action-btn:disabled {
+            background: var(--border);
+            color: var(--text-muted);
+            cursor: not-allowed;
+        }
+
+        .action-btn.danger {
+            background: var(--danger);
+        }
+
+        .action-btn.danger:hover {
+            background: #e53935;
+        }
+
+        /* --- Stats grid --- */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-box {
+            background: var(--bg-base);
+            border: 1px solid var(--border);
+            padding: 15px;
+            border-radius: 6px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .stat-val {
+            font-size: 24px;
+            font-weight: bold;
+            font-family: monospace;
+            color: var(--accent-hover);
+        }
+
+        .stat-lbl {
+            font-size: 11px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            margin-top: 4px;
+        }
+
+        /* --- Log Area --- */
+        .log-area {
+            flex: 1;
+            background: var(--bg-base);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 12px;
+            overflow-y: auto;
+            color: #d4d4d4;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .log-entry {
+            margin: 0;
+            padding: 2px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .log-entry.error {
+            color: #ff5f56;
+        }
+
+        .log-entry.success {
+            color: #27c93f;
+        }
+
+        .status-bar {
+            margin-top: 10px;
+            font-size: 12px;
+            display: flex;
+            justify-content: space-between;
+            color: var(--text-muted);
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--danger);
+            margin-right: 5px;
+        }
+
+        .status-indicator.connected {
+            background: var(--success);
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- Draggable Titlebar -->
+    <div class="titlebar" data-lotus-drag="true">
+        <div class="titlebar-title">Lotus IPC Diagnostics</div>
+        <div class="titlebar-controls" data-lotus-drag="false">
+            <button class="window-btn btn-minimize" onclick="windowControls('minimize')"></button>
+            <button class="window-btn btn-maximize" onclick="windowControls('maximize')"></button>
+            <button class="window-btn btn-close" onclick="windowControls('close')"></button>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- Configuration Sidebar -->
+        <div class="sidebar" data-lotus-drag="false">
+            <h3>Configuration</h3>
+
+            <div class="control-group">
+                <label>Test Mode</label>
+                <div class="toggle-group" id="mode-toggles">
+                    <button class="toggle-btn active" data-val="throughput">Throughput</button>
+                    <button class="toggle-btn" data-val="latency">Latency</button>
+                    <button class="toggle-btn" data-val="stress">Stress</button>
+                    <button class="toggle-btn" data-val="burst">Burst</button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>Messages</label>
+                <div class="toggle-group" id="count-toggles">
+                    <button class="toggle-btn" data-val="1000">1k</button>
+                    <button class="toggle-btn active" data-val="10000">10k</button>
+                    <button class="toggle-btn" data-val="50000">50k</button>
+                    <button class="toggle-btn" data-val="100000">100k</button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>Payload Size</label>
+                <div class="toggle-group" id="size-toggles">
+                    <button class="toggle-btn" data-val="0">0</button>
+                    <button class="toggle-btn" data-val="64">64B</button>
+                    <button class="toggle-btn active" data-val="1024">1KB</button>
+                    <button class="toggle-btn" data-val="10240">10KB</button>
+                    <button class="toggle-btn" data-val="1048576">1MB</button>
+                </div>
+            </div>
+
+            <div class="control-group">
+                <label>Payload Type</label>
+                <div class="toggle-group" id="type-toggles">
+                    <button class="toggle-btn active" data-val="string">String</button>
+                    <button class="toggle-btn" data-val="binary">Binary</button>
+                    <button class="toggle-btn" data-val="json">JSON</button>
+                </div>
+            </div>
+
+            <button id="btn-run" class="action-btn" onclick="runBenchmark()">▶ Run Test</button>
+
+            <hr style="border-color: var(--border); width: 100%; margin: 10px 0;">
+
+            <h3>Diagnostics</h3>
+            <button class="action-btn" style="background:var(--bg-base); border: 1px solid var(--border); color: white;"
+                onclick="getSystemInfo()">System Info</button>
+            <button class="action-btn danger" onclick="runTortureTest()">🔥 10MB Torture Test</button>
+        </div>
+
+        <!-- Main Display -->
+        <div class="main-area" data-lotus-drag="false">
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div class="stat-val" id="val-throughput">0</div>
+                    <div class="stat-lbl">Msg / Sec</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-val" id="val-time">0 ms</div>
+                    <div class="stat-lbl">Total Time</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-val" id="val-bandwidth">0 MB/s</div>
+                    <div class="stat-lbl">Bandwidth</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-val" id="val-latency">0 ms</div>
+                    <div class="stat-lbl">Avg Latency</div>
+                </div>
+            </div>
+
+            <h3>Execution Log</h3>
+            <div class="log-area" id="log-output">
+                <div class="log-entry">Waiting to start...</div>
+            </div>
+
+            <div class="status-bar">
+                <div id="ipc-status"><span class="status-indicator"></span>Disconnected</div>
+                <div id="progress-text">Ready</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // State
+        const state = {
+            mode: 'throughput',
+            count: 10000,
+            size: 1024,
+            type: 'string',
+            running: false,
+
+            // Runtime tracking
+            startTime: 0,
+            received: 0,
+            target: 0,
+            latencySum: 0,
+            payloadCache: null
+        };
+
+        // UI references
+        const btnRun = document.getElementById('btn-run');
+        const logArea = document.getElementById('log-output');
+        const pThroughput = document.getElementById('val-throughput');
+        const pTime = document.getElementById('val-time');
+        const pBandwidth = document.getElementById('val-bandwidth');
+        const pLatency = document.getElementById('val-latency');
+        const pProgress = document.getElementById('progress-text');
+
+        // Setup custom toggle buttons (fixes dropdown issues)
+        function setupToggles(groupId, stateKey) {
+            const group = document.getElementById(groupId);
+            const btns = group.querySelectorAll('.toggle-btn');
+            btns.forEach(btn => {
+                btn.addEventListener('click', () => {
+                    if (state.running) return;
+                    btns.forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+
+                    const val = btn.getAttribute('data-val');
+                    // Parse numeric if needed
+                    state[stateKey] = isNaN(val) || val === '' ? val : Number(val);
+                });
+            });
+        }
+
+        setupToggles('mode-toggles', 'mode');
+        setupToggles('count-toggles', 'count');
+        setupToggles('size-toggles', 'size');
+        setupToggles('type-toggles', 'type');
+
+        // Logging
+        function log(msg, type = '') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            const time = new Date().toISOString().split('T')[1].slice(0, 12);
+            entry.textContent = `[${time}] ${msg}`;
+            logArea.appendChild(entry);
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+
+        function formatNum(num) {
+            return new Intl.NumberFormat().format(Math.round(num));
+        }
+
+        function windowControls(action) {
+            if (window.lotus) window.lotus.send('window-control', action);
+        }
+
+        // --- Benchmark logic ---
+
+        function buildPayload() {
+            if (state.size === 0) return null;
+
+            if (state.type === 'string') {
+                return 'A'.repeat(state.size);
+            } else if (state.type === 'binary') {
+                const arr = new Uint8Array(state.size);
+                arr.fill(65);
+                return arr;
+            } else if (state.type === 'json') {
+                return {
+                    str: 'A'.repeat(Math.max(1, state.size / 2)),
+                    arr: [1, 2, 3, 4, 5],
+                    num: 42,
+                    flag: true
+                };
+            }
+        }
+
+        let lastUiUpdate = 0;
+        function updateStats() {
+            if (!state.running) return;
+
+            const now = performance.now();
+            if (now - lastUiUpdate > 100) {
+                const timeMs = now - state.startTime;
+                const timeSec = timeMs / 1000;
+
+                if (state.mode !== 'stress') {
+                    let msgsPerSec = 0;
+                    let bandwidthMbSec = 0;
+                    if (timeSec > 0) {
+                        msgsPerSec = state.received / timeSec;
+                        let totalBytes = state.received * state.size * 2;
+                        bandwidthMbSec = totalBytes / (1024 * 1024) / timeSec;
+                    }
+
+                    pThroughput.textContent = formatNum(msgsPerSec);
+                    pTime.textContent = timeMs.toFixed(1) + ' ms';
+                    pBandwidth.textContent = bandwidthMbSec.toFixed(2) + ' MB/s';
+                    pProgress.textContent = `Running: ${formatNum(state.received)} / ${formatNum(state.target)}`;
+                } else {
+                    pTime.textContent = timeMs.toFixed(1) + ' ms';
+                    pProgress.textContent = `Waiting for server return...`;
+                }
+
+                lastUiUpdate = now;
+            }
+
+            requestAnimationFrame(updateStats);
+        }
+
+        function finalizeBenchmark() {
+            const timeMs = performance.now() - state.startTime;
+            const timeSec = timeMs / 1000;
+            const msgsPerSec = state.target / timeSec;
+
+            let totalBytes = state.target * state.size * 2; // sent + received
+            let totalMb = totalBytes / (1024 * 1024);
+            let bandwidthMbSec = totalMb / timeSec;
+
+            let avgLatency = timeMs / state.target;
+            if (state.mode === 'latency') {
+                avgLatency = state.latencySum / state.target;
+            }
+
+            pThroughput.textContent = formatNum(msgsPerSec);
+            pTime.textContent = timeMs.toFixed(1) + ' ms';
+            pBandwidth.textContent = bandwidthMbSec.toFixed(2) + ' MB/s';
+            pLatency.textContent = avgLatency.toFixed(3) + ' ms';
+            pProgress.textContent = `Completed ${state.target} messages`;
+
+            log(`Completed ${state.mode}. Msg/s: ${formatNum(msgsPerSec)}, Bandwidth: ${bandwidthMbSec.toFixed(2)} MB/s`, 'success');
+
+            state.running = false;
+            btnRun.disabled = false;
+            btnRun.textContent = '▶ Run Test';
+        }
+
+        function runThroughputTest() {
+            state.received = 0;
+            state.target = state.count;
+            const payload = state.payloadCache;
+
+            log(`Starting Throughput blast: ${state.count} messages...`);
+            state.startTime = performance.now();
+
+            // Blast immediately
+            for (let i = 0; i < state.count; i++) {
+                window.lotus.send('benchmark-ping', { i, p: payload });
+            }
+        }
+
+        function runLatencyTest() {
+            state.received = 0;
+            state.target = Math.min(state.count, 5000); // cap latency test count
+            state.latencySum = 0;
+
+            log(`Starting Sequential Latency test: ${state.target} messages...`);
+            state.startTime = performance.now();
+
+            // Send first one
+            window.lotus.send('latency-ping', { id: 0, ts: performance.now() });
+        }
+
+        function runBurstTest() {
+            state.received = 0;
+            state.target = state.count;
+            const payload = state.payloadCache;
+
+            log(`Starting Burst synchronization test...`);
+            window.lotus.send('burst-start', { count: state.count });
+
+            state.startTime = performance.now();
+            for (let i = 0; i < state.count; i++) {
+                window.lotus.send('burst-ping', { id: i, p: payload });
+            }
+        }
+
+        function runBenchmark() {
+            if (!window.lotus || state.running) return;
+
+            state.running = true;
+            btnRun.disabled = true;
+            btnRun.textContent = 'Running...';
+
+            pThroughput.textContent = '---';
+            pTime.textContent = '---';
+            pBandwidth.textContent = '---';
+            pLatency.textContent = '---';
+            pProgress.textContent = 'Preparing...';
+
+            state.payloadCache = buildPayload();
+            log(`Preparing ${state.mode} test (size: ${state.size}, type: ${state.type})`);
+
+            lastUiUpdate = performance.now();
+            requestAnimationFrame(updateStats);
+
+            // Give UI time to update
+            setTimeout(() => {
+                if (state.mode === 'throughput' || state.mode === 'stress') runThroughputTest();
+                else if (state.mode === 'latency') runLatencyTest();
+                else if (state.mode === 'burst') runBurstTest();
+            }, 50);
+        }
+
+        function runTortureTest() {
+            if (!window.lotus || state.running) return;
+            state.running = true;
+            btnRun.disabled = true;
+
+            // Use stress mode for torture test so stats know how to display
+            state.mode = 'stress';
+
+            log('🔥 Initiating Torture Test: 10MB payload echo...', 'error');
+            state.startTime = performance.now();
+
+            lastUiUpdate = performance.now();
+            requestAnimationFrame(updateStats);
+
+            window.lotus.send('stress-request', { id: 'torture', size: 10 * 1024 * 1024 });
+        }
+
+        function getSystemInfo() {
+            if (window.lotus) {
+                window.lotus.send('get-system-info', { requestId: Date.now() });
+            }
+        }
+
+        // --- IPC Handlers ---
+        if (window.lotus) {
+            const ind = document.querySelector('.status-indicator');
+            ind.classList.add('connected');
+            document.getElementById('ipc-status').innerHTML = ind.outerHTML + `Connected (WebSocket)`;
+
+            // Throughput
+            window.lotus.on('benchmark-pong', () => {
+                if (!state.running || (state.mode !== 'throughput' && state.mode !== 'stress')) return;
+                state.received++;
+                if (state.received >= state.target) {
+                    finalizeBenchmark();
+                }
+            });
+
+            // Latency
+            window.lotus.on('latency-pong', (data) => {
+                if (!state.running || state.mode !== 'latency') return;
+
+                // Calculate latency for this single hop
+                state.latencySum += (performance.now() - state.startTime); // rough proxy since we do sequential
+
+                state.received++;
+                if (state.received >= state.target) {
+                    finalizeBenchmark();
+                } else {
+                    // Start next ping
+                    window.lotus.send('latency-ping', { id: state.received, ts: performance.now() });
+                }
+            });
+
+            // Burst
+            window.lotus.on('burst-complete', (data) => {
+                if (!state.running || state.mode !== 'burst') return;
+                log(`Server acknowledged ${data.received} messages in ${data.elapsed}ms server-side time`);
+                finalizeBenchmark();
+            });
+
+            // System Info
+            window.lotus.on('system-info-response', (info) => {
+                log(`[SysInfo] Node ${info.nodeVersion} on ${info.platform} ${info.arch}`);
+                log(`[SysInfo] CPU: ${info.cpuModel} (${info.cpus} cores)`);
+                log(`[SysInfo] Memory: ${info.freeMem}MB / ${info.totalMem}MB free`);
+                log(`[SysInfo] V8 Heap: ${info.heapUsed}MB / ${info.heapTotal}MB (Max: ${info.v8HeapSizeLimit}MB)`);
+            });
+
+            // Torture Test Response
+            window.lotus.on('stress-response', (data) => {
+                const timeMs = performance.now() - state.startTime;
+                log(`Torture test completed in ${timeMs.toFixed(1)}ms.`, 'success');
+                log(`Received ${data.size} bytes (${(data.size / 1024 / 1024).toFixed(2)} MB)`, 'success');
+                state.running = false;
+                btnRun.disabled = false;
+            });
+
+        } else {
+            log('Error: window.lotus not available. Are you running in Lotus mode?', 'error');
+        }
+    </script>
+</body>
+
+</html>

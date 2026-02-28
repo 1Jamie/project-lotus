@@ -49,10 +49,10 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
     *   **Security:** Directory jailing. You can't `../../` your way to `/etc/passwd`. Nice try.
 
 *   **Advanced IPC (The Steering Wheel):**
-    *   **Localhost IPC Server:** We use `tiny_http` on `127.0.0.1:0`. It works. It's fast.
-    *   **Auto-Adapting:** JSON? Binary? Blobs? We don't care. We handle it and almost never have to serialize it.
-    *   **MsgPack Batching:** We pack small messages together like sardines. Efficient, tasty sardines.
-    *   **Zero-Copy:** We try not to copy data. Copying data is for people who like waiting.
+    *   **WebSocket IPC Server:** We use `tokio` + `axum` on `127.0.0.1:0` with persistent `WebSocket` connections. It works. It's pretty dam fast and low latency.
+    *   **Auto-Adapting:** JSON? Binary? Blobs? We don't care. We handle it via WebSockets natively.
+    *   **MsgPack Batching (Pipelines):** We pack small messages together and unleash them in bursts to avoid starving the Winit rendering thread.
+    *   **Zero-Copy Routing:** We avoid parsing giant megabytes of JSON simply to route a window event. Copying/allocating data is for people who like waiting.
 
 *   **Window State Persistence:**
     *   It remembers where you put the window (if you give it an ID). Groundbreaking technology, I know.

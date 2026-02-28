@@ -51,6 +51,7 @@
     "test:base": "GLIBC_TUNABLES=glibc.rtld.optional_static_tls=4096 node example.js",
     "postinstall": "node scripts/install.js",
     "start": "RUST_LOG=info LOTUS_DEV_REQ=../ node test_app/main.js",
+    "benchmark": "RUST_LOG=info LOTUS_DEV_REQ=../ node ipc-benchmark/main.js",
     "test-app": "RUST_LOG=debug LOTUS_DEV_REQ=../ node test_app/main.js"
   },
   "devDependencies": {
