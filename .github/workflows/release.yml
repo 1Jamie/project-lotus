@@ -41,7 +41,7 @@ jobs:
             build: |
               docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
                 zypper --non-interactive refresh && \
-                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel python3 git gzip tar dpkg rpm-build zip unzip curl && \
+                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel python3 git gzip tar dpkg rpm-build zip unzip curl clang libclang-devel lld && \
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
                 npm install && \
