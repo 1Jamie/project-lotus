@@ -6,7 +6,12 @@ if (process.platform === 'linux') {
     const requiredTunable = 'glibc.rtld.optional_static_tls=4096';
     const currentTunables = process.env.GLIBC_TUNABLES || '';
 
-    if (!currentTunables.includes('optional_static_tls=4096')) {
+    // LOTUS_TLS_FIXED=1 is injected into the respawned process below.
+    // If it's already set we've already fixed the environment — never respawn again,
+    // even if the tunable string looks wrong, to prevent an infinite loop.
+    const alreadyFixed = process.env.LOTUS_TLS_FIXED === '1';
+
+    if (!alreadyFixed && !currentTunables.includes('optional_static_tls=4096')) {
         const newTunables = currentTunables
             ? `${currentTunables}:${requiredTunable}`
             : requiredTunable;
@@ -16,11 +21,12 @@ if (process.platform === 'linux') {
             stdio: 'inherit',
             env: {
                 ...process.env,
-                GLIBC_TUNABLES: newTunables
+                GLIBC_TUNABLES: newTunables,
+                LOTUS_TLS_FIXED: '1',  // <-- prevents any re-spawn loop
             }
         });
 
-        process.exit(result.status);
+        process.exit(result.status ?? 1);
 
         // Stop execution of the current process (don't load native module)
         return;
@@ -58,11 +64,55 @@ class IpcMain extends EventEmitter {
         super();
     }
 
+    /** Broadcast a message to ALL open windows. */
     send(channel, data) {
-        // Send to all windows (or we could have an 'activeWindow' concept)
         for (const win of windows.values()) {
             win.sendToRenderer(channel, data);
         }
+    }
+
+    /**
+     * Send a message to a single window by its ID.
+     * Used internally by handle() to route invoke() replies to the
+     * originating window only, avoiding unnecessary broadcasts.
+     */
+    sendTo(windowId, channel, data) {
+        const win = windows.get(windowId);
+        if (win) win.sendToRenderer(channel, data);
+    }
+
+    /**
+     * Register a request/reply handler for window.lotus.invoke() calls.
+     * The handler receives the payload (with _replyId stripped) and may
+     * return a value or a Promise. The resolved value is automatically
+     * sent back to the originating renderer window only (not broadcast).
+     * Thrown / rejected errors are forwarded as { _error: message }.
+     */
+    handle(channel, handler) {
+        // EventEmitter passes extra args — second arg is the windowId threaded
+        // through ipcMain.emit() by the batch routing code below.
+        this.on(channel, async (data, fromWindowId) => {
+            const replyId = data && data._replyId;
+            if (!replyId) return; // not an invoke() call; ignore
+            const payload = Object.assign({}, data);
+            delete payload._replyId;
+            try {
+                const result = await handler(payload);
+                // Reply to the originating window only — not all windows.
+                if (fromWindowId) {
+                    this.sendTo(fromWindowId, replyId, result);
+                } else {
+                    this.send(replyId, result); // fallback for legacy paths
+                }
+            } catch (err) {
+                const errPayload = { _error: err?.message ?? String(err) };
+                if (fromWindowId) {
+                    this.sendTo(fromWindowId, replyId, errPayload);
+                } else {
+                    this.send(replyId, errPayload);
+                }
+            }
+        });
     }
 }
 
@@ -200,6 +250,21 @@ function ensureApp() {
                     return;
                 }
 
+                if (msg.event === 'file-hover') {
+                    if (win) win.emit('file-hover', { path: msg.path });
+                    return;
+                }
+
+                if (msg.event === 'file-hover-cancelled') {
+                    if (win) win.emit('file-hover-cancelled');
+                    return;
+                }
+
+                if (msg.event === 'file-drop') {
+                    if (win) win.emit('file-drop', { path: msg.path });
+                    return;
+                }
+
                 if (msg.event === 'resized') {
                     if (win) win.emit('resize', { width: msg.width, height: msg.height });
                     return;
@@ -218,7 +283,8 @@ function ensureApp() {
                                         if (m[0] === 'lotus:set-drag-regions') {
                                             if (batchWindow) batchWindow.updateDragRegions(m[1]);
                                         } else {
-                                            ipcMain.emit(m[0], m[1]);
+                                            // Pass windowId as 2nd arg so handle() can reply to this window only.
+                                            ipcMain.emit(m[0], m[1], msg.window_id);
                                         }
                                     }
                                 });
@@ -240,7 +306,8 @@ function ensureApp() {
                                     win.updateDragRegions(m[1]);
                                 }
                             } else {
-                                ipcMain.emit(m[0], m[1]);
+                                // Pass windowId as 2nd arg so handle() can reply to this window only.
+                                ipcMain.emit(m[0], m[1], msg.window_id);
                             }
                         }
                     });
@@ -305,8 +372,14 @@ class ServoWindow extends EventEmitter {
     }
 
     sendToRenderer(channel, data) {
-        const json = JSON.stringify(data);
-        this.handle.sendToRenderer(channel, json);
+        if (!msgpackr) {
+            console.error('[Lotus] msgpackr not loaded, cannot sendToRenderer');
+            return;
+        }
+        // Pack as a single-entry batch [[channel, data]] — the renderer's
+        // window.lotus._ws.onmessage handler already decodes this format.
+        const packed = msgpackr.pack([[channel, data]]);
+        this.handle.sendToRenderer(Buffer.from(packed));
     }
 
     executeScript(script) {
@@ -323,6 +396,14 @@ class ServoWindow extends EventEmitter {
 
     setSize(width, height) {
         this.handle.resize(width, height);
+    }
+
+    setMinSize(width, height) {
+        this.handle.setMinSize(width, height);
+    }
+
+    setMaxSize(width, height) {
+        this.handle.setMaxSize(width, height);
     }
 
     setPosition(x, y) {

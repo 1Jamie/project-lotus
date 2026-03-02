@@ -69,6 +69,8 @@ const win = new ServoWindow(options);
 | `win.setTitle(title)` | Update the window title. |
 | `win.setDecorations(bool)` | Toggle native window decorations at runtime. |
 | `win.setSize(width, height)` | Resize the window. |
+| `win.setMinSize(width, height)` | Set the minimum size the user can resize to. Pass `0, 0` to remove the constraint. |
+| `win.setMaxSize(width, height)` | Set the maximum size the user can resize to. Pass `0, 0` to remove the constraint. |
 | `win.setPosition(x, y)` | Move the window. |
 | `win.minimize()` | Minimize the window to the taskbar/dock. |
 | `win.unminimize()` | Restore the window from a minimized state. |
@@ -91,6 +93,9 @@ const win = new ServoWindow(options);
 | `'focus'` | `()` | Window gained focus. |
 | `'blur'` | `()` | Window lost focus. |
 | `'closed'` | `()` | Window was closed. |
+| `'file-hover'` | `({ path: string })` | A file is being dragged over the window. Fires once per file. |
+| `'file-hover-cancelled'` | `()` | A drag operation left the window without dropping. |
+| `'file-drop'` | `({ path: string })` | A file was dropped onto the window. Fires once per file — accumulate multiple events if you need multi-file support. |
 
 ```javascript
 const win = new ServoWindow({
@@ -113,13 +118,19 @@ Handles communication between the main process (Node.js) and renderer (webpage).
 ```javascript
 const { ipcMain } = require('@lotus-gui/core');
 
-// Listen for messages from the renderer
+// Listen for messages from the renderer (fire-and-forget)
 ipcMain.on('channel-name', (data) => {
     console.log('Got:', data);
 });
 
 // Send to all windows
 ipcMain.send('response-channel', { status: 'ok' });
+
+// Request/reply handler — works with window.lotus.invoke() in the renderer
+ipcMain.handle('get-user', async ({ id }) => {
+    const user = await db.findUser(id); // may return a Promise
+    return user;                         // auto-sent back to the renderer
+});
 ```
 
 #### Renderer (Webpage)
@@ -127,17 +138,31 @@ ipcMain.send('response-channel', { status: 'ok' });
 The `window.lotus` bridge is automatically injected into every page.
 
 ```javascript
-// Send to main process
+// Fire-and-forget: send a message to Node.js
 window.lotus.send('channel-name', { key: 'value' });
 
 // Binary data
 window.lotus.send('binary-channel', new Blob(['binary data']));
 
-// Listen for responses
+// Listen for messages pushed from Node.js
 window.lotus.on('response-channel', (data) => {
     console.log('Got:', data);
 });
+
+// Promise-based invoke — awaits a reply from ipcMain.handle()
+const user = await window.lotus.invoke('get-user', { id: 42 });
+console.log(user.name);
 ```
+
+#### IPC Pattern Reference
+
+| Pattern | Renderer | Node.js | Use when |
+|---------|----------|---------|----------|
+| Fire-and-forget | `lotus.send(ch, data)` | `ipcMain.on(ch, fn)` | Notifications, events |
+| Push from Node | `lotus.on(ch, fn)` | `ipcMain.send(ch, data)` | Server-initiated updates |
+| **Request/reply** | `await lotus.invoke(ch, data)` | `ipcMain.handle(ch, async fn)` | **Queries, CRUD, any async call** |
+
+> **Note:** `handle` and `on` can coexist on the same channel. `handle` only fires when the message includes a `_replyId` (i.e., sent via `invoke`). Plain `send` calls still reach `on` listeners.
 
 ## Concepts
 
@@ -267,7 +292,7 @@ The Rust layer (`src/lib.rs`) handles:
 
 The JavaScript layer (`lotus.js`) provides:
 - `ServoWindow` class wrapping native window handles
-- `IpcMain` event emitter for message routing
+- `IpcMain` event emitter for message routing, including `handle()` for request/reply patterns
 - Auto-fix for Linux TLS allocation issues
 - Profiling support (`--profile` flag)
 

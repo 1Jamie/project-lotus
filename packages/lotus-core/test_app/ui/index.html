@@ -195,6 +195,15 @@
         </div>
 
         <div class="demo-section">
+            <h2>⚡ invoke() — Promise IPC</h2>
+            <button onclick="pingBackend()" class="demo-button" style="background: #7c4dff;">Invoke ping
+                (Promise-based)</button>
+            <div id="invoke-result" class="result-box">
+                <em>Click to call <code>window.lotus.invoke('ping', ...)</code> and await the reply...</em>
+            </div>
+        </div>
+
+        <div class="demo-section">
             <h2>📊 IPC Status</h2>
             <div class="status-box">
                 <div class="status-item">
@@ -251,10 +260,35 @@
             window.lotus.send('open-secondary-window', {});
         }
 
+        async function pingBackend() {
+            if (!window.lotus || !window.lotus.invoke) {
+                alert('invoke() not available!');
+                return;
+            }
+            const resultEl = document.getElementById('invoke-result');
+            resultEl.innerHTML = '<em style="color: #ffa500;">⏳ Awaiting reply from backend...</em>';
+            const t0 = performance.now();
+            try {
+                const reply = await window.lotus.invoke('ping', { msg: 'hello from renderer' });
+                const ms = (performance.now() - t0).toFixed(1);
+                resultEl.innerHTML = `
+                    <strong style="color:#7c4dff;">✅ invoke() resolved in ${ms}ms</strong><br>
+                    <div style="margin-left:20px;margin-top:10px;font-family:monospace;font-size:0.9em;">
+                        pong: <span style="color:#76b900;">${reply.pong}</span><br>
+                        echo: <span style="color:#76b900;">${reply.echo}</span><br>
+                        pid: <span style="color:#76b900;">${reply.pid}</span><br>
+                        timestamp: <span style="color:#76b900;">${new Date(reply.timestamp).toISOString()}</span>
+                    </div>
+                `;
+            } catch (err) {
+                resultEl.innerHTML = `<span style="color:#f44336;">❌ invoke() rejected: ${err.message}</span>`;
+            }
+        }
+
         // Set up IPC listeners
         if (window.lotus) {
             console.log('✅ window.lotus API is available!');
-            document.getElementById('ipc-status').textContent = 'Connected';
+            document.getElementById('ipc-status').textContent = window.lotus.invoke ? 'Connected (invoke ready)' : 'Connected';
             document.getElementById('ipc-status').style.color = '#4caf50';
 
             // Listen for system info response

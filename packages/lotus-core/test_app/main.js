@@ -49,6 +49,13 @@ win.on('load-status', (status) => {
 });
 
 // Set up IPC handlers
+
+// Demo: promise-based invoke() — call from renderer via window.lotus.invoke('ping', { msg: 'hello' })
+ipcMain.handle('ping', async ({ msg }) => {
+    console.log('[ipcMain] ping received:', msg);
+    return { pong: true, echo: msg, timestamp: Date.now(), pid: process.pid };
+});
+
 ipcMain.on('get-system-info', (data) => {
     console.log('[ipcMain] Received system info request:', data);
 

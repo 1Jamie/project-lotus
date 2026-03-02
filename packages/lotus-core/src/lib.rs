@@ -67,6 +67,18 @@ static EVENT_LOOP_PROXY: OnceCell<EventLoopProxy<EngineCommand>> = OnceCell::new
 // Global app state (thread-safe metadata only, no Rc types)
 static APP_STATE: OnceCell<Arc<Mutex<AppState>>> = OnceCell::new();
 
+// Global map of per-window WebSocket senders (for main→renderer pushes)
+// Populated by the Axum IPC thread; read by the Winit event-loop thread.
+static WS_SENDERS: OnceCell<Arc<dashmap::DashMap<String, tokio::sync::mpsc::UnboundedSender<axum::extract::ws::Message>>>> = OnceCell::new();
+
+// Outgoing message buffer: holds messages for windows whose WS is temporarily down
+// (e.g. during a page reload). Drained automatically when the WS reconnects.
+// Each entry is a queue of raw msgpack-packed frames, capped to avoid unbounded growth.
+static WS_PENDING: OnceCell<Arc<dashmap::DashMap<String, std::collections::VecDeque<Vec<u8>>>>> = OnceCell::new();
+
+// Maximum number of frames to buffer per window while the WS is disconnected.
+const WS_PENDING_MAX_FRAMES: usize = 64;
+
 #[cfg(target_os = "linux")]
 fn detect_linux_theme_robust() -> dark_light::Mode {
     // 1. Try standard crate
@@ -124,6 +136,7 @@ window.lotus = {
     _offlineQueue: [],
     _batch: [],
     _batchTimeout: null,
+    _pendingInvokes: {},
     port: null, // Will be set by init script
     token: null, // Will be set by init script
     id: null,    // Will be set by init script
@@ -195,74 +208,82 @@ window.lotus = {
 
         // Initialize connection lazily on first send, or explicitly elsewhere
         if (!window.lotus._ws && channel !== "lotus:internal-reconnect") {
-           window.lotus._connectWs();
+            window.lotus._connectWs();
         }
 
-        const isBinary = (data instanceof Blob || data instanceof ArrayBuffer || ArrayBuffer.isView(data));
-        
-        let payload;
-        if (isBinary) {
-            // We must wrap binary in the same batch format so the server can route it properly if it needs to,
-            // though the current Rust handling just dumps the raw bytes into the IpcMessage directly.
-            // Wait, actually, the previous implementation did: 
-            // `fetch(/ipc/${channel}, body: data)` ... which the rust side then wrapped in a vec![(channel, content)]
-            // So for WebSockets, we should probably just pack the binary into a msgpack array on JS side to keep parsing unified.
+        // All payloads — text, JSON, and binary (Blob/ArrayBuffer/TypedArray) —
+        // enter the same batch queue. msgpackr encodes binary entries as msgpack
+        // bin naturally, so no special-casing is needed here.
+        window.lotus._batch.push([channel, data]);
+
+        const flushBatch = () => {
+            if (window.lotus._batch.length === 0) return;
+            const batch = window.lotus._batch;
+            window.lotus._batch = [];
+            window.lotus._batchTimeout = null;
+
             if (window.msgpackr) {
-               payload = window.msgpackr.pack([[channel, data]]);
-            } else {
-               console.error("msgpackr not loaded, cannot send binary over WS");
-               return;
-            }
-        } else {
-            // Buffer for batching text/json payloads
-            window.lotus._batch.push([channel, data]);
-            
-            const flushBatch = () => {
-                if (window.lotus._batch.length === 0) return;
-                const batch = window.lotus._batch;
-                window.lotus._batch = [];
-                window.lotus._batchTimeout = null;
-                
-                if (window.msgpackr) {
-                    try {
-                        const packed = window.msgpackr.pack(batch);
-                        if (window.lotus._ws && window.lotus._ws.readyState === WebSocket.OPEN) {
-                            window.lotus._ws.send(packed);
-                        } else {
-                            window.lotus._offlineQueue.push(packed);
-                        }
-                    } catch (e) {
-                        console.error("Failed to pack batch", e);
+                try {
+                    const packed = window.msgpackr.pack(batch);
+                    if (window.lotus._ws && window.lotus._ws.readyState === WebSocket.OPEN) {
+                        window.lotus._ws.send(packed);
+                    } else {
+                        window.lotus._offlineQueue.push(packed);
                     }
+                } catch (e) {
+                    console.error("Failed to pack batch", e);
+                }
+            } else {
+                console.error("msgpackr not loaded");
+            }
+        };
+
+        // Eager flush to pipeline large bursts instead of packing 100 MB at once
+        if (window.lotus._batch.length >= 250) {
+            flushBatch();
+        } else if (!window.lotus._batchTimeout) {
+            queueMicrotask(flushBatch);
+            window.lotus._batchTimeout = true;
+        }
+    },
+    invoke: (channel, data) => {
+        return new Promise((resolve, reject) => {
+            const replyId = 'lotus:reply:' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+            const timeoutMs = 30000;
+            const timer = setTimeout(() => {
+                delete window.lotus._pendingInvokes[replyId];
+                reject(new Error(`lotus.invoke('${channel}') timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+            window.lotus._pendingInvokes[replyId] = (result) => {
+                clearTimeout(timer);
+                delete window.lotus._pendingInvokes[replyId];
+                if (result && result._error !== undefined) {
+                    reject(new Error(result._error));
                 } else {
-                    console.error("msgpackr not loaded");
+                    resolve(result);
                 }
             };
-
-            // Eager flush to pipeline large bursts instead of packing 100MB at once
-            if (window.lotus._batch.length >= 250) {
-                flushBatch();
-            } else if (!window.lotus._batchTimeout) {
-                queueMicrotask(flushBatch);
-                window.lotus._batchTimeout = true; 
-            }
-            return; // Return here since microtask/flush handles sending
-        }
-
-        // Direct send for binary
-        if (payload) {
-            if (window.lotus._ws && window.lotus._ws.readyState === WebSocket.OPEN) {
-                window.lotus._ws.send(payload);
-            } else {
-                window.lotus._offlineQueue.push(payload);
-            }
-        }
+            // Guard: if data is null/undefined/primitive, spread nothing rather than throwing.
+            // Objects are spread normally so all existing keys are preserved.
+            const payload = Object.assign(
+                {},
+                (data !== null && typeof data === 'object') ? data : {},
+                { _replyId: replyId }
+            );
+            window.lotus.send(channel, payload);
+        });
     },
     on: (channel, handler) => {
         if (!window.lotus.handlers[channel]) window.lotus.handlers[channel] = [];
         window.lotus.handlers[channel].push(handler);
     },
     emit: (channel, data) => {
+        // Route replies to pending invoke() calls first
+        if (channel.startsWith('lotus:reply:')) {
+            const cb = window.lotus._pendingInvokes[channel];
+            if (cb) { cb(data); }
+            return;
+        }
         (window.lotus.handlers[channel] || []).forEach(h => h(data));
     }
 };
@@ -400,7 +421,7 @@ pub enum EngineCommand {
     
     // Window-specific commands (all take window ID)
     LoadUrl(String, String), // window_id, url
-    SendToRenderer(String, String, serde_json::Value), // window_id, channel, data
+    SendToRenderer(String, Vec<u8>), // window_id, msgpack-packed [[channel, data]]
     IpcMessage(String, Vec<u8>), // window_id, raw_bytes
     IpcMessages(String, Vec<Vec<u8>>),
     Resize(String, winit::dpi::PhysicalSize<u32>), // window_id, size
@@ -420,8 +441,56 @@ pub enum EngineCommand {
     UnmaximizeWindow(String), // window_id
     FocusWindow(String), // window_id
     AnimatingChanged(String, bool), // window_id, animating
+    SetMinInnerSize(String, Option<winit::dpi::PhysicalSize<u32>>), // window_id, size (None = remove constraint)
+    SetMaxInnerSize(String, Option<winit::dpi::PhysicalSize<u32>>), // window_id, size (None = remove constraint)
 }
 
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DragRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DragRegionPayload {
+    pub drag: Option<Vec<DragRect>>,
+    #[serde(rename = "noDrag")]
+    #[allow(non_snake_case)]
+    pub noDrag: Option<Vec<DragRect>>,
+}
+
+fn intercept_drag_regions(raw_bytes: &[u8], window_id: String) {
+    if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, DragRegionPayload)>>(raw_bytes) {
+        for (channel, payload) in batch {
+            if channel == "lotus:set-drag-regions" {
+                let drag_regions = payload.drag.unwrap_or_default().into_iter().map(|r| {
+                    euclid::Rect::new(
+                        euclid::Point2D::new(r.x, r.y),
+                        euclid::Size2D::new(r.width, r.height)
+                    )
+                }).collect::<Vec<_>>();
+
+                let no_drag_regions = payload.noDrag.unwrap_or_default().into_iter().map(|r| {
+                    euclid::Rect::new(
+                        euclid::Point2D::new(r.x, r.y),
+                        euclid::Size2D::new(r.width, r.height)
+                    )
+                }).collect::<Vec<_>>();
+
+                if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                    let _ = proxy.send_event(EngineCommand::UpdateDragRegions(
+                        window_id.clone(),
+                        drag_regions,
+                        no_drag_regions
+                    ));
+                }
+            }
+        }
+    }
+}
 
 #[napi]
 pub struct WindowHandle {
@@ -443,15 +512,11 @@ impl WindowHandle {
     }
 
     #[napi]
-    pub fn send_to_renderer(&self, channel: String, data: String) -> napi::Result<()> {
-        let json_data: serde_json::Value = serde_json::from_str(&data)
-            .map_err(|e| napi::Error::from_reason(format!("Invalid JSON: {}", e)))?;
-        
+    pub fn send_to_renderer(&self, data: napi::bindgen_prelude::Buffer) -> napi::Result<()> {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
-            proxy.send_event(EngineCommand::SendToRenderer(self.id.clone(), channel, json_data))
+            proxy.send_event(EngineCommand::SendToRenderer(self.id.clone(), data.to_vec()))
                 .map_err(|e| napi::Error::from_reason(format!("Failed to send event: {}", e)))?;
         }
-        
         Ok(())
     }
 
@@ -528,42 +593,21 @@ impl WindowHandle {
     #[napi]
     pub fn update_drag_regions(&self, rects_json: String) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
-            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&rects_json) {
-                let mut drag_regions = Vec::new();
-                let mut no_drag_regions = Vec::new();
-                
-                if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
-                    for r in drag_arr {
-                        if let (Some(x), Some(y), Some(w), Some(h)) = (
-                            r.get("x").and_then(|v| v.as_f64()),
-                            r.get("y").and_then(|v| v.as_f64()),
-                            r.get("width").and_then(|v| v.as_f64()),
-                            r.get("height").and_then(|v| v.as_f64())
-                        ) {
-                            drag_regions.push(euclid::Rect::new(
-                                euclid::Point2D::new(x as f32, y as f32),
-                                euclid::Size2D::new(w as f32, h as f32)
-                            ));
-                        }
-                    }
-                }
-                
-                if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
-                    for r in no_drag_arr {
-                        if let (Some(x), Some(y), Some(w), Some(h)) = (
-                            r.get("x").and_then(|v| v.as_f64()),
-                            r.get("y").and_then(|v| v.as_f64()),
-                            r.get("width").and_then(|v| v.as_f64()),
-                            r.get("height").and_then(|v| v.as_f64())
-                        ) {
-                            no_drag_regions.push(euclid::Rect::new(
-                                euclid::Point2D::new(x as f32, y as f32),
-                                euclid::Size2D::new(w as f32, h as f32)
-                            ));
-                        }
-                    }
-                }
-                
+            if let Ok(data) = serde_json::from_str::<DragRegionPayload>(&rects_json) {
+                let drag_regions = data.drag.unwrap_or_default().into_iter().map(|r| {
+                    euclid::Rect::new(
+                        euclid::Point2D::new(r.x, r.y),
+                        euclid::Size2D::new(r.width, r.height)
+                    )
+                }).collect::<Vec<_>>();
+
+                let no_drag_regions = data.noDrag.unwrap_or_default().into_iter().map(|r| {
+                    euclid::Rect::new(
+                        euclid::Point2D::new(r.x, r.y),
+                        euclid::Size2D::new(r.width, r.height)
+                    )
+                }).collect::<Vec<_>>();
+
                 info!("Rust: Updated drag regions for window {}: drag: {}, no_drag: {}", self.id, drag_regions.len(), no_drag_regions.len());
                 let _ = proxy.send_event(EngineCommand::UpdateDragRegions(self.id.clone(), drag_regions, no_drag_regions));
             }
@@ -611,6 +655,34 @@ impl WindowHandle {
             let _ = proxy.send_event(EngineCommand::FocusWindow(self.id.clone()));
         }
     }
+
+    /// Set the minimum inner size the user can resize the window to.
+    /// Pass 0 for both width and height to remove the constraint.
+    #[napi]
+    pub fn set_min_size(&self, width: u32, height: u32) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let size = if width == 0 && height == 0 {
+                None
+            } else {
+                Some(winit::dpi::PhysicalSize::new(width, height))
+            };
+            let _ = proxy.send_event(EngineCommand::SetMinInnerSize(self.id.clone(), size));
+        }
+    }
+
+    /// Set the maximum inner size the user can resize the window to.
+    /// Pass 0 for both width and height to remove the constraint.
+    #[napi]
+    pub fn set_max_size(&self, width: u32, height: u32) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let size = if width == 0 && height == 0 {
+                None
+            } else {
+                Some(winit::dpi::PhysicalSize::new(width, height))
+            };
+            let _ = proxy.send_event(EngineCommand::SetMaxInnerSize(self.id.clone(), size));
+        }
+    }
 }
 
 
@@ -624,7 +696,7 @@ struct ResourceReader;
 
 impl resources::ResourceReaderMethods for ResourceReader {
     fn read(&self, file: Resource) -> Vec<u8> {
-        let mut path = resources_dir_path();
+        let mut path = resources_dir_path().clone();
         path.push(file.filename());
         // debug!("Rust: Reading resource: {:?}", path); 
         match fs::read(&path) {
@@ -636,16 +708,15 @@ impl resources::ResourceReaderMethods for ResourceReader {
         }
     }
     fn sandbox_access_files_dirs(&self) -> Vec<PathBuf> {
-        vec![resources_dir_path()]
+        vec![resources_dir_path().clone()]
     }
     fn sandbox_access_files(&self) -> Vec<PathBuf> {
         vec![]
     }
 }
 
-fn resources_dir_path() -> PathBuf {
-    // Try ./resources relative to current working directory first
-    let mut path = env::current_dir().unwrap();
+static RESOURCES_DIR: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::new(|| {
+    let mut path = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     path.push("resources");
     if path.exists() {
         return path;
@@ -653,6 +724,10 @@ fn resources_dir_path() -> PathBuf {
     // Fallback?
     path.pop();
     path
+});
+
+fn resources_dir_path() -> &'static PathBuf {
+    &RESOURCES_DIR
 }
 
 fn init_resources() {
@@ -1192,54 +1267,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     let contains_internal_cmd = raw_bytes.windows(needle.len()).any(|w| w == needle);
 
                     if contains_internal_cmd {
-                        if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&raw_bytes) {
-                            for (channel, data) in &batch {
-                                if channel == "lotus:set-drag-regions" {
-                                let mut drag_regions = Vec::new();
-                                let mut no_drag_regions = Vec::new();
-
-                                if let Some(drag_arr) = data.get("drag").and_then(|v| v.as_array()) {
-                                    for r in drag_arr {
-                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
-                                            r.get("x").and_then(|v| v.as_f64()),
-                                            r.get("y").and_then(|v| v.as_f64()),
-                                            r.get("width").and_then(|v| v.as_f64()),
-                                            r.get("height").and_then(|v| v.as_f64())
-                                        ) {
-                                            drag_regions.push(euclid::Rect::new(
-                                                euclid::Point2D::new(x as f32, y as f32),
-                                                euclid::Size2D::new(w as f32, h as f32)
-                                            ));
-                                        }
-                                    }
-                                }
-
-                                if let Some(no_drag_arr) = data.get("noDrag").and_then(|v| v.as_array()) {
-                                    for r in no_drag_arr {
-                                        if let (Some(x), Some(y), Some(w), Some(h)) = (
-                                            r.get("x").and_then(|v| v.as_f64()),
-                                            r.get("y").and_then(|v| v.as_f64()),
-                                            r.get("width").and_then(|v| v.as_f64()),
-                                            r.get("height").and_then(|v| v.as_f64())
-                                        ) {
-                                            no_drag_regions.push(euclid::Rect::new(
-                                                euclid::Point2D::new(x as f32, y as f32),
-                                                euclid::Size2D::new(w as f32, h as f32)
-                                            ));
-                                        }
-                                    }
-                                }
-                                
-                                if let Some(proxy) = EVENT_LOOP_PROXY.get() {
-                                    let _ = proxy.send_event(EngineCommand::UpdateDragRegions(
-                                        window_id.clone(),
-                                        drag_regions,
-                                        no_drag_regions
-                                    ));
-                                }
-                                }
-                            }
-                        }
+                        intercept_drag_regions(&raw_bytes, window_id.clone());
                     }
 
                     self.callback.call(raw_bytes, ThreadsafeFunctionCallMode::NonBlocking);
@@ -1252,11 +1280,37 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     }
                 }
             },
-            EngineCommand::SendToRenderer(window_id, channel, data) => {
-                if let Some(instance) = self.windows.get(&window_id) {
-                    let data_json = serde_json::to_string(&data).unwrap_or_else(|_| "null".to_string());
-                    let script = format!("if (window.lotus) {{ window.lotus.emit('{}', {}); }}", channel, data_json);
-                    instance.webview.evaluate_javascript(&script, |_| {});
+            EngineCommand::SendToRenderer(window_id, packed) => {
+                // Route through the WebSocket channel so the renderer receives a
+                // standard msgpack batch — same path as renderer→main IPC in reverse.
+                //
+                // NOTE on `return` placement: we `return` after finding the sender entry in
+                // WS_SENDERS (whether the send succeeded or failed) so we don't also hit
+                // the "sender not in map" fallback block below. This is intentional.
+                let msg = axum::extract::ws::Message::Binary(packed.clone().into());
+                if let Some(senders) = WS_SENDERS.get() {
+                    if let Some(tx) = senders.get(&window_id) {
+                        // WS is live — send directly.
+                        if tx.send(msg).is_err() {
+                            // Channel closed; fall through to queue.
+                            if let Some(pending) = WS_PENDING.get() {
+                                let mut q = pending.entry(window_id).or_insert_with(std::collections::VecDeque::new);
+                                if q.len() < WS_PENDING_MAX_FRAMES {
+                                    q.push_back(packed);
+                                }
+                            }
+                        }
+                        return; // Either sent or queued — done either way.
+                    }
+                }
+                // WS sender not present (window loading / reloading) — buffer the frame.
+                if let Some(pending) = WS_PENDING.get() {
+                    let mut q = pending.entry(window_id).or_insert_with(std::collections::VecDeque::new);
+                    if q.len() < WS_PENDING_MAX_FRAMES {
+                        q.push_back(packed);
+                    } else {
+                        warn!("Rust: SendToRenderer dropped frame for {} — pending queue full ({} frames)", q.key(), WS_PENDING_MAX_FRAMES);
+                    }
                 }
             },
             EngineCommand::Resize(window_id, size) => {
@@ -1286,6 +1340,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             EngineCommand::CloseWindow(window_id) => {
                 self.windows.remove(&window_id);
+                // Clean up per-window metadata so long-running apps don't leak.
+                if let Some(state) = APP_STATE.get() {
+                    if let Ok(mut s) = state.lock() {
+                        s.window_metadata.remove(&window_id);
+                        s.window_start_times.remove(&window_id);
+                    }
+                }
+                // Drop any buffered outgoing frames for this window.
+                if let Some(p) = WS_PENDING.get() { p.remove(&window_id); }
                 info!("Closed window: {}", window_id);
             },
             EngineCommand::SetDecorations(window_id, decorations) => {
@@ -1345,6 +1408,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     trace!("Rust: Window {} animating={}", window_id, animating);
                 }
             },
+            EngineCommand::SetMinInnerSize(window_id, size) => {
+                if let Some(instance) = self.windows.get(&window_id) {
+                    instance.window.set_min_inner_size(size);
+                }
+            },
+            EngineCommand::SetMaxInnerSize(window_id, size) => {
+                if let Some(instance) = self.windows.get(&window_id) {
+                    instance.window.set_max_inner_size(size);
+                }
+            },
         }
         
         if let Some(servo) = &self.servo {
@@ -1365,8 +1438,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
         // Log every RedrawRequested BEFORE any guard, so we know if winit is dispatching it at all
         if matches!(event, WindowEvent::RedrawRequested) {
-            info!("Rust: [RAW] RedrawRequested fired for winit id {:?}, known windows: {}", 
-                window_id, self.winit_id_to_uuid.len());
+            // info!("Rust: [RAW] RedrawRequested fired for winit id {:?}, known windows: {}", 
+            //    window_id, self.winit_id_to_uuid.len());
         }
 
         match event {
@@ -1436,6 +1509,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
                         self.windows.remove(&uuid);
                         self.winit_id_to_uuid.remove(&window_id);
+                        // Clean up per-window metadata to avoid unbounded growth
+                        // across many open/close cycles.
+                        if let Some(state) = APP_STATE.get() {
+                            if let Ok(mut s) = state.lock() {
+                                s.window_metadata.remove(&uuid);
+                                s.window_start_times.remove(&uuid);
+                            }
+                        }
+                        // Drop any buffered outgoing frames for this window.
+                        if let Some(p) = WS_PENDING.get() { p.remove(&uuid); }
                         if self.windows.is_empty() {
                             event_loop.exit();
                         }
@@ -1443,17 +1526,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     WindowEvent::RedrawRequested => {
                         let size = instance.window.inner_size();
                         // Changed to INFO level so we can see this in default logs
-                        info!("Rust: RedrawRequested for {}, size={}x{}, visible={}", 
-                            uuid, size.width, size.height, instance.window.is_visible().unwrap_or(true));
+                        //info!("Rust: RedrawRequested for {}, size={}x{}, visible={}", 
+                        //    uuid, size.width, size.height, instance.window.is_visible().unwrap_or(true));
                         
                         // Match servo's own winit_minimal.rs pattern exactly:
                         // just paint() → present().
                         let paint_start = Instant::now();
                         instance.webview.paint();
                         let paint_duration = paint_start.elapsed();
-                        info!("Rust: paint() complete in {:?}, calling present()", paint_duration);
+                        //info!("Rust: paint() complete in {:?}, calling present()", paint_duration);
                         instance.rendering_context.present();
-                        info!("Rust: present() complete");
+                        //info!("Rust: present() complete");
 
                         // WORKAROUND: If paint took a huge amount of time (e.g., >200ms),
                         // it might mean ANGLE was busy compiling shaders blockingly on the first frame.
@@ -1696,6 +1779,66 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             self.callback.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
                         }
                     },
+                    WindowEvent::HoveredFile(path) => {
+                        let path_str = path.to_string_lossy().into_owned();
+                        // Notify Node.js
+                        let mut msg = Vec::new();
+                        if rmp_serde::encode::write(&mut msg, &serde_json::json!({
+                            "event": "file-hover", "window_id": uuid, "path": path_str
+                        })).is_ok() {
+                            self.callback.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
+                        }
+                        // Push to renderer — standard [[channel, payload]] msgpack batch.
+                        // to_vec_named is used intentionally (same as to_vec but with
+                        // named struct fields) to produce human-readable msgpack maps;
+                        // consistent with the serde_json::Value payloads used here.
+                        if let Some(senders) = WS_SENDERS.get() {
+                            if let Some(tx) = senders.get(&uuid) {
+                                if let Ok(packed) = rmp_serde::encode::to_vec_named(
+                                    &vec![("file-hover", serde_json::json!({ "path": path_str }))]
+                                ) {
+                                    let _ = tx.send(axum::extract::ws::Message::Binary(packed.into()));
+                                }
+                            }
+                        }
+                    },
+                    WindowEvent::HoveredFileCancelled => {
+                        let mut msg = Vec::new();
+                        if rmp_serde::encode::write(&mut msg, &serde_json::json!({
+                            "event": "file-hover-cancelled", "window_id": uuid
+                        })).is_ok() {
+                            self.callback.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
+                        }
+                        if let Some(senders) = WS_SENDERS.get() {
+                            if let Some(tx) = senders.get(&uuid) {
+                                if let Ok(packed) = rmp_serde::encode::to_vec_named(
+                                    &vec![("file-hover-cancelled", serde_json::json!(null))]
+                                ) {
+                                    let _ = tx.send(axum::extract::ws::Message::Binary(packed.into()));
+                                }
+                            }
+                        }
+                    },
+                    WindowEvent::DroppedFile(path) => {
+                        let path_str = path.to_string_lossy().into_owned();
+                        // Notify Node.js
+                        let mut msg = Vec::new();
+                        if rmp_serde::encode::write(&mut msg, &serde_json::json!({
+                            "event": "file-drop", "window_id": uuid, "path": path_str
+                        })).is_ok() {
+                            self.callback.call(msg, ThreadsafeFunctionCallMode::NonBlocking);
+                        }
+                        // Push to renderer
+                        if let Some(senders) = WS_SENDERS.get() {
+                            if let Some(tx) = senders.get(&uuid) {
+                                if let Ok(packed) = rmp_serde::encode::to_vec_named(
+                                    &vec![("file-drop", serde_json::json!({ "path": path_str }))]
+                                ) {
+                                    let _ = tx.send(axum::extract::ws::Message::Binary(packed.into()));
+                                }
+                            }
+                        }
+                    },
                     _ => {}
                 }
             }
@@ -1874,14 +2017,36 @@ impl App {
                     ws_senders: Arc<DashMap<String, mpsc::UnboundedSender<WsMessage>>>,
                 }
 
+                let ws_senders_map: Arc<DashMap<String, mpsc::UnboundedSender<WsMessage>>> = Arc::new(DashMap::new());
+                // Expose the sender map globally so the Winit thread can push main→renderer messages.
+                WS_SENDERS.set(ws_senders_map.clone()).ok();
+
+                // Initialize the pending-message queue map.
+                let ws_pending_map: Arc<DashMap<String, std::collections::VecDeque<Vec<u8>>>> = Arc::new(DashMap::new());
+                WS_PENDING.set(ws_pending_map.clone()).ok();
+
                 let state = ServerState {
                     proxy: server_proxy,
                     token: server_token,
-                    ws_senders: Arc::new(DashMap::new()),
+                    ws_senders: ws_senders_map,
                 };
 
                 let cors = CorsLayer::new()
-                    .allow_origin(Any)
+                    // Only allow connections from localhost origins.
+                    // Servo loads pages via lotus-resource:// (origin: null) or http://127.0.0.1:
+                    // Both are covered by the null-origin case below plus the 127.0.0.1 check.
+                    // Reject any cross-origin request outright.
+                    .allow_origin([
+                        "http://127.0.0.1".parse::<HeaderValue>().unwrap(),
+                        "http://localhost".parse::<HeaderValue>().unwrap(),
+                        // lotus-resource:// pages send Origin: null (opaque origin per the Fetch spec).
+                        // This is the same value sent by file:// pages — a local attacker who tricks
+                        // the user into opening a crafted HTML file in another browser could also have
+                        // Origin: null. However, the token query parameter is the real security gate:
+                        // it's a random UUID injected only via UserScript into our own windows, so a
+                        // third-party page cannot know it. The origin check is defense-in-depth only.
+                        "null".parse::<HeaderValue>().unwrap(),
+                    ])
                     .allow_methods(Any)
                     .allow_headers(vec![
                         header::CONTENT_TYPE,
@@ -1913,8 +2078,7 @@ impl App {
                         .unwrap_or("unknown")
                         .to_string();
 
-                    if let Ok(batch) = rmp_serde::decode::from_slice::<Vec<(String, serde_json::Value)>>(&body) {
-                    }
+
 
                     let _ = state.proxy.send_event(EngineCommand::IpcMessage(window_id, body.to_vec()));
                     (StatusCode::OK, "ok").into_response()
@@ -1947,20 +2111,41 @@ impl App {
                 async fn handle_resource(
                     Path(path): Path<String>,
                 ) -> impl IntoResponse {
-                    let mut full_path = env::current_dir().unwrap_or_default();
+                    let root = env::current_dir().unwrap_or_default();
+                    let mut full_path = root.clone();
                     full_path.push(path.trim_start_matches('/'));
                     
-                    if full_path.exists() && full_path.is_file() {
-                        if let Ok(content) = fs::read(&full_path) {
-                            let mime = mime_guess::from_path(&full_path).first_or_octet_stream();
-                            let mut resp = Response::new(Body::from(content));
-                            resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_str(mime.as_ref()).unwrap_or(HeaderValue::from_static("application/octet-stream")));
-                            resp
-                        } else {
-                            (StatusCode::INTERNAL_SERVER_ERROR, "Error reading file").into_response()
+                    match (full_path.canonicalize(), root.canonicalize()) {
+                        (Ok(canonical_full), Ok(canonical_root)) => {
+                            if !canonical_full.starts_with(&canonical_root) {
+                                warn!("Blocked directory traversal attempt for {:?}", full_path);
+                                return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+                            }
+                            
+                            if canonical_full.is_file() {
+                                // Use tokio::fs::read so large files (videos, etc.) don't block
+                                // a Tokio worker thread for the duration of the disk I/O.
+                                match tokio::fs::read(&canonical_full).await {
+                                    Ok(content) => {
+                                        let mime = mime_guess::from_path(&canonical_full).first_or_octet_stream();
+                                        let mut resp = Response::new(Body::from(content));
+                                        resp.headers_mut().insert(
+                                            header::CONTENT_TYPE,
+                                            HeaderValue::from_str(mime.as_ref())
+                                                .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+                                        );
+                                        resp
+                                    }
+                                    Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Error reading file").into_response(),
+                                }
+                            } else {
+                                (StatusCode::NOT_FOUND, "Not Found").into_response()
+                            }
+                        },
+                        _ => {
+                            // Path doesn't exist or is malformed
+                            (StatusCode::NOT_FOUND, "Not Found").into_response()
                         }
-                    } else {
-                        (StatusCode::NOT_FOUND, "Not Found").into_response()
                     }
                 }
 
@@ -1968,9 +2153,24 @@ impl App {
                     ws: WebSocketUpgrade,
                     Query(query): Query<WsQuery>,
                     State(state): State<ServerState>,
+                    headers: axum::http::HeaderMap,
                 ) -> impl IntoResponse {
                     if query.token != state.token {
                         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+                    }
+
+                    // Validate that the request originates from localhost.
+                    // Servo sends lotus-resource:// pages with Origin: null; plain http pages
+                    // from 127.0.0.1 send Origin: http://127.0.0.1:<port>.
+                    // Anything else (third-party site navigated inside the webview) is rejected.
+                    let origin_ok = headers.get("origin")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|o| o == "null" || o.starts_with("http://127.0.0.1") || o.starts_with("http://localhost"))
+                        .unwrap_or(true); // absent Origin (same-origin non-browser fetch) is fine
+
+                    if !origin_ok {
+                        warn!("Rust: Rejected WebSocket upgrade from untrusted origin");
+                        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
                     }
 
                     ws.on_upgrade(move |socket| handle_ws_client(socket, query.id, state))
@@ -1981,7 +2181,16 @@ impl App {
                     let (mut sender, mut receiver) = socket.split();
                     
                     let (tx, mut rx) = mpsc::unbounded_channel();
-                    state.ws_senders.insert(window_id.clone(), tx);
+                    state.ws_senders.insert(window_id.clone(), tx.clone());
+
+                    // Drain any messages buffered while the WS was down (e.g. page reload gap).
+                    if let Some(pending) = WS_PENDING.get() {
+                        if let Some(mut entry) = pending.get_mut(&window_id) {
+                            while let Some(frame) = entry.pop_front() {
+                                let _ = tx.send(WsMessage::Binary(frame.into()));
+                            }
+                        }
+                    }
 
                     let send_task = async move {
                         while let Some(msg) = rx.recv().await {
@@ -1995,23 +2204,51 @@ impl App {
                     let window_id_clone = window_id.clone();
                     let recv_task = async move {
                         let mut batch_buffer: Vec<Vec<u8>> = Vec::with_capacity(32);
+                        // Cumulative byte size of messages currently in the batch buffer.
+                        // Flush early if this exceeds 5 MB to avoid one huge event-loop message.
+                        let mut batch_bytes: usize = 0;
+                        const BATCH_FLUSH_SIZE_BYTES: usize = 5 * 1024 * 1024; // 5 MB
                         
-                        while let Some(Ok(msg)) = receiver.next().await {
-                            match msg {
-                                WsMessage::Binary(bin) => {
-                                    batch_buffer.push(bin);
-                                },
-                                WsMessage::Text(txt) => {
-                                    batch_buffer.push(txt.into_bytes());
-                                },
-                                _ => {}
-                            }
-                            
-                            // Flush buffer when it grows or if we drain the visible queue 
-                            // (futures limit blocks true immediate drain so we just flush eagerly for now, batching on tight loops)
-                            if !batch_buffer.is_empty() {
-                               let msgs = std::mem::take(&mut batch_buffer);
-                               let _ = proxy.send_event(EngineCommand::IpcMessages(window_id_clone.clone(), msgs));
+                        loop {
+                            tokio::select! {
+                                // Default branch: Read an incoming chunk if we haven't reached the deadline yet
+                                msg_opt = receiver.next() => {
+                                    match msg_opt {
+                                        Some(Ok(WsMessage::Binary(bin))) => {
+                                            batch_bytes += bin.len();
+                                            batch_buffer.push(bin);
+                                        }
+                                        Some(Ok(WsMessage::Text(txt))) => {
+                                            batch_bytes += txt.len();
+                                            batch_buffer.push(txt.into_bytes());
+                                        }
+                                        Some(Err(_)) | None => {
+                                            if !batch_buffer.is_empty() {
+                                                let msgs = std::mem::take(&mut batch_buffer);
+                                                let _ = proxy.send_event(EngineCommand::IpcMessages(window_id_clone.clone(), msgs));
+                                            }
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                    
+                                    // Flush if count limit OR byte-size limit reached.
+                                    if batch_buffer.len() >= 32 || batch_bytes >= BATCH_FLUSH_SIZE_BYTES {
+                                        batch_bytes = 0;
+                                        let msgs = std::mem::take(&mut batch_buffer);
+                                        let _ = proxy.send_event(EngineCommand::IpcMessages(window_id_clone.clone(), msgs));
+                                    }
+                                }
+                                
+                                // Flush with a short idle sleep: gives the OS a chance to
+                                // deliver a burst of follow-on messages in one batch,
+                                // without adding more than 0.5ms to solo-message RTTs.
+                                // (invoke() round-trips are the most latency-sensitive path.)
+                                _ = tokio::time::sleep(std::time::Duration::from_micros(500)), if !batch_buffer.is_empty() => {
+                                    batch_bytes = 0;
+                                    let msgs = std::mem::take(&mut batch_buffer);
+                                    let _ = proxy.send_event(EngineCommand::IpcMessages(window_id_clone.clone(), msgs));
+                                }
                             }
                         }
                     };

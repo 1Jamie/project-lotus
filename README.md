@@ -53,6 +53,8 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
     *   **Auto-Adapting:** JSON? Binary? Blobs? We don't care. We handle it via WebSockets natively.
     *   **MsgPack Batching (Pipelines):** We pack small messages together and unleash them in bursts to avoid starving the Winit rendering thread.
     *   **Zero-Copy Routing:** We avoid parsing giant megabytes of JSON simply to route a window event. Copying/allocating data is for people who like waiting.
+    *   **`invoke()` / `handle()` (Promise IPC):** The renderer calls `window.lotus.invoke('ch', data)` and gets back a real `Promise`. Node registers `ipcMain.handle('ch', async fn)`. No manual reply channels, no leaked listeners, no correlation IDs in your app code.
+    *   **File Drag-and-Drop:** OS-level file drag is intercepted from winit and forwarded to both the renderer (`window.lotus.on('file-drop', ...)`) and Node.js (`win.on('file-drop', ...)`). Zero Servo involvement — pure winit event forwarding.
 
 *   **Window State Persistence:**
     *   It remembers where you put the window (if you give it an ID). Groundbreaking technology, I know.
@@ -246,6 +248,11 @@ ipcMain.on('hello', (data) => {
     console.log('Renderer says:', data);
     ipcMain.send('reply', { message: 'Hello from Node!' });
 });
+
+// Or use invoke() for a clean request/reply pattern
+ipcMain.handle('get-time', async () => {
+    return { ts: Date.now() };
+});
 ```
 
 ### Step 3: Create your UI
@@ -265,11 +272,18 @@ mkdir ui
         <button onclick="window.lotus.send('hello', { from: 'renderer' })">
             Talk to Node.js
         </button>
+        <button onclick="getTime()">
+            Invoke get-time (Promise)
+        </button>
     </div>
     <script>
         window.lotus.on('reply', (data) => {
             console.log('Node says:', data.message);
         });
+        async function getTime() {
+            const { ts } = await window.lotus.invoke('get-time');
+            console.log('Server time:', new Date(ts).toISOString());
+        }
     </script>
 </body>
 </html>
@@ -345,21 +359,31 @@ The renderer is a webpage. The main process is Node. They talk.
 
 **Renderer (The Webpage):**
 ```javascript
-// Send stuff.
+// Fire and forget.
 window.lotus.send('channel', { magic: true });
 
-// Send heavy stuff.
+// Binary.
 const blob = new Blob(['pure binary fury']);
 window.lotus.send('binary-channel', blob);
+
+// Promise-based request/reply — no manual reply channels needed.
+const result = await window.lotus.invoke('get-data', { id: 42 });
+console.log(result);
 ```
 
 **Main Process (Node):**
 ```javascript
 const { ipcMain } = require('@lotus-gui/core');
 
+// Fire-and-forget listener.
 ipcMain.on('channel', (data) => {
     console.log('Renderer said:', data);
     ipcMain.send('reply', { status: 'acknowledged' });
+});
+
+// Request/reply handler — pairs with window.lotus.invoke().
+ipcMain.handle('get-data', async ({ id }) => {
+    return await db.find(id); // returned value auto-sent to renderer
 });
 ```
 
@@ -431,12 +455,22 @@ win.unminimize();
 win.maximize();
 win.unmaximize();
 win.focus();
+win.setMinSize(800, 600); // enforce a minimum, or pass 0,0 to clear
+win.setMaxSize(1920, 1080);
 
 // Listen to OS-level events
 win.on('moved', ({ x, y }) => console.log('Window moved to', x, y));
 win.on('resize', ({ width, height }) => console.log('Resized to', width, height));
 win.on('focus', () => console.log('Window gained focus'));
 win.on('blur', () => console.log('Window lost focus'));
+
+// File drag-and-drop (OS-level, works everywhere)
+win.on('file-hover', ({ path }) => console.log('Hovering:', path));
+win.on('file-hover-cancelled', () => console.log('Drag cancelled'));
+win.on('file-drop', ({ path }) => console.log('Dropped:', path));
+
+// Renderer-side (same events arrive via window.lotus.on)
+// window.lotus.on('file-drop', ({ path }) => showDropOverlay(path));
 ```
 
 ### Multi-Window Support
