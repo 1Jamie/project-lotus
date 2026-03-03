@@ -1,5 +1,21 @@
 # 🪷 Lotus (lotus-gui)
 
+## Version 0.3.0 (Current) 
+* **Status:** Beta? I'm not sure what to call it, but it works way better than any alpha ive seen! but hasnt been around long enough to call it stable yet. This is a big release and brings with it support for linux and windows installers for apps built with lotus. This allows you to build apps with lotus and just npx lotus build and it will build the app installer for you for your platform. It is still a bit early so any feedback is appreciated! I plan for this to be a continued project for a while and I'm excited to see what we can do with it.
+
+### Supported-Installers 
+* **Windows:** MSI, EXE
+* **Linux:** RPM, DEB, AppImage, Pacman, Flatpak
+* **Mac:** None (yet! please feel free to contribute!)
+
+### Supported-Runtime-Platforms
+* **Windows:** 10, 11
+* **Linux:** Arch, Debian, Fedora, openSUSE, Ubuntu
+* **Mac:** None (yet! please feel free to contribute!)
+
+In general linux, bsd, and windows are supported. Mac is not supported because I don't have a mac. I dont know enough about bsd or suse to automate building installers for them yet but it should fully run there and if not please feel free to open an issue and i will do my best to resolve it!
+
+
 **🏆 "ELECTRON IS AN 80s FORD BRONCO."**
 *"Huge. Heavy. Built to survive off-roading, river crossings, and the open internet. Every window spins up a full browser like it's about to get lost in the wilderness."*
 
@@ -54,7 +70,7 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
     *   **MsgPack Batching (Pipelines):** We pack small messages together and unleash them in bursts to avoid starving the Winit rendering thread.
     *   **Zero-Copy Routing:** We avoid parsing giant megabytes of JSON simply to route a window event. Copying/allocating data is for people who like waiting.
     *   **`invoke()` / `handle()` (Promise IPC):** The renderer calls `window.lotus.invoke('ch', data)` and gets back a real `Promise`. Node registers `ipcMain.handle('ch', async fn)`. No manual reply channels, no leaked listeners, no correlation IDs in your app code.
-    *   **File Drag-and-Drop:** OS-level file drag is intercepted from winit and forwarded to both the renderer (`window.lotus.on('file-drop', ...)`) and Node.js (`win.on('file-drop', ...)`). Zero Servo involvement — pure winit event forwarding.
+    *   **File Drag-and-Drop:** OS-level file drag is intercepted from winit and forwarded to both the renderer (`window.lotus.on('file-drop', ...)`) and Node.js (`win.on('file-drop', ...)`). Zero Servo involvement -- pure winit event forwarding.
 
 *   **Window State Persistence:**
     *   It remembers where you put the window (if you give it an ID). Groundbreaking technology, I know.
@@ -69,9 +85,9 @@ Electron assumes you're lost. Lotus assumes you know where you're going. And tha
 
 *   **Frameless Windows:**
     *   Kill the title bar. Remove the frame. Build whatever crap you want.
-    *   **Custom Drag Regions:** Mark any element with `-webkit-app-region: drag` or `data-lotus-drag`. Lotus bridges it to the OS — no JS required.
+    *   **Custom Drag Regions:** Mark any element with `-webkit-app-region: drag` or `data-lotus-drag`. Lotus bridges it to the OS -- no JS required.
     *   **Custom Resize Borders:** 8px invisible resize handles on every edge and corner. They just work.
-    *   **Cursor-Aware:** Resize cursors show up at the borders. Servo drives all other cursors (grab, pointer, text, etc.) — no interference.
+    *   **Cursor-Aware:** Resize cursors show up at the borders. Servo drives all other cursors (grab, pointer, text, etc.) -- no interference.
 
 *   **Multi-Window Support:**
     *   Spawn multiple independent windows from a single Node process.
@@ -86,14 +102,14 @@ Lotus is organized as a monorepo with two packages:
 ```
 lotus/
 ├── packages/
-│   ├── lotus-core/          # @lotus-gui/core — Runtime engine (Servo + Node bindings)
+│   ├── lotus-core/          # @lotus-gui/core -- Runtime engine (Servo + Node bindings)
 │   │   ├── src/             # Rust source (N-API bindings, window management)
 │   │   ├── lotus.js         # High-level JS API (ServoWindow, IpcMain, App)
 │   │   ├── index.js         # Native binding loader
 │   │   ├── resources/       # IPC bridge scripts, debugger
 │   │   └── test_app/        # Example application
 │   │
-│   └── lotus-dev/           # @lotus-gui/dev — CLI toolkit for development & packaging
+│   └── lotus-dev/           # @lotus-gui/dev -- CLI toolkit for development & packaging
 │       ├── bin/lotus.js      # CLI entry point (lotus dev, build, clean)
 │       └── lib/templates/    # Installer templates (RPM spec, etc.)
 │
@@ -103,8 +119,8 @@ lotus/
 
 | Package | npm Name | What It Does |
 |---------|----------|--------------|
-| [lotus-core](./packages/lotus-core/) | `@lotus-gui/core` | The runtime — Servo engine, window management, IPC. This is what your app `require()`s. |
-| [lotus-dev](./packages/lotus-dev/) | `@lotus-gui/dev` | CLI toolkit — dev server with hot-reload, build system, DEB/RPM installer packaging. |
+| [lotus-core](./packages/lotus-core/) | `@lotus-gui/core` | The runtime -- Servo engine, window management, IPC. This is what your app `require()`s. |
+| [lotus-dev](./packages/lotus-dev/) | `@lotus-gui/dev` | CLI toolkit -- dev server with hot-reload, build system, DEB/RPM installer packaging. |
 
 ## 🛠️ Prerequisites
 
@@ -153,10 +169,25 @@ This is where development happens. It works here. Fully working `.node` file for
  | :--- | :--- | :--- | :--- | :--- |
  | **Linux (Debian/Ubuntu)** | x64 | ✅ Verified | `.deb` (Stable) | Ready |
  | **Linux (Fedora/RHEL)** | x64 | ✅ Verified | `.rpm` (Stable) | Ready |
- | **Linux (openSUSE)** | x64 | 🛠 Testing | `.rpm` (Planned v0.3) | Alpha |
- | **Windows** | x64 | ✅ Verified | `.msi` (Planned v0.3) | Beta |
- | **FreeBSD** | x64 | 🛠 Testing | TBD (Planned v0.3) | Alpha |
+ | **Linux (openSUSE)** | x64 | 🛠 Testing | Planned | Alpha |
+ | **Windows** | x64 | ✅ Verified | `.msi` (testing) | Beta *1 |
+ | **FreeBSD** | x64 | 🛠 Testing | Planned | Alpha |
  | **macOS** | arm64 | 🆘 Help Wanted | TBD | On Hold |
+
+ *1 **Windows Beta Status:**
+
+  - **What Works:**
+    - ✅ **Native Binary:** Pre-built `.node` available on npm
+    - ✅ **Build System:** `lotus build` creates `.msi` installers 
+    - ✅ **Runtime:** Angle + Servo + Node.js run correctly
+    - ✅ **VC++ Redist:** Auto-embedded and installed silently
+    - ✅ **Icon Handling:** PNG/JPG → ICO conversion for installers
+    - ✅ **PE Header Patching:** No black console window on launch
+  
+  - **Known Issues:**
+    - ⚠️ **Installer Signing:** Not yet implemented (requires EV cert)
+    - ⚠️ **NSIS Fallback:** `lotus build --target nsis` still uses old logic
+    - ⚠️ **Drag-and-Drop:** Not yet tested on Windows
 
 > **Note:**
 > *   **Installer Target:** The packaged distribution format (what users download/install)
@@ -240,7 +271,7 @@ const win = new ServoWindow({
     visible: false
 });
 
-// Show only after first frame — no white flash, ever
+// Show only after first frame -- no white flash, ever
 win.once('frame-ready', () => win.show());
 
 // IPC: talk to the webpage
@@ -366,7 +397,7 @@ window.lotus.send('channel', { magic: true });
 const blob = new Blob(['pure binary fury']);
 window.lotus.send('binary-channel', blob);
 
-// Promise-based request/reply — no manual reply channels needed.
+// Promise-based request/reply -- no manual reply channels needed.
 const result = await window.lotus.invoke('get-data', { id: 42 });
 console.log(result);
 ```
@@ -381,7 +412,7 @@ ipcMain.on('channel', (data) => {
     ipcMain.send('reply', { status: 'acknowledged' });
 });
 
-// Request/reply handler — pairs with window.lotus.invoke().
+// Request/reply handler -- pairs with window.lotus.invoke().
 ipcMain.handle('get-data', async ({ id }) => {
     return await db.find(id); // returned value auto-sent to renderer
 });
@@ -431,8 +462,8 @@ const win = new ServoWindow({
 ```
 
 Out of the box you get:
-- **8px resize borders** on every edge/corner — just move the mouse to the edge.
-- **Drag regions** driven by CSS — no JS wiring required.
+- **8px resize borders** on every edge/corner -- just move the mouse to the edge.
+- **Drag regions** driven by CSS -- no JS wiring required.
 
 **In your HTML:**
 ```html
@@ -525,7 +556,7 @@ Your app is now a real installed application with a binary in `/usr/bin/` and ev
 
 ## 🏗️ Building from Source (The Waiting Game)
 
-> **Pro Tip:** You don't actually have to build this yourself. Check the **Actions** tab on GitHub. Every commit produces working artifacts for Linux and Windows. Download, unzip, use the time saved to beat that level you've been procrastinating on. (expect npm install support without having to build yourself soon — you can just grab the `.node` files from the artifacts tab)
+> **Pro Tip:** You don't actually have to build this yourself. Check the **Actions** tab on GitHub. Every commit produces working artifacts for Linux and Windows. Download, unzip, use the time saved to beat that level you've been procrastinating on. (expect npm install support without having to build yourself soon -- you can just grab the `.node` files from the artifacts tab)
 
 ```bash
 git clone https://github.com/1jamie/project-lotus.git
@@ -566,8 +597,8 @@ npm run build
 *   `packages/lotus-dev/lib/templates/` - The Factory. Installer templates (RPM spec, etc.).
 
 For detailed API documentation, see:
-*   [@lotus-gui/core README](./packages/lotus-core/README.md) — Full `ServoWindow` API, IPC reference, architecture
-*   [@lotus-gui/dev README](./packages/lotus-dev/README.md) — CLI commands, config reference, build pipeline
+*   [@lotus-gui/core README](./packages/lotus-core/README.md) -- Full `ServoWindow` API, IPC reference, architecture
+*   [@lotus-gui/dev README](./packages/lotus-dev/README.md) -- CLI commands, config reference, build pipeline
 
 ## 🤝 Contributing
 

@@ -1,6 +1,22 @@
 # @lotus-gui/dev
+The Swiss Army Knife for building, debugging, and packaging Lotus applications.
 
-CLI toolkit for developing, building, and packaging Lotus applications into distributable installers.
+📦 v0.3.0: The "Installer Factory" Update
+The jump to 0.3.0 turns your project into a distributable product. You write the code; we build the dealership.
+
+🏗️ One-Command Build: Run npx lotus build and get a professional installer tailored for your platform. No more messing with complex C++ build flags or installer scripts.
+
+🪟 Windows Sovereignty (MSI/EXE): Fully working WiX-based MSI generation. We handle the heavy lifting:
+
+VC++ Redist Chaining: Automatically embeds and silently installs the Microsoft C++ Runtime.
+
+ANGLE Injection: Bundles the necessary DLLs for hardware-accelerated rendering on any Windows 10/11 machine.
+
+Icon Conversion: Automatically handles PNG/JPG to .ico conversion for your installers.
+
+🐧 Linux Distribution Mastery: Support for the "Big Five" targets: DEB, RPM, AppImage, Pacman, and Flatpak.
+
+🔥 Hot-Reload Dev Server: Our dev environment watches your Rust bindings and JS source, restarting the engine only when necessary to keep your feedback loop tight.
 
 ## Installation
 
@@ -68,14 +84,22 @@ lotus dev main.js      # Custom entry point
 Build your application into a native, single-executable distributable installer package using Node SEA and CrabNebula.
 
 ```bash
-lotus build --target appimage
+# Linux
 lotus build --target deb
-lotus build --target exe
+lotus build --target appimage
+lotus build --target pacman
+lotus build --target rpm
+lotus build --target flatpak
+
+# Windows (must run on Windows host)
+lotus build --target wix --platform win32    # .msi installer
+lotus build --target nsis --platform win32   # .exe installer
 ```
 
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
-| `--target` | `deb`, `appimage`, `pacman`, `msi`, `exe`, `dmg`, `app` | `deb` | Target installer format. Note: Windows targets (`msi`, `exe`) require building on a Windows host or properly configured cross-compilation environment. |
+| `--target` | `deb`, `appimage`, `pacman`, `rpm`, `flatpak` *(Linux)* · `wix` / `msi`, `nsis` / `exe` *(Windows)* | `deb` | Target installer format. `msi` is an alias for `wix`; `exe` is an alias for `nsis`. |
+| `--platform` | `linux`, `win32` | current OS | Target platform. Set to `win32` when building Windows packages on a Windows host. |
 
 **What it does:**
 1. Reads `lotus.config.json` from the current directory.
@@ -88,6 +112,7 @@ lotus build --target exe
 **System Requirements:**
 - `lotus.config.json` in the current directory
 - Modern Node.js (v20+ with SEA support)
+- **Windows (`wix`/`nsis`)**: WiX Toolset v3 must be installed ([wixtoolset.org](https://wixtoolset.org)) and builds must run on a Windows host.
 
 ### `lotus clean`
 
@@ -114,6 +139,7 @@ The build command reads configuration from `lotus.config.json` in your project r
     "icon": "./assets/icon.png",
     "author": "Your Name",
     "homepage": "https://github.com/you/my-app",
+    "resources": ["./ui"],
     "build": {
         "linux": {
             "wmClass": "my-app",
@@ -135,8 +161,28 @@ The build command reads configuration from `lotus.config.json` in your project r
 | `main` | No | Entry point file. Determines what the installed app runs. Falls back to `package.json`'s `main`, then `index.js`. |
 | `executableName` | No | Binary name (e.g., `my-app` → `/usr/bin/my-app`). Defaults to lowercase `name`. |
 | `icon` | No | Path to application icon (relative to project root). |
-| `author` | No | Maintainer name for package metadata. |
+| `author` | No | Maintainer name for package metadata. It is highly recommended to set this for Windows, as it maps to the Registry `Manufacturer` identity. |
 | `homepage` | No | Project URL for package metadata. |
+| `appId` | No | Reverse domain identifier (e.g., `com.company.app`). For Windows WiX, this is used to stably generate the `UpgradeCode`. Changing this will break Windows installer upgrades. |
+| `resources` | **Recommended** | Array of paths/globs to include in the installer (e.g., `["./ui", "./assets"]`). **Required for UI to render after installation** — when installed, resources are placed next to the executable, which is where `path.join(__dirname, 'ui')` resolves. Common directories (`ui/`, `public/`, `assets/`, `static/`) are auto-detected if present. |
+
+
+### Windows Build Options (`build.windows`, `build.wix`, `build.nsis`)
+
+You can pass configuration objects directly to the underlying CrabNebula Packager for Windows installers.
+
+| Field | Description |
+|-------|-------------|
+| `build.windows` | Configures signing: `certificateThumbprint`, `signCommand`, `digestAlgorithm`, etc. |
+| `build.wix` | Configures MSI options: `fipsCompliant`, `languages`, `template`, `fragmentPaths`. |
+| `build.nsis` | Configures EXE options: `installMode` (currentUser/perMachine), `compression`, `languages`. |
+
+### Windows Packaging Requirements
+
+When building for Windows (`--target wix` or `--target nsis`), the underlying tools (WiX Toolset specifically) enforce strict validation that will fail builds or break updates if not followed:
+1. **Version Format**: Version **must** be exactly `Major.Minor.Patch` (e.g., `1.0.0`). The numbers cannot exceed 65535. Pre-release tags (e.g. `1.0.0-beta`) are heavily discouraged, and the installer generation will gracefully strip them, acting as the base version.
+2. **`appId` / UpgradeCode**: The `appId` you configure determines the MSI's `UpgradeCode`. If you omit `appId`, it defaults to `com.lotus.my-app`. If you change the `appId` in the future, Windows will treat the update as an entirely new application and will *not* uninstall the old one.
+3. **`author` / Publisher**: The `author` field acts as the Windows Registry Manufacturer. If omitted, it defaults to `"Lotus Dev"`. You should set an `author` immediately for proper organization in "Add/Remove Programs".
 
 ### Linux Build Options (`build.linux`)
 

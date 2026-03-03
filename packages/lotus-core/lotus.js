@@ -7,7 +7,7 @@ if (process.platform === 'linux') {
     const currentTunables = process.env.GLIBC_TUNABLES || '';
 
     // LOTUS_TLS_FIXED=1 is injected into the respawned process below.
-    // If it's already set we've already fixed the environment — never respawn again,
+    // If it's already set we've already fixed the environment -- never respawn again,
     // even if the tunable string looks wrong, to prevent an infinite loop.
     const alreadyFixed = process.env.LOTUS_TLS_FIXED === '1';
 
@@ -89,7 +89,7 @@ class IpcMain extends EventEmitter {
      * Thrown / rejected errors are forwarded as { _error: message }.
      */
     handle(channel, handler) {
-        // EventEmitter passes extra args — second arg is the windowId threaded
+        // EventEmitter passes extra args -- second arg is the windowId threaded
         // through ipcMain.emit() by the batch routing code below.
         this.on(channel, async (data, fromWindowId) => {
             const replyId = data && data._replyId;
@@ -98,7 +98,7 @@ class IpcMain extends EventEmitter {
             delete payload._replyId;
             try {
                 const result = await handler(payload);
-                // Reply to the originating window only — not all windows.
+                // Reply to the originating window only -- not all windows.
                 if (fromWindowId) {
                     this.sendTo(fromWindowId, replyId, result);
                 } else {
@@ -376,7 +376,7 @@ class ServoWindow extends EventEmitter {
             console.error('[Lotus] msgpackr not loaded, cannot sendToRenderer');
             return;
         }
-        // Pack as a single-entry batch [[channel, data]] — the renderer's
+        // Pack as a single-entry batch [[channel, data]] -- the renderer's
         // window.lotus._ws.onmessage handler already decodes this format.
         const packed = msgpackr.pack([[channel, data]]);
         this.handle.sendToRenderer(Buffer.from(packed));

@@ -170,7 +170,7 @@ export const __dirname_macro = macroDir;
                         fileList.push(fullPath);
                     }
                 } catch (err) {
-                    if (err.code !== 'EACCES' && err.code !== 'EPERM') throw err;
+                    if (err.code !== 'EACCES' && err.code !== 'EPERM' && err.code !== 'ENOENT') throw err;
                 }
             }
             return fileList;
@@ -250,6 +250,26 @@ export const __dirname_macro = macroDir;
             // The sentinel fuse is hardcoded per Node.js documentation for SEA
             execSync(`npx postject "${binPath}" NODE_SEA_BLOB "${seaConfig.output}" --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2`, { env: { ...process.env }, stdio: 'inherit' });
 
+            // On Windows, patch the PE header subsystem field from CONSOLE (3) to WINDOWS GUI (2).
+            // node.exe is built as a console app; this prevents the black console window from
+            // appearing when the packaged app is launched.
+            if (isWindows) {
+                console.log('Patching PE header to suppress console window...');
+                const exeBuf = fs.readFileSync(binPath);
+                // Offset 0x3C holds the PE header start as a 4-byte LE integer.
+                const peOffset = exeBuf.readUInt32LE(0x3C);
+                // Subsystem field: PE sig (4) + COFF header (20) + 68 bytes into Optional Header
+                const subsystemOffset = peOffset + 4 + 20 + 68;
+                if (exeBuf.readUInt16LE(subsystemOffset) === 3) { // IMAGE_SUBSYSTEM_WINDOWS_CUI
+                    exeBuf.writeUInt16LE(2, subsystemOffset);      // IMAGE_SUBSYSTEM_WINDOWS_GUI
+                    // Zero out the PE checksum — it's now invalid and Windows doesn't enforce it
+                    // for unsigned executables. CrabNebula/WiX will package it as-is.
+                    exeBuf.writeUInt32LE(0, peOffset + 4 + 20 + 64); // CheckSum field
+                    fs.writeFileSync(binPath, exeBuf);
+                    console.log('PE subsystem patched: CONSOLE → WINDOWS GUI');
+                }
+            }
+
             // Cleanup temp SEA files
             fs.unlinkSync(bundlePath);
             fs.unlinkSync(seaConfig.output);
@@ -267,11 +287,12 @@ export const __dirname_macro = macroDir;
             productName: config.name,
             version: config.version,
             description: config.description || config.name,
-            identifier: `com.lotus.${binName}`,
+            identifier: config.appId || `com.lotus.${binName}`,
             authors: [config.author || 'Lotus Dev'],
+            publisher: config.author || 'Lotus Dev',
             outDir: path.resolve(distDir, 'installers'),
-            // CrabNebula requires paths relative to the current directory where it runs
-            binariesDir: path.relative(distDir, appDir),
+            // Use absolute paths so CrabNebula resolves them correctly regardless of process cwd
+            binariesDir: appDir,
             binaries: [
                 {
                     path: isWindows ? binName + '.exe' : binName,
@@ -280,9 +301,9 @@ export const __dirname_macro = macroDir;
             ],
             // Instruct packager to copy our native `.node` modules together into the final installation directory
             resources: [
-                path.join(path.relative(distDir, appDir), '*.node'),
-                path.join(path.relative(distDir, appDir), '*.dll'),
-                path.join(path.relative(distDir, appDir), 'msgpackr-renderer.js')
+                path.join(appDir, '*.node'),
+                path.join(appDir, '*.dll'),
+                path.join(appDir, 'msgpackr-renderer.js')
             ],
             deb: {
                 depends: []
@@ -298,11 +319,118 @@ export const __dirname_macro = macroDir;
             }
         }
 
-        if (config.icon) {
-            packagerConfig.icons = [path.resolve(config.icon)];
+        // Auto-detect common web asset directories and include them in the package.
+        // On Windows (WiX/NSIS) resources are installed next to the exe, which is where
+        // __dirname_macro resolves to — so ServoWindow({ root: path.join(__dirname, 'ui') }) works.
+        const commonAssetDirs = ['ui', 'public', 'assets', 'static', 'web', 'dist/renderer', 'renderer'];
+        for (const dir of commonAssetDirs) {
+            const dirPath = path.resolve(process.cwd(), dir);
+            if (
+                fs.existsSync(dirPath) &&
+                fs.statSync(dirPath).isDirectory() &&
+                // Skip if already listed in config.resources
+                !packagerConfig.resources.some(r => r === dirPath || r === dir || r === `./${dir}`)
+            ) {
+                packagerConfig.resources.push(dirPath);
+                console.log(`Auto-including asset directory: ${dir}/`);
+            }
         }
 
-        fs.writeFileSync(packagerConfigPath, JSON.stringify(packagerConfig, null, 2));
+        if (config.icon) {
+            let iconPath = path.resolve(config.icon);
+            // WiX/NSIS require ICO format. If the user provided a PNG/JPG, wrap it in a minimal
+            // ICO container. Windows Vista+ supports PNG-encoded ICOs natively, so we can just
+            // prepend the ICO binary header without re-encoding the image data.
+            if (isWindows && /\.(png|jpg|jpeg)$/i.test(iconPath) && fs.existsSync(iconPath)) {
+                const icoPath = path.join(appDir, `${binName}.ico`);
+                const imgData = fs.readFileSync(iconPath);
+                // Read dimensions from PNG IHDR (bytes 16-23) or fall back to 256
+                const isPng = imgData[1] === 0x50 && imgData[2] === 0x4E && imgData[3] === 0x47;
+                const w = isPng ? imgData.readUInt32BE(16) : 256;
+                const h = isPng ? imgData.readUInt32BE(20) : 256;
+                const header = Buffer.alloc(6 + 16);
+                header.writeUInt16LE(0, 0);  // Reserved
+                header.writeUInt16LE(1, 2);  // Type: ICO
+                header.writeUInt16LE(1, 4);  // Count: 1 image
+                header.writeUInt8(w >= 256 ? 0 : w, 6);  // Width  (0 → 256)
+                header.writeUInt8(h >= 256 ? 0 : h, 7);  // Height (0 → 256)
+                header.writeUInt8(0, 8);   // ColorCount
+                header.writeUInt8(0, 9);   // Reserved
+                header.writeUInt16LE(1, 10); // Planes
+                header.writeUInt16LE(32, 12); // BitCount
+                header.writeUInt32LE(imgData.length, 14); // BytesInRes
+                header.writeUInt32LE(6 + 16, 18);          // ImageOffset
+                fs.writeFileSync(icoPath, Buffer.concat([header, imgData]));
+                iconPath = icoPath;
+                console.log(`Converted icon to ICO: ${path.basename(icoPath)}`);
+            }
+            packagerConfig.icons = [iconPath];
+        }
+
+        if (target === 'wix' || target === 'nsis' || target === 'msi' || target === 'exe') {
+            const versionParts = config.version.split(/[-+]/);
+            const baseVersion = versionParts[0];
+            const versionRegex = /^(\d+)(\.(\d+))?(\.(\d+))?$/;
+            if (!versionRegex.test(baseVersion)) {
+                console.warn(`\x1b[33mWarning: Windows installers (WiX/NSIS) require versions to rigidly match Major.Minor.Patch format (e.g. 1.0.0). Your version \`${config.version}\` might cause the build to fail or upgrades to behave unexpectedly.\x1b[0m`);
+            } else if (versionParts.length > 1) {
+                console.warn(`\x1b[33mWarning: Windows installers generally ignore pre-release identifiers (like -beta or -rc). Your installer will behave as version \`${baseVersion}\`.\x1b[0m`);
+            }
+
+            if (config.build) {
+                if (config.build.windows) packagerConfig.windows = config.build.windows;
+                if (config.build.wix) packagerConfig.wix = config.build.wix;
+                if (config.build.nsis) packagerConfig.nsis = config.build.nsis;
+            }
+
+            // Embed and run Visual C++ Redistributable silently
+            // Angle and Servo strictly require VcRedist on Windows.
+            const vcRedistUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe';
+            const vcRedistPath = path.join(distDir, 'vc_redist.x64.exe');
+            if (!fs.existsSync(vcRedistPath)) {
+                console.log('Downloading Microsoft Visual C++ Redistributable...');
+                const { execSync } = require('child_process');
+                // Use curl which is available on modern Windows and all Linux builds
+                execSync(`curl -L -o "${vcRedistPath}" "${vcRedistUrl}"`, { stdio: 'inherit' });
+            }
+            packagerConfig.resources.push(vcRedistPath);
+
+            if (target === 'nsis' || target === 'exe') {
+                packagerConfig.nsis = packagerConfig.nsis || {};
+                const prevPreinstall = packagerConfig.nsis.preinstallSection || '';
+                packagerConfig.nsis.preinstallSection = prevPreinstall + `
+                    DetailPrint "Installing Microsoft Visual C++ Redistributable..."
+                    ExecWait '"$INSTDIR\\vc_redist.x64.exe" /install /quiet /norestart'
+                `;
+            } else if (target === 'wix' || target === 'msi') {
+                packagerConfig.wix = packagerConfig.wix || {};
+                packagerConfig.wix.fragments = packagerConfig.wix.fragments || [];
+                packagerConfig.wix.fragments.push(`<?xml version="1.0" encoding="utf-8"?>
+                    <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+                        <Fragment>
+                            <CustomAction Id="InstallVCRedist" Directory="INSTALLDIR" Execute="deferred" Impersonate="no" Return="ignore" ExeCommand="&quot;[INSTALLDIR]vc_redist.x64.exe&quot; /install /quiet /norestart" />
+                            <InstallExecuteSequence>
+                                <Custom Action="InstallVCRedist" Before="InstallFinalize">NOT Installed</Custom>
+                            </InstallExecuteSequence>
+                        </Fragment>
+                    </Wix>
+                `);
+            }
+        }
+
+        // CrabNebula's Rust backend cannot handle Windows backslash paths inside the JSON.
+        // Normalize all string values recursively to use forward slashes before writing.
+        const normalizePathsInConfig = (obj) => {
+            if (typeof obj === 'string') return obj.replace(/\\/g, '/');
+            if (Array.isArray(obj)) return obj.map(normalizePathsInConfig);
+            if (obj && typeof obj === 'object') {
+                return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, normalizePathsInConfig(v)]));
+            }
+            return obj;
+        };
+        const normalizedPackagerConfig = normalizePathsInConfig(packagerConfig);
+
+        fs.writeFileSync(packagerConfigPath, JSON.stringify(normalizedPackagerConfig, null, 2));
         const setupAppDir = async (targetBuildSystem = target) => {
             const appDirName = path.join(distDir, 'AppDir');
             if (fs.existsSync(appDirName)) return appDirName;
@@ -562,9 +690,16 @@ rm -rf %{buildroot}
                     return; // exit the block instead of hitting crabnebula
                 }
 
-                // We pass the stringified JSON configuration directly to avoid file resolving bugs in CrabNebula CLI
-                const safeConfigJson = JSON.stringify(packagerConfig).replace(/'/g, "'\\''");
-                execSync(`npx @crabnebula/packager -c '${safeConfigJson}' ${formatArg}`, { stdio: 'inherit', cwd: distDir });
+                // Use the native Node.js NAPI binding directly instead of shelling out to the CLI.
+                // This completely avoids all Windows shell quoting and path-escaping issues.
+                const crabTarget = target === 'msi' ? 'wix' : target === 'exe' ? 'nsis' : target;
+                if (['deb', 'appimage', 'pacman', 'wix', 'nsis'].includes(crabTarget)) {
+                    normalizedPackagerConfig.formats = [crabTarget];
+                }
+                // require the build/ JS wrapper — it calls JSON.stringify internally before
+                // forwarding to the native NAPI binding, so we pass the plain JS object.
+                const { packageApp } = require('@crabnebula/packager/build');
+                await packageApp(normalizedPackagerConfig);
 
                 console.log(`Successfully created packages in ${path.join(distDir, 'installers')}`);
             }
@@ -705,7 +840,10 @@ program
                     wmClass: metadata.name.toLowerCase().replace(/ /g, '-'),
                     categories: ["Utility"]
                 }
-            }
+            },
+            // UI/web assets to include in the installer.
+            // On install, these are placed next to the executable.
+            resources: ["./ui"]
         };
         // Remove undefined keys
         Object.keys(lotusConfig).forEach(key => lotusConfig[key] === undefined && delete lotusConfig[key]);

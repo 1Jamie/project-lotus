@@ -69,7 +69,7 @@ ipcMain.on('get-system-info', (data) => {
 });
 
 // ─── Stress Test: Large payload echo ─────────────────────────────────────────
-// Used for torture tests — generates a large response server-side.
+// Used for torture tests -- generates a large response server-side.
 ipcMain.on('stress-request', (data) => {
     const size = Math.min(data.size || 1024, 10 * 1024 * 1024); // cap at 10MB
     const responseData = {
@@ -121,7 +121,7 @@ ipcMain.on('calculate', (data) => {
         case 'power': result = Math.pow(a, b); break;
         case 'sqrt': result = Math.sqrt(a); break;
         case 'fib': {
-            // Iterative fibonacci — CPU stress test
+            // Iterative fibonacci -- CPU stress test
             let x = 0, y = 1;
             for (let i = 0; i < Math.min(a, 50); i++) { [x, y] = [y, x + y]; }
             result = x;

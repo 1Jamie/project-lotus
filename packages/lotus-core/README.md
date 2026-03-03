@@ -2,6 +2,22 @@
 
 The runtime engine for Lotus applications. Provides the Servo rendering engine, window management, and IPC system as a Node.js native addon.
 
+## 🪷 Lotus Core (@lotus-gui/core)
+The high-performance, low-latency engine at the heart of the Lotus ecosystem.
+
+### 🚀 What’s New in v0.3.0 (Windows & Linux Hardening)
+This release focuses on distribution-grade stability. We’ve moved beyond the prototype phase and into a "hardened" runtime that handles the "dirty work" of desktop development automatically. I think this is the first release that I would feel comfortable shipping to users for some apps.
+
+⚡ Sub-Millisecond IPC: Our new tokio + axum WebSocket bridge now achieves a deterministic ~0.11ms latency. We’ve added opportunistic 500μs flushing and MsgPack batching to ensure your UI thread never starves, even under extreme telemetry loads. Replacing the old tiny_http was a bit of a dance but it seems to be well worth it for the performance gains.
+
+🛡️ Reload-Safe Queuing: Introducing WS_PENDING. If your window reloads, Rust automatically buffers outgoing IPC messages and drains them the moment the new JS context connects. No more lost "init" data.
+
+👻 Native Stealth Mode: On Windows, we now hard-patch the PE Subsystem header. Your app launches as a true GUI process—no black Node.js console window, ever.
+
+🎨 Ghost-Mode Transparency: Zero-white-flash startup with true OS-level transparency. If your CSS is transparent, your window is transparent.
+
+"Node.js runs the logic. Servo paints the pixels. Lotus Core makes them talk at the speed of light."
+
 ## Installation
 
 ```bash
@@ -46,7 +62,7 @@ const win = new ServoWindow(options);
 | `id` | `string` | Random UUID | Window identifier. **Required for state persistence** (unless you want goldfish memory). |
 | `root` | `string` | `undefined` | Absolute path to UI directory. Enables Hybrid Mode (`lotus-resource://`). Keeps your files properly jailed. |
 | `index` | `string` | `'index.html'` | Entry HTML file (relative to `root`). |
-| `initialUrl` | `string` | — | URL to load (alternative to `root` + `index`). |
+| `initialUrl` | `string` | -- | URL to load (alternative to `root` + `index`). |
 | `width` | `number` | `1024` | Window width in pixels. |
 | `height` | `number` | `768` | Window height in pixels. |
 | `title` | `string` | `'Lotus'` | Window title. |
@@ -95,7 +111,7 @@ const win = new ServoWindow(options);
 | `'closed'` | `()` | Window was closed. |
 | `'file-hover'` | `({ path: string })` | A file is being dragged over the window. Fires once per file. |
 | `'file-hover-cancelled'` | `()` | A drag operation left the window without dropping. |
-| `'file-drop'` | `({ path: string })` | A file was dropped onto the window. Fires once per file — accumulate multiple events if you need multi-file support. |
+| `'file-drop'` | `({ path: string })` | A file was dropped onto the window. Fires once per file -- accumulate multiple events if you need multi-file support. |
 
 ```javascript
 const win = new ServoWindow({
@@ -126,7 +142,7 @@ ipcMain.on('channel-name', (data) => {
 // Send to all windows
 ipcMain.send('response-channel', { status: 'ok' });
 
-// Request/reply handler — works with window.lotus.invoke() in the renderer
+// Request/reply handler -- works with window.lotus.invoke() in the renderer
 ipcMain.handle('get-user', async ({ id }) => {
     const user = await db.findUser(id); // may return a Promise
     return user;                         // auto-sent back to the renderer
@@ -149,7 +165,7 @@ window.lotus.on('response-channel', (data) => {
     console.log('Got:', data);
 });
 
-// Promise-based invoke — awaits a reply from ipcMain.handle()
+// Promise-based invoke -- awaits a reply from ipcMain.handle()
 const user = await window.lotus.invoke('get-user', { id: 42 });
 console.log(user.name);
 ```
@@ -260,7 +276,7 @@ Frameless windows automatically get 8px invisible hit-zones on every edge and co
 | Drag region | Servo/CSS (`cursor: grab`, etc.) |
 | Content area | Servo/CSS (`cursor: pointer`, `cursor: text`, etc.) |
 
-CSS cursors work normally inside the window — `cursor: grab`, `cursor: pointer`, `cursor: text`, `cursor: wait` all function exactly as expected on hover.
+CSS cursors work normally inside the window -- `cursor: grab`, `cursor: pointer`, `cursor: text`, `cursor: wait` all function exactly as expected on hover.
 
 ### Multi-Window
 
