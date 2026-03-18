@@ -649,10 +649,10 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 
 ### window-vibrancy
 
-[window-vibrancy](https://github.com/1jamie/window-vibrancy) is a cross-platform windowing library for Rust that makes Lotus possible. Written in Rust and designed for massive parallelism, it provides modern web rendering capabilities without the overhead of a full Chromium instance.
+[window-vibrancy](https://github.com/tauri-apps/window-vibrancy) is a cross-platform windowing library for Rust that makes Lotus possible. Written in Rust and designed for massive parallelism, it provides modern web rendering capabilities without the overhead of a full Chromium instance.
 
 *   **Official Site:** [window-vibrancy.rs](https://window-vibrancy.rs/)
-*   **GitHub Repository:** [github.com/1jamie/window-vibrancy](https://github.com/1jamie/window-vibrancy)
+*   **GitHub Repository:** [github.com/tauri-apps/window-vibrancy](https://github.com/tauri-apps/window-vibrancy)
 
 
 
