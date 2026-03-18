@@ -1,8 +1,8 @@
 # 🪷 Lotus (lotus-gui)
 
-**Lotus is a high-performance, lightweight desktop GUI framework that pairs the power of Node.js with the speed of the Servo rendering engine.** 
+**Lotus is a high-performance, lightweight desktop GUI framework that pairs the power of Node.js with the speed of the Servo parallel rendering engine.** 
 
-It's designed for developers who want to build cross-platform desktop applications with web technologies (HTML/CSS/JS) and want someting a bit easier to use. By using Servo instead of Chromium and keeping Node.js in the driver's seat for OS integration, Lotus delivers a "blistering fast" experience with a tiny footprint.
+It's designed for developers who want to build cross-platform desktop applications with web technologies (HTML/CSS/JS) and want someting a bit easier to use. By using Servo instead of Chromium and keeping Node.js in the driver's seat for OS integration, Lotus delivers a "blistering fast" experience with a small footprint.
 
 ---
 
@@ -500,11 +500,11 @@ When you're ready to ship your application, Lotus uses a highly optimized Node S
    npx lotus build --target pacman
    
    # Windows Formats
-   npx lotus build --target exe
-   npx lotus build --target msi
+   npx lotus build --target msi --platform win32
+   npx lotus build --target exe --platform win32
    ```
 
-Because Lotus relies on native `.node` bindings, you **must build for the OS you are currently on** (e.g., execute `--target exe` inside a Windows CI/CD runner to get Windows binaries).
+Because Lotus relies on native `.node` bindings, you **must build for the OS you are currently on** (e.g., execute `--target exe --platform win32` inside a Windows CI/CD runner to get Windows binaries).
 
 Your app is now a real installed application with a binary in `/usr/bin/` and everything. Just like a grown-up program.
 
@@ -613,7 +613,7 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 
 ### v0.4.0: The Future (Community Input Welcome)
 *   **Build optimization:** See what we can strip out of the servo build. right now its fully support everything a browser does on the js and html side. so that includes things like VR support and XR support which i would say we probably dont need and probably many other things we can trim out. since its and open source project if someone wants to add them back i want to keep it as simple as a change to the build file to add it back in if they want.
-*   **Debugger:** Servo does support remote debugging through firefox. Though right now it is not exposed, i plan to have it exposed but only triggered by the dev package being used and if you use the encrypted VS for a closed source app it will fully disable it on build for end users in lotus-dev
+*   **Debugger:** Servo does support remote debugging through firefox. Though right now it is not exposed, i plan to have it exposed but only triggered by the dev package being used and if you use the encrypted VFS for a closed source app it will fully disable it on build for end users in lotus-dev
 *   **Open to suggestions:** I'm open to suggestions for the future. If you have an idea, let me know. Right now v0.4.0 is just a rough tenative plan for what I might do in the future.
 
 ---
@@ -622,43 +622,7 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 ## Pieces of the puzzle
 
 ### Servo
-```markdown
-[Servo](https://servo.org/) is the high-performance, memory-safe browser engine that makes Lotus possible. Written in Rust and designed for massive parallelism, it provides modern web rendering capabilities without the overhead of a full Chromium instance.
 
-*   **Official Site:** [servo.org](https://servo.org/)
-*   **GitHub Repository:** [github.com/servo/servo](https://github.com/servo/servo)
-```
-
-### Node.js
-```markdown
-[Node.js](https://nodejs.org/) is a JavaScript runtime built on Chrome's V8 engine, it is the backbone and brain of the operation and has a beauitiful expanse of available libs for anything from notifications to encryption, should be able to handle any and everything servo cant.
-
-*   **Official Site:** [nodejs.org](https://nodejs.org/)
-*   **GitHub Repository:** [github.com/nodejs/node](https://github.com/nodejs/node)
-```
-
-### Winit
-```markdown
-[Winit](https://github.com/rust-windowing/winit) is a cross-platform window creation and event loop library in Rust. It provides Lotus with native OS windows, raw input events, and hardware-accelerated rendering contexts.
-
-*   **Official Site:** [winit.rs](https://winit.rs/)
-*   **GitHub Repository:** [github.com/rust-windowing/winit](https://github.com/rust-windowing/winit)
-```
-
-### CrabNebula Packager
-```markdown
-[CrabNebula Packager](https://github.com/crabnebula-dev/cargo-packager) is a cross-platform executable packager and bundler for Rust. It is used by `lotus-dev` to generate native installers (DEB, RPM, MSI, NSIS, etc.) from the Node SEA binary.
-
-*   **Official Site:** [crabnebula.dev](https://crabnebula.dev/)
-*   **GitHub Repository:** [github.com/crabnebula-dev/cargo-packager](https://github.com/crabnebula-dev/cargo-packager)
-```
-
-### window-vibrancy
-```markdown
-[window-vibrancy](https://github.com/tauri-apps/window-vibrancy) is a library for bringing native window effects like blur, acrylic, mica, and vibrancy to Rust applications. Lotus uses it to achieve native OS transparency on Windows and macOS.
-
-*   **GitHub Repository:** [github.com/tauri-apps/window-vibrancy](https://github.com/tauri-apps/window-vibrancy)
-```
 
 **P.S.**
 
