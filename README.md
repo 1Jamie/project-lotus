@@ -1,38 +1,20 @@
 # 🪷 Lotus (lotus-gui)
 
-## Version 0.3.0 (Current) 
-* **Status:** Beta? I'm not sure what to call it, but it works way better than any alpha ive seen! but hasnt been around long enough to call it stable yet. This is a big release and brings with it support for linux and windows installers for apps built with lotus. This allows you to build apps with lotus and just npx lotus build and it will build the app installer for you for your platform. It is still a bit early so any feedback is appreciated! I plan for this to be a continued project for a while and I'm excited to see what we can do with it.
+**Lotus is a high-performance, lightweight desktop GUI framework that pairs the power of Node.js with the speed of the Servo rendering engine.** 
 
-### Supported-Installers 
-* **Windows:** MSI, EXE
-* **Linux:** RPM, DEB, AppImage, Pacman, Flatpak
-* **Mac:** None (yet! please feel free to contribute!)
+It's designed for developers who want to build cross-platform desktop applications with web technologies (HTML/CSS/JS) and want someting a bit easier to use. By using Servo instead of Chromium and keeping Node.js in the driver's seat for OS integration, Lotus delivers a "blistering fast" experience with a tiny footprint.
 
-### Supported-Runtime-Platforms
-* **Windows:** 10, 11
-* **Linux:** Arch, Debian, Fedora, openSUSE, Ubuntu
-* **Mac:** None (yet! please feel free to contribute!)
+---
 
-In general linux, bsd, and windows are supported. Mac is not supported because I don't have a mac. I dont know enough about bsd or suse to automate building installers for them yet but it should fully run there and if not please feel free to open an issue and i will do my best to resolve it!
-
-
-**🏆 "ELECTRON IS AN 80s FORD BRONCO."**
-*"Huge. Heavy. Built to survive off-roading, river crossings, and the open internet. Every window spins up a full browser like it's about to get lost in the wilderness."*
-
-**🏎️ "LOTUS IS... WELL, A LOTUS ELISE."**
+**🏎️ "LOTUS IS MADE WITH THE IDEOLOGY OF A LOTUS ELISE."**
 *"If a part doesn't make it start faster, use less memory, or render pixels, it's gone. No extra suspension. No spare tires. No browser pretending to be an operating system."*
 
 **🥊 THE ARCHITECTURE (Or: Why It's Fast)**
-*"Most desktop apps are just opening a preferences panel. I didn't think that required a second operating system."*
+• **Lotus Strategy:** 
+  *Node owns the OS. Servo paints the pixels. No magic. No fake sandboxes. No hidden instances listening to how you use each piece of it for telemetry. The Goal here is to just be a renderer and let the devs do everything else directly in node with a blistering fast ipc (tested up to 9k messages per second reliably)*
 
-• **Electron Strategy:** Puts the browser in charge and lets Node ride shotgun.
-  *"It builds a monster truck because it assumes you're off-roading."*
-• **Lotus Strategy:** The opposite.
-  *"Node owns the OS. Servo paints the pixels. No magic. No fake sandboxes. No hidden Chromium instances listening to how you use each piece of chrome for telemetry."*
-
-**🚨 STATUS: ALPHA (BUT IT WORKS)**
-We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core@0.2.0`).
-Mac support is missing (because their ecosystem needs an adult, please be its adult!). BSD and SUSE support is planned (because I know the pain points over there, see Roadmap). Tested support for building fully packaged .rpm installers for Linux but should support .deb and basic windows installers.
+  ![IPC Benchmark](ipc-bench-linux.png)
+  *IPC stress test: 9,000+ messages/second at 0.111ms average latency (Linux)*
 
 **🔧 THE ANALOGY THAT EXPLAINS EVERYTHING:**
 • **Node.js** is the track.
@@ -40,54 +22,81 @@ Mac support is missing (because their ecosystem needs an adult, please be its ad
 • **IPC** is the steering wheel.
   *"On a track, you don't worry about potholes. You worry about lap times."*
 
-**TL;DR:**
-Electron assumes you're lost. Lotus assumes you know where you're going. And that's why it's fast.
+**💡 THE POINT:**
+*"Node.js already does OS integration. We just needed a renderer. That's it. That's the whole project."*
 
 ---
 
-**💡 THE POINT:**
-*"Node.js already does OS integration. We just needed a renderer. That's it. That's the whole project."*
+## 🚀 Quick Start (Usage from NPM)
+
+> **The Easy Way:** working Windows and Linux builds are on npm. You don't need to build from source.
+
+### Option 1: Quick Start (Recommended)
+
+The fastest way to get started is with the CLI:
+
+```bash
+npx lotus init my-app
+cd my-app
+npm install
+npx lotus dev
+```
+
+### Option 2: Manual Setup
+
+If you prefer to set things up yourself:
+
+```bash
+mkdir my-lotus-app && cd my-lotus-app
+npm init -y
+npm install @lotus-gui/core @lotus-gui/dev
+```
+
+> Then see the example code below or check `node_modules/@lotus-gui/core/test_app` for a full reference.
+
+---
 
 ## 🚀 Features (The Good Stuff)
 
 *   **Speed that actually matters:**
-    *   Cold start to interactive window in **<300ms**. You can't even blink that fast.
-    *   A single window stack (Rust + Node + Servo) runs on **~300MB RAM**.
-    *   Adding a second window costs **~80MB**. We share the renderer. We don't spawn a new universe for every pop-up.
+    *   Cold start to interactive window can get below 400ms on linux
+    *   Windows is a litter slower right now as it has to compile ANGLE shaders, i am working on a pr to the servo project to add support for caching this on disk so it doesnt have to compile them every time. should eliminate the slower on windows after first launch
+    *   A single window stack (Rust + Node + Servo), even add windows maintains the reliance on the stack, you dont just spin  up a second renderer or instance, its just a second dom that's it. 
+    *   Adding a second window costs **~80MB**. We share the renderer.
 
 *   **Hybrid Runtime:**
-    *   **Core:** Rust-based Servo engine. It renders HTML/CSS. That's it.
+    *   **Core:** Rust-based Servo engine. It renders HTML/CSS/JS. That's it.
     *   **Controller:** Node.js main thread. It does literally everything else.
 
 *   **Hybrid Mode (File Serving):**
     *   **Custom Protocol:** `lotus-resource://` serves files from disk.
-    *   **Why?** Because spinning up an HTTP server just to show a JPEG is stupid.
-    *   **Security:** Directory jailing. You can't `../../` your way to `/etc/passwd`. Nice try.
+    *   **Why?** I wanted to eliminate the need for a webserver just to serve local files. It's faster and more secure this way though it also allows us to have direct control over the file serving process and protocol for adding encrypted virtual file systems in the future. (coming soon!)
+    *   **Security:** Directory jailing. You can't `../../` your way to `/etc/passwd`. Nice try. This will also be further enhanced with the encrypted file systems in the future as you will be chunk loading on the fly in the loader itself or from ram if we load the whole thing in so reaching outside of that is noticiably harder on accident.
 
 *   **Advanced IPC (The Steering Wheel):**
-    *   **WebSocket IPC Server:** We use `tokio` + `axum` on `127.0.0.1:0` with persistent `WebSocket` connections. It works. It's pretty dam fast and low latency.
-    *   **Auto-Adapting:** JSON? Binary? Blobs? We don't care. We handle it via WebSockets natively.
+    *   **WebSocket IPC Server:** We use `tokio` + `axum` on `127.0.0.1:0` with persistent `WebSocket` connections. It works. It's pretty fast and low latency. Yeah i know its a bit overkill but it works and it was fun to implement, though the main reasons are it also gives us blustering fast ipc, at least on my system in my personal testing i was able to get 10k messages per second reliably at an average latency of 0.111 ms in a string message test.  
+    *   **Auto-Adapting:** JSON? Binary? Blobs? We don't care. We handle it via WebSockets natively using msgpack to massively decrease the serialization/deserialization overhead and increase performance.
     *   **MsgPack Batching (Pipelines):** We pack small messages together and unleash them in bursts to avoid starving the Winit rendering thread.
-    *   **Zero-Copy Routing:** We avoid parsing giant megabytes of JSON simply to route a window event. Copying/allocating data is for people who like waiting.
-    *   **`invoke()` / `handle()` (Promise IPC):** The renderer calls `window.lotus.invoke('ch', data)` and gets back a real `Promise`. Node registers `ipcMain.handle('ch', async fn)`. No manual reply channels, no leaked listeners, no correlation IDs in your app code.
-    *   **File Drag-and-Drop:** OS-level file drag is intercepted from winit and forwarded to both the renderer (`window.lotus.on('file-drop', ...)`) and Node.js (`win.on('file-drop', ...)`). Zero Servo involvement -- pure winit event forwarding.
+    *   **Zero-Copy focused Routing:** It's not fully zero copy as we have to move between stacks but i have tried my best to minimize this as much as possibly and moving it as little as possible. the only time it becomes copy is when it moves stacks but inside themselves they are not. i am looking into ideas of how to see if we can hand them off with a shared memory space between node and servo but.... for now this is a imo beautiful solution that is fast and reliable. 
+    *   **`invoke()` / `handle()` (Promise IPC):** The renderer calls `window.lotus.invoke('ch', data)` and gets back a `Promise`. Node registers `ipcMain.handle('ch', async fn)`. No manual reply channels, no leaked listeners, no correlation IDs in your app code. I wanted this as simple as possible so it is easier to just pickup and use, though with the invoke and handle we still have .send and .on for the more advanced users who want more control over the ipc.
+    *   **File Drag-and-Drop:** OS-level file drag is intercepted from winit and forwarded to both the renderer (`window.lotus.on('file-drop', ...)`) and Node.js (`win.on('file-drop', ...)`). Zero Servo involvement, pure winit event forwarding so we dont have to have it touch pieces it doesnt have to.
 
 *   **Window State Persistence:**
-    *   It remembers where you put the window (if you give it an ID). Groundbreaking technology, I know.
-    *   Handles maximized state, size, position. You're welcome.
+    *   It remembers where you put the window (if you give it an ID). i know its a basic concept but i wanted to make it clear it does this on its own, you dont have to do anything special other than give it an ID.
+    *   Handles maximized state, size, position.
     
 *   **Script Injection:**
-    *   Execute arbitrary JS in the renderer from the main process. God mode unlocked.
+    *   Execute arbitrary JS in the renderer from the main process. God mode unlocked? Basically i know there are a lot of cases where you will want to inject scripts into the renderer from the main process on startup or dynamically or inject things into the window. This is the proper way to do it, if you run into any weird cases let me know. 
 
 *   **Native Look & Feel:**
-    *   **true OS transparency**, and actual working cursors. We don't just emulate a window; we *are* a window.
-    *   **No White Flash:** We paint transparently. Your users won't be blinded by a white box while your 5MB of JS loads.
+    *   **True OS transparency** I have gone through and built out the proper winit 0.30 so we are using the latest and greatest in windowing tech for linux, mac, and windows and is properly using window-vibrancy 0.5 for native os transparncy on windows so you dont have the horrible overhead of trying to use transparnecy that is software and it looks a lot nicer.
+    *   **No White Flash:** We paint transparently. Your users won't be blinded by a white box while your JS loads.
 
 *   **Frameless Windows:**
-    *   Kill the title bar. Remove the frame. Build whatever crap you want.
-    *   **Custom Drag Regions:** Mark any element with `-webkit-app-region: drag` or `data-lotus-drag`. Lotus bridges it to the OS -- no JS required.
-    *   **Custom Resize Borders:** 8px invisible resize handles on every edge and corner. They just work.
-    *   **Cursor-Aware:** Resize cursors show up at the borders. Servo drives all other cursors (grab, pointer, text, etc.) -- no interference.
+    *   Kill the title bar. Remove the frame. Build whatever you imagine.
+    *   **Custom Drag Regions:** Mark any element with `-webkit-app-region: drag` or `data-lotus-drag`. Lotus bridges it to the OS, no JS required.
+    *   **Custom Resize Borders:** 8px invisible resize handles on every edge and corner. They just work, i might add a parameter so you can adjust it if people find this is not how they like or want it differently. though if you are using the frame and decorations then this is handled by the os so i cant do much there.
+    *   **Cursor-Aware:** Resize cursors show up at the borders. Servo drives all other cursors (grab, pointer, text, etc.) no interference. it properly communicates with the os it is running on to properly trigger and show the right cursor for the right action.
 
 *   **Multi-Window Support:**
     *   Spawn multiple independent windows from a single Node process.
@@ -122,59 +131,20 @@ lotus/
 | [lotus-core](./packages/lotus-core/) | `@lotus-gui/core` | The runtime -- Servo engine, window management, IPC. This is what your app `require()`s. |
 | [lotus-dev](./packages/lotus-dev/) | `@lotus-gui/dev` | CLI toolkit -- dev server with hot-reload, build system, DEB/RPM installer packaging. |
 
-## 🛠️ Prerequisites
-
-If you want to run this, you need to be on an OS that respects you. (to be fair the plan is to support all platforms, so this is more of a joke to clarify)
-
-### Linux (Debian/Ubuntu/Fedora)
-This is where development happens. It works here. Fully working `.node` file for Linux is in the artifacts tab.
-
-*   **Node.js:** v22+. Don't come at me with v14, we legit require it, we are using N-API 4.
-*   **System Libraries:** You need these or things will scream at you.
-
-    **Ubuntu/Debian:**
-    ```bash
-    sudo apt-get update
-    sudo apt-get install libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev
-
-    # Required for building .deb installers with `lotus build`
-    sudo apt-get install dpkg-dev fakeroot
-    ```
-
-    **Fedora:**
-    ```bash
-    sudo dnf install mesa-libGL-devel openssl-devel python3 fontconfig-devel
-
-    # Required for building .rpm installers with `lotus build`
-    sudo dnf install rpm-build
-    ```
-
-> **Note:** We auto-fix the `GLIBC_TUNABLES` static TLS issue. If you see `ERR_DLOPEN_FAILED` and the app restarts itself, that's just Lotus fixing your environment for you. Don't panic.
-
-### Windows
-*   **Status:** Alpha ("It Works!")
-*   **NPM:** ✅ Verified - `@lotus-gui/core` includes the pre-built Windows binary.
-*   **Build Requirements (only if building from source):** Visual Studio Build Tools + `choco install llvm nasm python311`.
-
-
-### macOS
-*   **Status:** HELP WANTED 🆘
-*   I removed CI support because I honestly just don't know enough about the Mac app lifecycle to do it right. If you are a Mac developer and want to fix this, PRs are welcome. I just don't have a system to test on. "Here be dragons still." 🐉 (Translation: Please save me from Xcode.)
-
 ---
- 
- ## 🛠 Platform Support Matrix
- 
- | Platform | Arch | Native Binary (`.node`) | Installer Target | Status |
- | :--- | :--- | :--- | :--- | :--- |
- | **Linux (Debian/Ubuntu)** | x64 | ✅ Verified | `.deb` (Stable) | Ready |
- | **Linux (Fedora/RHEL)** | x64 | ✅ Verified | `.rpm` (Stable) | Ready |
- | **Linux (openSUSE)** | x64 | 🛠 Testing | Planned | Alpha |
- | **Windows** | x64 | ✅ Verified | `.msi` (testing) | Beta *1 |
- | **FreeBSD** | x64 | 🛠 Testing | Planned | Alpha |
- | **macOS** | arm64 | 🆘 Help Wanted | TBD | On Hold |
 
- *1 **Windows Beta Status:**
+## 🛠 Platform Support Matrix
+
+| Platform | Arch | Native Binary (`.node`) | Installer Target | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **Linux (Debian/Ubuntu)** | x64 | ✅ Verified | `.deb` (Stable) | Ready |
+| **Linux (Fedora/RHEL)** | x64 | ✅ Verified | `.rpm` (Stable) | Ready |
+| **Linux (openSUSE)** | x64 | 🛠 Testing | Planned | Alpha |
+| **Windows** | x64 | ✅ Verified | `.msi` (testing) | Beta *1 |
+| **FreeBSD** | x64 | 🛠 Testing | Planned | Alpha |
+| **macOS** | arm64 | 🆘 Help Wanted | TBD | On Hold |
+
+*1 **Windows Status:**
 
   - **What Works:**
     - ✅ **Native Binary:** Pre-built `.node` available on npm
@@ -187,48 +157,35 @@ This is where development happens. It works here. Fully working `.node` file for
   - **Known Issues:**
     - ⚠️ **Installer Signing:** Not yet implemented (requires EV cert)
     - ⚠️ **NSIS Fallback:** `lotus build --target nsis` still uses old logic
-    - ⚠️ **Drag-and-Drop:** Not yet tested on Windows
 
 > **Note:**
 > *   **Installer Target:** The packaged distribution format (what users download/install)
 > *   **Native Binary:** The `.node` file that powers the runtime (what developers `require()`)
- 
- ### **Verification Progress Tracking**
- For a detailed breakdown of build success, environmental linking, and functional testing per platform, see the master tracking issue: **🚀 Multi-Platform Support & Build Targets**.
- 
- * **Build Success:** CI/CD produces artifacts without warnings.
- * **Functionality:** Core features operational on clean installs.
- * **Environment:** Proper linking of native dependencies.
- 
- ---
 
-## 🚀 Quick Start (Usage from NPM)
+---
 
-> **The Easy Way:** working Windows and Linux builds are on npm. You don't need to build from source.
+## � STATUS: ALPHA almost BETA (BUT IT WORKS WELL!)
+We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core@0.3.0`).
+Mac support is missing (because their ecosystem needs someone who nows it, please feel free to help!). BSD and SUSE support is planned (because I know the pain points over there, see Roadmap). Right now there are builds for BSD and SUSE so you can use it though it does not have an installer builder for them yet. I plan to add that in future releases.
 
-### Option 1: Quick Start (Recommended)
+## ## Version 0.3.0 (Current) 
+* **Status:** Beta? I'm not sure what to call it, but it works way better than any alpha ive seen! but hasnt been around long enough to call it stable yet. This is a big release and brings with it support for linux and windows installers for apps built with lotus. This allows you to build apps with lotus and just npx lotus build and it will build the app installer for you for your platform. It is still a bit early so any feedback is appreciated! I plan to be a continued project for a while and I'm excited to see what we can do with it.
 
-The fastest way to get started is with the CLI:
+### Supported-Installers 
+* **Windows:** MSI, EXE
+* **Linux:** RPM, DEB, AppImage, Pacman, Flatpak
+* **Mac:** None (yet! please feel free to contribute!)
 
-```bash
-npx lotus init my-app
-cd my-app
-npm install
-npx lotus dev
-```
+### Supported-Runtime-Platforms
+* **Windows:** 10, 11
+* **Linux:** Arch, Debian, Fedora, openSUSE, Ubuntu
+* **Mac:** None (yet! please feel free to contribute!)
 
-### Option 2: Manual Setup
+In general linux, bsd, and windows are supported. Mac is not supported because I don't have a mac. I dont know enough about bsd or suse to automate building installers for them yet but it should fully run there and if not please feel free to open an issue and i will do my best to resolve it!
 
-If you prefer to set things up yourself:
+---
 
-```bash
-mkdir my-lotus-app && cd my-lotus-app
-npm init -y
-npm install @lotus-gui/core @lotus-gui/dev
-```
-
-> Then see the example code below or check `node_modules/@lotus-gui/core/test_app` for a full reference.
-
+## 🎯 Usage (Code Snippets)
 
 ### Step 1: Create `lotus.config.json`
 
@@ -364,10 +321,9 @@ lotus clean
 
 See the full [@lotus-gui/dev documentation](./packages/lotus-dev/README.md) for details on build output, flags, and project setup.
 
-## 🎯 Usage (Code Snippets)
+## 🎯 Advanced Usage (Code Snippets)
 
 ### Hybrid Mode: Serving Files
-Stop using Express to serve static files. It's embarrassing.
 
 ```javascript
 const { ServoWindow, app } = require('@lotus-gui/core');
@@ -386,7 +342,7 @@ const win = new ServoWindow({
 ```
 
 ### IPC: Talking to the Machine
-The renderer is a webpage. The main process is Node. They talk.
+The renderer is a webpage. The main process is Node. They talk and do it pretty well!
 
 **Renderer (The Webpage):**
 ```javascript
@@ -448,10 +404,10 @@ body {
 ```
 
 **The "White Flash" Killer:**
-Because the default backbone is transparent, there is **zero white flash** on startup. If your app takes 10ms to load, the user sees their wallpaper for 10ms, not a blinding white rectangle. You're welcome.
+Because the default backbone is transparent, there is **zero white flash** on startup. If your app takes 10ms to load, the user sees their wallpaper for 10ms, not a blinding white rectangle. Helps get rid of the cliche white square a lot of web based gui have when they are loading
 
 ### Frameless Windows: "Build Your Own Window"
-Tired of the OS telling you what your title bar looks like? Remove it.
+Tired of the how the title bar, frame and decorations look? Feel free to make your own! Its pretty easy to do and i even made sure to give you the tools to do it!
 
 ```javascript
 const win = new ServoWindow({
@@ -505,7 +461,7 @@ win.on('file-drop', ({ path }) => console.log('Dropped:', path));
 ```
 
 ### Multi-Window Support
-Creating specific windows? Easy. They share the same renderer instance, so it costs ~80MB per extra window instead of ~300MB.
+Creating specific windows? Easy. They share the same renderer instance, so it costs ~80MB per extra window instead of a whole second rendere top to bottom.
 
 ```javascript
 const win1 = new ServoWindow({ title: "Window 1" });
@@ -516,7 +472,7 @@ const win3 = new ServoWindow({ title: "Window 3" });
 ```
 
 ### Window State Persistence: "Total Recall"
-By default, windows have the memory span of a goldfish. They forget where they were. If you want them to remember, give them a name.
+By default, windows have the memory span of a goldfish. They forget where they were. If you want them to remember, give them a name. If you want the states to be remembered give a name, other wise do not give it an id and it will always open in the way the code specifies if that is the prefered operation you desire.
 
 ```javascript
 const win = new ServoWindow({
@@ -527,9 +483,9 @@ const win = new ServoWindow({
 ```
 
 **The Logic:**
-*   **No ID?** We generate a random UUID. New session, new window, default size.
+*   **No ID?** We generate a random UUID. New session, new window, default size or size set in the window constructor.
 *   **With ID?** We check `~/.config/app-name/window-state.json`. If we've seen "main-window" before, we put it back exactly where you left it.
-*   It snaps back to the last known position faster than you can say "Electron is bloat."
+*   It snaps back to the last known position immediately.
 
 ### Building Distributable Packages
 When you're ready to ship your application, Lotus uses a highly optimized Node Single Executable Application (SEA) generation pipeline tied directly into [CrabNebula](https://crabnebula.dev) to spit out installer payloads for every OS.
@@ -558,6 +514,45 @@ Your app is now a real installed application with a binary in `/usr/bin/` and ev
 
 > **Pro Tip:** You don't actually have to build this yourself. Check the **Actions** tab on GitHub. Every commit produces working artifacts for Linux and Windows. Download, unzip, use the time saved to beat that level you've been procrastinating on. (expect npm install support without having to build yourself soon -- you can just grab the `.node` files from the artifacts tab)
 
+
+## 🛠️ Prerequisites
+
+If you want to run this from source it should build on linux, windows, BSD and SUSE though the processes are not fully verified, i dont know those systems well and i mainly work on linux and use the github actions to do the builds for the other platforms and just grab the artifacts to test on those.... so if you do build anywhere else please let me know how it goes and feel free to send a pr to update the docs to add that build process :D
+
+### Linux (Debian/Ubuntu/Fedora)
+This is where development happens. I do all the dev work from here so i sadly only have build instructions for linux, though i have tested the builds on windows and BSD and SUSE and they work fine, i just have my own preferences for linux... and im honestly horrible at dev on windows... though everything is tested over there, this is just for dev of lotus purposes.
+
+*   **Node.js:** v22+. Don't come at me with v14, we legit require it, we are using N-API 4 so anything lower WILL BREAK.
+*   **System Libraries:** You need these or things will scream at you.
+
+    **Ubuntu/Debian:**
+    ```bash
+    sudo apt-get update
+    sudo apt-get install libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev
+
+    # Required for building .deb installers with `lotus build`
+    sudo apt-get install dpkg-dev fakeroot
+    ```
+
+    **Fedora:**
+    ```bash
+    sudo dnf install mesa-libGL-devel openssl-devel python3 fontconfig-devel
+
+    # Required for building .rpm installers with `lotus build`
+    sudo dnf install rpm-build
+    ```
+
+    basically you just need to make sure you have libgl1-mesa-dev, libssl-dev, python3, libfontconfig1-dev, dpkg-dev, fakeroot, rpm-build installed and you should be good to go (though obviously dpkg for debian, rpm for fedora, etc.)
+> **Note:** We auto-fix the `GLIBC_TUNABLES` static TLS issue. If you see `ERR_DLOPEN_FAILED` and the app restarts itself, that's just Lotus fixing your environment for you. Don't panic. i hope to some day not require this work around but for now it is what it is. not much i can do about it. 
+
+### Windows
+*   **Status:** ✅ Verified
+*   **NPM:** ✅ Verified - `@lotus-gui/core` includes the pre-built Windows binary.
+*   **Build Requirements** reference the github actions for the windows build as it will be a lot better than me trying to explain it, i wont lie, i def asked gemini for help with getting that build script working as im horrible at windows.
+
+
+## cloning and building
+
 ```bash
 git clone https://github.com/1jamie/project-lotus.git
 cd project-lotus
@@ -569,10 +564,10 @@ npm install
 ```bash
 cd packages/lotus-core
 
-# Debug Build (Faster compilation, still slow)
+# Debug Build (Faster compilation, still slowish on first compile but smalle changes are incremental builds so you only rebuild what was changed and no long trimming of the binary or anything)
 npm run build:debug
 
-# Release Build (Optimized, takes eons)
+# Release Build (Optimized, takes eons but is much smaller and more optimized)
 npm run build
 ```
 
@@ -613,35 +608,69 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 ---
 ## 🗺️ Roadmap
 
-### v0.2.0: The Shell & Frame (RELEASED)
-* ✅ **Frameless Mode:** Toggle window decorations off.
-* ✅ **CSS Dragging:** Bridge for custom CSS drag areas (`-webkit-app-region: drag`, `data-lotus-drag`).
-* ✅ **Resize Borders:** Custom 8px resize hit-zones on all edges/corners.
-* ✅ **Dev CLI:** `lotus init` command added to create a new Lotus project.
-
-> **Note:** Surprise! I changed my mind and gave you frameless support lol. I was just gonna say deal with it and give you native menu support but then i realized the headache.... so here we are! surprise! Now you can do wtf you want with window decorations! 
-
-### v0.3.0: The Support Expansion
-*   **Windows Support:** Full MSI/EXE distribution (moving beyond just the `.node` binary).
-*   **BSD Support:** Bringing the renderer to the BSD community.
-*   **SUSE Support:** Expanding `@lotus-gui/dev` to handle OpenSUSE RPM quirks.
-*   **Mac Support?** (If someone donates a Mac or a contributor steps up).
-*   **Verify/support build for all supported platforms.**: Go through the build process for all supported platforms and verify that it works and fix where it does not.
+### v0.3.5: Encrypted VFS
+*   **Encrypted VFS:** Add a encrypted VFS to the core that will allow for encrypted file storage and retrieval. I plan to build it into the build process as a derived key that is then fed into servo when it loads that it will then pull the vfs from storage and decrypt it into memory. This will allow for encrypted file storage and retrieval. since we have full control over the custom file protocol we can make it just flipping a flag for the developers.
 
 ### v0.4.0: The Future (Community Input Welcome)
-*   **Build optimization:** See what we can do about the electron builder as it does add deps we may not need and may be able to make it install less deps during the install processes.
-*   **Debugger:** Add a debugger to the dev CLI to give access to a dev console for helping with development. Will probably have a seperate package called lotus-core-debug that the dev CLI will use to start the app with a build of lotus with the debug symbols and a developers console in its own window to help with debugging and gui development.
+*   **Build optimization:** See what we can strip out of the servo build. right now its fully support everything a browser does on the js and html side. so that includes things like VR support and XR support which i would say we probably dont need and probably many other things we can trim out. since its and open source project if someone wants to add them back i want to keep it as simple as a change to the build file to add it back in if they want.
+*   **Debugger:** Servo does support remote debugging through firefox. Though right now it is not exposed, i plan to have it exposed but only triggered by the dev package being used and if you use the encrypted VS for a closed source app it will fully disable it on build for end users in lotus-dev
 *   **Open to suggestions:** I'm open to suggestions for the future. If you have an idea, let me know. Right now v0.4.0 is just a rough tenative plan for what I might do in the future.
 
 ---
 **License:** MIT. Do whatever you want, just don't blame me if your computer achieves sentience and takes flight.
 
+## Pieces of the puzzle
 
+### Servo
+```markdown
+[Servo](https://servo.org/) is the high-performance, memory-safe browser engine that makes Lotus possible. Written in Rust and designed for massive parallelism, it provides modern web rendering capabilities without the overhead of a full Chromium instance.
+
+*   **Official Site:** [servo.org](https://servo.org/)
+*   **GitHub Repository:** [github.com/servo/servo](https://github.com/servo/servo)
+```
+
+### Node.js
+```markdown
+[Node.js](https://nodejs.org/) is a JavaScript runtime built on Chrome's V8 engine, it is the backbone and brain of the operation and has a beauitiful expanse of available libs for anything from notifications to encryption, should be able to handle any and everything servo cant.
+
+*   **Official Site:** [nodejs.org](https://nodejs.org/)
+*   **GitHub Repository:** [github.com/nodejs/node](https://github.com/nodejs/node)
+```
+
+### Winit
+```markdown
+[Winit](https://github.com/rust-windowing/winit) is a cross-platform window creation and event loop library in Rust. It provides Lotus with native OS windows, raw input events, and hardware-accelerated rendering contexts.
+
+*   **Official Site:** [winit.rs](https://winit.rs/)
+*   **GitHub Repository:** [github.com/rust-windowing/winit](https://github.com/rust-windowing/winit)
+```
+
+### CrabNebula Packager
+```markdown
+[CrabNebula Packager](https://github.com/crabnebula-dev/cargo-packager) is a cross-platform executable packager and bundler for Rust. It is used by `lotus-dev` to generate native installers (DEB, RPM, MSI, NSIS, etc.) from the Node SEA binary.
+
+*   **Official Site:** [crabnebula.dev](https://crabnebula.dev/)
+*   **GitHub Repository:** [github.com/crabnebula-dev/cargo-packager](https://github.com/crabnebula-dev/cargo-packager)
+```
+
+### window-vibrancy
+```markdown
+[window-vibrancy](https://github.com/tauri-apps/window-vibrancy) is a library for bringing native window effects like blur, acrylic, mica, and vibrancy to Rust applications. Lotus uses it to achieve native OS transparency on Windows and macOS.
+
+*   **GitHub Repository:** [github.com/tauri-apps/window-vibrancy](https://github.com/tauri-apps/window-vibrancy)
+```
 
 **P.S.**
 
-The entire framework core is ~2,500 lines of code.
+The entire framework core is ~2,500 lines of code. (just the renderer piece to clarify)
 
 If that feels suspiciously light, it's because it is. I didn't try to build an OS inside your OS; I just gave Node a window and cut the fat until there was nothing left but speed.
 
 Electron carries the weight of the world. Lotus just carries the pixels.
+
+Though i want to clarify, this is not an "electron killer" or "electron replacement" or anything like that. This is simply a renderer designed to keep node in the front seat and just push the pixels for you. it doesnt have all the bells and whistles of electron, it doesnt have the same level of support, and it doesnt have the same level of maturity. But it is a good starting point for a lightweight GUI framework for nodejs and i plan to keep making it slimmer and faster over time and even more reliable. its not a good replacement for electron, its just a different approach to the same problem for specific use cases like local apps or apps you have full control over the content or you need blistering fast ipc with extremely low latency and throughput.
+
+
+**AI DISCLAIMER**
+
+I have used ai in the project for templating, troubleshooting, diving through source code to find the reference i needed to read and learn how worked, and documentation originally while i was rapidly itteratting and have since rewrote the documentation myself now the api is more stable. I have tried my best and spent countless hours and days to ensure that the code is correct and that the documentation is accurate, its not a huge code base so i have touched and worked with every line of code in this repo. I will tell you that this is not some BS "vibe coded" system or project. I have worked in IT, Programming and Engineering for going on 11 years. I spent the last 7 years as a Linux enterprise dev/ Linux systems engineer. I have spent a lot of time designing, testing working and griding my hard hours on this project and ensuring this is not some garbage that a unexpirenced person whipped together without actually knowing and understand the way computers work and how to practice proper programing hygene, testing and safe software lifecyle practices. I know what is where, why what works what way, i decided how each and every piece works, written a large amount of it, i have tested different setups and dependancies like the ipc system. I spent a lot of time researching takio, readind the docs figuring out exactly how to use it with my use case and axum so i can web socket the world of my ipc. I dumped so many hours into learning winit 0.30 (which btw, it is a pain to use by its features and layout are amazing, i do recomend the time to learn the new conventions of 0.30), i have poured over so much of the servo repo trying to get the best pieces integrated as nicely as possible and spent so much time fighting with the windows rendering pipeline. i do understand that there is a lot of worries around it and people vibe coding stuff but this is not "vibe coded", this is hundreads of my hours, nights and nights of deep coffee pots and genuine passion for this project. It was involved in this project but it is not running, planning, testing, integrating, designing or any of that, it was just a tool used to speed up piece here and there. There are way too many moving parts here and i have spent way too much time on this to have it reduced down to that.

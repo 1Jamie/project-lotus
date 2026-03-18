@@ -1,22 +1,21 @@
 # @lotus-gui/core
 
-The runtime engine for Lotus applications. Provides the Servo rendering engine, window management, and IPC system as a Node.js native addon.
+**The high-performance, low-latency runtime engine at the heart of the Lotus ecosystem.**
 
-## 🪷 Lotus Core (@lotus-gui/core)
-The high-performance, low-latency engine at the heart of the Lotus ecosystem.
+`@lotus-gui/core` provides the Servo rendering engine, window management, and IPC system as a Node.js native addon. It is designed to be the "steering wheel" for your application, allowing Node.js to own the OS logic while Servo paints the pixels.
 
-### 🚀 What’s New in v0.3.0 (Windows & Linux Hardening)
-This release focuses on distribution-grade stability. We’ve moved beyond the prototype phase and into a "hardened" runtime that handles the "dirty work" of desktop development automatically. I think this is the first release that I would feel comfortable shipping to users for some apps.
+---
 
-⚡ Sub-Millisecond IPC: Our new tokio + axum WebSocket bridge now achieves a deterministic ~0.11ms latency. We’ve added opportunistic 500μs flushing and MsgPack batching to ensure your UI thread never starves, even under extreme telemetry loads. Replacing the old tiny_http was a bit of a dance but it seems to be well worth it for the performance gains.
+## 🚀 What’s New in v0.3.0 (Stability & Performance)
 
-🛡️ Reload-Safe Queuing: Introducing WS_PENDING. If your window reloads, Rust automatically buffers outgoing IPC messages and drains them the moment the new JS context connects. No more lost "init" data.
+This release brings distribution-grade stability and significant performance improvements to the Lotus runtime.
 
-👻 Native Stealth Mode: On Windows, we now hard-patch the PE Subsystem header. Your app launches as a true GUI process—no black Node.js console window, ever.
+*   **⚡ Fast IPC:** The new `tokio` + `axum` WebSocket bridge can achieve as low as 0.111 ms latency in my testing on linux with 9000 messages a second. Includes opportunistic 500μs flushing and MsgPack batching to ensure the UI thread remains responsive even under heavy loads.
+*   **🛡️ Reload-Safe Queuing:** If a window reloads, outgoing IPC messages are automatically buffered and drained the moment the new JS context connects, preventing data loss during transitions.
+*   **👻 Native GUI Mode:** On Windows, the PE Subsystem header is now correctly patched so the app launches as a true GUI process without a console window.
+*   **🎨 Ghost-Mode Transparency:** True OS-level transparency with zero white-flash on startup. If your CSS is transparent, your window is transparent.
 
-🎨 Ghost-Mode Transparency: Zero-white-flash startup with true OS-level transparency. If your CSS is transparent, your window is transparent.
-
-"Node.js runs the logic. Servo paints the pixels. Lotus Core makes them talk at the speed of light."
+---
 
 ## Installation
 
@@ -24,7 +23,9 @@ This release focuses on distribution-grade stability. We’ve moved beyond the p
 npm install @lotus-gui/core
 ```
 
-> **Note:** Pre-built binaries are available for **Linux (x86_64)** and **Windows (x64)**. You likely do not need to build from source. Seriously, save your CPU cycles. I bled so you don't have to.
+> **Note:** Pre-built binaries are available for **Linux (x86_64)** and **Windows (x64)**. Manual compilation is typically not required.
+
+---
 
 ## API Reference
 
@@ -40,8 +41,8 @@ The application lifecycle controller.
 
 | Method | Description |
 |--------|-------------|
-| `app.warmup()` | Pre-initialize the Servo engine. Call before creating windows for faster startup. Like revving the engine at a red light. |
-| `app.quit()` | Shut down the application. Terminate with extreme prejudice. |
+| `app.warmup()` | Pre-initialize the Servo engine. Call before creating windows for faster startup. |
+| `app.quit()` | Shut down the application and close all windows. |
 
 ```javascript
 app.warmup(); // Pre-warm the engine
@@ -59,56 +60,56 @@ const win = new ServoWindow(options);
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `id` | `string` | Random UUID | Window identifier. **Required for state persistence** (unless you want goldfish memory). |
-| `root` | `string` | `undefined` | Absolute path to UI directory. Enables Hybrid Mode (`lotus-resource://`). Keeps your files properly jailed. |
-| `index` | `string` | `'index.html'` | Entry HTML file (relative to `root`). |
+| `id` | `string` | Random UUID | Unique identifier for the window. **Required for state persistence.** |
+| `root` | `string` | `undefined` | Absolute path to the UI directory. Enables Hybrid Mode (`lotus-resource://`). |
+| `index` | `string` | `'index.html'` | Entry HTML file relative to `root`. |
 | `initialUrl` | `string` | -- | URL to load (alternative to `root` + `index`). |
-| `width` | `number` | `1024` | Window width in pixels. |
-| `height` | `number` | `768` | Window height in pixels. |
+| `width` | `number` | `1024` | Initial window width in pixels. |
+| `height` | `number` | `768` | Initial window height in pixels. |
 | `title` | `string` | `'Lotus'` | Window title. |
-| `transparent` | `boolean` | `false` | Enable OS-level window transparency. Make your app look like a ghost. |
-| `visible` | `boolean` | `true` | Show window immediately. Set `false` to show after `frame-ready` to avoid the dreaded white flash of death. |
-| `frameless` | `boolean` | `false` | Remove the native window frame. Enables custom drag regions. The OS doesn't own your title bar anymore. |
-| `resizable` | `boolean` | `true` | Allow window resizing. |
-| `maximized` | `boolean` | `false` | Start maximized. Assert dominance immediately. |
-| `fullscreen` | `boolean` | `false` | Start in fullscreen. |
-| `alwaysOnTop` | `boolean` | `false` | Keep window above others. Because you're the main character. |
-| `restoreState` | `boolean` | `true` | Restore previous position/size (requires `id`). |
+| `transparent` | `boolean` | `false` | Enable OS-level window transparency. |
+| `visible` | `boolean` | `true` | Show window immediately. Set to `false` and show after `frame-ready` to avoid a white flash during loading. |
+| `frameless` | `boolean` | `false` | Remove the native window frame to enable custom title bars and drag regions. |
+| `resizable` | `boolean` | `true` | Allow the user to resize the window. |
+| `maximized` | `boolean` | `false` | Start the window in a maximized state. |
+| `fullscreen` | `boolean` | `false` | Start the window in fullscreen mode. |
+| `alwaysOnTop` | `boolean` | `false` | Keep the window above all other windows. |
+| `restoreState` | `boolean` | `true` | Automatically restore previous position and size (requires `id`). |
 
 #### Methods
 
 | Method | Description |
 |--------|-----------|
-| `win.loadUrl(url)` | Navigate to a URL. |
-| `win.executeScript(js)` | Execute JavaScript in the renderer context. |
-| `win.sendToRenderer(channel, data)` | Send data to the renderer on a named channel. |
+| `win.loadUrl(url)` | Navigate the window to a new URL. |
+| `win.executeScript(js)` | Execute arbitrary JavaScript in the renderer context. |
+| `win.sendToRenderer(channel, data)` | Send a message to the renderer on a named channel. |
 | `win.setTitle(title)` | Update the window title. |
 | `win.setDecorations(bool)` | Toggle native window decorations at runtime. |
-| `win.setSize(width, height)` | Resize the window. |
-| `win.setMinSize(width, height)` | Set the minimum size the user can resize to. Pass `0, 0` to remove the constraint. |
-| `win.setMaxSize(width, height)` | Set the maximum size the user can resize to. Pass `0, 0` to remove the constraint. |
-| `win.setPosition(x, y)` | Move the window. |
-| `win.minimize()` | Minimize the window to the taskbar/dock. |
+| `win.setSize(width, height)` | Resize the window programmatically. |
+| `win.setMinSize(width, height)` | Set a minimum window size. Pass `0, 0` to remove constraints. |
+| `win.setMaxSize(width, height)` | Set a maximum window size. Pass `0, 0` to remove constraints. |
+| `win.setPosition(x, y)` | Move the window to specific screen coordinates. |
+| `win.minimize()` | Minimize the window. |
 | `win.unminimize()` | Restore the window from a minimized state. |
-| `win.maximize()` | Maximize the window to fill the screen. |
+| `win.maximize()` | Maximize the window. |
 | `win.unmaximize()` | Restore the window from a maximized state. |
-| `win.focus()` | Bring the window to the front and request focus. |
-| `win.show()` | Show the window. |
+| `win.focus()` | Bring the window to the front and request input focus. |
+| `win.show()` | Make the window visible. |
 | `win.hide()` | Hide the window. |
-| `win.close()` | Close and destroy the window. |
+| `win.close()` | Close and destroy the window instance. |
 
 #### Events
 
 | Event | Callback | Description |
 |-------|----------|-------------|
-| `'ready'` | `()` | Window has been created and is operational. Ready for orders. |
-| `'frame-ready'` | `()` | First frame has been rendered. Best time to call `show()` unless you actually enjoy blinding your users. |
-| `'load-status'` | `(status: string)` | Page load status changed (`'loading'`, `'complete'`, etc.). |
-| `'moved'` | `({ x: number, y: number })` | Window position changed on the screen. |
-| `'resize'` | `({ width: number, height: number })` | Window size changed. |
+| `'ready'` | `()` | Window has been successfully created and is ready for use. |
+| `'frame-ready'` | `()` | The first frame has been rendered. Recommended time to call `show()`. |
+| `'load-status'` | `(status: string)` | Page load status changed (`'loading'`, `'complete'`). |
+| `'moved'` | `({ x: number, y: number })` | Window position has changed. |
+| `'resize'` | `({ width: number, height: number })` | Window size has changed. |
 | `'focus'` | `()` | Window gained focus. |
 | `'blur'` | `()` | Window lost focus. |
-| `'closed'` | `()` | Window was closed. |
+| `'closed'` | `()` | Window was closed and destroyed. |
 | `'file-hover'` | `({ path: string })` | A file is being dragged over the window. Fires once per file. |
 | `'file-hover-cancelled'` | `()` | A drag operation left the window without dropping. |
 | `'file-drop'` | `({ path: string })` | A file was dropped onto the window. Fires once per file -- accumulate multiple events if you need multi-file support. |
@@ -125,9 +126,11 @@ const win = new ServoWindow({
 win.once('frame-ready', () => win.show());
 ```
 
+---
+
 ### `ipcMain`
 
-Handles communication between the main process (Node.js) and renderer (webpage). Extends `EventEmitter`.
+Handles communication between the Node.js main process and the Servo renderer.
 
 #### Main Process
 
@@ -135,37 +138,36 @@ Handles communication between the main process (Node.js) and renderer (webpage).
 const { ipcMain } = require('@lotus-gui/core');
 
 // Listen for messages from the renderer (fire-and-forget)
-ipcMain.on('channel-name', (data) => {
-    console.log('Got:', data);
+ipcMain.on('my-channel', (data) => {
+    console.log('Received:', data);
 });
 
-// Send to all windows
-ipcMain.send('response-channel', { status: 'ok' });
+// Push data to all open windows
+ipcMain.send('status-update', { online: true });
 
-// Request/reply handler -- works with window.lotus.invoke() in the renderer
-ipcMain.handle('get-user', async ({ id }) => {
-    const user = await db.findUser(id); // may return a Promise
-    return user;                         // auto-sent back to the renderer
+// Handle requests from the renderer (request/reply)
+ipcMain.handle('get-data', async ({ id }) => {
+    return await database.fetch(id); 
 });
 ```
 
 #### Renderer (Webpage)
 
-The `window.lotus` bridge is automatically injected into every page.
+The `window.lotus` bridge is automatically available in every page.
 
 ```javascript
-// Fire-and-forget: send a message to Node.js
-window.lotus.send('channel-name', { key: 'value' });
+// Send a message to the main process
+window.lotus.send('my-channel', { message: 'Hello!' });
 
-// Binary data
-window.lotus.send('binary-channel', new Blob(['binary data']));
+// Send binary data
+window.lotus.send('upload', new Blob(['data']));
 
-// Listen for messages pushed from Node.js
-window.lotus.on('response-channel', (data) => {
-    console.log('Got:', data);
+// Listen for messages from the main process
+window.lotus.on('status-update', (data) => {
+    console.log('Server status:', data.online);
 });
 
-// Promise-based invoke -- awaits a reply from ipcMain.handle()
+// Invoke a remote method and await the result
 const user = await window.lotus.invoke('get-user', { id: 42 });
 console.log(user.name);
 ```
@@ -180,11 +182,17 @@ console.log(user.name);
 
 > **Note:** `handle` and `on` can coexist on the same channel. `handle` only fires when the message includes a `_replyId` (i.e., sent via `invoke`). Plain `send` calls still reach `on` listeners.
 
-## Concepts
+---
+
+## Core Concepts
 
 ### Hybrid Mode (`lotus-resource://`)
 
-Instead of spinning up a whole HTTP server just to serve your UI files (which, let's be honest, is embarrassing), Lotus serves them directly from disk via the `lotus-resource://` custom protocol.
+Lotus serves your UI files directly from disk via a custom protocol, eliminating the need for a local web server.
+
+*   **Performance:** Zero network overhead for local file serving.
+*   **Security:** Enforces strict directory jailing; files outside the specified `root` cannot be accessed.
+*   **Reliability:** Avoids port collisions and local firewall issues.
 
 ```javascript
 const win = new ServoWindow({
@@ -194,56 +202,28 @@ const win = new ServoWindow({
 // Internally loads: lotus-resource://localhost/index.html
 ```
 
-**Benefits:**
-- No HTTP server overhead. Because you're serving static files, not running a datacenter.
-- No port collisions. Because `EADDRINUSE` on port 8080 is cursed.
-- Directory jailing. You can't escape the root path. Try `../../`, I dare you.
+### Transparency & "White Flash" Elimination
 
-### Transparency (No White Flash)
+By default, the window remains transparent until the content finishes loading and tells the engine to show the window.
 
 ```javascript
 const win = new ServoWindow({
     transparent: true,
     visible: false
 });
-
 win.once('frame-ready', () => win.show());
 ```
 
-The window background is fully transparent until your CSS paints it. Combined with `visible: false`, this entirely eliminates the white flash that plagues web gui based apps. You're welcome.
+The window background is fully transparent until your CSS paints it. Combined with `visible: false`, this entirely eliminates the white flash that often plagues web-based GUI apps.
 
 ```css
 body { background: transparent; }
 .app { background: rgba(0, 0, 0, 0.9); }
 ```
 
-### Window State Persistence
+### Frameless Windows & Drag Regions
 
-Windows with an `id` automatically save their position, size, and maximized state to `~/.config/<app-name>/window-state.json`. By default, windows are amnesiac. Give them an `id` so they remember where they parked.
-
-```javascript
-const win = new ServoWindow({
-    id: 'main-window',    // Required for state saving
-    restoreState: true     // Default
-});
-```
-
-### Frameless Windows
-
-Remove native window decorations and implement your own title bar, controls, and drag behavior entirely in HTML/CSS.
-
-```javascript
-const win = new ServoWindow({
-    frameless: true,
-    transparent: true,   // Pair with transparent for a fully custom look
-    visible: false,
-});
-win.once('frame-ready', () => win.show());
-```
-
-#### Drag Regions
-
-Lotus automatically detects elements with `-webkit-app-region: drag` or `data-lotus-drag` and registers them as drag handles. No JavaScript needed on your side.
+Implement your own design language by removing OS decorations. Lotus automatically detects and handles drag regions defined in your CSS or HTML.
 
 ```html
 <!-- Option 1: CSS property (same as macOS/Electron convention) -->
@@ -278,6 +258,20 @@ Frameless windows automatically get 8px invisible hit-zones on every edge and co
 
 CSS cursors work normally inside the window -- `cursor: grab`, `cursor: pointer`, `cursor: text`, `cursor: wait` all function exactly as expected on hover.
 
+### Window State Persistence
+
+Windows with an `id` automatically save their position, size, and maximized state to `~/.config/<app-name>/window-state.json`.
+
+*   **No ID?** A random UUID is generated for the session, and the window starts with the default or specified size.
+*   **With ID?** Previous state is checked on launch. If found, the window is restored to its last known position immediately.
+
+```javascript
+const win = new ServoWindow({
+    id: 'main-window',    // Required for state saving
+    restoreState: true     // Default
+});
+```
+
 ### Multi-Window
 
 Each window costs ~80MB (shared renderer). No new browser instances. We don't spawn a whole new universe (or download more RAM) just for a popup.
@@ -289,39 +283,21 @@ const win2 = new ServoWindow({ id: 'preview', title: 'Preview' });
 
 ## Architecture
 
-```
-@lotus-gui/core
-├── src/lib.rs           # Rust N-API bindings, Servo event loop, IPC
-├── src/window_state.rs  # Window position/size persistence
-├── src/platform.rs      # OS-specific integrations (themes, cursors)
-├── lotus.js             # High-level JS API (ServoWindow, IpcMain, App)
-├── index.js             # Native .node binary loader
-└── resources/           # IPC bridge injection scripts
-```
+| Component | Responsibility |
+|-----------|----------------|
+| **Rust Layer** | Servo engine management, native window creation (`winit`/`glutin`), IPC server (`tokio`+`axum`), protocol handling, and binary event dispatch via MsgPack. |
+| **JS Layer** | High-level API (`ServoWindow`, `ipcMain`, `app`), binding management, auto-fixing Linux TLS allocation issues, and profiling support. |
 
-The Rust layer (`src/lib.rs`) handles:
-- Servo lifecycle and rendering
-- Native window creation via `winit`/`glutin`(`winit`/`surfman`/`mozangle` on Windows)
-- IPC server (`tokio` + `axum` on `127.0.0.1:0` via WebSockets)
-- `lotus-resource://` protocol handler
-- Event dispatch to Node.js via MsgPack
-
-The JavaScript layer (`lotus.js`) provides:
-- `ServoWindow` class wrapping native window handles
-- `IpcMain` event emitter for message routing, including `handle()` for request/reply patterns
-- Auto-fix for Linux TLS allocation issues
-- Profiling support (`--profile` flag)
+---
 
 ## Building from Source
 
 ### Prerequisites
+- **Rust** stable toolchain.
+- **Node.js** v22+.
+- System libraries: OpenGL, OpenSSL, and fontconfig.
 
-- **Rust** stable toolchain
-- **Node.js** v22+
-- System libraries (OpenGL, OpenSSL, fontconfig)
-
-### Build
-
+### Build Commands
 ```bash
 # From the monorepo root
 cd packages/lotus-core
@@ -333,16 +309,37 @@ npm run build:debug
 npm run build
 ```
 
-> **Warning:** First build compiles the Servo rendering engine. This takes a while. Go grab a coffee, or question your life choices. Subsequent builds are much faster.
+> **Note:** The first build compiles the entire Servo rendering engine and may take a significant amount of time. Subsequent builds are incremental and much faster.
+
+---
 
 ## Runtime Dependencies
 
 | Package | Purpose |
 |---------|---------|
-| `msgpackr` | MsgPack serialization for IPC (binary message packing) |
+| `msgpackr` | MsgPack serialization for high-performance IPC. |
 
 These are installed automatically when you `npm install @lotus-gui/core`.
+
+## Package Structure
+
+```
+@lotus-gui/core
+├── src/lib.rs           # Rust N-API bindings, Servo event loop, IPC
+├── src/window_state.rs  # Window position/size persistence
+├── src/platform.rs      # OS-specific integrations (themes, cursors)
+├── lotus.js             # High-level JS API (ServoWindow, IpcMain, App)
+├── index.js             # Native .node binary loader
+└── resources/           # IPC bridge injection scripts
+```
+
+---
 
 ## License
 
 MIT
+
+
+**AI DISCLAIMER**
+
+I have used ai in the project for templating, troubleshooting, diving through source code to find the reference i needed to read and learn how worked, and documentation originally while i was rapidly itteratting and have since rewrote the documentation myself now the api is more stable. I have tried my best and spent countless hours and days to ensure that the code is correct and that the documentation is accurate, its not a huge code base so i have touched and worked with every line of code in this repo. I will tell you that this is not some BS "vibe coded" system or project. I have worked in IT, Programming and Engineering for going on 11 years. I spent the last 7 years as a Linux enterprise dev/ Linux systems engineer. I have spent a lot of time designing, testing working and griding my hard hours on this project and ensuring this is not some garbage that a unexpirenced person whipped together without actually knowing and understand the way computers work and how to practice proper programing hygene, testing and safe software lifecyle practices. I know what is where, why what works what way, i decided how each and every piece works, written a large amount of it, i have tested different setups and dependancies like the ipc system. I spent a lot of time researching takio, readind the docs figuring out exactly how to use it with my use case and axum so i can web socket the world of my ipc. I dumped so many hours into learning winit 0.30 (which btw, it is a pain to use by its features and layout are amazing, i do recomend the time to learn the new conventions of 0.30), i have poured over so much of the servo repo trying to get the best pieces integrated as nicely as possible and spent so much time fighting with the windows rendering pipeline. i do understand that there is a lot of worries around it and people vibe coding stuff but this is not "vibe coded", this is hundreads of my hours, nights and nights of deep coffee pots and genuine passion for this project. It was involved in this project but it is not running, planning, testing, integrating, designing or any of that, it was just a tool used to speed up piece here and there. There are way too many moving parts here and i have spent way too much time on this to have it reduced down to that.

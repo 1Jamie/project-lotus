@@ -22,4 +22,4 @@ npm run build
 ```
 
 ## Binary Distribution
-By default, `npm install` tries to download a pre-built binary. To force a local build when installing (e.g., if you are working on the Rust code), you should just run the build command above. The `install.js` script is only for end-users who don't have the repo checked out.
+By default, `npm install` tries to download a pre-built binary. To force a local build when installing (e.g., if you are working on the Rust code), you should just run the build command above. The `install.js` script is only for end-users devs who don't have the repo checked out.
