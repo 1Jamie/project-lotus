@@ -1,8 +1,8 @@
 # 🪷 Lotus (lotus-gui)
 
-**Lotus is a high-performance, lightweight desktop GUI framework that pairs the power of Node.js with the speed of the Servo parallel rendering engine.** 
+**Lotus is a high-performance, lightweight desktop GUI framework that pairs the power of Node.js with the speed of the Servo rendering engine.** 
 
-It's designed for developers who want to build cross-platform desktop applications with web technologies (HTML/CSS/JS) and want someting a bit easier to use. By using Servo instead of Chromium and keeping Node.js in the driver's seat for OS integration, Lotus delivers a "blistering fast" experience with a small footprint.
+It's designed for developers who want to build cross-platform desktop applications with web technologies (HTML/CSS/JS) and want someting a bit easier to use. By using Servo instead of Chromium and keeping Node.js in the driver's seat for OS integration, Lotus delivers a "blistering fast" experience with a tiny footprint.
 
 ---
 
@@ -622,6 +622,39 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 ## Pieces of the puzzle
 
 ### Servo
+
+[Servo](https://servo.org/) is the high-performance, memory-safe browser engine that makes Lotus possible. Written in Rust and designed for massive parallelism, it provides modern web rendering capabilities without the overhead of a full Chromium instance.
+
+*   **Official Site:** [servo.org](https://servo.org/)
+*   **GitHub Repository:** [github.com/servo/servo](https://github.com/servo/servo)
+
+
+### Node.js
+
+[Node.js](https://nodejs.org/) is a JavaScript runtime built on Chrome's V8 engine, it is the backbone and brain of the operation and has a beauitiful expanse of available libs for anything from notifications to encryption, should be able to handle any and everything servo cant.
+
+*   **Official Site:** [nodejs.org](https://nodejs.org/)
+*   **GitHub Repository:** [github.com/nodejs/node](https://github.com/nodejs/node)
+
+
+### Winit
+
+[Winit](https://github.com/rust-windowing/winit) is a cross-platform window creation and event loop library in Rust. It provides Lotus with native OS windows, raw input events, and hardware-accelerated rendering contexts.
+
+*   **Official Site:** [winit.rs](https://winit.rs/)
+*   **GitHub Repository:** [github.com/rust-windowing/winit](https://github.com/rust-windowing/winit)
+
+
+### crabnebula cargo
+
+### window-vibrancy
+
+[window-vibrancy](https://github.com/1jamie/window-vibrancy) is a cross-platform windowing library for Rust that makes Lotus possible. Written in Rust and designed for massive parallelism, it provides modern web rendering capabilities without the overhead of a full Chromium instance.
+
+*   **Official Site:** [window-vibrancy.rs](https://window-vibrancy.rs/)
+*   **GitHub Repository:** [github.com/1jamie/window-vibrancy](https://github.com/1jamie/window-vibrancy)
+
+
 
 
 **P.S.**
