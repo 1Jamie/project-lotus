@@ -165,10 +165,10 @@ lotus/
 ---
 
 ## � STATUS: ALPHA almost BETA (BUT IT WORKS WELL!)
-We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core@0.3.0`).
+We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core@0.3.1`).
 Mac support is missing (because their ecosystem needs someone who nows it, please feel free to help!). BSD and SUSE support is planned (because I know the pain points over there, see Roadmap). Right now there are builds for BSD and SUSE so you can use it though it does not have an installer builder for them yet. I plan to add that in future releases.
 
-## ## Version 0.3.0 (Current) 
+## ## Version 0.3.1 (Current) 
 * **Status:** Beta? I'm not sure what to call it, but it works way better than any alpha ive seen! but hasnt been around long enough to call it stable yet. This is a big release and brings with it support for linux and windows installers for apps built with lotus. This allows you to build apps with lotus and just npx lotus build and it will build the app installer for you for your platform. It is still a bit early so any feedback is appreciated! I plan to be a continued project for a while and I'm excited to see what we can do with it.
 
 ### Supported-Installers 

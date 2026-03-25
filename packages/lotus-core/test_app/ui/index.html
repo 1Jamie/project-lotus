@@ -11,10 +11,57 @@
             background: linear-gradient(135deg, #1e1e2f, #2d2d44);
             color: #ffffff;
             margin: 0;
-            padding: 20px;
+            padding: 60px 20px 20px 20px;
             min-height: 100vh;
             /* Removed overflow: hidden to enable scrolling */
         }
+
+        .title-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 1000;
+            -webkit-app-region: drag;
+            cursor: default;
+            padding: 10px 20px;
+            background: rgba(30, 30, 47, 0.85);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(118, 185, 0, 0.3);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            user-select: none;
+        }
+
+        .title-text {
+            font-weight: bold;
+            color: #76b900;
+        }
+
+        .window-controls {
+            -webkit-app-region: no-drag;
+            display: flex;
+            gap: 8px;
+        }
+
+        .control-btn {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            border: none;
+            cursor: pointer;
+            transition: transform 0.2s ease, filter 0.2s ease;
+        }
+
+        .control-btn:hover {
+            transform: scale(1.1);
+            filter: brightness(1.2);
+        }
+
+        .minimize { background: #ffbd44; }
+        .maximize { background: #00ca4e; }
+        .close { background: #ff605c; }
 
         .container {
             text-align: center;
@@ -127,22 +174,18 @@
 </head>
 
 <body>
-    <div class="container">
-        <div data-lotus-drag="true"
-            style="-webkit-app-region: drag; cursor: default; padding: 10px; border-radius: 8px 8px 0 0; background: rgba(118, 185, 0, 0.2); border-bottom: 1px solid rgba(118,185,0,0.4); margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; user-select: none;">
-            <div style="font-weight: bold; color: #76b900; margin-left: 10px;">Hybrid Lotus App</div>
-            <div style="-webkit-app-region: no-drag; display: flex; gap: 8px; margin-right: 5px;">
-                <button onclick="window.lotus.send('window-control', 'minimize')"
-                    style="width: 24px; height: 24px; border-radius: 50%; border: none; background: #ffbd44; cursor: pointer;"
-                    title="Minimize"></button>
-                <button onclick="window.lotus.send('window-control', 'maximize')"
-                    style="width: 24px; height: 24px; border-radius: 50%; border: none; background: #00ca4e; cursor: pointer;"
-                    title="Maximize"></button>
-                <button onclick="window.lotus.send('window-control', 'close')"
-                    style="width: 24px; height: 24px; border-radius: 50%; border: none; background: #ff605c; cursor: pointer;"
-                    title="Close"></button>
-            </div>
+    <div class="title-bar" data-lotus-drag="true">
+        <div class="title-text">Hybrid Lotus App</div>
+        <div class="window-controls" data-lotus-drag="false">
+            <button onclick="window.lotus.send('window-control', 'minimize')" class="control-btn minimize"
+                title="Minimize"></button>
+            <button onclick="window.lotus.send('window-control', 'maximize')" class="control-btn maximize"
+                title="Maximize"></button>
+            <button onclick="window.lotus.send('window-control', 'close')" class="control-btn close"
+                title="Close"></button>
         </div>
+    </div>
+    <div class="container">
         <h1>Lotus Runtime</h1>
         <p>Backend Communication Demo</p>
 
@@ -192,6 +235,15 @@
             <h2>🪟 Multi-Window Test</h2>
             <button onclick="openSecondaryWindow()" class="demo-button" style="background: #ff9800;">Open Secondary
                 Window</button>
+        </div>
+
+        <div class="demo-section">
+            <h2>⌨️ Keyboard Input Test</h2>
+            <input type="text" id="keyboard-input" placeholder="Type here to test keyboard input..." 
+                   style="width: 100%; padding: 10px; margin-bottom: 10px; border-radius: 4px; border: 1px solid #76b900; background: rgba(0,0,0,0.2); color: white;">
+            <div id="keyboard-log" class="result-box" style="font-family: monospace; font-size: 0.9em; text-align: left;">
+                <em>Key events will appear here...</em>
+            </div>
         </div>
 
         <div class="demo-section">
@@ -283,6 +335,29 @@
             } catch (err) {
                 resultEl.innerHTML = `<span style="color:#f44336;">❌ invoke() rejected: ${err.message}</span>`;
             }
+        }
+
+        // Keyboard Test Logging
+        const keyboardInput = document.getElementById('keyboard-input');
+        const keyboardLog = document.getElementById('keyboard-log');
+
+        function logKeyEvent(e) {
+            const time = new Date().toLocaleTimeString().split(' ')[0];
+            const eventInfo = `[${time}] <strong>${e.type}</strong>: key='<span style="color:#76b900;">${e.key}</span>' code='<span style="color:#76b900;">${e.code}</span>' shift='<span style="color:#76b900;">${e.shiftKey}</span>' ctrl='<span style="color:#76b900;">${e.ctrlKey}</span>' alt='<span style="color:#76b900;">${e.altKey}</span>' meta='<span style="color:#76b900;">${e.metaKey}</span>'`;
+            
+            const div = document.createElement('div');
+            div.innerHTML = eventInfo;
+            keyboardLog.prepend(div);
+            
+            // Keep only the last 10 events
+            while (keyboardLog.children.length > 11) {
+                keyboardLog.removeChild(keyboardLog.lastChild);
+            }
+        }
+
+        if (keyboardInput) {
+            keyboardInput.addEventListener('keydown', logKeyEvent);
+            keyboardInput.addEventListener('keyup', logKeyEvent);
         }
 
         // Set up IPC listeners

@@ -1,6 +1,6 @@
 [package]
 name = "lotus"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 build = "build.rs"
 
@@ -14,8 +14,8 @@ winit = { version = "0.30" }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 webrender = "0.68"
 euclid = "0.22"
-servo_url = { path = "servo/components/url", package = "servo_url" }
-servo = { path = "servo/components/servo", package = "libservo" }
+servo_url = { path = "servo/components/url", package = "servo-url" }
+servo = { path = "servo/components/servo" }
 
 # Cross-platform dependencies
 dpi = "0.1"
@@ -51,7 +51,7 @@ raw-window-handle = "0.6"
 
 # Windows-only dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
-servo = { path = "servo/components/servo", package = "libservo", features = ["no-wgl"] }
+servo = { path = "servo/components/servo", features = ["no-wgl"] }
 
 [build-dependencies]
 napi-build = "2"

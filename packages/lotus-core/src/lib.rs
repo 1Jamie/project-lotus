@@ -42,13 +42,14 @@ use servo::{
     ServoBuilder, WebViewDelegate, 
     WebViewBuilder, WindowRenderingContext, RenderingContext,
     resources::{self, Resource},
-    InputEvent, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    InputEvent, KeyboardEvent as ServoKeyboardEvent,
+    Code, Key, KeyState, Location, Modifiers,
+    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     WheelEvent, WheelDelta, WheelMode,
     LoadStatus,
     ConsoleLogLevel,
     WebResourceLoad,
     UserContentManager, UserScript,
-
 };
 use euclid::{Point2D, Scale};
 use servo::{DeviceIndependentPixel, DevicePixel};
@@ -354,12 +355,131 @@ struct WindowMetadata {
     root_path: Option<PathBuf>,
 }
 
+fn map_winit_modifiers(winit_mods: winit::event::Modifiers) -> Modifiers {
+    let mut s_mods = Modifiers::empty();
+    let state = winit_mods.state();
+    if state.shift_key() { s_mods.insert(Modifiers::SHIFT); }
+    if state.control_key() { s_mods.insert(Modifiers::CONTROL); }
+    if state.alt_key() { s_mods.insert(Modifiers::ALT); }
+    if state.super_key() { s_mods.insert(Modifiers::META); }
+    s_mods
+}
+
+fn map_winit_key(winit_key: &winit::keyboard::Key) -> Key {
+    use winit::keyboard::Key as WKey;
+    use winit::keyboard::NamedKey as WNamed;
+    use servo::NamedKey as SKey;
+    match winit_key {
+        WKey::Character(s) => Key::Character(s.to_string()),
+        WKey::Named(n) => match n {
+            WNamed::Backspace => Key::Named(SKey::Backspace),
+            WNamed::Tab => Key::Named(SKey::Tab),
+            WNamed::Enter => Key::Named(SKey::Enter),
+            WNamed::Escape => Key::Named(SKey::Escape),
+            WNamed::Space => Key::Character(" ".to_string()),
+            WNamed::ArrowLeft => Key::Named(SKey::ArrowLeft),
+            WNamed::ArrowRight => Key::Named(SKey::ArrowRight),
+            WNamed::ArrowUp => Key::Named(SKey::ArrowUp),
+            WNamed::ArrowDown => Key::Named(SKey::ArrowDown),
+            WNamed::PageUp => Key::Named(SKey::PageUp),
+            WNamed::PageDown => Key::Named(SKey::PageDown),
+            WNamed::Home => Key::Named(SKey::Home),
+            WNamed::End => Key::Named(SKey::End),
+            WNamed::Insert => Key::Named(SKey::Insert),
+            WNamed::Delete => Key::Named(SKey::Delete),
+            WNamed::F1 => Key::Named(SKey::F1),
+            WNamed::F2 => Key::Named(SKey::F2),
+            WNamed::F3 => Key::Named(SKey::F3),
+            WNamed::F4 => Key::Named(SKey::F4),
+            WNamed::F5 => Key::Named(SKey::F5),
+            WNamed::F6 => Key::Named(SKey::F6),
+            WNamed::F7 => Key::Named(SKey::F7),
+            WNamed::F8 => Key::Named(SKey::F8),
+            WNamed::F9 => Key::Named(SKey::F9),
+            WNamed::F10 => Key::Named(SKey::F10),
+            WNamed::F11 => Key::Named(SKey::F11),
+            WNamed::F12 => Key::Named(SKey::F12),
+            WNamed::Shift => Key::Named(SKey::Shift),
+            WNamed::Control => Key::Named(SKey::Control),
+            WNamed::Alt => Key::Named(SKey::Alt),
+            WNamed::Super => Key::Named(SKey::Meta),
+            _ => Key::Named(SKey::Unidentified),
+        },
+        _ => Key::Named(SKey::Unidentified),
+    }
+}
+
+fn map_winit_code(winit_code: winit::keyboard::PhysicalKey) -> Code {
+    use winit::keyboard::PhysicalKey as WCode;
+    use winit::keyboard::KeyCode as WKeyCode;
+    match winit_code {
+        WCode::Code(c) => match c {
+            WKeyCode::KeyA => Code::KeyA,
+            WKeyCode::KeyB => Code::KeyB,
+            WKeyCode::KeyC => Code::KeyC,
+            WKeyCode::KeyD => Code::KeyD,
+            WKeyCode::KeyE => Code::KeyE,
+            WKeyCode::KeyF => Code::KeyF,
+            WKeyCode::KeyG => Code::KeyG,
+            WKeyCode::KeyH => Code::KeyH,
+            WKeyCode::KeyI => Code::KeyI,
+            WKeyCode::KeyJ => Code::KeyJ,
+            WKeyCode::KeyK => Code::KeyK,
+            WKeyCode::KeyL => Code::KeyL,
+            WKeyCode::KeyM => Code::KeyM,
+            WKeyCode::KeyN => Code::KeyN,
+            WKeyCode::KeyO => Code::KeyO,
+            WKeyCode::KeyP => Code::KeyP,
+            WKeyCode::KeyQ => Code::KeyQ,
+            WKeyCode::KeyR => Code::KeyR,
+            WKeyCode::KeyS => Code::KeyS,
+            WKeyCode::KeyT => Code::KeyT,
+            WKeyCode::KeyU => Code::KeyU,
+            WKeyCode::KeyV => Code::KeyV,
+            WKeyCode::KeyW => Code::KeyW,
+            WKeyCode::KeyX => Code::KeyX,
+            WKeyCode::KeyY => Code::KeyY,
+            WKeyCode::KeyZ => Code::KeyZ,
+            WKeyCode::Digit1 => Code::Digit1,
+            WKeyCode::Digit2 => Code::Digit2,
+            WKeyCode::Digit3 => Code::Digit3,
+            WKeyCode::Digit4 => Code::Digit4,
+            WKeyCode::Digit5 => Code::Digit5,
+            WKeyCode::Digit6 => Code::Digit6,
+            WKeyCode::Digit7 => Code::Digit7,
+            WKeyCode::Digit8 => Code::Digit8,
+            WKeyCode::Digit9 => Code::Digit9,
+            WKeyCode::Digit0 => Code::Digit0,
+            WKeyCode::Space => Code::Space,
+            WKeyCode::Enter => Code::Enter,
+            WKeyCode::Escape => Code::Escape,
+            WKeyCode::Backspace => Code::Backspace,
+            WKeyCode::Tab => Code::Tab,
+            WKeyCode::ArrowLeft => Code::ArrowLeft,
+            WKeyCode::ArrowRight => Code::ArrowRight,
+            WKeyCode::ArrowUp => Code::ArrowUp,
+            WKeyCode::ArrowDown => Code::ArrowDown,
+            WKeyCode::ShiftLeft => Code::ShiftLeft,
+            WKeyCode::ShiftRight => Code::ShiftRight,
+            WKeyCode::ControlLeft => Code::ControlLeft,
+            WKeyCode::ControlRight => Code::ControlRight,
+            WKeyCode::AltLeft => Code::AltLeft,
+            WKeyCode::AltRight => Code::AltRight,
+            WKeyCode::SuperLeft => Code::MetaLeft,
+            WKeyCode::SuperRight => Code::MetaRight,
+            _ => Code::Unidentified,
+        },
+        _ => Code::Unidentified,
+    }
+}
+
 struct WindowInstance {
     webview: servo::WebView,
     rendering_context: Rc<WindowRenderingContext>,
     window: Arc<Window>,
     last_mouse_pos: Point2D<f32, servo::DevicePixel>,
     is_mouse_down: bool,
+    modifiers: Modifiers,
     frameless: bool,
     drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
     no_drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
@@ -1211,6 +1331,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     window: window.clone(),
                     last_mouse_pos: Point2D::new(0.0, 0.0),
                     is_mouse_down: false,
+                    modifiers: Modifiers::empty(),
                     frameless: options.frameless,
                     drag_regions: Vec::new(),
                     no_drag_regions: Vec::new(),
@@ -1838,6 +1959,30 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                             }
                         }
+                    },
+                    WindowEvent::ModifiersChanged(modifiers) => {
+                        instance.modifiers = map_winit_modifiers(modifiers);
+                    },
+                    WindowEvent::KeyboardInput { event, .. } => {
+                        let state = match event.state {
+                            winit::event::ElementState::Pressed => KeyState::Down,
+                            winit::event::ElementState::Released => KeyState::Up,
+                        };
+                        
+                        let key = map_winit_key(&event.logical_key);
+                        let code = map_winit_code(event.physical_key);
+                        
+                        let keyboard_event = ServoKeyboardEvent::new_without_event(
+                            state,
+                            key,
+                            code,
+                            Location::Standard,
+                            instance.modifiers,
+                            event.repeat,
+                            false, // is_composing
+                        );
+                        
+                        instance.webview.notify_input_event(InputEvent::Keyboard(keyboard_event));
                     },
                     _ => {}
                 }

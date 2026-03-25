@@ -6,9 +6,9 @@
 
 ---
 
-## 📦 What’s New in v0.3.0 (Distribution & Packaging)
+## 📦 What’s New in v0.3.1 (Distribution & Packaging)
 
-The v0.3.0 release introduces automated installer generation, turning your project into a distributable product with a single command.
+The v0.3.1 release introduces automated installer generation, turning your project into a distributable product with a single command.
 
 *   **🏗️ One-Command Build:** Generate professional installers (DEB, RPM, MSI, NSIS) tailored for your target platform using `lotus build`.
 *   **🪟 Windows Support (MSI/EXE):** Fully integrated WiX-based MSI and NSIS-based EXE generation.

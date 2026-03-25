@@ -6,7 +6,7 @@
 
 ---
 
-## 🚀 What’s New in v0.3.0 (Stability & Performance)
+## 🚀 What’s New in v0.3.1 (Stability & Performance)
 
 This release brings distribution-grade stability and significant performance improvements to the Lotus runtime.
 
