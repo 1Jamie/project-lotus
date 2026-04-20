@@ -6,14 +6,22 @@
 
 ---
 
-## 🚀 What’s New in v0.3.1 (Stability & Performance)
+> ### ⚠️ IMPORTANT
+>
+> **NEW SUPPORT FOR ENCRYPTED APPS with AEAD-ENCRYPTED (AES-256-GCM) VFS**
+> The latest version adds support for packaging your app in a VFS with a natively derived key. This allows developers to ship closed-source applications while still leveraging web-based frontends. The decryption key is sharded across the native binary and never touches the V8 heap or the Node.js environment.
+>
+> **Disclaimer about Encryption and Closed-Source Software**: Lotus supports encryption to protect your intellectual property. However, the encryption layer relies on secrets injected during the build process. Anyone with access to the decrypted application in memory (e.g., using debugging tools like WinDbg, Frida, or manual memory inspection) may eventually extract these secrets. Users should be aware that client-side encryption is primarily a deterrent against casual reverse engineering and unauthorized distribution, not a guarantee of absolute security against determined adversaries. As always, security in distributed binaries is a game of making extraction difficult enough that most people won't bother. It is fundamentally impossible to keep assets perfectly secure in the presence of a dedicated reverse engineer.
 
-This release brings distribution-grade stability and significant performance improvements to the Lotus runtime.
+## 🚀 What’s New in v0.3.2 (Encrypted VFS & Stability)
 
-*   **⚡ Fast IPC:** The new `tokio` + `axum` WebSocket bridge can achieve as low as 0.111 ms latency in my testing on linux with 9000 messages a second. Includes opportunistic 500μs flushing and MsgPack batching to ensure the UI thread remains responsive even under heavy loads.
-*   **🛡️ Reload-Safe Queuing:** If a window reloads, outgoing IPC messages are automatically buffered and drained the moment the new JS context connects, preventing data loss during transitions.
-*   **👻 Native GUI Mode:** On Windows, the PE Subsystem header is now correctly patched so the app launches as a true GUI process without a console window.
+This release brings support for strictly closed-source applications and significant stability improvements to the Lotus runtime.
+
+*   **🔒 Asset Protection (Encrypted VFS):** Want to ship a closed-source app? Lotus uses an AEAD-encrypted (AES-256-GCM) Virtual File System where the decryption key **never touches JavaScript or the V8 heap**. 
+*   **⚡ Native Key Sharding:** The CLI shards the master key across compiled Rust constants and native binary sections (ELF/PE). The Rust core autonomously derives the key in protected memory.
+*   **🧊 Byte-Limited LRU Cache:** We mitigate decryption overhead with a strict 128MB byte-limited LRU cache. Once an asset is loaded, it's served from memory at blistering speeds without risking an Out-Of-Memory (OOM) panic on heavy media files.
 *   **🎨 Ghost-Mode Transparency:** True OS-level transparency with zero white-flash on startup. If your CSS is transparent, your window is transparent.
+*   **⚡ Fast IPC:** The WebSocket bridge ensures the UI thread remains responsive even under heavy loads with MsgPack batching and opportunistic flushing.
 
 ---
 
@@ -41,11 +49,13 @@ The application lifecycle controller.
 
 | Method | Description |
 |--------|-------------|
+| `app.initVfs()` | Initialize the Encrypted VFS natively. Must be called before `warmup()`. If the app wasn't built with `--encrypt`, this safely skips itself. |
 | `app.warmup()` | Pre-initialize the Servo engine. Call before creating windows for faster startup. |
 | `app.quit()` | Shut down the application and close all windows. |
 
 ```javascript
-app.warmup(); // Pre-warm the engine
+app.initVfs(); // Initialize secure VFS (if present)
+app.warmup();  // Pre-warm the engine
 ```
 
 ### `ServoWindow`
@@ -61,7 +71,7 @@ const win = new ServoWindow(options);
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `id` | `string` | Random UUID | Unique identifier for the window. **Required for state persistence.** |
-| `root` | `string` | `undefined` | Absolute path to the UI directory. Enables Hybrid Mode (`lotus-resource://`). |
+| `root` | `string` | `undefined` | Absolute path to the UI directory. Enables Hybrid Mode (`lotus-resource://`). If using an encrypted build, this path will map to the VFS internally. |
 | `index` | `string` | `'index.html'` | Entry HTML file relative to `root`. |
 | `initialUrl` | `string` | -- | URL to load (alternative to `root` + `index`). |
 | `width` | `number` | `1024` | Initial window width in pixels. |
@@ -200,6 +210,32 @@ const win = new ServoWindow({
     index: 'index.html'               // Entry point
 });
 // Internally loads: lotus-resource://localhost/index.html
+```
+
+### 🔒 The Encrypted VFS
+
+If you are building proprietary software and don't want users simply unzipping your binary to steal your assets, use the `--encrypt` flag during build (see `@lotus-gui/dev`).
+
+When encrypted, Lotus packs your `ui/` folder into a high-entropy binary blob injected directly into the executable. Decryption happens entirely in native memory, ensuring your code is never exposed to the JavaScript environment or the OS filesystem.
+
+**Implementation:**
+```javascript
+const { ServoWindow, app } = require('@lotus-gui/core');
+const path = require('path');
+
+// 1. Initialize the Encrypted VFS natively (Must happen before warmup)
+app.initVfs(); 
+
+// 2. Wake up the engine
+app.warmup(); 
+
+const win = new ServoWindow({
+    id: 'secure-window',
+    root: path.join(__dirname, 'ui'), // Maps to the encrypted VFS!
+    index: 'index.html',
+    width: 1024,
+    height: 768
+});
 ```
 
 ### Transparency & "White Flash" Elimination

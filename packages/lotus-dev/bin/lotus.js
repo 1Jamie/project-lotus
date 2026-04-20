@@ -7,7 +7,14 @@ const path = require('path');
 const fs = require('fs');
 const prompts = require('prompts');
 const os = require('os');
+const crypto = require('crypto');
 const { Jimp } = require('jimp');
+
+let postjectPath = 'npx -y postject';
+try {
+    const pj = require.resolve('postject/dist/cli.js', { paths: [__dirname, process.cwd(), path.join(__dirname, '..')] });
+    if (fs.existsSync(pj)) postjectPath = `node "${pj}"`;
+} catch (e) {}
 
 const program = new Command();
 
@@ -73,10 +80,12 @@ program
     .description('Build the application for production')
     .option('--platform <platform>', 'Target platform (linux, win32)', process.platform)
     .option('--target <target>', 'Target format (deb, appimage, msi, nsis)', 'deb')
+    .option('--encrypt', 'Enable application encryption and VFS')
     .action(async (cmdOptions) => {
         const platform = cmdOptions.platform;
         const target = cmdOptions.target;
-        console.log(`Building for ${platform} (${target})...`);
+        const encrypt = !!cmdOptions.encrypt;
+        console.log(`Building for ${platform} (${target})...${encrypt ? ' [ENCRYPTED]' : ''}`);
 
         const configPath = path.resolve('lotus.config.json');
         if (!fs.existsSync(configPath)) {
@@ -176,9 +185,32 @@ export const __dirname_macro = macroDir;
             return fileList;
         };
 
-        const nodeFiles = findNodeFiles(path.resolve('node_modules'));
+        let nodeModulesPath = path.resolve('node_modules');
+        if (!fs.existsSync(nodeModulesPath)) {
+            // Try parent directory (monorepo support)
+            const parentModules = path.resolve('..', 'node_modules');
+            if (fs.existsSync(parentModules)) {
+                nodeModulesPath = parentModules;
+            } else {
+                const rootModules = path.resolve('..', '..', 'node_modules');
+                if (fs.existsSync(rootModules)) {
+                    nodeModulesPath = rootModules;
+                }
+            }
+        }
+
+        console.log(`Searching for native modules in ${nodeModulesPath}...`);
+        let nodeFiles = findNodeFiles(nodeModulesPath);
+        
+        // Also check if we are in a package that has the .node file locally
+        const localNodeFiles = findNodeFiles(process.cwd());
+        nodeFiles = [...new Set([...nodeFiles, ...localNodeFiles])];
+
         for (const file of nodeFiles) {
             const fileName = path.basename(file);
+            // Skip files in dist/ to avoid infinite loops if build is run multiple times
+            if (file.includes(path.sep + 'dist' + path.sep)) continue;
+            
             fs.copyFileSync(file, path.join(appDir, fileName));
             console.log(`Copied ${fileName}`);
         }
@@ -246,9 +278,52 @@ export const __dirname_macro = macroDir;
             fs.copyFileSync(process.execPath, binPath);
             if (!isWindows) fs.chmodSync(binPath, 0o755);
 
-            // Inject blob
+            if (encrypt) {
+                console.log('Generating encryption shards and VFS...');
+                const masterKey = crypto.randomBytes(32);
+                
+                // Shard 1 is in Rust (constant)
+                const s1 = Buffer.from("LotusMasterFrameworkShard_v1_2026");
+                // Generate shards 2 & 3 such that s1 ^ s2 ^ s3 = masterKey
+                const { s2, s3 } = generateShards(masterKey, s1);
+                
+                const vfsBlob = vfsPack(path.join(process.cwd(), 'ui'), masterKey);
+                
+                console.log('Injecting Lotus Data into binary...');
+                const vfsPath = path.join(appDir, 'lotus.vfs');
+                const s1Path = path.join(appDir, 's1.bin');
+                const s2Path = path.join(appDir, 's2.bin');
+                
+                fs.writeFileSync(s1Path, s2);
+                fs.writeFileSync(s2Path, s3);
+                fs.writeFileSync(vfsPath, vfsBlob);
+
+                if (platform === 'linux') {
+                    try {
+                        console.log('Injecting Lotus Data via objcopy...');
+                        // IMPORTANT: We run objcopy BEFORE postject.
+                        // objcopy can safely add sections to the raw node binary.
+                        execSync(`objcopy --add-section LOTUS_APP_S1="${s1Path}" "${binPath}"`, { stdio: 'inherit' });
+                        execSync(`objcopy --add-section LOTUS_APP_S2="${s2Path}" "${binPath}"`, { stdio: 'inherit' });
+                        execSync(`objcopy --add-section LOTUS_VFS="${vfsPath}" "${binPath}"`, { stdio: 'inherit' });
+                    } catch (e) {
+                        console.error('objcopy failed:', e.message);
+                    }
+                } else {
+                    // Windows / other (postject will be run later if we can make it work, 
+                    // but for now Windows encryption is secondary to fixing Linux segfault)
+                }
+
+                // Cleanup temp files
+                fs.unlinkSync(s1Path);
+                fs.unlinkSync(s2Path);
+                fs.unlinkSync(vfsPath);
+            }
+
+            // Inject SEA blob
             // The sentinel fuse is hardcoded per Node.js documentation for SEA
-            execSync(`npx postject "${binPath}" NODE_SEA_BLOB "${seaConfig.output}" --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2`, { env: { ...process.env }, stdio: 'inherit' });
+            console.log('Injecting Node SEA blob...');
+            execSync(`${postjectPath} "${binPath}" NODE_SEA_BLOB "${seaConfig.output}" --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2`, { env: { ...process.env }, stdio: 'inherit' });
 
             // On Windows, patch the PE header subsystem field from CONSOLE (3) to WINDOWS GUI (2).
             // node.exe is built as a console app; this prevents the black console window from
@@ -331,6 +406,10 @@ export const __dirname_macro = macroDir;
                 // Skip if already listed in config.resources
                 !packagerConfig.resources.some(r => r === dirPath || r === dir || r === `./${dir}`)
             ) {
+                if (encrypt && (dir === 'ui' || dir === 'renderer' || dir === 'dist/renderer')) {
+                    console.log(`Encrypting asset directory into VFS: ${dir}/ (Skipping raw copy)`);
+                    continue;
+                }
                 packagerConfig.resources.push(dirPath);
                 console.log(`Auto-including asset directory: ${dir}/`);
             }
@@ -458,6 +537,11 @@ export const __dirname_macro = macroDir;
             // Copy extra resources into usr/lib/<binName>/
             if (config.resources && Array.isArray(config.resources)) {
                 for (const res of config.resources) {
+                    // If encrypting, skip the 'ui' directory as it's already in the VFS
+                    if (encrypt && (res === 'ui' || res === './ui')) {
+                        console.log('Skipping "ui" resource (already in VFS)...');
+                        continue;
+                    }
                     const resPath = path.resolve(process.cwd(), res);
                     if (fs.existsSync(resPath)) {
                         const destPath = path.join(libDir, path.basename(res));
@@ -937,4 +1021,49 @@ program
         console.log(`  npx lotus dev\n`);
     });
 
+function generateShards(masterKey, s1) {
+    const s2 = crypto.randomBytes(32);
+    const s3 = Buffer.alloc(32);
+    for (let i = 0; i < 32; i++) {
+        s3[i] = masterKey[i] ^ s2[i] ^ s1[i % s1.length];
+    }
+    return { s2, s3 };
+}
+
 program.parse();
+function vfsPack(sourceDir, key) {
+    const files = [];
+    const index = {};
+    let offset = 0;
+
+    const walk = (dir) => {
+        if (!fs.existsSync(dir)) return;
+        for (const file of fs.readdirSync(dir)) {
+            const fullPath = path.join(dir, file);
+            if (fs.statSync(fullPath).isDirectory()) {
+                walk(fullPath);
+            } else {
+                const relativePath = path.relative(sourceDir, fullPath).replace(/\\/g, '/');
+                const content = fs.readFileSync(fullPath);
+                
+                const nonce = crypto.randomBytes(12);
+                const cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
+                const encrypted = Buffer.concat([cipher.update(content), cipher.final(), cipher.getAuthTag()]);
+                
+                // Block: [nonce(12)][ciphertext + tag]
+                const block = Buffer.concat([nonce, encrypted]);
+                files.push(block);
+                index[relativePath] = [offset, block.length];
+                offset += block.length;
+            }
+        }
+    };
+    walk(sourceDir);
+
+    const indexJson = Buffer.from(JSON.stringify(index));
+    const header = Buffer.alloc(12);
+    header.write('LOTUSVFS', 0);
+    header.writeUInt32LE(indexJson.length, 8);
+
+    return Buffer.concat([header, indexJson, ...files]);
+}

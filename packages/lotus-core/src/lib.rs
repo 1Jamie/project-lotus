@@ -2,8 +2,9 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::{env, fs, path::PathBuf, process::Command};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+use std::num::NonZeroUsize;
 
 use once_cell::sync::OnceCell;
 
@@ -58,6 +59,12 @@ use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 
 use http::StatusCode;
 use dark_light;
+use aes_gcm::{
+    aead::{Aead, KeyInit, Payload},
+    Aes256Gcm, Nonce
+};
+use lru::LruCache;
+use memmap2::Mmap;
 
 
 // IPC Message structure - Removed! process raw bytes.
@@ -118,6 +125,213 @@ fn detect_linux_theme_robust() -> dark_light::Mode {
     mode
 }
 
+struct ByteLimitedLruCache {
+    cache: LruCache<PathBuf, (Vec<u8>, String)>,
+    current_bytes: usize,
+    max_bytes: usize,
+}
+
+impl ByteLimitedLruCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            cache: LruCache::new(NonZeroUsize::new(1000).unwrap()), // Cap at 1000 items as secondary guard
+            current_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, key: &PathBuf) -> Option<&(Vec<u8>, String)> {
+        self.cache.get(key)
+    }
+
+    fn put(&mut self, key: PathBuf, val: (Vec<u8>, String)) {
+        let size = val.0.len();
+        // If the new item is larger than the total cache size, don't cache it
+        if size > self.max_bytes {
+            return;
+        }
+
+        while self.current_bytes + size > self.max_bytes {
+            if let Some((_, (old_data, _))) = self.cache.pop_lru() {
+                self.current_bytes -= old_data.len();
+            } else {
+                break;
+            }
+        }
+
+        self.current_bytes += size;
+        self.cache.put(key, val);
+    }
+}
+
+struct AutonomousKeyDeriver;
+
+impl AutonomousKeyDeriver {
+    fn derive_key() -> Option<[u8; 32]> {
+        let shard1 = b"LotusMasterFrameworkShard_v1_2026";
+        let shard2 = Self::read_shard_from_binary("LOTUS_APP_S1")?;
+        let shard3 = Self::read_shard_from_binary("LOTUS_APP_S2")?;
+        
+        if shard2.len() != 32 || shard3.len() != 32 {
+            eprintln!("[DEBUG] Invalid shard length: s2={}, s3={}", shard2.len(), shard3.len());
+            return None;
+        }
+
+        let mut key = [0u8; 32];
+        for i in 0..32 {
+            key[i] = shard2[i] ^ shard3[i] ^ shard1[i % shard1.len()];
+        }
+        eprintln!("[DEBUG] Key derivation successful.");
+        Some(key)
+    }
+
+    fn read_shard_from_binary(name: &str) -> Option<Vec<u8>> {
+        eprintln!("[DEBUG] Reading shard: {}", name);
+        #[cfg(target_os = "windows")]
+        {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, FindResourceW, LoadResource, LockResource, SizeofResource};
+            use windows_sys::Win32::System::Memory::PAGE_READONLY;
+            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+
+            unsafe {
+                let module = GetModuleHandleW(std::ptr::null());
+                if module == 0 { return None; }
+
+                // Convert name to UTF-16
+                let name_u16: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+                // RT_RCDATA is 10
+                let rt_rcdata = 10 as *const u16;
+
+                let res = FindResourceW(module, name_u16.as_ptr(), rt_rcdata);
+                if res == 0 { return None; }
+
+                let size = SizeofResource(module, res);
+                if size == 0 { return None; }
+
+                let handle = LoadResource(module, res);
+                if handle == 0 { return None; }
+
+                let data_ptr = LockResource(handle);
+                if data_ptr.is_null() { return None; }
+
+                let mut data = vec![0u8; size as usize];
+                std::ptr::copy_nonoverlapping(data_ptr as *const u8, data.as_mut_ptr(), size as usize);
+                Some(data)
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use object::{Object, ObjectSection};
+            use std::fs::File;
+            let file = match File::open("/proc/self/exe") {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[DEBUG] Failed to open /proc/self/exe: {}", e);
+                    return None;
+                }
+            };
+            let mmap = unsafe {
+                match memmap2::Mmap::map(&file) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("[DEBUG] Failed to map /proc/self/exe: {}", e);
+                        return None;
+                    }
+                }
+            };
+            let obj_file = match object::File::parse(&*mmap) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("[DEBUG] Failed to parse ELF: {}", e);
+                    return None;
+                }
+            };
+            let section = match obj_file.section_by_name(name) {
+                Some(s) => s,
+                None => {
+                    eprintln!("[DEBUG] Section not found: {}", name);
+                    return None;
+                }
+            };
+            eprintln!("[DEBUG] Found section {}, size: {}", name, section.size());
+            section.data().ok().map(|d| d.to_vec())
+        }
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            None
+        }
+    }
+}
+
+struct EncryptedVfs {
+    data: Vec<u8>,
+    index: HashMap<String, (usize, usize)>, // path -> (offset, size)
+    data_offset: usize,
+    cipher: Aes256Gcm,
+}
+
+impl EncryptedVfs {
+    fn init() -> Option<Self> {
+        eprintln!("[DEBUG] Initializing EncryptedVfs...");
+        let key = match AutonomousKeyDeriver::derive_key() {
+            Some(k) => k,
+            None => {
+                eprintln!("[DEBUG] Key derivation failed in VFS init.");
+                return None;
+            }
+        };
+        let cipher = Aes256Gcm::new(&key.into());
+
+        let vfs_data = match AutonomousKeyDeriver::read_shard_from_binary("LOTUS_VFS") {
+            Some(d) => d,
+            None => {
+                eprintln!("[DEBUG] Failed to read VFS blob.");
+                return None;
+            }
+        };
+        
+        if vfs_data.len() < 12 || &vfs_data[0..8] != b"LOTUSVFS" {
+            eprintln!("[DEBUG] Invalid VFS magic or size.");
+            return None;
+        }
+        
+        let index_size = u32::from_le_bytes(vfs_data[8..12].try_into().unwrap()) as usize;
+        eprintln!("[DEBUG] VFS Index size: {}", index_size);
+        let index_json = &vfs_data[12..12+index_size];
+        let index: HashMap<String, (usize, usize)> = match serde_json::from_slice(index_json) {
+            Ok(idx) => idx,
+            Err(e) => {
+                eprintln!("[DEBUG] Failed to parse VFS index JSON: {}", e);
+                return None;
+            }
+        };
+        
+        let data_offset = 12 + index_size;
+        eprintln!("[DEBUG] VFS initialized with {} entries.", index.len());
+        
+        Some(Self {
+            data: vfs_data,
+            index,
+            data_offset,
+            cipher,
+        })
+    }
+
+    fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        let (offset, size) = self.index.get(path)?;
+        let encrypted_data = &self.data[self.data_offset + offset .. self.data_offset + offset + size];
+        
+        // Nonce is prepended to the data block in our VFS format
+        if encrypted_data.len() < 12 { return None; }
+        let (nonce_bytes, ciphertext) = encrypted_data.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        
+        self.cipher.decrypt(nonce, ciphertext).ok()
+    }
+}
+
 struct AppState {
     window_metadata: HashMap<String, WindowMetadata>,
     window_states: WindowStateManager,
@@ -127,6 +341,8 @@ struct AppState {
     profiling: bool,
     start_time: Instant,
     window_start_times: HashMap<String, Instant>,
+    vfs: Option<Arc<EncryptedVfs>>,
+    resource_cache: ByteLimitedLruCache,
 }
 
 // IPC bootstrap script injected into every page
@@ -835,6 +1051,9 @@ impl resources::ResourceReaderMethods for ResourceReader {
     }
 }
 
+static RESOURCE_READER: ResourceReader = ResourceReader;
+servo::submit_resource_reader!(&RESOURCE_READER);
+
 static RESOURCES_DIR: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::new(|| {
     let mut path = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     path.push("resources");
@@ -848,10 +1067,6 @@ static RESOURCES_DIR: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::ne
 
 fn resources_dir_path() -> &'static PathBuf {
     &RESOURCES_DIR
-}
-
-fn init_resources() {
-    resources::set(Box::new(ResourceReader));
 }
 
 // ------------------------------------------------------------------
@@ -929,7 +1144,66 @@ impl WebViewDelegate for LotusWebViewDelegate {
         let url_str = url.as_str();
         
         if url_str.starts_with("lotus-resource://") {
-             // 1. Get root path for this window
+            let path_in_url = url.path();
+            let relative_path = path_in_url.trim_start_matches('/');
+            let path_buf = PathBuf::from(relative_path);
+
+            // 1. Check LRU Cache
+            if let Some(state) = APP_STATE.get() {
+                if let Ok(mut s) = state.lock() {
+                    if let Some((data, mime_str)) = s.resource_cache.get(&path_buf) {
+                        debug!("Rust: Cache hit for {:?}", path_buf);
+                        let mut headers = HeaderMap::new();
+                        if let Ok(val) = HeaderValue::from_str(mime_str) {
+                             headers.insert(CONTENT_TYPE, val);
+                        }
+                        let response = WebResourceResponse::new(url)
+                            .headers(headers)
+                            .status_code(StatusCode::OK);
+                        let mut intercepted = load.intercept(response);
+                        intercepted.send_body_data(data.clone());
+                        intercepted.finish();
+                        return;
+                    }
+                }
+            }
+
+            // 2. Check VFS
+            let mut vfs_data = None;
+            if let Some(state) = APP_STATE.get() {
+                if let Ok(s) = state.lock() {
+                    if let Some(vfs) = &s.vfs {
+                        vfs_data = vfs.read_file(relative_path);
+                    }
+                }
+            }
+
+            if let Some(data) = vfs_data {
+                debug!("Rust: Loaded from VFS: {}", relative_path);
+                let mime = mime_guess::from_path(relative_path).first_or_octet_stream();
+                let mime_str = mime.to_string();
+                
+                // Cache it
+                if let Some(state) = APP_STATE.get() {
+                    if let Ok(mut s) = state.lock() {
+                        s.resource_cache.put(path_buf.clone(), (data.clone(), mime_str.clone()));
+                    }
+                }
+
+                let mut headers = HeaderMap::new();
+                if let Ok(val) = HeaderValue::from_str(&mime_str) {
+                     headers.insert(CONTENT_TYPE, val);
+                }
+                let response = WebResourceResponse::new(url)
+                    .headers(headers)
+                    .status_code(StatusCode::OK);
+                let mut intercepted = load.intercept(response);
+                intercepted.send_body_data(data);
+                intercepted.finish();
+                return;
+            }
+
+             // 3. Fallback to physical filesystem
              let root_path = if let Some(state) = APP_STATE.get() {
                  if let Ok(s) = state.lock() {
                      s.window_metadata.get(&self.window_id)
@@ -942,17 +1216,9 @@ impl WebViewDelegate for LotusWebViewDelegate {
              };
 
              if let Some(root) = root_path {
-                 // 2. Resolve file path
-                 // Handle "lotus-resource://localhost/path/to/file"
-                 // The path() method returns "/path/to/file"
-                 let path_in_url = url.path();
-                 // Remove leading slash safely
-                 let relative_path = path_in_url.trim_start_matches('/');
-                 
                  let full_path = root.join(relative_path);
                  
                  // Security: Prevent directory traversal attacks.
-                 // Canonicalize both paths and verify full_path stays within root.
                  match (full_path.canonicalize(), root.canonicalize()) {
                      (Ok(canonical_full), Ok(canonical_root)) => {
                          if !canonical_full.starts_with(&canonical_root) {
@@ -963,17 +1229,23 @@ impl WebViewDelegate for LotusWebViewDelegate {
                              return;
                          }
                          // Path is safe — serve it
-                         debug!("Rust: Loading resource: {:?}", canonical_full);
+                         debug!("Rust: Loading resource from disk: {:?}", canonical_full);
                          match fs::read(&canonical_full) {
                              Ok(data) => {
                                  let mime = mime_guess::from_path(&canonical_full).first_or_octet_stream();
                                  let mime_str = mime.to_string();
                                  
+                                 // Cache it
+                                 if let Some(state) = APP_STATE.get() {
+                                     if let Ok(mut s) = state.lock() {
+                                         s.resource_cache.put(path_buf.clone(), (data.clone(), mime_str.clone()));
+                                     }
+                                 }
+
                                  let mut headers = HeaderMap::new();
                                  if let Ok(val) = HeaderValue::from_str(&mime_str) {
                                       headers.insert(CONTENT_TYPE, val);
                                  }
-
                                  let response = WebResourceResponse::new(url)
                                      .headers(headers)
                                      .status_code(StatusCode::OK);
@@ -991,8 +1263,7 @@ impl WebViewDelegate for LotusWebViewDelegate {
                          }
                      },
                      _ => {
-                         // Path doesn't exist or is malformed
-                         debug!("Rust: Resource not found or malformed path: {:?}", full_path);
+                         debug!("Rust: Resource not found: {:?}", full_path);
                          let response = WebResourceResponse::new(url)
                              .status_code(StatusCode::NOT_FOUND);
                          load.intercept(response).finish();
@@ -1544,16 +1815,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
-        // Cap animation-driven redraws to ~60 fps using WaitUntil instead of Poll.
-        // ControlFlow::Poll would spin at 100% CPU; WaitUntil yields the core back
-        // to the OS and wakes again no earlier than the next frame deadline.
-        let any_animating = self.windows.values().any(|w| w.animating);
-        if any_animating {
-            let next_frame = std::time::Instant::now() + std::time::Duration::from_millis(16);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(next_frame));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        }
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
@@ -1590,16 +1852,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
-        // Cap animation-driven redraws to ~60 fps using WaitUntil instead of Poll.
-        // ControlFlow::Poll would spin at 100% CPU; WaitUntil yields the core back
-        // to the OS and wakes again no earlier than the next frame deadline.
-        let any_animating = self.windows.values().any(|w| w.animating);
-        if any_animating {
-            let next_frame = std::time::Instant::now() + std::time::Duration::from_millis(16);
-            event_loop.set_control_flow(ControlFlow::WaitUntil(next_frame));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        }
+        event_loop.set_control_flow(ControlFlow::Wait);
 
         if let Some(uuid) = self.winit_id_to_uuid.get(&window_id).cloned() {
             if let Some(instance) = self.windows.get_mut(&uuid) {
@@ -2037,6 +2290,8 @@ impl App {
             profiling,
             start_time,
             window_start_times: HashMap::new(),
+            vfs: None,
+            resource_cache: ByteLimitedLruCache::new(128 * 1024 * 1024), // 128MB limit
         }));
         APP_STATE.set(app_state.clone()).ok();
 
@@ -2417,7 +2672,7 @@ impl App {
         let ready_token = token.clone();
         let ready_callback = callback.clone();
         thread::spawn(move || {
-            init_resources();
+            // init_resources() is now handled by the submit_resource_reader! macro at compile-time.
             
             // Wait up to 1s for port to be assigned from axum
             let port = port_rx.recv_timeout(std::time::Duration::from_millis(1000)).unwrap_or(0);
@@ -2433,6 +2688,23 @@ impl App {
         });
 
         Ok(App {})
+    }
+
+    #[napi]
+    pub fn init_vfs(&self) -> napi::Result<()> {
+        if let Some(state) = APP_STATE.get() {
+            if let Ok(mut s) = state.lock() {
+                if s.vfs.is_none() {
+                    if let Some(vfs) = EncryptedVfs::init() {
+                        s.vfs = Some(Arc::new(vfs));
+                        info!("Rust: Encrypted VFS initialized successfully.");
+                    } else {
+                        warn!("Rust: Encrypted VFS initialization skipped (no VFS or shards found).");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[napi]

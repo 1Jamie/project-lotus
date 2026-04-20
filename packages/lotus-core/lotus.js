@@ -3,32 +3,23 @@ const { spawn } = require('child_process');
 // Auto-fix for Linux TLS allocation issue (ERR_DLOPEN_FAILED)
 // This must run BEFORE loading the native module in index.js
 if (process.platform === 'linux') {
-    const requiredTunable = 'glibc.rtld.optional_static_tls=4096';
+    const requiredTunable = 'glibc.rtld.optional_static_tls=16384';
     const currentTunables = process.env.GLIBC_TUNABLES || '';
-
-    // LOTUS_TLS_FIXED=1 is injected into the respawned process below.
-    // If it's already set we've already fixed the environment -- never respawn again,
-    // even if the tunable string looks wrong, to prevent an infinite loop.
     const alreadyFixed = process.env.LOTUS_TLS_FIXED === '1';
 
-    if (!alreadyFixed && !currentTunables.includes('optional_static_tls=4096')) {
-        const newTunables = currentTunables
-            ? `${currentTunables}:${requiredTunable}`
-            : requiredTunable;
-
+    if (!alreadyFixed && !currentTunables.includes('optional_static_tls=')) {
+        console.log(`[LOTUS] Detected Linux. Respawning with ${requiredTunable} to prevent TLS allocation issues...`);
         const { spawnSync } = require('child_process');
         const result = spawnSync(process.execPath, process.argv.slice(1), {
             stdio: 'inherit',
             env: {
                 ...process.env,
-                GLIBC_TUNABLES: newTunables,
-                LOTUS_TLS_FIXED: '1',  // <-- prevents any re-spawn loop
+                GLIBC_TUNABLES: currentTunables ? `${currentTunables}:${requiredTunable}` : requiredTunable,
+                LOTUS_TLS_FIXED: '1',
             }
         });
 
-        process.exit(result.status ?? 1);
-
-        // Stop execution of the current process (don't load native module)
+        process.exit(result.status ?? 0);
         return;
     }
 }
@@ -460,6 +451,10 @@ module.exports = {
     ipcMain,
     app: {
         quit: () => globalApp && globalApp.quit(),
-        warmup: ensureApp
+        warmup: ensureApp,
+        initVfs: () => {
+            ensureApp();
+            if (globalApp) globalApp.initVfs();
+        }
     }
 };

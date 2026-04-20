@@ -6,17 +6,22 @@
 
 ---
 
-## 📦 What’s New in v0.3.1 (Distribution & Packaging)
+> ### ⚠️ IMPORTANT
+>
+> **NEW SUPPORT FOR ENCRYPTED APPS with AEAD-ENCRYPTED (AES-256-GCM) VFS**
+> The latest version adds support for packaging your app in a VFS with a natively derived key. This allows developers to ship closed-source applications while still leveraging web-based frontends. The decryption key is sharded across the native binary and never touches the V8 heap or the Node.js environment.
+>
+> **Disclaimer about Encryption and Closed-Source Software**: Lotus supports encryption to protect your intellectual property. However, the encryption layer relies on secrets injected during the build process. Anyone with access to the decrypted application in memory (e.g., using debugging tools like WinDbg, Frida, or manual memory inspection) may eventually extract these secrets. Users should be aware that client-side encryption is primarily a deterrent against casual reverse engineering and unauthorized distribution, not a guarantee of absolute security against determined adversaries. As always, security in distributed binaries is a game of making extraction difficult enough that most people won't bother. It is fundamentally impossible to keep assets perfectly secure in the presence of a dedicated reverse engineer.
 
-The v0.3.1 release introduces automated installer generation, turning your project into a distributable product with a single command.
+## 📦 What’s New in v0.3.2 (Encrypted Packaging)
 
+The v0.3.2 release introduces support for strictly closed-source applications via native VFS encryption.
+
+*   **🔒 Closed-Source App Support:** Use the `--encrypt` flag to pack your UI files into an AEAD-encrypted (AES-256-GCM) binary blob.
+*   **🏗️ Native Key Injection:** The build pipeline automatically generates encryption shards and injects them into ELF/PE binary sections.
 *   **🏗️ One-Command Build:** Generate professional installers (DEB, RPM, MSI, NSIS) tailored for your target platform using `lotus build`.
 *   **🪟 Windows Support (MSI/EXE):** Fully integrated WiX-based MSI and NSIS-based EXE generation.
-    *   **VC++ Redist Chaining:** Automatically embeds and installs the Microsoft C++ Runtime silently.
-    *   **ANGLE Injection:** Bundles necessary DLLs for hardware-accelerated rendering on Windows 10 & 11.
-    *   **Icon Conversion:** Automatically handles PNG/JPG to `.ico` conversion for application icons.
 *   **🐧 Linux Distribution:** Native support for DEB, RPM, AppImage, Pacman, and Flatpak.
-*   **🔥 Hot-Reload Dev Server:** A high-performance development environment that monitors file changes and auto-restarts the engine for rapid iteration.
 
 ---
 
@@ -94,12 +99,16 @@ lotus build --target appimage
 # Example Windows Targets (must run on Windows)
 lotus build --target msi --platform win32
 lotus build --target exe --platform win32
+
+# Build a strictly Closed-Source encrypted application
+lotus build --platform win32 --target exe --encrypt
 ```
 
 | Flag | Values | Default | Description |
 |------|--------|---------|-------------|
 | `--target` | `deb`, `appimage`, `pacman`, `rpm`, `flatpak`, `msi`, `exe` | `deb` | Target installer format. |
 | `--platform` | `linux`, `win32` | Current OS | Target OS platform. |
+| `--encrypt` | (none) | `false` | Enable AEAD encryption for UI resources. |
 
 **System Requirements:**
 - `lotus.config.json` in the current directory.
@@ -109,6 +118,20 @@ lotus build --target exe --platform win32
 ### `lotus clean`
 
 Remove the `dist/` directory and all build artifacts.
+
+---
+
+## 🔒 Closed-Source Apps: The Encrypted VFS
+
+If you are building proprietary software and don't want users simply unzipping your binary to steal your assets, use the `--encrypt` flag during the build process.
+
+When you pass the `--encrypt` flag, Lotus completely skips copying your `ui/` folder into the application library directory. Instead, it:
+1. Generates a random 32-byte Master Key.
+2. Shards the key into three parts (one hardcoded in Rust, two injected as ELF/PE sections).
+3. Packs your `ui/` directory into an AEAD-encrypted (AES-256-GCM) VFS blob.
+4. Injects the VFS blob directly into the binary.
+
+Because the architecture relies on native key derivation, the decryption key **never touches JavaScript or the V8 heap**, making it extremely difficult for casual reverse engineers to extract your source code.
 
 ---
 
@@ -190,8 +213,9 @@ The `lotus build` command follows these steps:
 2.  **Bundling:** Uses `esbuild` to bundle application JS into a single file and proxies native modules.
 3.  **Discovery:** Discovers native `.node` modules and copies them out for the installer.
 4.  **SEA Generation:** Creates a Node.js Single Executable Application blob.
-5.  **Injection:** Injects the payload into a Node.js binary.
-6.  **Packaging:** Invokes CrabNebula to wrap the binary, native modules, and resources into the final installer format.
+5.  **Encryption (Optional):** If `--encrypt` is set, generates encryption shards and packs resources into the encrypted VFS.
+6.  **Injection:** Injects the VFS, shards, and SEA payload into the binary using `objcopy` and `postject`.
+7.  **Packaging:** Invokes CrabNebula to wrap the binary, native modules, and resources into the final installer format.
 
 ## Build Output
 

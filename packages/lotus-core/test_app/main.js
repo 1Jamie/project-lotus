@@ -2,8 +2,9 @@ const { ServoWindow, ipcMain, app } = require('@lotus-gui/core');
 const path = require('path');
 
 // Pre-warm backend
-console.log("[App] Warming up backend...");
+console.log("[App] Warming up backend and initializing VFS...");
 app.warmup();
+app.initVfs();
 
 const UI_DIR = path.join(__dirname, 'ui');
 

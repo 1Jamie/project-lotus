@@ -1,5 +1,19 @@
 # 🪷 Lotus (lotus-gui)
 
+> ### ⚠️ IMPORTANT
+>
+> **UPDATED TO USE THE LATEST SERVO EMBEDDINGS 0.1.0!**
+>
+> We were using 0.0.6 so this is a large jump and allows us better control and ci along with bring in a whole sport of improvements from stability to performance. Please go take a look and give them some love! [Servo 0.1.0 release](https://servo.org/blog/2026/04/13/servo-0.1.0-release/)
+>
+> **NEW SUPPORT FOR ENCRYPTED APPS with AEAD-ENCRYPTED (AES-256-GCM) VFS**
+>
+> The latest version adds support for packaging your app in a VFS with a natively derived key. This allows developers to ship closed-source applications while still leveraging web-based frontends. The decryption key is sharded across the native binary and never touches the V8 heap or the Node.js environment.
+>
+> **Disclaimer about Encryption and Closed-Source Software**
+>
+> Lotus supports encryption to protect your intellectual property. However, the encryption layer relies on secrets injected during the build process. Anyone with access to the decrypted application in memory (e.g., using debugging tools like WinDbg, Frida, or manual memory inspection) may eventually extract these secrets. Users should be aware that client-side encryption is primarily a deterrent against casual reverse engineering and unauthorized distribution, not a guarantee of absolute security against determined adversaries. As always, security in distributed binaries is a game of making extraction difficult enough that most people won't bother. It is fundamentally impossible to keep assets perfectly secure in the presence of a dedicated reverse engineer.
+
 **Lotus is a high-performance, lightweight desktop GUI framework that pairs the power of Node.js with the speed of the Servo rendering engine.** 
 
 It's designed for developers who want to build cross-platform desktop applications with web technologies (HTML/CSS/JS) and want someting a bit easier to use. By using Servo instead of Chromium and keeping Node.js in the driver's seat for OS integration, Lotus delivers a "blistering fast" experience with a tiny footprint.
@@ -12,9 +26,6 @@ It's designed for developers who want to build cross-platform desktop applicatio
 **🥊 THE ARCHITECTURE (Or: Why It's Fast)**
 • **Lotus Strategy:** 
   *Node owns the OS. Servo paints the pixels. No magic. No fake sandboxes. No hidden instances listening to how you use each piece of it for telemetry. The Goal here is to just be a renderer and let the devs do everything else directly in node with a blistering fast ipc (tested up to 9k messages per second reliably)*
-
-  ![IPC Benchmark](ipc-bench-linux.png)
-  *IPC stress test: 9,000+ messages/second at 0.111ms average latency (Linux)*
 
 **🔧 THE ANALOGY THAT EXPLAINS EVERYTHING:**
 • **Node.js** is the track.
@@ -73,9 +84,19 @@ npm install @lotus-gui/core @lotus-gui/dev
     *   **Why?** I wanted to eliminate the need for a webserver just to serve local files. It's faster and more secure this way though it also allows us to have direct control over the file serving process and protocol for adding encrypted virtual file systems in the future. (coming soon!)
     *   **Security:** Directory jailing. You can't `../../` your way to `/etc/passwd`. Nice try. This will also be further enhanced with the encrypted file systems in the future as you will be chunk loading on the fly in the loader itself or from ram if we load the whole thing in so reaching outside of that is noticiably harder on accident.
 
+*   **Asset Protection (Encrypted VFS):**
+    *   **Zero-Trust Architecture:** Want to ship a closed-source app? Lotus uses an AEAD-encrypted (AES-256-GCM) Virtual File System where the decryption key **never touches JavaScript or the V8 heap**. 
+    *   **Native Key Sharding:** The CLI shards the master key across compiled Rust constants and native binary sections (ELF/PE). The Rust core autonomously derives the key in protected memory.
+    *   **Byte-Limited LRU Cache:** We mitigate decryption overhead with a strict 128MB byte-limited LRU cache. Once an asset is loaded, it's served from memory at blistering speeds without risking an Out-Of-Memory (OOM) panic on heavy media files.
+
 *   **Advanced IPC (The Steering Wheel):**
     *   **WebSocket IPC Server:** We use `tokio` + `axum` on `127.0.0.1:0` with persistent `WebSocket` connections. It works. It's pretty fast and low latency. Yeah i know its a bit overkill but it works and it was fun to implement, though the main reasons are it also gives us blustering fast ipc, at least on my system in my personal testing i was able to get 10k messages per second reliably at an average latency of 0.111 ms in a string message test.  
-    *   **Auto-Adapting:** JSON? Binary? Blobs? We don't care. We handle it via WebSockets natively using msgpack to massively decrease the serialization/deserialization overhead and increase performance.
+ 
+ ![IPC Benchmark](ipc-bench-linux.png)
+ *IPC stress test: 9,000+ messages/second at 0.111ms average latency (Linux)*
+
+
+*   **Auto-Adapting:** JSON? Binary? Blobs? We don't care. We handle it via WebSockets natively using msgpack to massively decrease the serialization/deserialization overhead and increase performance.
     *   **MsgPack Batching (Pipelines):** We pack small messages together and unleash them in bursts to avoid starving the Winit rendering thread.
     *   **Zero-Copy focused Routing:** It's not fully zero copy as we have to move between stacks but i have tried my best to minimize this as much as possibly and moving it as little as possible. the only time it becomes copy is when it moves stacks but inside themselves they are not. i am looking into ideas of how to see if we can hand them off with a shared memory space between node and servo but.... for now this is a imo beautiful solution that is fast and reliable. 
     *   **`invoke()` / `handle()` (Promise IPC):** The renderer calls `window.lotus.invoke('ch', data)` and gets back a `Promise`. Node registers `ipcMain.handle('ch', async fn)`. No manual reply channels, no leaked listeners, no correlation IDs in your app code. I wanted this as simple as possible so it is easier to just pickup and use, though with the invoke and handle we still have .send and .on for the more advanced users who want more control over the ipc.
@@ -312,8 +333,11 @@ The `@lotus-gui/dev` package provides the `lotus` CLI:
 # Start dev server with hot-reload (watches for changes, auto-restarts)
 lotus dev [entry]
 
-# Build a distributable installer (DEB or RPM)
-lotus build --platform <linux|win32> --target <deb|rpm>
+# Build a distributable installer (DEB, RPM, MSI, EXE)
+lotus build --platform <linux|win32> --target <deb|rpm|msi|exe>
+
+# Build a strictly Closed-Source encrypted application
+lotus build --platform win32 --target exe --encrypt
 
 # Clean build artifacts (removes dist/)
 lotus clean
@@ -339,6 +363,34 @@ const win = new ServoWindow({
 });
 
 // Now serving at lotus-resource://localhost/index.html
+```
+
+### 🔒 Closed-Source Apps: The Encrypted VFS
+If you are building proprietary software and don't want users simply unzipping your `.exe` to steal your CSS and JavaScript, Lotus has you covered natively.
+
+When you pass the `--encrypt` flag to the build command, Lotus completely skips copying your `ui/` folder. Instead, it packs it into a high-entropy binary blob and injects it directly into the final executable alongside the Node SEA payload. 
+
+Because the architecture relies on native key derivation, initializing the secure VFS requires exactly one line of JavaScript. Your JS never handles the keys, NAPI hooks can't intercept them, and casual reverse engineers hit a brick wall.
+
+**In your `main.js`:**
+```javascript
+const { ServoWindow, app } = require('@lotus-gui/core');
+const path = require('path');
+
+// 1. Initialize the Encrypted VFS natively (Must happen before warmup)
+// If the app wasn't built with --encrypt, this safely skips itself.
+app.initVfs(); 
+
+// 2. Wake up the engine
+app.warmup(); 
+
+const win = new ServoWindow({
+    id: 'secure-window',
+    root: path.join(__dirname, 'ui'), // Still maps to the VFS internally!
+    index: 'index.html',
+    width: 1024,
+    height: 768
+});
 ```
 
 ### IPC: Talking to the Machine
@@ -607,9 +659,6 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 
 ---
 ## 🗺️ Roadmap
-
-### v0.3.5: Encrypted VFS
-*   **Encrypted VFS:** Add a encrypted VFS to the core that will allow for encrypted file storage and retrieval. I plan to build it into the build process as a derived key that is then fed into servo when it loads that it will then pull the vfs from storage and decrypt it into memory. This will allow for encrypted file storage and retrieval. since we have full control over the custom file protocol we can make it just flipping a flag for the developers.
 
 ### v0.4.0: The Future (Community Input Welcome)
 *   **Build optimization:** See what we can strip out of the servo build. right now its fully support everything a browser does on the js and html side. so that includes things like VR support and XR support which i would say we probably dont need and probably many other things we can trim out. since its and open source project if someone wants to add them back i want to keep it as simple as a change to the build file to add it back in if they want.

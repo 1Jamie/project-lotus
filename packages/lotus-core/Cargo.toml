@@ -1,7 +1,8 @@
 [package]
 name = "lotus"
-version = "0.3.1"
+version = "0.3.3"
 edition = "2021"
+
 build = "build.rs"
 
 [lib]
@@ -14,10 +15,14 @@ winit = { version = "0.30" }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 webrender = "0.68"
 euclid = "0.22"
-servo_url = { path = "servo/components/url", package = "servo-url" }
-servo = { path = "servo/components/servo" }
+servo-url = "0.1"
+servo = { version = "0.1", default-features = false, features = ["js_jit", "clipboard", "baked-in-resources", "webgpu", "bluetooth", "native-bluetooth", "gamepad"] }
 
 # Cross-platform dependencies
+aes-gcm = "0.10"
+memmap2 = "0.9"
+lru = "0.12"
+object = "0.36"
 dpi = "0.1"
 crossbeam-channel = "0.5"
 url = "2.5"
@@ -41,6 +46,7 @@ mime_guess = "2.0.5"
 http = "1.4.0"
 window-vibrancy = "0.5"
 dark-light = "1.0"
+glib = "0.22.0-alpha.3"
 
 # Linux-only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -51,7 +57,8 @@ raw-window-handle = "0.6"
 
 # Windows-only dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
-servo = { path = "servo/components/servo", features = ["no-wgl"] }
+servo = { version = "0.1", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "baked-in-resources", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "gstreamer", "media-gstreamer"] }
+windows-sys = { version = "0.52", features = ["Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_Foundation"] }
 
 [build-dependencies]
 napi-build = "2"
