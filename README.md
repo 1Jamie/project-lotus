@@ -605,7 +605,7 @@ This is where development happens. I do all the dev work from here so i sadly on
     - **Rust**: stable-x86_64-pc-windows-msvc
     - **Node.js**: v22+
     - **LLVM & NASM**: Required for N-API and native linking (`choco install llvm nasm`)
-    - **GStreamer**: Required for media support (`choco install gstreamer pkgconfiglite`)
+    - **GStreamer**: Required for media support (`choco install gstreamer gstreamer-devel pkgconfiglite`)
     - **Environment**: You must set `GSTREAMER_1_0_ROOT_X86_64` to your GStreamer install path (e.g., `C:\gstreamer\1.0\msvc_x86_64`) and add the `bin` directory to your `PATH`.
 
 

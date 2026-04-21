@@ -29,12 +29,12 @@ jobs:
             build_id: x86_64-pc-windows-msvc
             setup: |
               git config --global core.longpaths true
-              choco install llvm nasm python311 gstreamer pkgconfiglite
+              choco install llvm nasm python311 gstreamer gstreamer-devel pkgconfiglite
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
-              echo "GSTREAMER_1_0_ROOT_X86_64=C:\gstreamer\1.0\msvc_x86_64" >> $GITHUB_ENV
-              echo "PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" >> $GITHUB_ENV
-              echo "C:\gstreamer\1.0\msvc_x86_64\bin" >> $GITHUB_PATH
+              echo "GSTREAMER_1_0_ROOT_X86_64=C:/gstreamer/1.0/msvc_x86_64" >> $GITHUB_ENV
+              echo "PKG_CONFIG_PATH=C:/gstreamer/1.0/msvc_x86_64/lib/pkgconfig" >> $GITHUB_ENV
+              echo "C:/gstreamer/1.0/msvc_x86_64/bin" >> $GITHUB_PATH
             build: |
               npm run build --workspace=@lotus-gui/core
           - host: ubuntu-latest
