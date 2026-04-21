@@ -580,7 +580,7 @@ This is where development happens. I do all the dev work from here so i sadly on
     **Ubuntu/Debian:**
     ```bash
     sudo apt-get update
-    sudo apt-get install libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev
+    sudo apt-get install libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev libdbus-1-dev pkg-config
 
     # Required for building .deb installers with `lotus build`
     sudo apt-get install dpkg-dev fakeroot
@@ -600,7 +600,13 @@ This is where development happens. I do all the dev work from here so i sadly on
 ### Windows
 *   **Status:** ✅ Verified
 *   **NPM:** ✅ Verified - `@lotus-gui/core` includes the pre-built Windows binary.
-*   **Build Requirements** reference the github actions for the windows build as it will be a lot better than me trying to explain it, i wont lie, i def asked gemini for help with getting that build script working as im horrible at windows.
+*   **Build Requirements**: 
+    - **Note**: Reference the github actions for the windows build as it will be a lot better than me trying to explain it, i wont lie, i def asked gemini for help with getting that build script working as im horrible at windows. But if you really want to try it yourself, here is what i've gathered so far:
+    - **Rust**: stable-x86_64-pc-windows-msvc
+    - **Node.js**: v22+
+    - **LLVM & NASM**: Required for N-API and native linking (`choco install llvm nasm`)
+    - **GStreamer**: Required for media support (`choco install gstreamer pkgconfiglite`)
+    - **Environment**: You must set `GSTREAMER_1_0_ROOT_X86_64` to your GStreamer install path (e.g., `C:\gstreamer\1.0\msvc_x86_64`) and add the `bin` directory to your `PATH`.
 
 
 ## cloning and building

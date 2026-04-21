@@ -29,9 +29,12 @@ jobs:
             build_id: x86_64-pc-windows-msvc
             setup: |
               git config --global core.longpaths true
-              choco install llvm nasm python311
+              choco install llvm nasm python311 gstreamer pkgconfiglite
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
+              echo "GSTREAMER_1_0_ROOT_X86_64=C:\gstreamer\1.0\msvc_x86_64" >> $GITHUB_ENV
+              echo "PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" >> $GITHUB_ENV
+              echo "C:\gstreamer\1.0\msvc_x86_64\bin" >> $GITHUB_PATH
             build: |
               npm run build --workspace=@lotus-gui/core
           - host: ubuntu-latest
@@ -40,6 +43,7 @@ jobs:
             setup: |
               sudo apt-get update && sudo apt-get install -y \
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
+                libdbus-1-dev pkg-config \
                 clang libclang-dev lld
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
@@ -51,7 +55,7 @@ jobs:
             build: |
               docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
                 zypper --non-interactive refresh && \
-                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel python3 git gzip tar dpkg rpm-build curl clang clang-devel lld && \
+                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python3 git gzip tar dpkg rpm-build curl clang clang-devel lld && \
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
                 npm install && \

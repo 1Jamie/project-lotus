@@ -331,7 +331,7 @@ const win2 = new ServoWindow({ id: 'preview', title: 'Preview' });
 ### Prerequisites
 - **Rust** stable toolchain.
 - **Node.js** v22+.
-- System libraries: OpenGL, OpenSSL, and fontconfig.
+- System libraries: OpenGL, OpenSSL, fontconfig, dbus-1, and pkg-config.
 
 ### Build Commands
 ```bash

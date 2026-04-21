@@ -46,7 +46,6 @@ mime_guess = "2.0.5"
 http = "1.4.0"
 window-vibrancy = "0.5"
 dark-light = "1.0"
-glib = "0.22.0-alpha.3"
 
 # Linux-only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
