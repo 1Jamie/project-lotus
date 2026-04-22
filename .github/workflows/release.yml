@@ -24,7 +24,17 @@ jobs:
             setup: |
               git config --global core.longpaths true
               choco install llvm nasm python311 pkgconfiglite gstreamer gstreamer-devel --no-progress -y
-              powershell -Command "New-Item -ItemType Junction -Path 'C:\gst' -Target 'C:\gstreamer\1.0\msvc_x86_64'"
+              powershell -Command "
+                \$paths = @(
+                  \"C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\",
+                  \"C:\\gstreamer\\1.0\\msvc_x86_64\",
+                  \$env:GSTREAMER_1_0_ROOT_MSVC_X86_64
+                )
+                \$gstPath = \$paths | Where-Object { \$_ -and (Test-Path \$_) } | Select-Object -First 1
+                if (-not \$gstPath) { throw \"GStreamer not found in expected locations\" }
+                Write-Host \"Found GStreamer at: \$gstPath\"
+                New-Item -ItemType Junction -Path 'C:\gst' -Target \$gstPath
+              "
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
               echo "GSTREAMER_1_0_ROOT_X86_64=C:/gst" >> $GITHUB_ENV
