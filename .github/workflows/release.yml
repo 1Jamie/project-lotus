@@ -23,8 +23,12 @@ jobs:
           - host: windows-latest
             setup: |
               git config --global core.longpaths true
-              choco install llvm nasm python311 gstreamer gstreamer-devel pkgconfiglite --no-progress
-              powershell -Command "New-Item -ItemType Junction -Path 'C:\gst' -Target 'C:\Program Files\gstreamer\1.0\msvc_x86_64'"
+              choco install llvm nasm python311 pkgconfiglite --no-progress
+              curl -L -O https://gstreamer.freedesktop.org/data/pkg/windows/1.24.12/msvc/gstreamer-1.0-msvc-x86_64-1.24.12.msi
+              curl -L -O https://gstreamer.freedesktop.org/data/pkg/windows/1.24.12/msvc/gstreamer-1.0-devel-msvc-x86_64-1.24.12.msi
+              powershell -Command "Start-Process msiexec.exe -ArgumentList '/i gstreamer-1.0-msvc-x86_64-1.24.12.msi /quiet /norestart' -Wait"
+              powershell -Command "Start-Process msiexec.exe -ArgumentList '/i gstreamer-1.0-devel-msvc-x86_64-1.24.12.msi /quiet /norestart' -Wait"
+              powershell -Command "New-Item -ItemType Junction -Path 'C:\gst' -Target 'C:\gstreamer\1.0\msvc_x86_64'"
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
               echo "GSTREAMER_1_0_ROOT_X86_64=C:/gst" >> $GITHUB_ENV
