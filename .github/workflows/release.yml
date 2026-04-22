@@ -23,8 +23,8 @@ jobs:
           - host: windows-latest
             setup: |
               git config --global core.longpaths true
-              choco install llvm nasm python311 pkgconfiglite --no-progress
-              powershell -Command "New-Item -ItemType Junction -Path 'C:\gst' -Target \"$GSTREAMER_1_0_ROOT_MSVC_X86_64\""
+              choco install llvm nasm python311 pkgconfiglite gstreamer gstreamer-devel --no-progress -y
+              powershell -Command "New-Item -ItemType Junction -Path 'C:\gst' -Target 'C:\gstreamer\1.0\msvc_x86_64'"
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
               echo "GSTREAMER_1_0_ROOT_X86_64=C:/gst" >> $GITHUB_ENV
@@ -101,12 +101,6 @@ jobs:
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' }}
         with:
           version: 0.11.0
-      - name: Setup GStreamer
-        if: matrix.settings.host == 'windows-latest'
-        uses: blinemedical/setup-gstreamer@v1.4.0
-        with:
-          version: '1.24.12'
-          arch: 'x86_64'
       - name: Setup toolchain
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
