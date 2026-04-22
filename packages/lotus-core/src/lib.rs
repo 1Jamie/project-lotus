@@ -1,8 +1,10 @@
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::{env, fs, path::PathBuf, process::Command};
-use std::collections::{HashMap, VecDeque};
+use std::{env, fs, path::PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::Command;
+use std::collections::HashMap;
 use std::time::Instant;
 use std::num::NonZeroUsize;
 
@@ -29,10 +31,6 @@ use winit::raw_window_handle::{HasWindowHandle, HasDisplayHandle};
 use dpi::PhysicalSize as ServoPhysicalSize;
 #[cfg(target_os = "macos")]
 use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
-#[cfg(target_os = "windows")]
-use window_vibrancy::{apply_blur, apply_mica};
-#[cfg(target_os = "windows")]
-use winit::platform::windows::WindowAttributesExtWindows;
 #[cfg(target_os = "linux")]
 use winit::platform::x11::WindowAttributesExtX11;
 #[cfg(target_os = "linux")]
@@ -60,11 +58,10 @@ use http::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use http::StatusCode;
 use dark_light;
 use aes_gcm::{
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce
 };
 use lru::LruCache;
-use memmap2::Mmap;
 
 
 // IPC Message structure - Removed! process raw bytes.
@@ -190,8 +187,6 @@ impl AutonomousKeyDeriver {
         #[cfg(target_os = "windows")]
         {
             use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, FindResourceW, LoadResource, LockResource, SizeofResource};
-            use windows_sys::Win32::System::Memory::PAGE_READONLY;
-            use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
             unsafe {
                 let module = GetModuleHandleW(std::ptr::null());
@@ -209,7 +204,7 @@ impl AutonomousKeyDeriver {
                 if size == 0 { return None; }
 
                 let handle = LoadResource(module, res);
-                if handle == 0 { return None; }
+                if handle.is_null() { return None; }
 
                 let data_ptr = LockResource(handle);
                 if data_ptr.is_null() { return None; }
@@ -339,7 +334,7 @@ struct AppState {
     ipc_server_token: String,
     msgpackr_source: String,
     profiling: bool,
-    start_time: Instant,
+    _start_time: Instant,
     window_start_times: HashMap<String, Instant>,
     vfs: Option<Arc<EncryptedVfs>>,
     resource_cache: ByteLimitedLruCache,
@@ -795,7 +790,7 @@ pub struct DragRegionPayload {
     pub drag: Option<Vec<DragRect>>,
     #[serde(rename = "noDrag")]
     #[allow(non_snake_case)]
-    pub noDrag: Option<Vec<DragRect>>,
+    pub no_drag: Option<Vec<DragRect>>,
 }
 
 fn intercept_drag_regions(raw_bytes: &[u8], window_id: String) {
@@ -809,7 +804,7 @@ fn intercept_drag_regions(raw_bytes: &[u8], window_id: String) {
                     )
                 }).collect::<Vec<_>>();
 
-                let no_drag_regions = payload.noDrag.unwrap_or_default().into_iter().map(|r| {
+                let no_drag_regions = payload.no_drag.unwrap_or_default().into_iter().map(|r| {
                     euclid::Rect::new(
                         euclid::Point2D::new(r.x, r.y),
                         euclid::Size2D::new(r.width, r.height)
@@ -937,7 +932,7 @@ impl WindowHandle {
                     )
                 }).collect::<Vec<_>>();
 
-                let no_drag_regions = data.noDrag.unwrap_or_default().into_iter().map(|r| {
+                let no_drag_regions = data.no_drag.unwrap_or_default().into_iter().map(|r| {
                     euclid::Rect::new(
                         euclid::Point2D::new(r.x, r.y),
                         euclid::Size2D::new(r.width, r.height)
@@ -1898,7 +1893,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
                     },
                     WindowEvent::RedrawRequested => {
-                        let size = instance.window.inner_size();
+                        let _size = instance.window.inner_size();
                         // Changed to INFO level so we can see this in default logs
                         //info!("Rust: RedrawRequested for {}, size={}x{}, visible={}", 
                         //    uuid, size.width, size.height, instance.window.is_visible().unwrap_or(true));
@@ -2288,7 +2283,7 @@ impl App {
             ipc_server_token: Uuid::new_v4().to_string(),
             msgpackr_source,
             profiling,
-            start_time,
+            _start_time: start_time,
             window_start_times: HashMap::new(),
             vfs: None,
             resource_cache: ByteLimitedLruCache::new(128 * 1024 * 1024), // 128MB limit

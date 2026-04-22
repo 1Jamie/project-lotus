@@ -4676,7 +4676,7 @@ dependencies = [
 
 [[package]]
 name = "lotus"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aes-gcm",
  "axum",
@@ -4689,7 +4689,6 @@ dependencies = [
  "env_logger",
  "euclid",
  "futures-util",
- "glib",
  "glutin",
  "glutin-winit",
  "http 1.4.0",
