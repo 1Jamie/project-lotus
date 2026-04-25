@@ -4,6 +4,9 @@
     "description": "Test Application for Lotus",
     "main": "main.js",
     "license": "ISC",
+    "scripts": {
+        "dev": "LOTUS_DEV_REQ=../ lotus dev main.js"
+    },
     "dependencies": {
         "@lotus-gui/core": "file:..",
         "@lotus-gui/dev": "file:../../lotus-dev"

@@ -1,6 +1,6 @@
 [package]
 name = "lotus"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 
 build = "build.rs"
@@ -16,7 +16,7 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 webrender = "0.68"
 euclid = "0.22"
 servo-url = "0.1"
-servo = { version = "0.1", default-features = false, features = ["js_jit", "clipboard", "baked-in-resources", "webgpu", "bluetooth", "native-bluetooth", "gamepad"] }
+servo = { version = "0.1", default-features = false, features = ["js_jit", "clipboard", "webgpu", "bluetooth", "native-bluetooth", "gamepad"] }
 
 # Cross-platform dependencies
 aes-gcm = "0.10"
@@ -56,7 +56,7 @@ raw-window-handle = "0.6"
 
 # Windows-only dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
-servo = { version = "0.1", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "baked-in-resources", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "gstreamer", "media-gstreamer"] }
+servo = { version = "0.1", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "gstreamer", "media-gstreamer"] }
 windows-sys = { version = "0.52", features = ["Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_Foundation"] }
 
 [build-dependencies]

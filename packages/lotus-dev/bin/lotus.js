@@ -27,38 +27,102 @@ program
     .command('dev [entry]')
     .description('Launch the Lotus runner with hot-reloading')
     .action((entry = 'index.js') => {
-        console.log(`Starting Lotus dev server...`);
+        console.log(`\x1b[36m[Lotus] Starting dev server...\x1b[0m`);
 
         let appProcess = null;
+        let isRestarting = false;
+        let restartPending = false;
+        let debounceTimer = null;
 
-        const startApp = () => {
+        const startApp = async () => {
+            if (isRestarting) {
+                restartPending = true;
+                return;
+            }
+            isRestarting = true;
+
             if (appProcess) {
-                appProcess.kill();
+                console.log(`\x1b[33m[Lotus] Stopping previous process (PID: ${appProcess.pid})...\x1b[0m`);
+                
+                // Try graceful termination first
+                appProcess.kill('SIGTERM');
+                
+                const exitPromise = new Promise(resolve => {
+                    const forceTimeout = setTimeout(() => {
+                        if (appProcess && appProcess.exitCode === null) {
+                            console.log(`\x1b[31m[Lotus] Process did not exit gracefully, forcing kill...\x1b[0m`);
+                            appProcess.kill('SIGKILL');
+                        }
+                        resolve();
+                    }, 2000); // Wait up to 2 seconds for graceful exit
+                    
+                    appProcess.on('exit', () => {
+                        clearTimeout(forceTimeout);
+                        resolve();
+                    });
+                });
+                
+                await exitPromise;
+                appProcess = null;
             }
 
-            console.log(`Launching ${entry}...`);
-            appProcess = spawn('node', [entry], {
-                stdio: 'inherit',
-                env: { ...process.env, LOTUS_DEV: 'true' }
-            });
+            if (!fs.existsSync(entry)) {
+                console.log(`\x1b[31m[Lotus] Error: Entry file "${entry}" not found.\x1b[0m`);
+                isRestarting = false;
+                return;
+            }
 
-            appProcess.on('close', (code) => {
-                if (code !== 0 && code !== null) {
-                    console.log(`Lotus app exited with code ${code}`);
-                }
-            });
+            console.log(`\x1b[32m[Lotus] Launching ${entry}...\x1b[0m`);
+            try {
+                appProcess = spawn('node', [entry], {
+                    stdio: 'inherit',
+                    env: { ...process.env, LOTUS_DEV: 'true' }
+                });
+
+                appProcess.on('error', (err) => {
+                    console.log(`\x1b[31m[Lotus] Failed to start process: ${err.message}\x1b[0m`);
+                    appProcess = null;
+                });
+
+                appProcess.on('close', (code) => {
+                    if (code !== 0 && code !== null) {
+                        // Only log error if it wasn't us killing it
+                        if (appProcess && !appProcess.killed) {
+                            console.log(`\x1b[31m[Lotus] App exited with code ${code}\x1b[0m`);
+                        }
+                    }
+                });
+            } catch (err) {
+                console.log(`\x1b[31m[Lotus] Unexpected error during spawn: ${err.message}\x1b[0m`);
+            }
+
+            isRestarting = false;
+            if (restartPending) {
+                restartPending = false;
+                startApp();
+            }
         };
 
         const watcher = chokidar.watch('.', {
-            ignored: /(^|[\/\\])\..|node_modules|dist/,
-            persistent: true
+            ignored: [
+                /(^|[\/\\])\../,
+                'node_modules',
+                'dist',
+                'package-lock.json',
+                'yarn.lock',
+                '.git'
+            ],
+            persistent: true,
+            ignoreInitial: true
         });
 
-        watcher.on('change', (path) => {
-            console.log(`File ${path} has been changed`);
-            startApp();
+        watcher.on('all', (event, path) => {
+            console.log(`\x1b[34m[Lotus] ${event}: ${path}\x1b[0m`);
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(startApp, 200);
         });
 
+        // Initial start
         startApp();
     });
 
