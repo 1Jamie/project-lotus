@@ -28,7 +28,7 @@ win.on('ready', () => {
     console.log("[App] ServoWindow reported READY");
 });
 
-win.once('frame-ready', () => {
+win.once('ready-to-show', () => {
     console.log("[App] First Frame Ready - Showing Window (No Flash guaranteed)");
     win.show();
 });

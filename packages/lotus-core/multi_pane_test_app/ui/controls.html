@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: rgba(30, 41, 59, 0.8);
+            backdrop-filter: blur(8px);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 100vh;
+            box-sizing: border-box;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            -webkit-user-select: none;
+            user-select: none;
+        }
+
+        .drag-region {
+            flex-grow: 1;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            padding-left: 20px;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.8rem;
+            color: #94a3b8;
+            font-weight: 600;
+            cursor: default;
+        }
+
+        .controls {
+            display: flex;
+            gap: 8px;
+            padding-right: 15px;
+        }
+
+        .control-btn {
+            width: 120px; /* Wider buttons for a premium look */
+            height: 24px;
+            border-radius: 6px;
+            border: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .btn-minimize {
+            background: rgba(255, 255, 255, 0.05);
+            color: #94a3b8;
+        }
+        .btn-minimize:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+
+        .btn-maximize {
+            background: rgba(255, 255, 255, 0.05);
+            color: #94a3b8;
+        }
+        .btn-maximize:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+
+        .btn-close {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+        }
+        .btn-close:hover {
+            background: rgba(239, 68, 68, 0.4);
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="drag-region" id="drag" data-lotus-drag="true">
+        LOTUS FRAMEWORK
+    </div>
+    <div class="controls">
+        <button class="control-btn btn-minimize" onclick="minimize()">Minimize</button>
+        <button class="control-btn btn-maximize" onclick="maximize()">Maximize</button>
+        <button class="control-btn btn-close" onclick="closeWin()">Close</button>
+    </div>
+
+    <script>
+        function minimize() {
+            if (window.lotus) window.lotus.send('window-minimize');
+        }
+        function maximize() {
+            if (window.lotus) window.lotus.send('window-maximize');
+        }
+        function closeWin() {
+            if (window.lotus) window.lotus.send('window-close');
+        }
+    </script>
+</body>
+</html>

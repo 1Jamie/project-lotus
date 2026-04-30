@@ -3,6 +3,7 @@
   "version": "0.3.4",
 
   "main": "lotus.js",
+  "types": "lotus.d.ts",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/1Jamie/project-lotus.git"
@@ -46,6 +47,7 @@
   "scripts": {
     "build": "napi build --platform --release && node scripts/extract_angle_dlls.js",
     "build:debug": "napi build --platform && node scripts/extract_angle_dlls.js",
+    "patch": "bash ./scripts/apply-patches.sh",
     "clean": "node scripts/clean.js",
     "artifacts": "echo 'Artifacts moved by CI workflow'",
     "test": "npm run test:base",

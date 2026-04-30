@@ -1,0 +1,15 @@
+{
+    "name": "lotus-test-app",
+    "version": "1.0.0",
+    "description": "Test Application for Lotus",
+    "main": "main.js",
+    "license": "ISC",
+    "scripts": {
+        "start": "node main.js",
+        "dev": "LOTUS_DEV_REQ=../ lotus dev main.js"
+    },
+    "dependencies": {
+        "@lotus-gui/core": "file:..",
+        "@lotus-gui/dev": "file:../../lotus-dev"
+    }
+}

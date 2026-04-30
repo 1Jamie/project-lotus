@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { 
+            background: #000; 
+            color: #4af626; 
+            font-family: monospace; 
+            margin: 0; 
+            padding: 16px; 
+            height: 100vh; 
+            box-sizing: border-box; 
+            border-top: 1px solid #333; 
+            overflow-y: hidden;
+            border-bottom-left-radius: 20px;
+            border-bottom-right-radius: 20px;
+        }
+        .prompt::before { content: "$ "; color: #888; }
+        .cursor { display: inline-block; width: 8px; height: 15px; background: #4af626; animation: blink 1s step-end infinite; vertical-align: middle; margin-left: 4px;}
+        @keyframes blink { 50% { opacity: 0; } }
+    </style>
+</head>
+<body>
+    <div>Lotus Developer Console</div>
+    <div>Native Docking System Activated...</div>
+    <div>Bottom Anchor Attached.</div>
+    <div class="prompt">lotus-core start <span class="cursor"></span></div>
+</body>
+</html>

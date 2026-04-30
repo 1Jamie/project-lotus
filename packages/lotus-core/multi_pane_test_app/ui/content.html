@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Outfit:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        :root { --bg: #020617; --surface: #0f172a; --accent: #3b82f6; --text: #f8fafc; --muted: #94a3b8; }
+        body { 
+            background-color: var(--bg); 
+            color: var(--text); 
+            font-family: 'Inter', sans-serif; 
+            margin: 0; 
+            padding: 48px; 
+            height: 100vh; 
+            box-sizing: border-box; 
+            border-top-right-radius: 20px;
+            border-bottom-right-radius: 20px;
+        }
+        .card { background: var(--surface); padding: 32px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.05); box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
+        h1 { font-family: 'Outfit', sans-serif; color: var(--text); margin-top: 0; }
+        p { color: var(--muted); line-height: 1.6; }
+        .info-tag { display: inline-block; padding: 4px 12px; background: rgba(59, 130, 246, 0.1); color: var(--accent); border-radius: 20px; font-size: 0.75rem; font-weight: 600; margin-bottom: 16px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="info-tag">Active View</div>
+        <h1 id="view-title">Dashboard</h1>
+        <p id="view-desc">Select an item from the sidebar to test IPC message routing.</p>
+        <p>Try opening the terminal or command palette from the sidebar to see the native layout algorithm dynamically un-fill this pane in real-time, with zero IPC lag.</p>
+    </div>
+
+    <script>
+        if (window.lotus) {
+            window.lotus.on('update-view', (data) => {
+                document.getElementById('view-title').textContent = data.view;
+                document.getElementById('view-desc').textContent = `Successfully routed IPC message to switch view to ${data.view}.`;
+            });
+        }
+    </script>
+</body>
+</html>

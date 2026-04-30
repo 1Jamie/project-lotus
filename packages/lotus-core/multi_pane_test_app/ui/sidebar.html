@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Outfit:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        :root { --bg: #0f172a; --accent: #3b82f6; --text: #f8fafc; --muted: #64748b; --hover: #1e293b; }
+        body { 
+            background: var(--bg); 
+            color: var(--text); 
+            font-family: 'Inter', sans-serif; 
+            margin: 0; 
+            padding: 24px; 
+            height: 100vh; 
+            border-right: 1px solid rgba(255,255,255,0.1); 
+            box-sizing: border-box; 
+            display: flex; 
+            flex-direction: column;
+            border-top-left-radius: 20px;
+            border-bottom-left-radius: 20px;
+        }
+        h2 { font-family: 'Outfit', sans-serif; font-size: 1.5rem; margin-bottom: 32px; background: linear-gradient(to right, #60a5fa, #a855f7); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        ul { list-style: none; padding: 0; margin: 0; flex-grow: 1; }
+        li { padding: 12px 16px; margin-bottom: 8px; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; color: var(--muted); font-weight: 500; }
+        li:hover { background: var(--hover); color: var(--text); transform: translateX(4px); }
+        li.active { background: rgba(59, 130, 246, 0.1); color: var(--accent); }
+        button { background: var(--accent); color: white; border: none; padding: 10px; border-radius: 8px; cursor: pointer; font-weight: bold; width: 100%; margin-top: 10px; }
+        button:hover { opacity: 0.9; }
+        .footer { font-size: 0.75rem; color: var(--muted); padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.05); }
+    </style>
+</head>
+<body>
+    <h2>Lotus Engine</h2>
+    <ul id="nav">
+        <li data-view="Dashboard" class="active">Dashboard</li>
+        <li data-view="Metrics">Metrics</li>
+        <li data-view="Settings">Settings</li>
+    </ul>
+    
+    <div style="margin-bottom: 20px;">
+        <button id="btn-term">Toggle Terminal</button>
+        <button id="btn-pal">Command Palette (Ctrl+P)</button>
+    </div>
+
+    <div class="footer">
+        Lotus Core Showcase<br>
+        Multi-Pane Architecture
+    </div>
+
+    <script>
+        document.getElementById('nav').addEventListener('click', (e) => {
+            if (e.target.tagName === 'LI') {
+                document.querySelectorAll('li').forEach(li => li.classList.remove('active'));
+                e.target.classList.add('active');
+                
+                if (window.lotus) {
+                    window.lotus.send('sidebar-navigate', { view: e.target.dataset.view });
+                }
+            }
+        });
+
+        document.getElementById('btn-term').addEventListener('click', () => {
+            if (window.lotus) window.lotus.send('toggle-terminal');
+        });
+
+        document.getElementById('btn-pal').addEventListener('click', () => {
+            if (window.lotus) window.lotus.send('toggle-palette');
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.ctrlKey && e.key === 'p') {
+                if (window.lotus) window.lotus.send('toggle-palette');
+            }
+        });
+    </script>
+</body>
+</html>

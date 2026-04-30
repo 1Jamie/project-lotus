@@ -78,7 +78,7 @@ const win = new ServoWindow(options);
 | `height` | `number` | `768` | Initial window height in pixels. |
 | `title` | `string` | `'Lotus'` | Window title. |
 | `transparent` | `boolean` | `false` | Enable OS-level window transparency. |
-| `visible` | `boolean` | `true` | Show window immediately. Set to `false` and show after `frame-ready` to avoid a white flash during loading. |
+| `visible` | `boolean` | `true` | Show window immediately. Set to `false` and show after `ready-to-show` to avoid a white flash during loading. |
 | `frameless` | `boolean` | `false` | Remove the native window frame to enable custom title bars and drag regions. |
 | `resizable` | `boolean` | `true` | Allow the user to resize the window. |
 | `maximized` | `boolean` | `false` | Start the window in a maximized state. |
@@ -112,8 +112,8 @@ const win = new ServoWindow(options);
 
 | Event | Callback | Description |
 |-------|----------|-------------|
-| `'ready'` | `()` | Window has been successfully created and is ready for use. |
-| `'frame-ready'` | `()` | The first frame has been rendered. Recommended time to call `show()`. |
+| `'ready'` | `()` | The renderer (webpage) has finished loading and is ready for IPC. (Alias for `dom-ready`) |
+| `'ready-to-show'` | `()` | The first frame has been rendered. Recommended time to call `show()`. (Alias for `frame-ready`) |
 | `'load-status'` | `(status: string)` | Page load status changed (`'loading'`, `'complete'`). |
 | `'moved'` | `({ x: number, y: number })` | Window position has changed. |
 | `'resize'` | `({ width: number, height: number })` | Window size has changed. |
@@ -133,7 +133,7 @@ const win = new ServoWindow({
 });
 
 // Show only after first frame (prevents white flash)
-win.once('frame-ready', () => win.show());
+win.once('ready-to-show', () => win.show());
 ```
 
 ---
@@ -247,7 +247,7 @@ const win = new ServoWindow({
     transparent: true,
     visible: false
 });
-win.once('frame-ready', () => win.show());
+win.once('ready-to-show', () => win.show());
 ```
 
 The window background is fully transparent until your CSS paints it. Combined with `visible: false`, this entirely eliminates the white flash that often plagues web-based GUI apps.

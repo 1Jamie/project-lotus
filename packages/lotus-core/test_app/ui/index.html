@@ -272,6 +272,13 @@
                 </div>
             </div>
         </div>
+        <div class="demo-section">
+            <h2>🔊 Audio Support Check</h2>
+            <button onclick="checkAudioSupport()" class="demo-button" style="background: #e91e63;">Check Audio Support</button>
+            <div id="audio-status" class="result-box">
+                <em>Click to check for AudioContext and media support...</em>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -415,6 +422,25 @@
             console.error('❌ window.lotus is NOT available - IPC injection failed');
             document.getElementById('ipc-status').textContent = 'Failed';
             document.getElementById('ipc-status').style.color = '#f44336';
+        }
+
+        function checkAudioSupport() {
+            const statusEl = document.getElementById('audio-status');
+            const hasAudioContext = typeof window.AudioContext !== 'undefined' || typeof window.webkitAudioContext !== 'undefined';
+            const audioTag = document.createElement('audio');
+            const canPlayMp3 = audioTag.canPlayType('audio/mpeg');
+            const canPlayOgg = audioTag.canPlayType('audio/ogg');
+            const canPlayWav = audioTag.canPlayType('audio/wav');
+
+            statusEl.innerHTML = `
+                <strong>Audio Results:</strong><br>
+                <div style="margin-left: 20px; margin-top: 10px; font-family: monospace; font-size: 0.9em;">
+                    AudioContext: <span style="color: ${hasAudioContext ? '#76b900' : '#f44336'};">${hasAudioContext ? 'AVAILABLE' : 'MISSING'}</span><br>
+                    MP3 Support: <span style="color: ${canPlayMp3 ? '#76b900' : '#f44336'};">${canPlayMp3 || 'no'}</span><br>
+                    OGG Support: <span style="color: ${canPlayOgg ? '#76b900' : '#f44336'};">${canPlayOgg || 'no'}</span><br>
+                    WAV Support: <span style="color: ${canPlayWav ? '#76b900' : '#f44336'};">${canPlayWav || 'no'}</span>
+                </div>
+            `;
         }
 
         console.log("Lotus UI loaded.");

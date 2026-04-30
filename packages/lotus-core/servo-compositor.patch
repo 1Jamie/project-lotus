@@ -1,0 +1,33 @@
+diff --git a/components/shared/paint/rendering_context.rs b/components/shared/paint/rendering_context.rs
+index 0bd82ae05f7..2b4f746ff2f 100644
+--- a/components/shared/paint/rendering_context.rs
++++ b/components/shared/paint/rendering_context.rs
+@@ -753,7 +753,7 @@ pub struct OffscreenRenderingContext {
+     framebuffer: RefCell<Framebuffer>,
+ }
+ 
+-type RenderToParentCallback = Box<dyn Fn(&glow::Context, Rect<i32>) + Send + Sync>;
++type RenderToParentCallback = Box<dyn Fn(&glow::Context, Rect<i32>, u32) + Send + Sync>;
+ 
+ impl OffscreenRenderingContext {
+     fn new(parent_context: Rc<WindowRenderingContext>, size: PhysicalSize<u32>) -> Self {
+@@ -778,16 +778,16 @@ impl OffscreenRenderingContext {
+         // Don't accept a `None` context for the source framebuffer.
+         let front_framebuffer_id =
+             NonZeroU32::new(self.framebuffer.borrow().framebuffer_id).map(NativeFramebuffer)?;
+-        let parent_context_framebuffer_id = self.parent_context.surfman_context.framebuffer();
+         let size = self.size.get();
+         let size = Size2D::new(size.width as i32, size.height as i32);
+-        Some(Box::new(move |gl, target_rect| {
++        Some(Box::new(move |gl, target_rect, target_fbo| {
++            let target_framebuffer_id = NonZeroU32::new(target_fbo).map(NativeFramebuffer);
+             Self::blit_framebuffer(
+                 gl,
+                 Rect::new(Point2D::origin(), size.to_i32()),
+                 front_framebuffer_id,
+                 target_rect,
+-                parent_context_framebuffer_id,
++                target_framebuffer_id,
+             );
+         }))
+     }
