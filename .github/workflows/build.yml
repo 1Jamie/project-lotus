@@ -28,7 +28,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             build_id: x86_64-pc-windows-msvc
             setup: |
-              git config --global core.longpaths true
               choco install llvm nasm python311 pkgconfiglite gstreamer gstreamer-devel --no-progress -y
               powershell -Command "
                 \$paths = @(
@@ -56,7 +55,8 @@ jobs:
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
                 libdbus-1-dev pkg-config \
                 clang libclang-dev lld \
-                libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+                libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+                libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
           - host: ubuntu-latest
@@ -67,7 +67,7 @@ jobs:
             build: |
               docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
                 zypper --non-interactive refresh && \
-                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python3 git gzip tar dpkg rpm-build curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel && \
+                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python3 git gzip tar dpkg rpm-build curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-good-devel gstreamer-plugins-bad-devel && \
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
                 npm install && \
@@ -81,7 +81,9 @@ jobs:
             setup: |
               sudo apt-get update && sudo apt-get install -y \
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
-                clang libclang-dev lld
+                clang libclang-dev lld \
+                libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+                libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd && \
               mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node && \
@@ -89,6 +91,9 @@ jobs:
     name: stable - ${{ matrix.settings.build_id }} - node@22
     runs-on: ${{ matrix.settings.host }}
     steps:
+      - name: Enable long paths on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
       - uses: actions/checkout@v4
         with:
           submodules: recursive
