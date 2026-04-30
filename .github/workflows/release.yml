@@ -60,7 +60,7 @@ jobs:
             build: |
               docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
                 zypper --non-interactive refresh && \
-                zypper --non-interactive install -y npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python3 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-good-devel gstreamer-plugins-bad-devel && \
+                zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel && \
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
                 npm install && \
@@ -73,7 +73,8 @@ jobs:
             build_id: x86_64-unknown-freebsd
             setup: |
               sudo apt-get update
-              sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev libdbus-1-dev pkg-config
+              sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev libdbus-1-dev pkg-config \
+                libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd && \
               mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node && \
