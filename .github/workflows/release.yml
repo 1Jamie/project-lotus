@@ -22,7 +22,7 @@ jobs:
         settings:
           - host: windows-latest
             setup: |
-              choco install llvm nasm python311 pkgconfiglite gstreamer gstreamer-devel --no-progress -y
+              choco install llvm nasm python311 pkgconfiglite gstreamer --version 1.24.5 gstreamer-devel --version 1.24.5 --no-progress -y
               powershell -Command "
                 \$paths = @(
                   \"C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\",
@@ -119,10 +119,6 @@ jobs:
       - name: Install dependencies
         run: npm install
       - name: Build
-        env:
-          ac_cv_type_strerror_r_return_type: int
-          ac_cv_func_strerror_r_char_p: no
-          ac_cv_func_getcontext: no
         run: ${{ matrix.settings.build }}
         shell: bash
       - name: Upload artifact
