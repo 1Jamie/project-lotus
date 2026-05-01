@@ -85,10 +85,19 @@ jobs:
                 clang libclang-dev lld \
                 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
                 libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
+              
+              # Pipeline Patch: Exclude FreeBSD from jemalloc usage in the submodule.
+              # This is necessary because tikv-jemalloc-sys's configure script fails during cross-compilation for FreeBSD
+              # (specifically detecting strerror_r). Since FreeBSD has jemalloc in libc, we don't need to build it.
+              # We modify the submodule's Cargo.toml and .rs files transiently during CI to use the system allocator.
+              echo "[Lotus] Applying transient FreeBSD jemalloc patches to submodule..."
+              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" -print0 | xargs -0 sed -i 's/target_os = "windows"/target_os = "windows", target_os = "freebsd"/g'
+              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" -print0 | xargs -0 sed -i 's/any(windows/any(windows, target_os = "freebsd"/g'
             build: |
-              # Pipeline Patch: Exclude FreeBSD from jemalloc usage in the submodule
-              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" | xargs sed -i 's/target_os = "windows"/target_os = "windows", target_os = "freebsd"/g'
-              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" | xargs sed -i 's/any(windows/any(windows, target_os = "freebsd"/g'
+              # Verification: Confirm tikv-jemalloc is not in the dependency tree for FreeBSD
+              echo "[Lotus] Verifying dependency tree for FreeBSD..."
+              (cd packages/lotus-core && cargo tree --target x86_64-unknown-freebsd | grep "tikv-jemalloc") && (echo "[Error] tikv-jemalloc still found in dependency tree!" && exit 1) || echo "[Lotus] Success: tikv-jemalloc excluded."
+              
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
     name: stable - ${{ matrix.settings.build_id }} - node@22
     runs-on: ${{ matrix.settings.host }}
