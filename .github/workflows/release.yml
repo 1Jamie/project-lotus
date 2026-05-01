@@ -62,6 +62,8 @@ jobs:
               sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev \
                 clang libclang-dev lld
               
+              echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
+              
               # Pipeline Patch: Exclude FreeBSD from jemalloc usage in the submodule.
               echo "[Lotus] Applying transient FreeBSD jemalloc patches to submodule..."
               # 1. Patch servo-allocator

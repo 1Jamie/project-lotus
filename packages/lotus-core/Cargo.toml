@@ -12,7 +12,8 @@ crate-type = ["cdylib"]
 napi = { version = "2", features = ["napi4"] }
 napi-derive = "2"
 winit = { version = "0.30" }
-rustls = { version = "0.23", features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+async-tungstenite = { version = "0.34", default-features = false, features = ["tokio-runtime", "tokio-rustls-manual-roots"] }
 webrender = "0.68"
 euclid = "0.22"
 servo-url = { path = "servo/components/url" }
@@ -87,3 +88,4 @@ strip = true
 lto = true
 codegen-units = 1
 panic = "abort"
+
