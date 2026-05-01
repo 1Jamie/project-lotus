@@ -35,12 +35,12 @@ jobs:
               $gst_devel_url = "https://gstreamer.freedesktop.org/data/pkg/windows/$gst_version/msvc/gstreamer-1.0-devel-msvc-x86_64-$gst_version.msi"
               
               Write-Host "Downloading GStreamer $gst_version runtime..."
-              Invoke-WebRequest -Uri $gst_runtime_url -OutFile 'gstreamer.msi'
+              Invoke-WebRequest -Uri $gst_runtime_url -OutFile 'gstreamer.msi' -UserAgent "Mozilla/5.0"
               Write-Host 'Installing GStreamer runtime...'
               Start-Process msiexec.exe -ArgumentList '/i gstreamer.msi /qn' -Wait
               
               Write-Host "Downloading GStreamer $gst_version devel..."
-              Invoke-WebRequest -Uri $gst_devel_url -OutFile 'gstreamer-devel.msi'
+              Invoke-WebRequest -Uri $gst_devel_url -OutFile 'gstreamer-devel.msi' -UserAgent "Mozilla/5.0"
               Write-Host 'Installing GStreamer devel...'
               Start-Process msiexec.exe -ArgumentList '/i gstreamer-devel.msi /qn' -Wait
               
