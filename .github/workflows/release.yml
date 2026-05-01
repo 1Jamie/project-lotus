@@ -22,7 +22,8 @@ jobs:
         settings:
           - host: windows-latest
             setup: |
-              choco install llvm nasm python311 pkgconfiglite gstreamer --version 1.24.5 gstreamer-devel --version 1.24.5 --no-progress -y
+              choco install llvm nasm python311 pkgconfiglite --no-progress -y
+              choco install gstreamer --version 1.24.13 gstreamer-devel --version 1.24.13 --no-progress -y
               powershell -Command "
                 \$paths = @(
                   \"C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64\",
@@ -31,7 +32,7 @@ jobs:
                 )
                 \$gstPath = \$paths | Where-Object { \$_ -and (Test-Path \$_) } | Select-Object -First 1
                 if (-not \$gstPath) { throw \"GStreamer not found in expected locations\" }
-                Write-Host \"Found GStreamer at: \$gstPath\"
+                Write-Host ""Found GStreamer at: \$gstPath""
                 New-Item -ItemType Junction -Path 'C:\gst' -Target \$gstPath
               "
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
