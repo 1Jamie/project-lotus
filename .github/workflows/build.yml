@@ -67,17 +67,25 @@ jobs:
             setup: |
               sudo apt-get update && sudo apt-get install -y \
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
-                clang libclang-dev lld pkg-config build-essential python3 \
-                gcc-x86-64-freebsd-gnu g++-x86-64-freebsd-gnu binutils-x86-64-freebsd-gnu
+                clang libclang-dev lld pkg-config build-essential python3
+
+              # Ubuntu 24.04+ does not ship gcc-x86-64-freebsd-gnu. Zig bundles FreeBSD libc + cross C/C++.
+              sudo install -d /usr/local/bin
+              printf '%s\n' '#!/usr/bin/env bash' 'exec zig cc -target x86_64-freebsd "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
+              printf '%s\n' '#!/usr/bin/env bash' 'exec zig c++ -target x86_64-freebsd "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
+              printf '%s\n' '#!/usr/bin/env bash' 'exec zig ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
+              printf '%s\n' '#!/usr/bin/env bash' 'exec zig ranlib "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ranlib >/dev/null
+              sudo chmod +x /usr/local/bin/x86_64-unknown-freebsd-gcc \
+                /usr/local/bin/x86_64-unknown-freebsd-g++ \
+                /usr/local/bin/x86_64-unknown-freebsd-ar \
+                /usr/local/bin/x86_64-unknown-freebsd-ranlib
 
               echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
-              # mozjs_sys has no prebuilt SpiderMonkey tarball for x86_64-unknown-freebsd on GitHub Releases
-              # (curl 404 → "entity not found"), so CI must compile SM with a FreeBSD cross toolchain.
-              echo "CC_x86_64_unknown_freebsd=x86_64-freebsd-gcc" >> $GITHUB_ENV
-              echo "CXX_x86_64_unknown_freebsd=x86_64-freebsd-g++" >> $GITHUB_ENV
-              echo "AR_x86_64_unknown_freebsd=x86_64-freebsd-ar" >> $GITHUB_ENV
-              echo "RANLIB_x86_64_unknown_freebsd=x86_64-freebsd-ranlib" >> $GITHUB_ENV
-              echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=x86_64-freebsd-gcc" >> $GITHUB_ENV
+              echo "CC_x86_64_unknown_freebsd=x86_64-unknown-freebsd-gcc" >> $GITHUB_ENV
+              echo "CXX_x86_64_unknown_freebsd=x86_64-unknown-freebsd-g++" >> $GITHUB_ENV
+              echo "AR_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ar" >> $GITHUB_ENV
+              echo "RANLIB_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ranlib" >> $GITHUB_ENV
+              echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=x86_64-unknown-freebsd-gcc" >> $GITHUB_ENV
             build: |
               # Verification: Confirm tikv-jemalloc is not in the dependency tree for FreeBSD
               echo "[Lotus] Verifying dependency tree for FreeBSD..."
@@ -128,6 +136,10 @@ jobs:
             target/
             ${{ runner.os == 'Windows' && 'D:/t' || '' }}
           key: ${{ matrix.settings.build_id }}-cargo-${{ matrix.settings.host }}
+      - uses: goto-bus-stop/setup-zig@v2
+        if: ${{ matrix.settings.target == 'x86_64-unknown-freebsd' }}
+        with:
+          version: 0.13.0
       - name: Setup GStreamer (Windows)
         uses: blinemedical/setup-gstreamer@v1.2.0
         if: runner.os == 'Windows'
