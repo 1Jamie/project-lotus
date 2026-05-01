@@ -38,6 +38,8 @@ It's designed for developers who want to build cross-platform desktop applicatio
 
 ---
 
+> as a heads up bsd does not have bluetooth support due to servo using btleplug which does not work on BSD, so sadly the BT support is missing in BSD. i would love to fix it but the amount of upstream work would be unreasonable and well out of scope.
+
 ## 🚀 Quick Start (Usage from NPM)
 
 > **The Easy Way:** working Windows and Linux builds are on npm. You don't need to build from source.

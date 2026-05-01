@@ -20,28 +20,23 @@ fn main() {
     } else {
         #[cfg(target_os = "windows")]
         {
-            println!("[Lotus] Applying Servo engine patches (Windows)...");
-            let output = Command::new("git")
-                .arg("apply")
-                .arg("--ignore-space-change") // often needed for cross-platform patches
-                .arg("--ignore-whitespace") // often needed for cross-platform patches
-                .arg("--directory")
-                .arg(&servo_dir)
-                .arg(&patch_file)
-                .output()
-                .expect("Failed to execute git apply");
+            let script_path = Path::new(&manifest_dir).join("scripts").join("apply-patches.ps1");
+            println!("cargo:rerun-if-changed={}", script_path.display());
 
-            if !output.status.success() {
-                // If git apply fails, it might be because the patch is already applied.
-                // We should only panic if it's a real error.
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.contains("already applied") && !stderr.contains("patch does not apply") {
-                    panic!("Failed to apply patch: {}\n{}", String::from_utf8_lossy(&output.stdout), stderr);
-                } else {
-                    println!("[Lotus] Servo patches already applied or minor conflict, continuing.");
+            if script_path.exists() {
+                println!("[Lotus] Applying Servo engine patches (Windows PowerShell)...");
+                let status = Command::new("powershell")
+                    .arg("-File")
+                    .arg(&script_path)
+                    .status()
+                    .expect("Failed to execute apply-patches.ps1");
+
+                if !status.success() {
+                    panic!("apply-patches.ps1 failed with status: {}", status);
                 }
             } else {
-                println!("[Lotus] Servo patches applied successfully (Windows).");
+                eprintln!("[Error] apply-patches.ps1 not found at {:?}", script_path);
+                panic!("Patch script not found, cannot proceed with Windows build.");
             }
         }
 

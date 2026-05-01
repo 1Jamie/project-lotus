@@ -40,7 +40,7 @@ jobs:
               echo "PKG_CONFIG_PATH=/c/gst/lib/pkgconfig" >> $GITHUB_ENV
               echo "C:/gst/bin" >> $GITHUB_PATH
             build: |
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc && npm run extract-angle --workspace=@lotus-gui/core
             target: x86_64-pc-windows-msvc
             build_id: x86_64-pc-windows-msvc
           - host: ubuntu-latest
@@ -76,9 +76,7 @@ jobs:
               sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev libdbus-1-dev pkg-config \
                 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
             build: |
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd && \
-              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node && \
-              mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-freebsd 2>/dev/null || true
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
     name: stable - ${{ matrix.settings.build_id }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:

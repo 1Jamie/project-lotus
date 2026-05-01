@@ -45,8 +45,9 @@
     }
   },
   "scripts": {
-    "build": "napi build --platform --release && node scripts/extract_angle_dlls.js",
-    "build:debug": "napi build --platform && node scripts/extract_angle_dlls.js",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "extract-angle": "node scripts/extract_angle_dlls.js",
     "patch": "bash ./scripts/apply-patches.sh",
     "clean": "node scripts/clean.js",
     "artifacts": "echo 'Artifacts moved by CI workflow'",
