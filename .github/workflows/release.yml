@@ -119,6 +119,8 @@ jobs:
       - name: Install dependencies
         run: npm install
       - name: Build
+        env:
+          ac_cv_type_strerror_r_return_type: int
         run: ${{ matrix.settings.build }}
         shell: bash
       - name: Upload artifact
