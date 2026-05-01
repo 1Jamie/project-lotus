@@ -30,16 +30,16 @@ jobs:
                 
                 Write-Host ""Downloading GStreamer runtime from \$gst_runtime_url""
                 (New-Object System.Net.WebClient).DownloadFile(\$gst_runtime_url, 'gstreamer.msi')
-                Write-Host ""Installing GStreamer runtime...""
+                Write-Host 'Installing GStreamer runtime...'
                 Start-Process msiexec.exe -ArgumentList '/i gstreamer.msi /qn' -Wait
                 
                 Write-Host ""Downloading GStreamer devel from \$gst_devel_url""
                 (New-Object System.Net.WebClient).DownloadFile(\$gst_devel_url, 'gstreamer-devel.msi')
-                Write-Host ""Installing GStreamer devel...""
+                Write-Host 'Installing GStreamer devel...'
                 Start-Process msiexec.exe -ArgumentList '/i gstreamer-devel.msi /qn' -Wait
                 
                 \$gstPath = 'C:\gstreamer\1.0\msvc_x86_64'
-                if (-not (Test-Path \$gstPath)) { throw ""GStreamer not found at \$gstPath after installation"" }
+                if (-not (Test-Path \$gstPath)) { throw 'GStreamer not found after installation' }
                 
                 Write-Host ""Found GStreamer at: \$gstPath""
                 New-Item -ItemType Junction -Path 'C:\gst' -Target \$gstPath
@@ -86,6 +86,9 @@ jobs:
               sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev libdbus-1-dev pkg-config \
                 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
             build: |
+              # Pipeline Patch: Exclude FreeBSD from jemalloc usage in the submodule
+              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" | xargs sed -i 's/target_os = "windows"/target_os = "windows", target_os = "freebsd"/g'
+              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" | xargs sed -i 's/any(windows/any(windows, target_os = "freebsd"/g'
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
     name: stable - ${{ matrix.settings.build_id }} - node@20
     runs-on: ${{ matrix.settings.host }}

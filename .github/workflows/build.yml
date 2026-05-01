@@ -86,6 +86,9 @@ jobs:
                 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
                 libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
             build: |
+              # Pipeline Patch: Exclude FreeBSD from jemalloc usage in the submodule
+              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" | xargs sed -i 's/target_os = "windows"/target_os = "windows", target_os = "freebsd"/g'
+              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" | xargs sed -i 's/any(windows/any(windows, target_os = "freebsd"/g'
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
     name: stable - ${{ matrix.settings.build_id }} - node@22
     runs-on: ${{ matrix.settings.host }}
