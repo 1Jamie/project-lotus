@@ -90,6 +90,37 @@ index 170a0e9b15f..97e9908ab3e 100644
  
  [[test]]
  name = "main"
+diff --git a/components/net/connector.rs b/components/net/connector.rs
+index 8fc4bd13fc1..8f67489c3c7 100644
+--- a/components/net/connector.rs
++++ b/components/net/connector.rs
+@@ -25,7 +25,7 @@ use log::warn;
+ use parking_lot::Mutex;
+ use rustls::client::danger::ServerCertVerifier;
+ use rustls::client::{ClientConnection, EchStatus};
+-use rustls::crypto::{CryptoProvider, aws_lc_rs};
++use rustls::crypto::{ring, CryptoProvider};
+ use rustls::{ClientConfig, ProtocolVersion};
+ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+ use servo_config::pref;
+@@ -415,7 +415,7 @@ static CRYPTO_PROVIDER_CACHE: LazyLock<Arc<CryptoProvider>> = LazyLock::new(|| {
+         // initializing servo, so this should never fail.
+         .unwrap_or_else(|| {
+             warn!("Default crypto provider not initialized before first access in connector.");
+-            Arc::new(aws_lc_rs::default_provider())
++            Arc::new(ring::default_provider())
+         })
+ });
+ 
+@@ -433,7 +433,7 @@ static RUSTLS_PLATFORM_VERIFIER_CACHE: LazyLock<Arc<rustls_platform_verifier::Ve
+ 
+ /// Prewarm the TLS stack to speed up the first connection
+ ///
+-/// Currently, this force-seeds the crypto provider (from aws_lc_rs),
++/// Currently, this force-seeds the crypto provider (from *ring*),
+ /// which on my system takes around 30-50ms according to samply, spent in
+ /// `tree_jitter_initialize_once`. If we don't call this function, then
+ /// the initialization will happen much later, on a tokio runtime thread.
 diff --git a/components/profile/Cargo.toml b/components/profile/Cargo.toml
 index 7f8d3847524..a6b4fef44da 100644
 --- a/components/profile/Cargo.toml
@@ -160,6 +191,18 @@ index 9c1c72a2cd2..cfe7c35458a 100644
  backtrace = { workspace = true }
  base64 = { workspace = true }
  base64ct = { workspace = true }
+diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
+index 15f96c91546..dfe5c1a027e 100644
+--- a/components/shared/layout/lib.rs
++++ b/components/shared/layout/lib.rs
+@@ -68,6 +68,7 @@ use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
+ use style::str::char_is_whitespace;
+ use style::stylesheets::{DocumentStyleSheet, Stylesheet};
+ use style::stylist::Stylist;
++#[cfg(debug_assertions)]
+ use style::thread_state::{self, ThreadState};
+ use style::values::computed::Overflow;
+ use style_traits::CSSPixel;
 diff --git a/components/shared/paint/rendering_context.rs b/components/shared/paint/rendering_context.rs
 index 0bd82ae05f7..2b4f746ff2f 100644
 --- a/components/shared/paint/rendering_context.rs
