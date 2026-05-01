@@ -121,6 +121,8 @@ jobs:
       - name: Build
         env:
           ac_cv_type_strerror_r_return_type: int
+          ac_cv_func_strerror_r_char_p: no
+          ac_cv_func_getcontext: no
         run: ${{ matrix.settings.build }}
         shell: bash
       - name: Upload artifact
