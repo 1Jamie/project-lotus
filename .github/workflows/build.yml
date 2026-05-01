@@ -78,6 +78,9 @@ jobs:
               sed -i 's/not(any(windows, target_env = "ohos"))/not(any(windows, target_os = "freebsd", target_env = "ohos"))/g' packages/lotus-core/servo/components/allocator/Cargo.toml
               sed -i 's/not(any(windows, feature = "use-system-allocator", target_env = "ohos"))/not(any(windows, target_os = "freebsd", feature = "use-system-allocator", target_env = "ohos"))/' packages/lotus-core/servo/components/allocator/lib.rs
               perl -i -0pe 's/all\(\s*not\(windows\),\s*any\(feature = "use-system-allocator", target_env = "ohos"\)\s*\)/all(not(windows), any(feature = "use-system-allocator", target_os = "freebsd", target_env = "ohos"))/s' packages/lotus-core/servo/components/allocator/lib.rs
+              echo "" >> packages/lotus-core/servo/components/allocator/Cargo.toml
+              echo "[target.'cfg(target_os = \"freebsd\")'.dependencies]" >> packages/lotus-core/servo/components/allocator/Cargo.toml
+              echo "libc = { workspace = true }" >> packages/lotus-core/servo/components/allocator/Cargo.toml
               # 2. Patch servo-profile
               sed -i 's/target_os = "windows", target_env = "ohos"/target_os = "windows", target_os = "freebsd", target_env = "ohos"/g' packages/lotus-core/servo/components/profile/Cargo.toml
               sed -i 's/target_os = "windows", target_env = "ohos"/target_os = "windows", target_os = "freebsd", target_env = "ohos"/g' packages/lotus-core/servo/components/profile/system_reporter.rs
