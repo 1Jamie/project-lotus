@@ -23,27 +23,30 @@ jobs:
           - host: windows-latest
             setup: |
               choco install llvm nasm python311 pkgconfiglite --no-progress -y
-              powershell -Command "
-                \$gst_version = '1.24.13'
-                \$gst_runtime_url = ""https://gstreamer.freedesktop.org/data/pkg/windows/\$gst_version/msvc/gstreamer-1.0-msvc-x86_64-\$gst_version.msi""
-                \$gst_devel_url = ""https://gstreamer.freedesktop.org/data/pkg/windows/\$gst_version/msvc/gstreamer-1.0-devel-msvc-x86_64-\$gst_version.msi""
-                
-                Write-Host ""Downloading GStreamer runtime from \$gst_runtime_url""
-                (New-Object System.Net.WebClient).DownloadFile(\$gst_runtime_url, 'gstreamer.msi')
-                Write-Host 'Installing GStreamer runtime...'
-                Start-Process msiexec.exe -ArgumentList '/i gstreamer.msi /qn' -Wait
-                
-                Write-Host ""Downloading GStreamer devel from \$gst_devel_url""
-                (New-Object System.Net.WebClient).DownloadFile(\$gst_devel_url, 'gstreamer-devel.msi')
-                Write-Host 'Installing GStreamer devel...'
-                Start-Process msiexec.exe -ArgumentList '/i gstreamer-devel.msi /qn' -Wait
-                
-                \$gstPath = 'C:\gstreamer\1.0\msvc_x86_64'
-                if (-not (Test-Path \$gstPath)) { throw 'GStreamer not found after installation' }
-                
-                Write-Host ""Found GStreamer at: \$gstPath""
-                New-Item -ItemType Junction -Path 'C:\gst' -Target \$gstPath
-              "
+              cat << 'EOF' > install_gst.ps1
+              $gst_version = '1.24.13'
+              $gst_runtime_url = "https://gstreamer.freedesktop.org/data/pkg/windows/$gst_version/msvc/gstreamer-1.0-msvc-x86_64-$gst_version.msi"
+              $gst_devel_url = "https://gstreamer.freedesktop.org/data/pkg/windows/$gst_version/msvc/gstreamer-1.0-devel-msvc-x86_64-$gst_version.msi"
+              
+              Write-Host "Downloading GStreamer $gst_version runtime..."
+              Invoke-WebRequest -Uri $gst_runtime_url -OutFile 'gstreamer.msi'
+              Write-Host 'Installing GStreamer runtime...'
+              Start-Process msiexec.exe -ArgumentList '/i gstreamer.msi /qn' -Wait
+              
+              Write-Host "Downloading GStreamer $gst_version devel..."
+              Invoke-WebRequest -Uri $gst_devel_url -OutFile 'gstreamer-devel.msi'
+              Write-Host 'Installing GStreamer devel...'
+              Start-Process msiexec.exe -ArgumentList '/i gstreamer-devel.msi /qn' -Wait
+              
+              $gstPath = 'C:\gstreamer\1.0\msvc_x86_64'
+              if (-not (Test-Path $gstPath)) { throw "GStreamer not found at $gstPath after installation" }
+              
+              Write-Host "Found GStreamer at: $gstPath"
+              if (Test-Path 'C:\gst') { Remove-Item 'C:\gst' -Force -Recurse }
+              New-Item -ItemType Junction -Path 'C:\gst' -Target $gstPath
+              EOF
+              powershell -ExecutionPolicy Bypass -File install_gst.ps1
+              
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
               echo "GSTREAMER_1_0_ROOT_X86_64=C:/gst" >> $GITHUB_ENV
