@@ -1,5 +1,5 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 37ee5313bf1..a4d29cfa812 100644
+index 37ee5313bf1..704e94ef7fe 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -36,9 +36,9 @@ app_units = "0.7"
@@ -14,11 +14,12 @@ index 37ee5313bf1..a4d29cfa812 100644
  backtrace = "0.3"
  base64 = "0.22.1"
  base64ct = { version = "1.8", features = ["alloc"] }
-@@ -160,7 +160,7 @@ regex = "1.12"
+@@ -160,7 +160,8 @@ regex = "1.12"
  resvg = "0.45.0"
  rsa = { version = "0.9.10", features = ["sha1", "sha2"] }
  rustc-hash = "2.1.2"
 -rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
++ring = "0.17"
 +rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"] }
  rustls-pki-types = "1.14"
  rustls-platform-verifier = "0.7.0"
@@ -180,7 +181,7 @@ index 97996d3f532..48353ab3678 100644
      None
  }
 diff --git a/components/script/Cargo.toml b/components/script/Cargo.toml
-index 9c1c72a2cd2..cfe7c35458a 100644
+index 9c1c72a2cd2..ccea3db5c4c 100644
 --- a/components/script/Cargo.toml
 +++ b/components/script/Cargo.toml
 @@ -48,7 +48,6 @@ app_units = { workspace = true }
@@ -191,6 +192,262 @@ index 9c1c72a2cd2..cfe7c35458a 100644
  backtrace = { workspace = true }
  base64 = { workspace = true }
  base64ct = { workspace = true }
+@@ -123,6 +122,7 @@ postcard = { workspace = true }
+ profile_traits = { workspace = true }
+ rand = { workspace = true }
+ regex = { workspace = true }
++ring = { workspace = true }
+ rsa = { workspace = true }
+ rustc-hash = { workspace = true }
+ script_bindings = { workspace = true }
+diff --git a/components/script/dom/webcrypto/subtlecrypto/ed25519_operation.rs b/components/script/dom/webcrypto/subtlecrypto/ed25519_operation.rs
+index 0bdbaf4bdee..9b3ca61cbb1 100644
+--- a/components/script/dom/webcrypto/subtlecrypto/ed25519_operation.rs
++++ b/components/script/dom/webcrypto/subtlecrypto/ed25519_operation.rs
+@@ -2,8 +2,11 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use aws_lc_rs::encoding::{AsBigEndian, AsDer};
+-use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair, ParsedPublicKey, UnparsedPublicKey};
++use der::asn1::{BitString, OctetString};
++use der::{Decode, Encode};
++use pkcs8::spki::AlgorithmIdentifier;
++use pkcs8::{ObjectIdentifier, PrivateKeyInfo, SubjectPublicKeyInfo};
++use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
+ use js::context::JSContext;
+ use rand::TryRngCore;
+ use rand::rngs::OsRng;
+@@ -23,6 +26,7 @@ use crate::dom::subtlecrypto::{
+ };
+ 
+ const ED25519_SEED_LENGTH: usize = 32;
++const ED25519_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
+ 
+ /// <https://w3c.github.io/webcrypto/#ed25519-operations-sign>
+ pub(crate) fn sign(key: &CryptoKey, message: &[u8]) -> Result<Vec<u8>, Error> {
+@@ -75,7 +79,7 @@ pub(crate) fn verify(key: &CryptoKey, message: &[u8], signature: &[u8]) -> Resul
+     let public_key = UnparsedPublicKey::new(&ED25519, key.handle().as_bytes());
+     let result = match public_key.verify(message, signature) {
+         Ok(()) => true,
+-        Err(aws_lc_rs::error::Unspecified) => false,
++        Err(ring::error::Unspecified) => false,
+     };
+ 
+     // Step 6. Return result.
+@@ -202,11 +206,18 @@ pub(crate) fn import_key(
+             // is present, then throw a DataError.
+             // Step 2.6. Let publicKey be the Ed25519 public key identified by the subjectPublicKey
+             // field of spki.
+-            let public_key = ParsedPublicKey::new(&ED25519, key_data).map_err(|error| {
+-                Error::Data(Some(format!(
+-                    "The key was rejected for the following reason: {error}"
+-                )))
+-            })?;
++            let spki = SubjectPublicKeyInfo::from_der(key_data)
++                .map_err(|_| Error::Data(Some("Failed to parse SubjectPublicKeyInfo".into())))?;
++            if spki.algorithm.oid != ED25519_OID {
++                return Err(Error::Data(Some(
++                    "Algorithm OID is not id-Ed25519".into(),
++                )));
++            }
++            let public_key_bytes = spki
++                .subject_public_key
++                .as_bytes()
++                .ok_or_else(|| Error::Data(Some("Invalid subjectPublicKey bit string".into())))?
++                .to_vec();
+ 
+             // Step 2.9. Let algorithm be a new KeyAlgorithm.
+             // Step 2.10. Set the name attribute of algorithm to "Ed25519".
+@@ -224,7 +235,7 @@ pub(crate) fn import_key(
+                 extractable,
+                 KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
+                 usages,
+-                Handle::Ed25519PublicKey(public_key.as_ref().to_vec()),
++                Handle::Ed25519PublicKey(public_key_bytes),
+             )
+         },
+         // If format is "pkcs8":
+@@ -245,29 +256,20 @@ pub(crate) fn import_key(
+             // Step 2.5. If the parameters field of the privateKeyAlgorithm
+             // PrivateKeyAlgorithmIdentifier field of privateKeyInfo is present, then throw a
+             // DataError.
+-            let private_key_info = Ed25519KeyPair::from_pkcs8(key_data).map_err(|error| {
+-                Error::Data(Some(format!(
+-                    "The key was rejected for the following reason: {error}"
+-                )))
+-            })?;
+-
+             // Step 2.6. Let curvePrivateKey be the result of performing the parse an ASN.1
+             // structure algorithm, with data as the privateKey field of privateKeyInfo, structure
+             // as the ASN.1 CurvePrivateKey structure specified in Section 7 of [RFC8410], and
+             // exactData set to true.
+             // Step 2.7. If an error occurred while parsing, then throw a DataError.
+-            let curve_private_key = private_key_info
+-                .seed()
+-                .map_err(|_| {
+-                    Error::Data(Some("Failed to get the seed from the private key".into()))
+-                })?
+-                .as_be_bytes()
+-                .map_err(|_| {
+-                    Error::Data(Some(
+-                        "Failed to serialize the seed of the private key".into(),
+-                    ))
+-                })?
+-                .as_ref()
++            let pki = PrivateKeyInfo::from_der(key_data)
++                .map_err(|_| Error::Data(Some("Failed to parse PrivateKeyInfo".into())))?;
++            if pki.algorithm.oid != ED25519_OID {
++                return Err(Error::Data(Some("Algorithm OID is not id-Ed25519".into())));
++            }
++            // RFC 8410: privateKey is a CurvePrivateKey = OCTET STRING wrapping the seed.
++            let curve_private_key = OctetString::from_der(pki.private_key)
++                .map_err(|_| Error::Data(Some("Failed to parse CurvePrivateKey".into())))?
++                .as_bytes()
+                 .to_vec();
+ 
+             // Step 2.10. Let algorithm be a new KeyAlgorithm.
+@@ -371,11 +373,16 @@ pub(crate) fn import_key(
+                 // described in Section 2 of [RFC8037], then throw a DataError.
+                 let d = jwk.decode_required_string_field(JwkStringField::D)?;
+                 let x = jwk.decode_required_string_field(JwkStringField::X)?;
+-                let _ = Ed25519KeyPair::from_seed_and_public_key(&d, &x).map_err(|error| {
++                let key_pair = Ed25519KeyPair::from_seed_unchecked(&d).map_err(|error| {
+                     Error::Data(Some(format!(
+                         "Key rejected for the following reason: {error}"
+                     )))
+                 })?;
++                if key_pair.public_key().as_ref() != x.as_slice() {
++                    return Err(Error::Data(Some(
++                        "Public key does not match private key seed".into(),
++                    )));
++                }
+ 
+                 // Step 2.9.2. Let key be a new CryptoKey object that represents the Ed25519
+                 // private key identified by interpreting jwk according to Section
+@@ -533,22 +540,24 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
+             //         Set the algorithm object identifier to the id-Ed25519 OID defined in
+             //         [RFC8410].
+             //     Set the subjectPublicKey field to keyData.
+-            let data = ParsedPublicKey::new(&ED25519, key_data).map_err(|error| {
+-                Error::Operation(Some(format!(
+-                    "The key was rejected for the following reason: {error}"
+-                )))
++            let spki_bits = BitString::from_bytes(key_data).map_err(|_| {
++                Error::Operation(Some("Failed to encode public key as BitString".into()))
+             })?;
++            let spki = SubjectPublicKeyInfo {
++                algorithm: AlgorithmIdentifier {
++                    oid: ED25519_OID,
++                    parameters: None::<der::asn1::AnyRef>,
++                },
++                subject_public_key: spki_bits,
++            };
+ 
+             // Step 3.3. Let result be the result of DER-encoding data.
+             ExportedKey::Bytes(
+-                data.as_der()
+-                    .map_err(|_| {
+-                        Error::Operation(Some(
+-                            "Failed to serialize the key into a DER format".into(),
+-                        ))
+-                    })?
+-                    .as_ref()
+-                    .to_vec(),
++                spki.to_der().map_err(|_| {
++                    Error::Operation(Some(
++                        "Failed to serialize the key into a DER format".into(),
++                    ))
++                })?,
+             )
+         },
+         // If format is "pkcs8":
+@@ -570,22 +579,30 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
+             //         [RFC8410].
+             //     Set the privateKey field to the result of DER-encoding a CurvePrivateKey ASN.1
+             //     type, as defined in Section 7 of [RFC8410], that represents the Ed25519 private
+-            //     key represented by the [[handle]] internal slot of key
+-            let data = Ed25519KeyPair::from_seed_unchecked(key_data)
+-                .map_err(|error| {
+-                    Error::Operation(Some(format!(
+-                        "The key was rejected for the following reason: {error}"
+-                    )))
+-                })?
+-                .to_pkcs8v1()
+-                .map_err(|_| {
+-                    Error::Operation(Some(
+-                        "Failed to serialize the key into a PKCS#8 format".into(),
+-                    ))
+-                })?;
++            //     key represented by the [[handle]] internal slot of key.
++            // RFC 8410: CurvePrivateKey = OCTET STRING containing the seed, wrapped in another
++            // OCTET STRING as the privateKey field of PrivateKeyInfo.
++            let curve_private_key = OctetString::new(key_data).map_err(|_| {
++                Error::Operation(Some("Failed to encode seed as CurvePrivateKey".into()))
++            })?;
++            let curve_private_key_der = curve_private_key.to_der().map_err(|_| {
++                Error::Operation(Some("Failed to DER-encode CurvePrivateKey".into()))
++            })?;
++            let pki = PrivateKeyInfo {
++                algorithm: AlgorithmIdentifier {
++                    oid: ED25519_OID,
++                    parameters: None::<der::asn1::AnyRef>,
++                },
++                private_key: &curve_private_key_der,
++                public_key: None,
++            };
+ 
+             // Step 3.3. Let result be the result of DER-encoding data.
+-            ExportedKey::Bytes(data.as_ref().to_vec())
++            ExportedKey::Bytes(pki.to_der().map_err(|_| {
++                Error::Operation(Some(
++                    "Failed to serialize the key into a PKCS#8 format".into(),
++                ))
++            })?)
+         },
+         // If format is "jwk":
+         KeyFormat::Jwk => {
+diff --git a/components/script/dom/webcrypto/subtlecrypto/hmac_operation.rs b/components/script/dom/webcrypto/subtlecrypto/hmac_operation.rs
+index d06ff276d78..0fec159a0ea 100644
+--- a/components/script/dom/webcrypto/subtlecrypto/hmac_operation.rs
++++ b/components/script/dom/webcrypto/subtlecrypto/hmac_operation.rs
+@@ -2,8 +2,8 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use aws_lc_rs::constant_time::verify_slices_are_equal;
+-use aws_lc_rs::hmac;
++use ring::constant_time::verify_slices_are_equal;
++use ring::hmac;
+ use js::context::JSContext;
+ use rand::TryRngCore;
+ use rand::rngs::OsRng;
+diff --git a/components/script/dom/webcrypto/subtlecrypto/pbkdf2_operation.rs b/components/script/dom/webcrypto/subtlecrypto/pbkdf2_operation.rs
+index 6e72b059027..5bf1618da8a 100644
+--- a/components/script/dom/webcrypto/subtlecrypto/pbkdf2_operation.rs
++++ b/components/script/dom/webcrypto/subtlecrypto/pbkdf2_operation.rs
+@@ -4,7 +4,7 @@
+ 
+ use std::num::NonZero;
+ 
+-use aws_lc_rs::pbkdf2;
++use ring::pbkdf2;
+ use js::context::JSContext;
+ 
+ use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::{KeyType, KeyUsage};
+diff --git a/components/script/dom/webcrypto/subtlecrypto/sha_operation.rs b/components/script/dom/webcrypto/subtlecrypto/sha_operation.rs
+index 6b46ae4e4e6..74c47ad9cb9 100644
+--- a/components/script/dom/webcrypto/subtlecrypto/sha_operation.rs
++++ b/components/script/dom/webcrypto/subtlecrypto/sha_operation.rs
+@@ -2,7 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use aws_lc_rs::digest;
++use ring::digest;
+ 
+ use crate::dom::bindings::error::Error;
+ use crate::dom::subtlecrypto::{CryptoAlgorithm, SubtleAlgorithm};
 diff --git a/components/shared/layout/lib.rs b/components/shared/layout/lib.rs
 index 15f96c91546..dfe5c1a027e 100644
 --- a/components/shared/layout/lib.rs
