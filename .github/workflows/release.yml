@@ -63,9 +63,19 @@ jobs:
                 clang libclang-dev lld pkg-config build-essential
 
               # Ubuntu 24.04+ does not ship gcc-x86-64-freebsd-gnu. Zig bundles FreeBSD libc + cross C/C++.
+              # cc-rs appends --target=x86_64-unknown-freebsd (Rust triple) which Zig rejects.
+              # The wrappers strip any incoming --target=* and substitute the correct Zig triple.
               sudo install -d /usr/local/bin
-              printf '%s\n' '#!/usr/bin/env bash' 'exec zig cc -target x86_64-freebsd "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
-              printf '%s\n' '#!/usr/bin/env bash' 'exec zig c++ -target x86_64-freebsd "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
+              printf '%s\n' \
+                '#!/usr/bin/env bash' \
+                'args=(); for a in "$@"; do [[ "$a" == --target=* ]] && continue; args+=("$a"); done' \
+                'exec zig cc -target x86_64-freebsd "${args[@]}"' \
+                | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
+              printf '%s\n' \
+                '#!/usr/bin/env bash' \
+                'args=(); for a in "$@"; do [[ "$a" == --target=* ]] && continue; args+=("$a"); done' \
+                'exec zig c++ -target x86_64-freebsd "${args[@]}"' \
+                | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ranlib "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ranlib >/dev/null
               sudo chmod +x /usr/local/bin/x86_64-unknown-freebsd-gcc \
