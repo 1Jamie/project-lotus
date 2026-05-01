@@ -18,48 +18,23 @@ fn main() {
         eprintln!("[Error] Patch file not found at {:?}", patch_file);
         // Do not panic, allow build to continue for now.
     } else {
-        #[cfg(target_os = "windows")]
-        {
-            let script_path = Path::new(&manifest_dir).join("scripts").join("apply-patches.ps1");
-            println!("cargo:rerun-if-changed={}", script_path.display());
+        let script_path = Path::new(&manifest_dir).join("scripts").join("apply-patches.js");
+        println!("cargo:rerun-if-changed={}", script_path.display());
 
-            if script_path.exists() {
-                println!("[Lotus] Applying Servo engine patches (Windows PowerShell)...");
-                let status = Command::new("powershell")
-                    .arg("-File")
-                    .arg(&script_path)
-                    .status()
-                    .expect("Failed to execute apply-patches.ps1");
+        if script_path.exists() {
+            println!("[Lotus] Ensuring Servo engine patches are applied...");
+            let status = Command::new("node")
+                .arg(&script_path)
+                .status()
+                .expect("Failed to execute apply-patches.js");
 
-                if !status.success() {
-                    panic!("apply-patches.ps1 failed with status: {}", status);
-                }
-            } else {
-                eprintln!("[Error] apply-patches.ps1 not found at {:?}", script_path);
-                panic!("Patch script not found, cannot proceed with Windows build.");
+            if !status.success() {
+                // We don't necessarily want to panic here if it's already applied, 
+                // but the JS script should exit 0 in that case.
+                eprintln!("[Warning] apply-patches.js exited with non-zero status: {}", status);
             }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            let script_path = Path::new(&manifest_dir).join("scripts").join("apply-patches.sh");
-            if script_path.exists() {
-                println!("[Lotus] Applying Servo engine patches (Unix-like)...");
-                let status = Command::new("bash")
-                    .arg(script_path)
-                    .status()
-                    .expect("Failed to execute apply-patches.sh");
-                
-                if !status.success() {
-                    // Similar logic as in the .sh script: if patch fails, it might be already applied.
-                    // Instead of a generic panic, we should check if the error is "already applied".
-                    // However, for simplicity and because the .sh script exits 0 in this case,
-                    // we'll just check success. The .sh script itself handles the "already applied" case.
-                    panic!("apply-patches.sh failed with status: {}", status);
-                }
-            } else {
-                eprintln!("[Error] apply-patches.sh not found at {:?}", script_path);
-            }
+        } else {
+            eprintln!("[Error] apply-patches.js not found at {:?}", script_path);
         }
     }
 

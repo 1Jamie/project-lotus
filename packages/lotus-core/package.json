@@ -46,6 +46,7 @@
   },
   "scripts": {
     "build": "napi build --platform --release",
+    "prebuild": "node scripts/apply-patches.js",
     "build:debug": "napi build --platform",
     "extract-angle": "node scripts/extract_angle_dlls.js",
     "patch": "bash ./scripts/apply-patches.sh",

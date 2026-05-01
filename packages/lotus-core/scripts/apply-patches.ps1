@@ -3,7 +3,12 @@ $ErrorActionPreference = "Stop"
 
 # The script is in 'packages/lotus-core/scripts/'. The target file is relative to that.
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$TargetFile = Join-Path $ScriptDir ".." "servo" "components" "shared" "paint" "rendering_context.rs"
+$TargetFile = Join-Path $ScriptDir ".."
+$TargetFile = Join-Path $TargetFile "servo"
+$TargetFile = Join-Path $TargetFile "components"
+$TargetFile = Join-Path $TargetFile "shared"
+$TargetFile = Join-Path $TargetFile "paint"
+$TargetFile = Join-Path $TargetFile "rendering_context.rs"
 
 Write-Host "[Lotus] Applying Servo engine patches (Windows PowerShell)..."
 
