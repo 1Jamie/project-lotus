@@ -23,35 +23,8 @@ jobs:
           - host: windows-latest
             setup: |
               choco install llvm nasm python311 pkgconfiglite --no-progress -y
-              cat << 'EOF' > install_gst.ps1
-              $gst_version = '1.24.13'
-              $gst_runtime_url = "https://gstreamer.freedesktop.org/data/pkg/windows/$gst_version/msvc/gstreamer-1.0-msvc-x86_64-$gst_version.msi"
-              $gst_devel_url = "https://gstreamer.freedesktop.org/data/pkg/windows/$gst_version/msvc/gstreamer-1.0-devel-msvc-x86_64-$gst_version.msi"
-              
-              Write-Host "Downloading GStreamer $gst_version runtime..."
-              Invoke-WebRequest -Uri $gst_runtime_url -OutFile 'gstreamer.msi' -UserAgent "Mozilla/5.0"
-              Write-Host 'Installing GStreamer runtime...'
-              Start-Process msiexec.exe -ArgumentList '/i gstreamer.msi /qn' -Wait
-              
-              Write-Host "Downloading GStreamer $gst_version devel..."
-              Invoke-WebRequest -Uri $gst_devel_url -OutFile 'gstreamer-devel.msi' -UserAgent "Mozilla/5.0"
-              Write-Host 'Installing GStreamer devel...'
-              Start-Process msiexec.exe -ArgumentList '/i gstreamer-devel.msi /qn' -Wait
-              
-              $gstPath = 'C:\gstreamer\1.0\msvc_x86_64'
-              if (-not (Test-Path $gstPath)) { throw "GStreamer not found at $gstPath after installation" }
-              
-              Write-Host "Found GStreamer at: $gstPath"
-              if (Test-Path 'C:\gst') { Remove-Item 'C:\gst' -Force -Recurse }
-              New-Item -ItemType Junction -Path 'C:\gst' -Target $gstPath
-              EOF
-              powershell -ExecutionPolicy Bypass -File install_gst.ps1
-              
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
-              echo "GSTREAMER_1_0_ROOT_X86_64=C:/gst" >> $GITHUB_ENV
-              echo "PKG_CONFIG_PATH=/c/gst/lib/pkgconfig" >> $GITHUB_ENV
-              echo "C:/gst/bin" >> $GITHUB_PATH
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc && npm run extract-angle --workspace=@lotus-gui/core
             target: x86_64-pc-windows-msvc
@@ -90,12 +63,12 @@ jobs:
                 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
               
               # Pipeline Patch: Exclude FreeBSD from jemalloc usage in the submodule.
-              # This is necessary because tikv-jemalloc-sys's configure script fails during cross-compilation for FreeBSD
-              # (specifically detecting strerror_r). Since FreeBSD has jemalloc in libc, we don't need to build it.
-              # We modify the submodule's Cargo.toml and .rs files transiently during CI to use the system allocator.
               echo "[Lotus] Applying transient FreeBSD jemalloc patches to submodule..."
-              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" -print0 | xargs -0 sed -i 's/target_os = "windows"/target_os = "windows", target_os = "freebsd"/g'
-              find packages/lotus-core/servo -name "Cargo.toml" -o -name "*.rs" -print0 | xargs -0 sed -i 's/any(windows/any(windows, target_os = "freebsd"/g'
+              # 1. Patch servo-allocator
+              sed -i 's/not(any(windows, target_env = "ohos"))/not(any(windows, target_os = "freebsd", target_env = "ohos"))/g' packages/lotus-core/servo/components/allocator/Cargo.toml
+              # 2. Patch servo-profile
+              sed -i 's/target_os = "windows", target_env = "ohos"/target_os = "windows", target_os = "freebsd", target_env = "ohos"/g' packages/lotus-core/servo/components/profile/Cargo.toml
+              sed -i 's/target_os = "windows", target_env = "ohos"/target_os = "windows", target_os = "freebsd", target_env = "ohos"/g' packages/lotus-core/servo/components/profile/system_reporter.rs
             build: |
               # Verification: Confirm tikv-jemalloc is not in the dependency tree for FreeBSD
               echo "[Lotus] Verifying dependency tree for FreeBSD..."
@@ -137,6 +110,18 @@ jobs:
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' }}
         with:
           version: 0.11.0
+      - name: Setup GStreamer (Windows)
+        uses: blinemedical/setup-gstreamer@v1.2.0
+        if: runner.os == 'Windows'
+        with:
+          version: '1.24.13'
+      - name: GStreamer Env (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # The action sets GSTREAMER_1_0_ROOT_MSVC_X86_64
+          echo "GSTREAMER_1_0_ROOT_X86_64=$GSTREAMER_1_0_ROOT_MSVC_X86_64" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$GSTREAMER_1_0_ROOT_MSVC_X86_64/lib/pkgconfig" >> $GITHUB_ENV
+        shell: bash
       - name: Setup toolchain
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
