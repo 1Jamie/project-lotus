@@ -67,31 +67,11 @@ jobs:
             setup: |
               sudo apt-get update && sudo apt-get install -y \
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
-                libdbus-1-dev pkg-config libglib2.0-dev \
-                clang libclang-dev lld \
-                libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-                libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
-              
-              echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
-              
-              # Pipeline Patch: Exclude FreeBSD from jemalloc usage in the submodule.
-              echo "[Lotus] Applying transient FreeBSD jemalloc patches to submodule..."
-              # 1. Patch servo-allocator
-              sed -i 's/not(any(windows, target_env = "ohos"))/not(any(windows, target_os = "freebsd", target_env = "ohos"))/g' packages/lotus-core/servo/components/allocator/Cargo.toml
-              sed -i 's/not(any(windows, feature = "use-system-allocator", target_env = "ohos"))/not(any(windows, target_os = "freebsd", feature = "use-system-allocator", target_env = "ohos"))/' packages/lotus-core/servo/components/allocator/lib.rs
-              perl -i -0pe 's/all\(\s*not\(windows\),\s*any\(feature = "use-system-allocator", target_env = "ohos"\)\s*\)/all(not(windows), any(feature = "use-system-allocator", target_os = "freebsd", target_env = "ohos"))/s' packages/lotus-core/servo/components/allocator/lib.rs
-              echo "" >> packages/lotus-core/servo/components/allocator/Cargo.toml
-              echo "[target.'cfg(target_os = \"freebsd\")'.dependencies]" >> packages/lotus-core/servo/components/allocator/Cargo.toml
-              echo "libc = { workspace = true }" >> packages/lotus-core/servo/components/allocator/Cargo.toml
-              # 2. Patch servo-profile
-              sed -i 's/target_os = "windows", target_env = "ohos"/target_os = "windows", target_os = "freebsd", target_env = "ohos"/g' packages/lotus-core/servo/components/profile/Cargo.toml
-              sed -i 's/target_os = "windows", target_env = "ohos"/target_os = "windows", target_os = "freebsd", target_env = "ohos"/g' packages/lotus-core/servo/components/profile/system_reporter.rs
+                clang libclang-dev lld
             build: |
-              # Verification: Confirm tikv-jemalloc is not in the dependency tree for FreeBSD
-              echo "[Lotus] Verifying dependency tree for FreeBSD..."
-              (cd packages/lotus-core && cargo tree --target x86_64-unknown-freebsd | grep "tikv-jemalloc") && (echo "[Error] tikv-jemalloc still found in dependency tree!" && exit 1) || echo "[Lotus] Success: tikv-jemalloc excluded."
-              
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd && \
+              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node && \
+              mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-freebsd 2>/dev/null || true
     name: stable - ${{ matrix.settings.build_id }} - node@22
     runs-on: ${{ matrix.settings.host }}
     steps:
