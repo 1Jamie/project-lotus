@@ -59,7 +59,22 @@ jobs:
                 zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\"
-                export CFLAGS=\"-include /tmp/glslopt_compat.h\"
+                printf '%s\n' \
+                  '#!/usr/bin/env sh' \
+                  'need_shim=0' \
+                  'for a in "$@"; do' \
+                  '  case "$a" in' \
+                  '    *glsl-optimizer/*|*glslopt-*) need_shim=1 ;;' \
+                  '  esac' \
+                  'done' \
+                  'if [ "$need_shim" -eq 1 ]; then' \
+                  '  exec cc -include /tmp/glslopt_compat.h "$@"' \
+                  'else' \
+                  '  exec cc "$@"' \
+                  'fi' \
+                  > /tmp/cc-glslopt-shim
+                chmod +x /tmp/cc-glslopt-shim
+                export CC=/tmp/cc-glslopt-shim
                 npm install
                 npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
                 mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
@@ -80,7 +95,7 @@ jobs:
                 mkdir -p "$FREE_ROOT"
                 curl -fSL --proto '=https' --tlsv1.2 \
                   "https://download.freebsd.org/ftp/releases/amd64/14.3-RELEASE/base.txz" \
-                  | tar -xJ -f - -C "$FREE_ROOT" usr/include
+                  | tar -xJ -f - -C "$FREE_ROOT" --wildcards --no-anchored "usr/include/*"
               fi
               echo "FREEBSD_SYSROOT_INC=$FREE_INC" >> "$GITHUB_ENV"
 
