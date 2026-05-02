@@ -235,7 +235,7 @@ index 0bdbaf4bdee..9b3ca61cbb1 100644
      };
  
      // Step 6. Return result.
-@@ -202,11 +206,18 @@ pub(crate) fn import_key(
+@@ -202,11 +206,19 @@ pub(crate) fn import_key(
              // is present, then throw a DataError.
              // Step 2.6. Let publicKey be the Ed25519 public key identified by the subjectPublicKey
              // field of spki.
@@ -244,7 +244,8 @@ index 0bdbaf4bdee..9b3ca61cbb1 100644
 -                    "The key was rejected for the following reason: {error}"
 -                )))
 -            })?;
-+            let spki = SubjectPublicKeyInfo::from_der(key_data)
++            let spki: SubjectPublicKeyInfo<der::asn1::AnyRef<'_>, der::asn1::BitStringRef<'_>> =
++                SubjectPublicKeyInfo::from_der(key_data)
 +                .map_err(|_| Error::Data(Some("Failed to parse SubjectPublicKeyInfo".into())))?;
 +            if spki.algorithm.oid != ED25519_OID {
 +                return Err(Error::Data(Some(
@@ -259,7 +260,7 @@ index 0bdbaf4bdee..9b3ca61cbb1 100644
  
              // Step 2.9. Let algorithm be a new KeyAlgorithm.
              // Step 2.10. Set the name attribute of algorithm to "Ed25519".
-@@ -224,7 +235,7 @@ pub(crate) fn import_key(
+@@ -224,7 +236,7 @@ pub(crate) fn import_key(
                  extractable,
                  KeyAlgorithmAndDerivatives::KeyAlgorithm(algorithm),
                  usages,
@@ -268,7 +269,7 @@ index 0bdbaf4bdee..9b3ca61cbb1 100644
              )
          },
          // If format is "pkcs8":
-@@ -245,29 +256,20 @@ pub(crate) fn import_key(
+@@ -245,29 +257,20 @@ pub(crate) fn import_key(
              // Step 2.5. If the parameters field of the privateKeyAlgorithm
              // PrivateKeyAlgorithmIdentifier field of privateKeyInfo is present, then throw a
              // DataError.
@@ -307,7 +308,7 @@ index 0bdbaf4bdee..9b3ca61cbb1 100644
                  .to_vec();
  
              // Step 2.10. Let algorithm be a new KeyAlgorithm.
-@@ -371,11 +373,16 @@ pub(crate) fn import_key(
+@@ -371,11 +374,16 @@ pub(crate) fn import_key(
                  // described in Section 2 of [RFC8037], then throw a DataError.
                  let d = jwk.decode_required_string_field(JwkStringField::D)?;
                  let x = jwk.decode_required_string_field(JwkStringField::X)?;
@@ -325,7 +326,7 @@ index 0bdbaf4bdee..9b3ca61cbb1 100644
  
                  // Step 2.9.2. Let key be a new CryptoKey object that represents the Ed25519
                  // private key identified by interpreting jwk according to Section
-@@ -533,22 +540,24 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
+@@ -533,22 +541,24 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
              //         Set the algorithm object identifier to the id-Ed25519 OID defined in
              //         [RFC8410].
              //     Set the subjectPublicKey field to keyData.
@@ -362,7 +363,7 @@ index 0bdbaf4bdee..9b3ca61cbb1 100644
              )
          },
          // If format is "pkcs8":
-@@ -570,22 +579,30 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
+@@ -570,22 +580,30 @@ pub(crate) fn export_key(format: KeyFormat, key: &CryptoKey) -> Result<ExportedK
              //         [RFC8410].
              //     Set the privateKey field to the result of DER-encoding a CurvePrivateKey ASN.1
              //     type, as defined in Section 7 of [RFC8410], that represents the Ed25519 private

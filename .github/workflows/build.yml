@@ -37,7 +37,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             build_id: x86_64-unknown-linux-gnu
             setup: |
-              sudo apt-get update && sudo apt-get install -y \
+              sudo apt-get update && sudo apt-get install -y --fix-missing \
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
                 libdbus-1-dev pkg-config \
                 clang libclang-dev lld \
@@ -65,7 +65,7 @@ jobs:
             target: x86_64-unknown-freebsd
             build_id: x86_64-unknown-freebsd
             setup: |
-              sudo apt-get update && sudo apt-get install -y \
+              sudo apt-get update && sudo apt-get install -y --fix-missing \
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
                 clang libclang-dev lld pkg-config build-essential python3
 
@@ -96,10 +96,19 @@ jobs:
               echo "AR_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ar" >> $GITHUB_ENV
               echo "RANLIB_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ranlib" >> $GITHUB_ENV
               echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=x86_64-unknown-freebsd-gcc" >> $GITHUB_ENV
+              # zig 0.13 does not bundle FreeBSD libc headers. ring's C code only needs standard
+              # C headers (assert.h, stdint.h, etc.) which are identical on any POSIX host.
+              # Pass the host's /usr/include as a system include path so ring can find them.
+              echo "CFLAGS_x86_64_unknown_freebsd=-isystem /usr/include" >> $GITHUB_ENV
             build: |
               # Verification: Confirm tikv-jemalloc is not in the dependency tree for FreeBSD
               echo "[Lotus] Verifying dependency tree for FreeBSD..."
-              (cd packages/lotus-core && cargo tree --target x86_64-unknown-freebsd | grep "tikv-jemalloc") && (echo "[Error] tikv-jemalloc still found in dependency tree!" && exit 1) || echo "[Lotus] Success: tikv-jemalloc excluded."
+              if cd packages/lotus-core && cargo tree --target x86_64-unknown-freebsd 2>/dev/null | grep -q "tikv-jemalloc"; then
+                echo "[Error] tikv-jemalloc still found in dependency tree!"
+                exit 1
+              fi
+              cd "$GITHUB_WORKSPACE"
+              echo "[Lotus] Success: tikv-jemalloc excluded."
 
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd && \
               mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node && \
@@ -151,19 +160,28 @@ jobs:
         with:
           version: 0.13.0
       - name: Setup GStreamer (Windows)
-        uses: blinemedical/setup-gstreamer@v1.2.0
         if: runner.os == 'Windows'
-        with:
-          version: '1.24.13'
-      - name: GStreamer Env (Windows)
-        if: runner.os == 'Windows'
+        shell: powershell
         run: |
-          # The action sets GSTREAMER_1_0_ROOT_MSVC_X86_64
-          # We also set the generic variable used by some build scripts
-          echo "GSTREAMER_1_0_ROOT_X86_64=$GSTREAMER_1_0_ROOT_MSVC_X86_64" >> $GITHUB_ENV
-          # Ensure pkg-config can find GStreamer
-          echo "PKG_CONFIG_PATH=$GSTREAMER_1_0_ROOT_MSVC_X86_64/lib/pkgconfig" >> $GITHUB_ENV
-        shell: bash
+          $gstVer = "1.24.13"
+          $gstBase = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVer/msvc"
+          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+          $runtime = "$env:TEMP\gstreamer-runtime.msi"
+          $devel   = "$env:TEMP\gstreamer-devel.msi"
+          Write-Host "Downloading GStreamer $gstVer runtime..."
+          Invoke-WebRequest -Uri "$gstBase/gstreamer-1.0-msvc-x86_64-$gstVer.msi" `
+            -OutFile $runtime -UserAgent $ua -UseBasicParsing
+          Write-Host "Downloading GStreamer $gstVer devel..."
+          Invoke-WebRequest -Uri "$gstBase/gstreamer-1.0-devel-msvc-x86_64-$gstVer.msi" `
+            -OutFile $devel -UserAgent $ua -UseBasicParsing
+          Write-Host "Installing GStreamer runtime..."
+          Start-Process msiexec -ArgumentList "/i `"$runtime`" /qn TARGETDIR=C:\gstreamer" -Wait -NoNewWindow
+          Write-Host "Installing GStreamer devel..."
+          Start-Process msiexec -ArgumentList "/i `"$devel`" /qn TARGETDIR=C:\gstreamer" -Wait -NoNewWindow
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" >> $env:GITHUB_ENV
+          echo "GSTREAMER_1_0_ROOT_X86_64=$gstRoot" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" >> $env:GITHUB_ENV
       - name: Setup toolchain
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
@@ -174,6 +192,7 @@ jobs:
         run: ${{ matrix.settings.build }}
         shell: bash
       - name: Upload artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.settings.build_id }}

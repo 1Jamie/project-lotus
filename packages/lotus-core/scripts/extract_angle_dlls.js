@@ -19,7 +19,13 @@ if (!fs.existsSync(destDir)) {
 }
 
 let foundEgl = false;
-const possibleTargetDirs = [localTargetDir, workspaceTargetDir];
+// Include CARGO_TARGET_DIR if set (e.g. D:/t on Windows CI to avoid MAX_PATH issues)
+const cargoTargetDir = process.env.CARGO_TARGET_DIR;
+const possibleTargetDirs = [
+    localTargetDir,
+    workspaceTargetDir,
+    ...(cargoTargetDir ? [cargoTargetDir] : []),
+];
 
 for (const targetDir of possibleTargetDirs) {
     if (!fs.existsSync(targetDir)) continue;
