@@ -45,35 +45,8 @@ jobs:
               docker pull opensuse/tumbleweed
             build: |
               printf '%s\n' \
-                '#ifndef LOTUS_GLSLOPT_COMPAT_H' \
-                '#define LOTUS_GLSLOPT_COMPAT_H' \
                 '#include <stdlib.h>' \
-                '#include <pthread.h>' \
-                '#include <time.h>' \
                 '#define EMULATED_THREADS_H_INCLUDED_' \
-                '#ifndef TIME_UTC' \
-                '#define TIME_UTC 1' \
-                '#endif' \
-                'typedef pthread_cond_t cnd_t;' \
-                'typedef pthread_t thrd_t;' \
-                'typedef pthread_key_t tss_t;' \
-                'typedef pthread_mutex_t mtx_t;' \
-                'typedef void (*tss_dtor_t)(void*);' \
-                'typedef int (*thrd_start_t)(void*);' \
-                'enum { mtx_plain=0, mtx_try=1, mtx_timed=2, mtx_recursive=4 };' \
-                'enum { thrd_success=0, thrd_timeout, thrd_error, thrd_busy, thrd_nomem };' \
-                '#define ONCE_FLAG_INIT PTHREAD_ONCE_INIT' \
-                '#define _MTX_INITIALIZER_NP PTHREAD_MUTEX_INITIALIZER' \
-                'static inline void call_once(once_flag *f, void (*fn)(void)) { pthread_once(f, fn); }' \
-                'static inline int mtx_init(mtx_t *m, int t) { return pthread_mutex_init(m, NULL) == 0 ? 0 : -1; }' \
-                'static inline int mtx_destroy(mtx_t *m) { return pthread_mutex_destroy(m) == 0 ? 0 : -1; }' \
-                'static inline int mtx_lock(mtx_t *m) { return pthread_mutex_lock(m) == 0 ? 0 : -1; }' \
-                'static inline int mtx_unlock(mtx_t *m) { return pthread_mutex_unlock(m) == 0 ? 0 : -1; }' \
-                '#ifndef thrd_create' \
-                'static inline int thrd_create(thrd_t *t, int (*fn)(void*), void *arg) { return pthread_create(t, NULL, (void*(*)(void*))fn, arg) == 0 ? 0 : -1; }' \
-                'static inline int thrd_join(thrd_t t, int *res) { void *r; int e = pthread_join(t, &r); if (res) *res = (int)(long)r; return e == 0 ? 0 : -1; }' \
-                '#endif' \
-                '#endif' \
                 > /tmp/glslopt_compat.h
               docker run --rm -v $GITHUB_WORKSPACE:/workspace -v /tmp/glslopt_compat.h:/tmp/glslopt_compat.h -w /workspace opensuse/tumbleweed /bin/sh -c "
                 set -e
@@ -121,6 +94,17 @@ jobs:
                 '#endif' \
                 '#endif' \
                 > /tmp/freebsd-stubs/stdlib.h
+              printf '%s\n' \
+                '#pragma once' \
+                '#ifndef _ASSERT_H' \
+                '#define _ASSERT_H' \
+                '#ifdef NDEBUG' \
+                '#define assert(x) ((void)0)' \
+                '#else' \
+                '#define assert(x) ((x) ? (void)0 : __builtin_trap())' \
+                '#endif' \
+                '#endif' \
+                > /tmp/freebsd-stubs/assert.h
 
               sudo install -d /usr/local/bin
               printf '%s\n' \
