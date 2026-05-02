@@ -45,8 +45,12 @@ jobs:
               docker pull opensuse/tumbleweed
             build: |
               printf '%s\n' \
+                '#ifndef _GNU_SOURCE' \
+                '#define _GNU_SOURCE 1' \
+                '#endif' \
                 '#include <stdlib.h>' \
                 '#include <threads.h>' \
+                '#include <pthread.h>' \
                 '#define EMULATED_THREADS_H_INCLUDED_' \
                 > /tmp/glslopt_compat.h
               docker run --rm -v $GITHUB_WORKSPACE:/workspace -v /tmp/glslopt_compat.h:/tmp/glslopt_compat.h -w /workspace opensuse/tumbleweed /bin/sh -c "
@@ -69,85 +73,29 @@ jobs:
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
                 clang libclang-dev lld pkg-config build-essential python3
 
-              # zig 0.13.0 bundles Linux libc headers but NOT FreeBSD libc headers.
-              # When zig cc targets x86_64-freebsd, it adds its own clang built-in headers
-              # (lib/include) which include xmmintrin.h -> mm_malloc.h -> <stdlib.h>.
-              # Since zig has no FreeBSD stdlib.h, the build fails.
-              # Fix: create a minimal stdlib.h stub and inject it via -isystem in the wrapper.
-              mkdir -p /tmp/freebsd-stubs
-              printf '%s\n' \
-                '#pragma once' \
-                '#ifndef _STDLIB_H' \
-                '#define _STDLIB_H' \
-                'typedef __SIZE_TYPE__ size_t;' \
-                'void *malloc(size_t size);' \
-                'void *calloc(size_t n, size_t size);' \
-                'void *realloc(void *ptr, size_t size);' \
-                'void free(void *ptr);' \
-                'void abort(void);' \
-                'void exit(int status);' \
-                'int abs(int n);' \
-                'long labs(long n);' \
-                '#define EXIT_SUCCESS 0' \
-                '#define EXIT_FAILURE 1' \
-                '#ifndef NULL' \
-                '#define NULL ((void*)0)' \
-                '#endif' \
-                '#endif' \
-                > /tmp/freebsd-stubs/stdlib.h
-              printf '%s\n' \
-                '#pragma once' \
-                '#ifndef _ASSERT_H' \
-                '#define _ASSERT_H' \
-                '#ifdef NDEBUG' \
-                '#define assert(x) ((void)0)' \
-                '#else' \
-                '#define assert(x) ((x) ? (void)0 : __builtin_trap())' \
-                '#endif' \
-                '#endif' \
-                > /tmp/freebsd-stubs/assert.h
-              printf '%s\n' \
-                '#pragma once' \
-                '#ifndef _STRING_H' \
-                '#define _STRING_H' \
-                'typedef __SIZE_TYPE__ size_t;' \
-                'void *memcpy(void *dst, const void *src, size_t n);' \
-                'void *memmove(void *dst, const void *src, size_t n);' \
-                'void *memset(void *s, int c, size_t n);' \
-                'int memcmp(const void *a, const void *b, size_t n);' \
-                'void *memchr(const void *s, int c, size_t n);' \
-                'char *strcpy(char *dst, const char *src);' \
-                'char *strncpy(char *dst, const char *src, size_t n);' \
-                'int strcmp(const char *a, const char *b);' \
-                'int strncmp(const char *a, const char *b, size_t n);' \
-                'size_t strlen(const char *s);' \
-                'char *strchr(const char *s, int c);' \
-                'char *strstr(const char *h, const char *n);' \
-                '#endif' \
-                > /tmp/freebsd-stubs/string.h
-              printf '%s\n' \
-                '#pragma once' \
-                '#ifndef __STDALIGN_H' \
-                '#define __STDALIGN_H' \
-                '#ifndef alignas' \
-                '#define alignas _Alignas' \
-                '#endif' \
-                '#ifndef alignof' \
-                '#define alignof _Alignof' \
-                '#endif' \
-                '#endif' \
-                > /tmp/freebsd-stubs/stdalign.h
+              FREE_ROOT="${RUNNER_TEMP:-/tmp}/freebsd-14.3"
+              FREE_INC="$FREE_ROOT/usr/include"
+              if [ ! -f "$FREE_INC/stdio.h" ]; then
+                echo "[Lotus] Extracting FreeBSD usr/include from base.txz (one-time ~210 MiB download)..."
+                mkdir -p "$FREE_ROOT"
+                curl -fSL --proto '=https' --tlsv1.2 \
+                  "https://download.freebsd.org/ftp/releases/amd64/14.3-RELEASE/base.txz" \
+                  | tar -xJ -f - -C "$FREE_ROOT" usr/include
+              fi
+              echo "FREEBSD_SYSROOT_INC=$FREE_INC" >> "$GITHUB_ENV"
 
               sudo install -d /usr/local/bin
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
+                ': "${FREEBSD_SYSROOT_INC:?FREEBSD_SYSROOT_INC is not set}"' \
                 'args=(); for a in "$@"; do [[ "$a" == --target=* || "$a" == -m64 ]] && continue; args+=("$a"); done' \
-                'exec zig cc -target x86_64-freebsd -isystem /tmp/freebsd-stubs "${args[@]}"' \
+                'exec zig cc -target x86_64-freebsd -isystem "$FREEBSD_SYSROOT_INC" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
+                ': "${FREEBSD_SYSROOT_INC:?FREEBSD_SYSROOT_INC is not set}"' \
                 'args=(); for a in "$@"; do [[ "$a" == --target=* || "$a" == -m64 ]] && continue; args+=("$a"); done' \
-                'exec zig c++ -target x86_64-freebsd -isystem /tmp/freebsd-stubs "${args[@]}"' \
+                'exec zig c++ -target x86_64-freebsd -isystem "$FREEBSD_SYSROOT_INC" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ranlib "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ranlib >/dev/null
@@ -224,6 +172,12 @@ jobs:
         if: ${{ matrix.settings.target == 'x86_64-unknown-freebsd' }}
         with:
           version: 0.13.0
+      - name: Cache FreeBSD usr/include (base.txz extract)
+        if: ${{ matrix.settings.target == 'x86_64-unknown-freebsd' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/freebsd-14.3/usr/include
+          key: freebsd-14.3-amd64-usr-include-v1
       - uses: goto-bus-stop/setup-zig@v2
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' }}
         with:
@@ -242,13 +196,21 @@ jobs:
           $gstRoot = $gstRoot.TrimEnd('\')
           Write-Host "GStreamer runtime root: $gstRoot"
           Write-Host "Downloading GStreamer $gstVer devel MSI..."
-          $devel = "$env:TEMP\gstreamer-devel.msi"
+          $devel = Join-Path $env:TEMP "gstreamer-devel.msi"
           & curl.exe -fsSL --user-agent $ua `
             -o $devel "$gstBase/gstreamer-1.0-devel-msvc-x86_64-$gstVer.msi"
+          $develSize = (Get-Item -LiteralPath $devel).Length
+          Write-Host "Devel MSI size: $develSize bytes"
+          if ($develSize -lt 50000000) {
+            throw "Devel MSI is too small ($develSize B); download failed or is not a valid MSI"
+          }
           $installDir = Split-Path (Split-Path $gstRoot -Parent) -Parent
           Write-Host "Installing GStreamer devel to $installDir ..."
-          $msiArgs = "/i `"$devel`" /qn TARGETDIR=`"$installDir`""
-          $proc = Start-Process msiexec -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+          $proc = Start-Process -FilePath "msiexec.exe" -ArgumentList @(
+            "/i", $devel,
+            "/qn",
+            ("TARGETDIR=" + $installDir)
+          ) -Wait -PassThru -NoNewWindow
           if ($proc.ExitCode -ne 0) { throw "msiexec failed with exit code $($proc.ExitCode)" }
           Write-Host "GStreamer devel installed successfully."
           $pkgConfigPath = "$gstRoot\lib\pkgconfig" -replace '\\', '/'
