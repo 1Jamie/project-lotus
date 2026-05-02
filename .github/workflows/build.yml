@@ -79,13 +79,8 @@ jobs:
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\"
                 printf '%s\n' \
                   '#!/usr/bin/env sh' \
-                  'need_shim=0' \
-                  'for a in "$@"; do' \
-                  '  case "$a" in' \
-                  '    *glsl-optimizer/*|*glslopt-*) need_shim=1 ;;' \
-                  '  esac' \
-                  'done' \
-                  'if [ "$need_shim" -eq 1 ]; then' \
+                  'cmdline="$*"' \
+                  'if printf %s "$cmdline" | grep -Eq "glsl-optimizer/|glslopt-"; then' \
                   '  exec cc -include /tmp/glslopt_compat.h "$@"' \
                   'else' \
                   '  exec cc "$@"' \
@@ -126,12 +121,18 @@ jobs:
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
                 ': "${FREEBSD_SYSROOT_INC:?FREEBSD_SYSROOT_INC is not set}"' \
+                'for a in "$@"; do' \
+                '  [[ "$a" == --target=x86_64-linux-gnu || "$a" == --target=*-linux-gnu* ]] && exec cc "$@"' \
+                'done' \
                 'args=(); for a in "$@"; do [[ "$a" == --target=* || "$a" == -m64 ]] && continue; args+=("$a"); done' \
                 'exec zig cc -target x86_64-freebsd -isystem "$FREEBSD_SYSROOT_INC" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
                 ': "${FREEBSD_SYSROOT_INC:?FREEBSD_SYSROOT_INC is not set}"' \
+                'for a in "$@"; do' \
+                '  [[ "$a" == --target=x86_64-linux-gnu || "$a" == --target=*-linux-gnu* ]] && exec c++ "$@"' \
+                'done' \
                 'args=(); for a in "$@"; do [[ "$a" == --target=* || "$a" == -m64 ]] && continue; args+=("$a"); done' \
                 'exec zig c++ -target x86_64-freebsd -isystem "$FREEBSD_SYSROOT_INC" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
