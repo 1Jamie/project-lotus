@@ -89,20 +89,21 @@ jobs:
                 clang libclang-dev llvm lld pkg-config build-essential python3
 
               FREE_ROOT="${RUNNER_TEMP:-/tmp}/freebsd-14.3"
-              FREE_INC="$FREE_ROOT/usr/include"
-              if [ ! -f "$FREE_INC/stdio.h" ]; then
-                echo "[Lotus] Extracting FreeBSD usr/include from base.txz (one-time ~210 MiB download)..."
+              if [ ! -f "$FREE_ROOT/usr/include/stdio.h" ] || [ ! -f "$FREE_ROOT/usr/lib/libc.so" ]; then
+                echo "[Lotus] Extracting FreeBSD sysroot from base.txz (one-time ~210 MiB download)..."
+                rm -rf "$FREE_ROOT"
                 mkdir -p "$FREE_ROOT"
                 curl -fSL --proto '=https' --tlsv1.2 \
                   "https://download.freebsd.org/ftp/releases/amd64/14.3-RELEASE/base.txz" \
-                  | tar -xJ -f - -C "$FREE_ROOT" --wildcards --no-anchored "usr/include/*"
+                  | tar -xJ -f - -C "$FREE_ROOT" --wildcards --no-anchored \
+                    "usr/include/*" "lib/*" "usr/lib/*"
               fi
-              echo "FREEBSD_SYSROOT_INC=$FREE_INC" >> "$GITHUB_ENV"
+              echo "FREEBSD_SYSROOT=$FREE_ROOT" >> "$GITHUB_ENV"
 
               sudo install -d /usr/local/bin
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
-                ': "${FREEBSD_SYSROOT_INC:?FREEBSD_SYSROOT_INC is not set}"' \
+                ': "${FREEBSD_SYSROOT:?FREEBSD_SYSROOT is not set}"' \
                 'host_probe=0' \
                 'args=()' \
                 'skip_next=0' \
@@ -114,11 +115,11 @@ jobs:
                 '  args+=("$a")' \
                 'done' \
                 'if (( host_probe )); then exec cc "${args[@]}"; fi' \
-                'exec zig cc -target x86_64-freebsd -isystem "$FREEBSD_SYSROOT_INC" "${args[@]}"' \
+                'exec zig cc -target x86_64-freebsd --sysroot "$FREEBSD_SYSROOT" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
-                ': "${FREEBSD_SYSROOT_INC:?FREEBSD_SYSROOT_INC is not set}"' \
+                ': "${FREEBSD_SYSROOT:?FREEBSD_SYSROOT is not set}"' \
                 'host_probe=0' \
                 'args=()' \
                 'skip_next=0' \
@@ -130,7 +131,7 @@ jobs:
                 '  args+=("$a")' \
                 'done' \
                 'if (( host_probe )); then exec c++ "${args[@]}"; fi' \
-                'exec zig c++ -target x86_64-freebsd -isystem "$FREEBSD_SYSROOT_INC" "${args[@]}"' \
+                'exec zig c++ -target x86_64-freebsd --sysroot "$FREEBSD_SYSROOT" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ranlib "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ranlib >/dev/null
