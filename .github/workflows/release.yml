@@ -96,7 +96,7 @@ jobs:
                 curl -fSL --proto '=https' --tlsv1.2 \
                   "https://download.freebsd.org/ftp/releases/amd64/14.3-RELEASE/base.txz" \
                   | tar -xJ -f - -C "$FREE_ROOT" --wildcards --no-anchored \
-                    "usr/include/*" "lib/*" "usr/lib/*"
+                    "./usr/include/*" "./lib/*" "./usr/lib/*"
               fi
               echo "FREEBSD_SYSROOT=$FREE_ROOT" >> "$GITHUB_ENV"
 
@@ -208,12 +208,15 @@ jobs:
         if: ${{ matrix.settings.target == 'x86_64-unknown-freebsd' }}
         with:
           version: 0.13.0
-      - name: Cache FreeBSD usr/include (base.txz extract)
+      - name: Cache FreeBSD sysroot (base.txz extract)
         if: ${{ matrix.settings.target == 'x86_64-unknown-freebsd' }}
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/freebsd-14.3/usr/include
-          key: freebsd-14.3-amd64-usr-include-v1
+          path: |
+            ${{ runner.temp }}/freebsd-14.3/usr/include
+            ${{ runner.temp }}/freebsd-14.3/usr/lib
+            ${{ runner.temp }}/freebsd-14.3/lib
+          key: freebsd-14.3-amd64-sysroot-v2
       - uses: goto-bus-stop/setup-zig@v2
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' }}
         with:
