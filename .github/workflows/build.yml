@@ -51,15 +51,17 @@ jobs:
             setup: |
               docker pull opensuse/tumbleweed
             build: |
-              docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
-                zypper --non-interactive refresh && \
-                zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel && \
-                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-                export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
-                npm install && \
-                npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu && \
-                mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node && \
-                mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-linux-suse 2>/dev/null || true \
+              docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "
+                set -e
+                zypper --non-interactive refresh
+                zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                export PATH=\"\$HOME/.cargo/bin:\$PATH\"
+                export CFLAGS='-UHAVE_TIMESPEC_GET'
+                npm install
+                npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
+                mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
+                mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-linux-suse 2>/dev/null || true
               "
           - host: ubuntu-latest
             target: x86_64-unknown-freebsd
@@ -101,17 +103,18 @@ jobs:
               # Pass the host's /usr/include as a system include path so ring can find them.
               echo "CFLAGS_x86_64_unknown_freebsd=-isystem /usr/include" >> $GITHUB_ENV
             build: |
-              # Verification: Confirm tikv-jemalloc is not in the dependency tree for FreeBSD
-              echo "[Lotus] Verifying dependency tree for FreeBSD..."
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
+
+              # Post-build verification: patch was applied during prebuild, confirm tikv-jemalloc is gone
+              echo "[Lotus] Verifying tikv-jemalloc is excluded from FreeBSD dependency tree..."
               if cd packages/lotus-core && cargo tree --target x86_64-unknown-freebsd 2>/dev/null | grep -q "tikv-jemalloc"; then
-                echo "[Error] tikv-jemalloc still found in dependency tree!"
+                echo "[Error] tikv-jemalloc still found in dependency tree after patch!"
                 exit 1
               fi
               cd "$GITHUB_WORKSPACE"
               echo "[Lotus] Success: tikv-jemalloc excluded."
 
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd && \
-              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node && \
+              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node
               mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-freebsd 2>/dev/null || true
     name: stable - ${{ matrix.settings.build_id }} - node@22
     runs-on: ${{ matrix.settings.host }}
@@ -165,15 +168,15 @@ jobs:
         run: |
           $gstVer = "1.24.13"
           $gstBase = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVer/msvc"
-          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
           $runtime = "$env:TEMP\gstreamer-runtime.msi"
           $devel   = "$env:TEMP\gstreamer-devel.msi"
+          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
           Write-Host "Downloading GStreamer $gstVer runtime..."
-          Invoke-WebRequest -Uri "$gstBase/gstreamer-1.0-msvc-x86_64-$gstVer.msi" `
-            -OutFile $runtime -UserAgent $ua -UseBasicParsing
+          & curl.exe -fsSL --user-agent $ua `
+            -o $runtime "$gstBase/gstreamer-1.0-msvc-x86_64-$gstVer.msi"
           Write-Host "Downloading GStreamer $gstVer devel..."
-          Invoke-WebRequest -Uri "$gstBase/gstreamer-1.0-devel-msvc-x86_64-$gstVer.msi" `
-            -OutFile $devel -UserAgent $ua -UseBasicParsing
+          & curl.exe -fsSL --user-agent $ua `
+            -o $devel "$gstBase/gstreamer-1.0-devel-msvc-x86_64-$gstVer.msi"
           Write-Host "Installing GStreamer runtime..."
           Start-Process msiexec -ArgumentList "/i `"$runtime`" /qn TARGETDIR=C:\gstreamer" -Wait -NoNewWindow
           Write-Host "Installing GStreamer devel..."
