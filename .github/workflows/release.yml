@@ -115,7 +115,9 @@ jobs:
                 '  args+=("$a")' \
                 'done' \
                 'if (( host_probe )); then exec cc "${args[@]}"; fi' \
-                'exec zig cc -target x86_64-freebsd --sysroot "$FREEBSD_SYSROOT" "${args[@]}"' \
+                'exec zig cc -target x86_64-freebsd --sysroot "$FREEBSD_SYSROOT" \' \
+                '  -isystem "$FREEBSD_SYSROOT/usr/include" \' \
+                '  -L"$FREEBSD_SYSROOT/usr/lib" -L"$FREEBSD_SYSROOT/lib" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
@@ -131,7 +133,9 @@ jobs:
                 '  args+=("$a")' \
                 'done' \
                 'if (( host_probe )); then exec c++ "${args[@]}"; fi' \
-                'exec zig c++ -target x86_64-freebsd --sysroot "$FREEBSD_SYSROOT" "${args[@]}"' \
+                'exec zig c++ -target x86_64-freebsd --sysroot "$FREEBSD_SYSROOT" \' \
+                '  -isystem "$FREEBSD_SYSROOT/usr/include" -isystem "$FREEBSD_SYSROOT/usr/include/c++/v1" \' \
+                '  -L"$FREEBSD_SYSROOT/usr/lib" -L"$FREEBSD_SYSROOT/lib" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ranlib "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ranlib >/dev/null
