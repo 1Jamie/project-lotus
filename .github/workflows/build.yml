@@ -51,16 +51,31 @@ jobs:
             setup: |
               docker pull opensuse/tumbleweed
             build: |
+              # glsl-optimizer ships its own C11 threads emulation (threads_posix.h) which
+              # unconditionally typedef-s once_flag as pthread_once_t. Modern glibc (2.28+)
+              # on openSUSE Tumbleweed natively defines once_flag as __once_flag (also an int,
+              # but a distinct typedef), causing a "conflicting types" error.
+              #
+              # Fix: force-include this shim via CFLAGS="-include /tmp/glslopt_compat.h".
+              # The shim includes <stdlib.h> FIRST so glibc defines once_flag as __once_flag.
+              # It then sets the EMULATED_THREADS_H_INCLUDED_ guard so that glsl-optimizer's
+              # threads.h (which includes threads_posix.h) is skipped entirely.
+              # Finally it defines the remaining pthread-based types (mtx_t, thrd_t, etc.)
+              # and call_once WITHOUT redefining once_flag (glibc already owns it).
               printf '%s\n' \
-                '#ifndef EMULATED_THREADS_H_INCLUDED_' \
-                '#define EMULATED_THREADS_H_INCLUDED_' \
+                '#ifndef LOTUS_GLSLOPT_COMPAT_H' \
+                '#define LOTUS_GLSLOPT_COMPAT_H' \
+                '#include <stdlib.h>' \
                 '#include <pthread.h>' \
                 '#include <time.h>' \
+                '#define EMULATED_THREADS_H_INCLUDED_' \
+                '#ifndef TIME_UTC' \
+                '#define TIME_UTC 1' \
+                '#endif' \
                 'typedef pthread_cond_t cnd_t;' \
                 'typedef pthread_t thrd_t;' \
                 'typedef pthread_key_t tss_t;' \
                 'typedef pthread_mutex_t mtx_t;' \
-                'typedef pthread_once_t once_flag;' \
                 'typedef void (*tss_dtor_t)(void*);' \
                 'typedef int (*thrd_start_t)(void*);' \
                 'enum { mtx_plain=0, mtx_try=1, mtx_timed=2, mtx_recursive=4 };' \
@@ -68,8 +83,13 @@ jobs:
                 '#define ONCE_FLAG_INIT PTHREAD_ONCE_INIT' \
                 '#define _MTX_INITIALIZER_NP PTHREAD_MUTEX_INITIALIZER' \
                 'static inline void call_once(once_flag *f, void (*fn)(void)) { pthread_once(f, fn); }' \
-                '#ifndef TIME_UTC' \
-                '#define TIME_UTC 1' \
+                'static inline int mtx_init(mtx_t *m, int t) { return pthread_mutex_init(m, NULL) == 0 ? 0 : -1; }' \
+                'static inline int mtx_destroy(mtx_t *m) { return pthread_mutex_destroy(m) == 0 ? 0 : -1; }' \
+                'static inline int mtx_lock(mtx_t *m) { return pthread_mutex_lock(m) == 0 ? 0 : -1; }' \
+                'static inline int mtx_unlock(mtx_t *m) { return pthread_mutex_unlock(m) == 0 ? 0 : -1; }' \
+                '#ifndef thrd_create' \
+                'static inline int thrd_create(thrd_t *t, int (*fn)(void*), void *arg) { return pthread_create(t, NULL, (void*(*)(void*))fn, arg) == 0 ? 0 : -1; }' \
+                'static inline int thrd_join(thrd_t t, int *res) { void *r; int e = pthread_join(t, &r); if (res) *res = (int)(long)r; return e == 0 ? 0 : -1; }' \
                 '#endif' \
                 '#endif' \
                 > /tmp/glslopt_compat.h
@@ -96,16 +116,45 @@ jobs:
               # Ubuntu 24.04+ does not ship gcc-x86-64-freebsd-gnu. Zig bundles FreeBSD libc + cross C/C++.
               # cc-rs appends --target=x86_64-unknown-freebsd (Rust triple) which Zig rejects.
               # The wrappers strip any incoming --target=* and substitute the correct Zig triple.
+              # zig 0.13.0 bundles Linux libc headers but NOT FreeBSD libc headers.
+              # When zig cc targets x86_64-freebsd, it adds its own clang built-in headers
+              # (lib/include) which include xmmintrin.h -> mm_malloc.h -> <stdlib.h>.
+              # Since zig has no FreeBSD stdlib.h, the build fails.
+              # Fix: create a minimal stdlib.h stub and inject it via -isystem in the wrapper.
+              # This stub provides only what mm_malloc.h and ring's C code actually need
+              # (type declarations for malloc/free/realloc) without any platform-specific bits.
+              mkdir -p /tmp/freebsd-stubs
+              printf '%s\n' \
+                '#pragma once' \
+                '#ifndef _STDLIB_H' \
+                '#define _STDLIB_H' \
+                'typedef __SIZE_TYPE__ size_t;' \
+                'void *malloc(size_t size);' \
+                'void *calloc(size_t n, size_t size);' \
+                'void *realloc(void *ptr, size_t size);' \
+                'void free(void *ptr);' \
+                'void abort(void);' \
+                'void exit(int status);' \
+                'int abs(int n);' \
+                'long labs(long n);' \
+                '#define EXIT_SUCCESS 0' \
+                '#define EXIT_FAILURE 1' \
+                '#ifndef NULL' \
+                '#define NULL ((void*)0)' \
+                '#endif' \
+                '#endif' \
+                > /tmp/freebsd-stubs/stdlib.h
+
               sudo install -d /usr/local/bin
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
-                'args=(); for a in "$@"; do [[ "$a" == --target=* ]] && continue; args+=("$a"); done' \
-                'exec zig cc -target x86_64-freebsd "${args[@]}"' \
+                'args=(); for a in "$@"; do [[ "$a" == --target=* || "$a" == -m64 ]] && continue; args+=("$a"); done' \
+                'exec zig cc -target x86_64-freebsd -isystem /tmp/freebsd-stubs "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
-                'args=(); for a in "$@"; do [[ "$a" == --target=* ]] && continue; args+=("$a"); done' \
-                'exec zig c++ -target x86_64-freebsd "${args[@]}"' \
+                'args=(); for a in "$@"; do [[ "$a" == --target=* || "$a" == -m64 ]] && continue; args+=("$a"); done' \
+                'exec zig c++ -target x86_64-freebsd -isystem /tmp/freebsd-stubs "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ranlib "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ranlib >/dev/null
@@ -120,12 +169,6 @@ jobs:
               echo "AR_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ar" >> $GITHUB_ENV
               echo "RANLIB_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ranlib" >> $GITHUB_ENV
               echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=x86_64-unknown-freebsd-gcc" >> $GITHUB_ENV
-              # ring's check.h includes assert.h guarded by RING_CORE_NOSTDLIBINC.
-              # When cross-compiling for FreeBSD with zig cc, the standard libc headers
-              # are not available on the Ubuntu host. Define RING_CORE_NOSTDLIBINC so
-              # ring skips assert.h entirely and uses its built-in fallback instead.
-              # Also define NDEBUG so assertions compile away to no-ops.
-              echo "CFLAGS_x86_64_unknown_freebsd=-DRING_CORE_NOSTDLIBINC -DNDEBUG" >> $GITHUB_ENV
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
 
@@ -199,6 +242,7 @@ jobs:
           # Re-read it from the machine scope since this shell session predates the install.
           $gstRoot = [System.Environment]::GetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", "Machine")
           if (-not $gstRoot) { $gstRoot = "D:\gstreamer\1.0\msvc_x86_64" }
+          $gstRoot = $gstRoot.TrimEnd('\')
           Write-Host "GStreamer runtime root: $gstRoot"
           Write-Host "Downloading GStreamer $gstVer devel MSI..."
           $devel = "$env:TEMP\gstreamer-devel.msi"
