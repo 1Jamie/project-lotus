@@ -50,7 +50,29 @@ jobs:
                 zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\"
-                export CFLAGS='-Donce_flag=__glslopt_once_flag -Dcall_once=__glslopt_call_once -UHAVE_TIMESPEC_GET'
+                cat > /tmp/glslopt_compat.h << 'SHIM_EOF'
+#ifndef EMULATED_THREADS_H_INCLUDED_
+#define EMULATED_THREADS_H_INCLUDED_
+#include <pthread.h>
+#include <time.h>
+typedef pthread_cond_t  cnd_t;
+typedef pthread_t       thrd_t;
+typedef pthread_key_t   tss_t;
+typedef pthread_mutex_t mtx_t;
+typedef pthread_once_t  once_flag;
+typedef void (*tss_dtor_t)(void*);
+typedef int (*thrd_start_t)(void*);
+enum { mtx_plain=0, mtx_try=1, mtx_timed=2, mtx_recursive=4 };
+enum { thrd_success=0, thrd_timeout, thrd_error, thrd_busy, thrd_nomem };
+#define ONCE_FLAG_INIT PTHREAD_ONCE_INIT
+#define _MTX_INITIALIZER_NP PTHREAD_MUTEX_INITIALIZER
+static inline void call_once(once_flag *f, void (*fn)(void)) { pthread_once(f, fn); }
+#ifndef TIME_UTC
+#define TIME_UTC 1
+#endif
+#endif
+SHIM_EOF
+                export CFLAGS=\"-include /tmp/glslopt_compat.h\"
                 npm install
                 npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
                 mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
@@ -91,9 +113,7 @@ jobs:
               echo "AR_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ar" >> $GITHUB_ENV
               echo "RANLIB_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ranlib" >> $GITHUB_ENV
               echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=x86_64-unknown-freebsd-gcc" >> $GITHUB_ENV
-              ZIG_LIB=$(zig env 2>/dev/null | grep '"lib_dir"' | sed 's/.*"lib_dir": "\(.*\)".*/\1/')
-              FBSD_INC="$ZIG_LIB/libc/include"
-              echo "CFLAGS_x86_64_unknown_freebsd=-isystem $FBSD_INC/x86_64-freebsd-none -isystem $FBSD_INC/generic-freebsd" >> $GITHUB_ENV
+              echo "CFLAGS_x86_64_unknown_freebsd=-DRING_CORE_NOSTDLIBINC -DNDEBUG" >> $GITHUB_ENV
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
 
@@ -166,17 +186,19 @@ jobs:
         run: |
           $gstVer = "1.24.13"
           $gstBase = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVer/msvc"
-          # Use the Chocolatey UA - freedesktop.org Anubis allows known package manager tools
           $ua = "chocolatey command line"
           Write-Host "Installing GStreamer $gstVer runtime via choco..."
           choco install gstreamer --version $gstVer --no-progress -y
-          Write-Host "Downloading GStreamer $gstVer devel MSI (choco package only has up to 1.24.11)..."
+          $gstRoot = [System.Environment]::GetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", "Machine")
+          if (-not $gstRoot) { $gstRoot = "D:\gstreamer\1.0\msvc_x86_64" }
+          Write-Host "GStreamer runtime root: $gstRoot"
+          Write-Host "Downloading GStreamer $gstVer devel MSI..."
           $devel = "$env:TEMP\gstreamer-devel.msi"
           & curl.exe -fsSL --user-agent $ua `
             -o $devel "$gstBase/gstreamer-1.0-devel-msvc-x86_64-$gstVer.msi"
-          Write-Host "Installing GStreamer devel..."
-          Start-Process msiexec -ArgumentList "/i `"$devel`" /qn TARGETDIR=C:\gstreamer" -Wait -NoNewWindow
-          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          $installDir = Split-Path (Split-Path $gstRoot -Parent) -Parent
+          Write-Host "Installing GStreamer devel to $installDir ..."
+          Start-Process msiexec -ArgumentList "/i `"$devel`" /qn TARGETDIR=`"$installDir`"" -Wait -NoNewWindow
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" >> $env:GITHUB_ENV
           echo "GSTREAMER_1_0_ROOT_X86_64=$gstRoot" >> $env:GITHUB_ENV
           echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" >> $env:GITHUB_ENV
