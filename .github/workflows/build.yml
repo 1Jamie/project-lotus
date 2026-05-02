@@ -106,16 +106,10 @@ jobs:
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
                 clang libclang-dev llvm lld pkg-config build-essential python3
 
-              # Ubuntu 24.04+ does not ship gcc-x86-64-freebsd-gnu. Zig bundles FreeBSD libc + cross C/C++.
-              # cc-rs appends --target=x86_64-unknown-freebsd (Rust triple) which Zig rejects.
-              # The wrappers strip any incoming --target=* and substitute the correct Zig triple.
-              # mozjs_sys also invokes the target wrapper for Linux host probes with
-              # --target=x86_64-linux-gnu. Native Ubuntu cc/c++ is GCC and rejects that Clang-only
-              # flag, so those host probes must strip --target=* before execing native cc/c++.
-              # zig 0.13.0 does not ship FreeBSD libc. Tiny header stubs break libz-sys, and
-              # mozjs_sys configure performs link probes that need libc/crt objects too.
-              # Use headers and libs from the FreeBSD 14.3-RELEASE base dist as a real sysroot.
-              # base.txz member paths start with ./ (e.g. ./usr/lib/...); globs must include that prefix.
+              # No Debian cross-GCC for FreeBSD: use Clang + official 14.3-RELEASE base.txz as sysroot.
+              # Zig cc was dropped: its linker breaks mozjs configure (libc not available, no -Wl,@file).
+              # Wrappers add --target/--sysroot; strip duplicate --target=* from cc-rs and use native
+              # cc/c++ for Linux-gnu host probes (mozjs_sys). base.txz paths use ./ prefix in tar globs.
               FREE_ROOT="${RUNNER_TEMP:-/tmp}/freebsd-14.3"
               if [ ! -f "$FREE_ROOT/usr/include/stdio.h" ] || [ ! -f "$FREE_ROOT/usr/lib/libc.so" ]; then
                 echo "[Lotus] Extracting FreeBSD sysroot from base.txz (one-time ~210 MiB download)..."
@@ -143,7 +137,7 @@ jobs:
                 '  args+=("$a")' \
                 'done' \
                 'if (( host_probe )); then exec cc "${args[@]}"; fi' \
-                'exec zig cc -target x86_64-freebsd --sysroot "$FREEBSD_SYSROOT" \' \
+                'exec clang --target=x86_64-unknown-freebsd --sysroot="$FREEBSD_SYSROOT" \' \
                 '  -isystem "$FREEBSD_SYSROOT/usr/include" \' \
                 '  -L"$FREEBSD_SYSROOT/usr/lib" -L"$FREEBSD_SYSROOT/lib" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
@@ -161,12 +155,12 @@ jobs:
                 '  args+=("$a")' \
                 'done' \
                 'if (( host_probe )); then exec c++ "${args[@]}"; fi' \
-                'exec zig c++ -target x86_64-freebsd --sysroot "$FREEBSD_SYSROOT" \' \
+                'exec clang++ --target=x86_64-unknown-freebsd --sysroot="$FREEBSD_SYSROOT" \' \
                 '  -isystem "$FREEBSD_SYSROOT/usr/include" -isystem "$FREEBSD_SYSROOT/usr/include/c++/v1" \' \
                 '  -L"$FREEBSD_SYSROOT/usr/lib" -L"$FREEBSD_SYSROOT/lib" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
-              printf '%s\n' '#!/usr/bin/env bash' 'exec zig ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
-              printf '%s\n' '#!/usr/bin/env bash' 'exec zig ranlib "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ranlib >/dev/null
+              printf '%s\n' '#!/usr/bin/env bash' 'exec llvm-ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
+              printf '%s\n' '#!/usr/bin/env bash' 'exec llvm-ranlib "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ranlib >/dev/null
               sudo chmod +x /usr/local/bin/x86_64-unknown-freebsd-gcc \
                 /usr/local/bin/x86_64-unknown-freebsd-g++ \
                 /usr/local/bin/x86_64-unknown-freebsd-ar \
@@ -234,10 +228,6 @@ jobs:
             target/
             ${{ runner.os == 'Windows' && 'D:/t' || '' }}
           key: ${{ matrix.settings.build_id }}-cargo-${{ matrix.settings.host }}
-      - uses: goto-bus-stop/setup-zig@v2
-        if: ${{ matrix.settings.target == 'x86_64-unknown-freebsd' }}
-        with:
-          version: 0.13.0
       - name: Cache FreeBSD sysroot (base.txz extract)
         if: ${{ matrix.settings.target == 'x86_64-unknown-freebsd' }}
         uses: actions/cache@v4
