@@ -53,22 +53,27 @@ jobs:
                 '#include <pthread.h>' \
                 '#define EMULATED_THREADS_H_INCLUDED_' \
                 > /tmp/glslopt_compat.h
-              docker run --rm -v $GITHUB_WORKSPACE:/workspace -v /tmp/glslopt_compat.h:/tmp/glslopt_compat.h -w /workspace opensuse/tumbleweed /bin/sh -c "
+              # Build the CC shim on the host: generating it inside docker -c "..." breaks because
+              # inner double-quotes (e.g. grep -Eq "...") terminate the outer -c string and | becomes a pipe.
+              printf '%s\n' \
+                '#!/usr/bin/env sh' \
+                'cmdline="$*"' \
+                'if printf %s "$cmdline" | grep -Eq "glsl-optimizer/|glslopt-"; then' \
+                '  exec cc -include /tmp/glslopt_compat.h "$@"' \
+                'else' \
+                '  exec cc "$@"' \
+                'fi' \
+                > /tmp/cc-glslopt-shim
+              chmod +x /tmp/cc-glslopt-shim
+              docker run --rm -v $GITHUB_WORKSPACE:/workspace \
+                -v /tmp/glslopt_compat.h:/tmp/glslopt_compat.h \
+                -v /tmp/cc-glslopt-shim:/tmp/cc-glslopt-shim \
+                -w /workspace opensuse/tumbleweed /bin/sh -c "
                 set -e
                 zypper --non-interactive refresh
                 zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\"
-                printf '%s\n' \
-                  '#!/usr/bin/env sh' \
-                  'cmdline="$*"' \
-                  'if printf %s "$cmdline" | grep -Eq "glsl-optimizer/|glslopt-"; then' \
-                  '  exec cc -include /tmp/glslopt_compat.h "$@"' \
-                  'else' \
-                  '  exec cc "$@"' \
-                  'fi' \
-                  > /tmp/cc-glslopt-shim
-                chmod +x /tmp/cc-glslopt-shim
                 export CC=/tmp/cc-glslopt-shim
                 npm install
                 npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
@@ -98,19 +103,33 @@ jobs:
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
                 ': "${FREEBSD_SYSROOT_INC:?FREEBSD_SYSROOT_INC is not set}"' \
+                'host_probe=0' \
+                'args=()' \
+                'skip_next=0' \
                 'for a in "$@"; do' \
-                '  [[ "$a" == --target=x86_64-linux-gnu || "$a" == --target=*-linux-gnu* ]] && exec cc "$@"' \
+                '  if (( skip_next )); then skip_next=0; continue; fi' \
+                '  if [[ "$a" == --target=*-linux-gnu* ]]; then host_probe=1; continue; fi' \
+                '  if [[ "$a" == --target ]]; then host_probe=1; skip_next=1; continue; fi' \
+                '  [[ "$a" == --target=* || "$a" == -m64 ]] && continue' \
+                '  args+=("$a")' \
                 'done' \
-                'args=(); for a in "$@"; do [[ "$a" == --target=* || "$a" == -m64 ]] && continue; args+=("$a"); done' \
+                'if (( host_probe )); then exec cc "${args[@]}"; fi' \
                 'exec zig cc -target x86_64-freebsd -isystem "$FREEBSD_SYSROOT_INC" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
               printf '%s\n' \
                 '#!/usr/bin/env bash' \
                 ': "${FREEBSD_SYSROOT_INC:?FREEBSD_SYSROOT_INC is not set}"' \
+                'host_probe=0' \
+                'args=()' \
+                'skip_next=0' \
                 'for a in "$@"; do' \
-                '  [[ "$a" == --target=x86_64-linux-gnu || "$a" == --target=*-linux-gnu* ]] && exec c++ "$@"' \
+                '  if (( skip_next )); then skip_next=0; continue; fi' \
+                '  if [[ "$a" == --target=*-linux-gnu* ]]; then host_probe=1; continue; fi' \
+                '  if [[ "$a" == --target ]]; then host_probe=1; skip_next=1; continue; fi' \
+                '  [[ "$a" == --target=* || "$a" == -m64 ]] && continue' \
+                '  args+=("$a")' \
                 'done' \
-                'args=(); for a in "$@"; do [[ "$a" == --target=* || "$a" == -m64 ]] && continue; args+=("$a"); done' \
+                'if (( host_probe )); then exec c++ "${args[@]}"; fi' \
                 'exec zig c++ -target x86_64-freebsd -isystem "$FREEBSD_SYSROOT_INC" "${args[@]}"' \
                 | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
               printf '%s\n' '#!/usr/bin/env bash' 'exec zig ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
