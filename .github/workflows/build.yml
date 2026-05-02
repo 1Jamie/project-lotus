@@ -52,16 +52,19 @@ jobs:
               docker pull opensuse/tumbleweed
             build: |
               # glsl-optimizer bundles its own C11 threads emulation (threads_posix.h) which
-              # redefines once_flag, call_once, mtx_t etc. On openSUSE Tumbleweed, glibc 2.43
-              # already provides ALL of these natively via stdlib.h -> threads.h.
-              # Redefining any of them causes "conflicting types" / "static follows non-static" errors.
+              # redefines once_flag, call_once, mtx_t, thrd_t, cnd_t, tss_t etc.
+              # On openSUSE Tumbleweed (glibc 2.43), all of these are provided natively:
+              #   stdlib.h  -> once_flag, call_once (C11 thread-once, part of stdlib extension)
+              #   threads.h -> thrd_t, mtx_t, cnd_t, tss_t and all C11 thread functions
+              # Redefining any of them causes "conflicting types" or "static follows non-static" errors.
               #
-              # Fix: force-include this shim. It includes <stdlib.h> first so glibc claims all
-              # C11 thread types and functions, then sets EMULATED_THREADS_H_INCLUDED_ to prevent
-              # glsl-optimizer's threads.h from including threads_posix.h at all.
-              # glibc provides everything threads_posix.h would have emulated - nothing else needed.
+              # Fix: force-include this shim via CFLAGS="-include /tmp/glslopt_compat.h".
+              # Including <stdlib.h> then <threads.h> lets glibc claim all C11 thread symbols,
+              # then EMULATED_THREADS_H_INCLUDED_ prevents glsl-optimizer's threads.h from
+              # including threads_posix.h, which would try to redefine them all.
               printf '%s\n' \
                 '#include <stdlib.h>' \
+                '#include <threads.h>' \
                 '#define EMULATED_THREADS_H_INCLUDED_' \
                 > /tmp/glslopt_compat.h
               docker run --rm -v $GITHUB_WORKSPACE:/workspace -v /tmp/glslopt_compat.h:/tmp/glslopt_compat.h -w /workspace opensuse/tumbleweed /bin/sh -c "
@@ -126,6 +129,37 @@ jobs:
                 '#endif' \
                 '#endif' \
                 > /tmp/freebsd-stubs/assert.h
+              printf '%s\n' \
+                '#pragma once' \
+                '#ifndef _STRING_H' \
+                '#define _STRING_H' \
+                'typedef __SIZE_TYPE__ size_t;' \
+                'void *memcpy(void *dst, const void *src, size_t n);' \
+                'void *memmove(void *dst, const void *src, size_t n);' \
+                'void *memset(void *s, int c, size_t n);' \
+                'int memcmp(const void *a, const void *b, size_t n);' \
+                'void *memchr(const void *s, int c, size_t n);' \
+                'char *strcpy(char *dst, const char *src);' \
+                'char *strncpy(char *dst, const char *src, size_t n);' \
+                'int strcmp(const char *a, const char *b);' \
+                'int strncmp(const char *a, const char *b, size_t n);' \
+                'size_t strlen(const char *s);' \
+                'char *strchr(const char *s, int c);' \
+                'char *strstr(const char *h, const char *n);' \
+                '#endif' \
+                > /tmp/freebsd-stubs/string.h
+              printf '%s\n' \
+                '#pragma once' \
+                '#ifndef __STDALIGN_H' \
+                '#define __STDALIGN_H' \
+                '#ifndef alignas' \
+                '#define alignas _Alignas' \
+                '#endif' \
+                '#ifndef alignof' \
+                '#define alignof _Alignof' \
+                '#endif' \
+                '#endif' \
+                > /tmp/freebsd-stubs/stdalign.h
 
               sudo install -d /usr/local/bin
               printf '%s\n' \
@@ -233,10 +267,17 @@ jobs:
           # Install devel to the same root that choco used for the runtime
           $installDir = Split-Path (Split-Path $gstRoot -Parent) -Parent
           Write-Host "Installing GStreamer devel to $installDir ..."
-          Start-Process msiexec -ArgumentList "/i `"$devel`" /qn TARGETDIR=`"$installDir`"" -Wait -NoNewWindow
+          $msiArgs = "/i `"$devel`" /qn TARGETDIR=`"$installDir`""
+          $proc = Start-Process msiexec -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) { throw "msiexec failed with exit code $($proc.ExitCode)" }
+          Write-Host "GStreamer devel installed successfully."
+          # Use forward slashes in PKG_CONFIG_PATH - pkgconfiglite on Windows handles
+          # backslash paths poorly (splits on ':' treating drive letter as separator).
+          $pkgConfigPath = "$gstRoot\lib\pkgconfig" -replace '\\', '/'
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" >> $env:GITHUB_ENV
           echo "GSTREAMER_1_0_ROOT_X86_64=$gstRoot" >> $env:GITHUB_ENV
-          echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$pkgConfigPath" >> $env:GITHUB_ENV
+          Write-Host "PKG_CONFIG_PATH set to: $pkgConfigPath"
       - name: Setup toolchain
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
