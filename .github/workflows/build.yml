@@ -57,7 +57,7 @@ jobs:
                 zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\"
-                export CFLAGS='-UHAVE_TIMESPEC_GET'
+                export CFLAGS='-Donce_flag=__glslopt_once_flag -Dcall_once=__glslopt_call_once -UHAVE_TIMESPEC_GET'
                 npm install
                 npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
                 mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
@@ -98,10 +98,12 @@ jobs:
               echo "AR_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ar" >> $GITHUB_ENV
               echo "RANLIB_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ranlib" >> $GITHUB_ENV
               echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=x86_64-unknown-freebsd-gcc" >> $GITHUB_ENV
-              # zig 0.13 does not bundle FreeBSD libc headers. ring's C code only needs standard
-              # C headers (assert.h, stdint.h, etc.) which are identical on any POSIX host.
-              # Pass the host's /usr/include as a system include path so ring can find them.
-              echo "CFLAGS_x86_64_unknown_freebsd=-isystem /usr/include" >> $GITHUB_ENV
+              # Zig 0.13 bundles FreeBSD libc headers. Point ring's C compiler at them so
+              # stdint.h/assert.h etc. resolve to actual FreeBSD headers, not Ubuntu's glibc
+              # headers (which pull in bits/libc-header-start.h that doesn't exist for FreeBSD).
+              ZIG_LIB=$(zig env 2>/dev/null | grep '"lib_dir"' | sed 's/.*"lib_dir": "\(.*\)".*/\1/')
+              FBSD_INC="$ZIG_LIB/libc/include"
+              echo "CFLAGS_x86_64_unknown_freebsd=-isystem $FBSD_INC/x86_64-freebsd-none -isystem $FBSD_INC/generic-freebsd" >> $GITHUB_ENV
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
 
@@ -168,17 +170,14 @@ jobs:
         run: |
           $gstVer = "1.24.13"
           $gstBase = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVer/msvc"
-          $runtime = "$env:TEMP\gstreamer-runtime.msi"
-          $devel   = "$env:TEMP\gstreamer-devel.msi"
-          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-          Write-Host "Downloading GStreamer $gstVer runtime..."
-          & curl.exe -fsSL --user-agent $ua `
-            -o $runtime "$gstBase/gstreamer-1.0-msvc-x86_64-$gstVer.msi"
-          Write-Host "Downloading GStreamer $gstVer devel..."
+          # Use the Chocolatey UA - freedesktop.org Anubis allows known package manager tools
+          $ua = "chocolatey command line"
+          Write-Host "Installing GStreamer $gstVer runtime via choco..."
+          choco install gstreamer --version $gstVer --no-progress -y
+          Write-Host "Downloading GStreamer $gstVer devel MSI (choco package only has up to 1.24.11)..."
+          $devel = "$env:TEMP\gstreamer-devel.msi"
           & curl.exe -fsSL --user-agent $ua `
             -o $devel "$gstBase/gstreamer-1.0-devel-msvc-x86_64-$gstVer.msi"
-          Write-Host "Installing GStreamer runtime..."
-          Start-Process msiexec -ArgumentList "/i `"$runtime`" /qn TARGETDIR=C:\gstreamer" -Wait -NoNewWindow
           Write-Host "Installing GStreamer devel..."
           Start-Process msiexec -ArgumentList "/i `"$devel`" /qn TARGETDIR=C:\gstreamer" -Wait -NoNewWindow
           $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"

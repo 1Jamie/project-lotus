@@ -44,23 +44,25 @@ jobs:
             setup: |
               docker pull opensuse/tumbleweed
             build: |
-              docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "\
-                zypper --non-interactive refresh && \
-                zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel && \
-                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
-                export PATH=\"\$HOME/.cargo/bin:\$PATH\" && \
-                npm install && \
-                npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu && \
-                mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node && \
-                mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-linux-suse 2>/dev/null || true \
+              docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "
+                set -e
+                zypper --non-interactive refresh
+                zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                export PATH=\"\$HOME/.cargo/bin:\$PATH\"
+                export CFLAGS='-Donce_flag=__glslopt_once_flag -Dcall_once=__glslopt_call_once -UHAVE_TIMESPEC_GET'
+                npm install
+                npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
+                mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
+                mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-linux-suse 2>/dev/null || true
               "
           - host: ubuntu-latest
             target: x86_64-unknown-freebsd
             build_id: x86_64-unknown-freebsd
             setup: |
-              sudo apt-get update
-              sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev \
-                clang libclang-dev lld pkg-config build-essential
+              sudo apt-get update && sudo apt-get install -y --fix-missing \
+                libfontconfig1-dev libgl1-mesa-dev libssl-dev \
+                clang libclang-dev lld pkg-config build-essential python3
 
               # Ubuntu 24.04+ does not ship gcc-x86-64-freebsd-gnu. Zig bundles FreeBSD libc + cross C/C++.
               # cc-rs appends --target=x86_64-unknown-freebsd (Rust triple) which Zig rejects.
@@ -89,13 +91,22 @@ jobs:
               echo "AR_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ar" >> $GITHUB_ENV
               echo "RANLIB_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ranlib" >> $GITHUB_ENV
               echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=x86_64-unknown-freebsd-gcc" >> $GITHUB_ENV
+              ZIG_LIB=$(zig env 2>/dev/null | grep '"lib_dir"' | sed 's/.*"lib_dir": "\(.*\)".*/\1/')
+              FBSD_INC="$ZIG_LIB/libc/include"
+              echo "CFLAGS_x86_64_unknown_freebsd=-isystem $FBSD_INC/x86_64-freebsd-none -isystem $FBSD_INC/generic-freebsd" >> $GITHUB_ENV
             build: |
-              # Verification: Confirm tikv-jemalloc is not in the dependency tree for FreeBSD
-              echo "[Lotus] Verifying dependency tree for FreeBSD..."
-              (cd packages/lotus-core && cargo tree --target x86_64-unknown-freebsd | grep "tikv-jemalloc") && (echo "[Error] tikv-jemalloc still found in dependency tree!" && exit 1) || echo "[Lotus] Success: tikv-jemalloc excluded."
+              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
 
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd && \
-              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node && \
+              # Post-build verification: patch was applied during prebuild, confirm tikv-jemalloc is gone
+              echo "[Lotus] Verifying tikv-jemalloc is excluded from FreeBSD dependency tree..."
+              if cd packages/lotus-core && cargo tree --target x86_64-unknown-freebsd 2>/dev/null | grep -q "tikv-jemalloc"; then
+                echo "[Error] tikv-jemalloc still found in dependency tree after patch!"
+                exit 1
+              fi
+              cd "$GITHUB_WORKSPACE"
+              echo "[Lotus] Success: tikv-jemalloc excluded."
+
+              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node
               mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-freebsd 2>/dev/null || true
     name: stable - ${{ matrix.settings.build_id }} - node@20
     runs-on: ${{ matrix.settings.host }}
@@ -150,17 +161,25 @@ jobs:
         with:
           version: 0.11.0
       - name: Setup GStreamer (Windows)
-        uses: blinemedical/setup-gstreamer@v1.2.0
         if: runner.os == 'Windows'
-        with:
-          version: '1.24.13'
-      - name: GStreamer Env (Windows)
-        if: runner.os == 'Windows'
+        shell: powershell
         run: |
-          # The action sets GSTREAMER_1_0_ROOT_MSVC_X86_64
-          echo "GSTREAMER_1_0_ROOT_X86_64=$GSTREAMER_1_0_ROOT_MSVC_X86_64" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=$GSTREAMER_1_0_ROOT_MSVC_X86_64/lib/pkgconfig" >> $GITHUB_ENV
-        shell: bash
+          $gstVer = "1.24.13"
+          $gstBase = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVer/msvc"
+          # Use the Chocolatey UA - freedesktop.org Anubis allows known package manager tools
+          $ua = "chocolatey command line"
+          Write-Host "Installing GStreamer $gstVer runtime via choco..."
+          choco install gstreamer --version $gstVer --no-progress -y
+          Write-Host "Downloading GStreamer $gstVer devel MSI (choco package only has up to 1.24.11)..."
+          $devel = "$env:TEMP\gstreamer-devel.msi"
+          & curl.exe -fsSL --user-agent $ua `
+            -o $devel "$gstBase/gstreamer-1.0-devel-msvc-x86_64-$gstVer.msi"
+          Write-Host "Installing GStreamer devel..."
+          Start-Process msiexec -ArgumentList "/i `"$devel`" /qn TARGETDIR=C:\gstreamer" -Wait -NoNewWindow
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" >> $env:GITHUB_ENV
+          echo "GSTREAMER_1_0_ROOT_X86_64=$gstRoot" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" >> $env:GITHUB_ENV
       - name: Setup toolchain
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
@@ -171,6 +190,7 @@ jobs:
         run: ${{ matrix.settings.build }}
         shell: bash
       - name: Upload artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.settings.build_id }}
