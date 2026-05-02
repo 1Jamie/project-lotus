@@ -44,34 +44,34 @@ jobs:
             setup: |
               docker pull opensuse/tumbleweed
             build: |
-              docker run --rm -v $GITHUB_WORKSPACE:/workspace -w /workspace opensuse/tumbleweed /bin/sh -c "
+              printf '%s\n' \
+                '#ifndef EMULATED_THREADS_H_INCLUDED_' \
+                '#define EMULATED_THREADS_H_INCLUDED_' \
+                '#include <pthread.h>' \
+                '#include <time.h>' \
+                'typedef pthread_cond_t cnd_t;' \
+                'typedef pthread_t thrd_t;' \
+                'typedef pthread_key_t tss_t;' \
+                'typedef pthread_mutex_t mtx_t;' \
+                'typedef pthread_once_t once_flag;' \
+                'typedef void (*tss_dtor_t)(void*);' \
+                'typedef int (*thrd_start_t)(void*);' \
+                'enum { mtx_plain=0, mtx_try=1, mtx_timed=2, mtx_recursive=4 };' \
+                'enum { thrd_success=0, thrd_timeout, thrd_error, thrd_busy, thrd_nomem };' \
+                '#define ONCE_FLAG_INIT PTHREAD_ONCE_INIT' \
+                '#define _MTX_INITIALIZER_NP PTHREAD_MUTEX_INITIALIZER' \
+                'static inline void call_once(once_flag *f, void (*fn)(void)) { pthread_once(f, fn); }' \
+                '#ifndef TIME_UTC' \
+                '#define TIME_UTC 1' \
+                '#endif' \
+                '#endif' \
+                > /tmp/glslopt_compat.h
+              docker run --rm -v $GITHUB_WORKSPACE:/workspace -v /tmp/glslopt_compat.h:/tmp/glslopt_compat.h -w /workspace opensuse/tumbleweed /bin/sh -c "
                 set -e
                 zypper --non-interactive refresh
                 zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\"
-                cat > /tmp/glslopt_compat.h << 'SHIM_EOF'
-#ifndef EMULATED_THREADS_H_INCLUDED_
-#define EMULATED_THREADS_H_INCLUDED_
-#include <pthread.h>
-#include <time.h>
-typedef pthread_cond_t  cnd_t;
-typedef pthread_t       thrd_t;
-typedef pthread_key_t   tss_t;
-typedef pthread_mutex_t mtx_t;
-typedef pthread_once_t  once_flag;
-typedef void (*tss_dtor_t)(void*);
-typedef int (*thrd_start_t)(void*);
-enum { mtx_plain=0, mtx_try=1, mtx_timed=2, mtx_recursive=4 };
-enum { thrd_success=0, thrd_timeout, thrd_error, thrd_busy, thrd_nomem };
-#define ONCE_FLAG_INIT PTHREAD_ONCE_INIT
-#define _MTX_INITIALIZER_NP PTHREAD_MUTEX_INITIALIZER
-static inline void call_once(once_flag *f, void (*fn)(void)) { pthread_once(f, fn); }
-#ifndef TIME_UTC
-#define TIME_UTC 1
-#endif
-#endif
-SHIM_EOF
                 export CFLAGS=\"-include /tmp/glslopt_compat.h\"
                 npm install
                 npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
