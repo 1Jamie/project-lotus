@@ -86,7 +86,7 @@ jobs:
             setup: |
               sudo apt-get update && sudo apt-get install -y --fix-missing \
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
-                clang libclang-dev lld pkg-config build-essential python3
+                clang libclang-dev llvm lld pkg-config build-essential python3
 
               FREE_ROOT="${RUNNER_TEMP:-/tmp}/freebsd-14.3"
               FREE_INC="$FREE_ROOT/usr/include"

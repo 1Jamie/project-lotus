@@ -104,7 +104,7 @@ jobs:
             setup: |
               sudo apt-get update && sudo apt-get install -y --fix-missing \
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
-                clang libclang-dev lld pkg-config build-essential python3
+                clang libclang-dev llvm lld pkg-config build-essential python3
 
               # Ubuntu 24.04+ does not ship gcc-x86-64-freebsd-gnu. Zig bundles FreeBSD libc + cross C/C++.
               # cc-rs appends --target=x86_64-unknown-freebsd (Rust triple) which Zig rejects.
