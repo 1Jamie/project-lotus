@@ -17,8 +17,6 @@ function getPlatform() {
         return `lotus.win32-${arch}-msvc.node`;
     } else if (platform === 'darwin') {
         return `lotus.darwin-${arch}.node`;
-    } else if (platform === 'freebsd') {
-        return `lotus.freebsd-${arch}.node`;
     } else if (platform === 'linux') {
         // Check for openSUSE
         try {

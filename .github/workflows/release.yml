@@ -80,90 +80,6 @@ jobs:
                 mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
                 mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-linux-suse 2>/dev/null || true
               "
-          - host: ubuntu-latest
-            target: x86_64-unknown-freebsd
-            build_id: x86_64-unknown-freebsd
-            setup: |
-              sudo apt-get update && sudo apt-get install -y --fix-missing \
-                libfontconfig1-dev libgl1-mesa-dev libssl-dev \
-                clang libclang-dev llvm lld pkg-config build-essential python3
-
-              FREE_ROOT="${RUNNER_TEMP:-/tmp}/freebsd-14.3"
-              if [ ! -f "$FREE_ROOT/usr/include/stdio.h" ] || [ ! -f "$FREE_ROOT/usr/lib/libc.so" ]; then
-                echo "[Lotus] Extracting FreeBSD sysroot from base.txz (one-time ~210 MiB download)..."
-                rm -rf "$FREE_ROOT"
-                mkdir -p "$FREE_ROOT"
-                curl -fSL --proto '=https' --tlsv1.2 \
-                  "https://download.freebsd.org/ftp/releases/amd64/14.3-RELEASE/base.txz" \
-                  | tar -xJ -f - -C "$FREE_ROOT" --wildcards --no-anchored \
-                    "./usr/include/*" "./lib/*" "./usr/lib/*"
-              fi
-              echo "FREEBSD_SYSROOT=$FREE_ROOT" >> "$GITHUB_ENV"
-
-              sudo install -d /usr/local/bin
-              printf '%s\n' \
-                '#!/usr/bin/env bash' \
-                ': "${FREEBSD_SYSROOT:?FREEBSD_SYSROOT is not set}"' \
-                'host_probe=0' \
-                'args=()' \
-                'skip_next=0' \
-                'for a in "$@"; do' \
-                '  if (( skip_next )); then skip_next=0; continue; fi' \
-                '  if [[ "$a" == --target=*-linux-gnu* ]]; then host_probe=1; continue; fi' \
-                '  if [[ "$a" == --target ]]; then host_probe=1; skip_next=1; continue; fi' \
-                '  [[ "$a" == --target=* || "$a" == -m64 ]] && continue' \
-                '  args+=("$a")' \
-                'done' \
-                'if (( host_probe )); then exec cc "${args[@]}"; fi' \
-                'exec clang --target=x86_64-unknown-freebsd --sysroot="$FREEBSD_SYSROOT" \' \
-                '  -isystem "$FREEBSD_SYSROOT/usr/include" \' \
-                '  -L"$FREEBSD_SYSROOT/usr/lib" -L"$FREEBSD_SYSROOT/lib" "${args[@]}"' \
-                | sudo tee /usr/local/bin/x86_64-unknown-freebsd-gcc >/dev/null
-              printf '%s\n' \
-                '#!/usr/bin/env bash' \
-                ': "${FREEBSD_SYSROOT:?FREEBSD_SYSROOT is not set}"' \
-                'host_probe=0' \
-                'args=()' \
-                'skip_next=0' \
-                'for a in "$@"; do' \
-                '  if (( skip_next )); then skip_next=0; continue; fi' \
-                '  if [[ "$a" == --target=*-linux-gnu* ]]; then host_probe=1; continue; fi' \
-                '  if [[ "$a" == --target ]]; then host_probe=1; skip_next=1; continue; fi' \
-                '  [[ "$a" == --target=* || "$a" == -m64 ]] && continue' \
-                '  args+=("$a")' \
-                'done' \
-                'if (( host_probe )); then exec c++ "${args[@]}"; fi' \
-                'exec clang++ --target=x86_64-unknown-freebsd --sysroot="$FREEBSD_SYSROOT" \' \
-                '  -isystem "$FREEBSD_SYSROOT/usr/include" -isystem "$FREEBSD_SYSROOT/usr/include/c++/v1" \' \
-                '  -L"$FREEBSD_SYSROOT/usr/lib" -L"$FREEBSD_SYSROOT/lib" "${args[@]}"' \
-                | sudo tee /usr/local/bin/x86_64-unknown-freebsd-g++ >/dev/null
-              printf '%s\n' '#!/usr/bin/env bash' 'exec llvm-ar "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ar >/dev/null
-              printf '%s\n' '#!/usr/bin/env bash' 'exec llvm-ranlib "$@"' | sudo tee /usr/local/bin/x86_64-unknown-freebsd-ranlib >/dev/null
-              sudo chmod +x /usr/local/bin/x86_64-unknown-freebsd-gcc \
-                /usr/local/bin/x86_64-unknown-freebsd-g++ \
-                /usr/local/bin/x86_64-unknown-freebsd-ar \
-                /usr/local/bin/x86_64-unknown-freebsd-ranlib
-
-              echo "PKG_CONFIG_ALLOW_CROSS=1" >> $GITHUB_ENV
-              echo "CC_x86_64_unknown_freebsd=x86_64-unknown-freebsd-gcc" >> $GITHUB_ENV
-              echo "CXX_x86_64_unknown_freebsd=x86_64-unknown-freebsd-g++" >> $GITHUB_ENV
-              echo "AR_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ar" >> $GITHUB_ENV
-              echo "RANLIB_x86_64_unknown_freebsd=x86_64-unknown-freebsd-ranlib" >> $GITHUB_ENV
-              echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=x86_64-unknown-freebsd-gcc" >> $GITHUB_ENV
-            build: |
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-freebsd
-
-              # Post-build verification: patch was applied during prebuild, confirm tikv-jemalloc is gone
-              echo "[Lotus] Verifying tikv-jemalloc is excluded from FreeBSD dependency tree..."
-              if cd packages/lotus-core && cargo tree --target x86_64-unknown-freebsd 2>/dev/null | grep -q "tikv-jemalloc"; then
-                echo "[Error] tikv-jemalloc still found in dependency tree after patch!"
-                exit 1
-              fi
-              cd "$GITHUB_WORKSPACE"
-              echo "[Lotus] Success: tikv-jemalloc excluded."
-
-              mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.freebsd-x64.node
-              mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-freebsd 2>/dev/null || true
     name: stable - ${{ matrix.settings.build_id }} - node@20
     runs-on: ${{ matrix.settings.host }}
     steps:
@@ -208,15 +124,6 @@ jobs:
             target/
             ${{ runner.os == 'Windows' && 'D:/t' || '' }}
           key: ${{ matrix.settings.build_id }}-cargo-${{ matrix.settings.host }}
-      - name: Cache FreeBSD sysroot (base.txz extract)
-        if: ${{ matrix.settings.target == 'x86_64-unknown-freebsd' }}
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ runner.temp }}/freebsd-14.3/usr/include
-            ${{ runner.temp }}/freebsd-14.3/usr/lib
-            ${{ runner.temp }}/freebsd-14.3/lib
-          key: freebsd-14.3-amd64-sysroot-v2
       - uses: goto-bus-stop/setup-zig@v2
         if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' }}
         with:

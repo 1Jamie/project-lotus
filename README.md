@@ -38,7 +38,7 @@ It's designed for developers who want to build cross-platform desktop applicatio
 
 ---
 
-> as a heads up bsd does not have bluetooth support due to servo using btleplug which does not work on BSD, so sadly the BT support is missing in BSD. i would love to fix it but the amount of upstream work would be unreasonable and well out of scope.
+> **BSD Support Status:** BSD support has been moved to the TODO list with a TBD target. Previously, BSD lacked bluetooth support due to servo using btleplug which does not work on BSD.
 
 ## 🚀 Quick Start (Usage from NPM)
 
@@ -164,7 +164,7 @@ lotus/
 | **Linux (Fedora/RHEL)** | x64 | ✅ Verified | `.rpm` (Stable) | Ready |
 | **Linux (openSUSE)** | x64 | 🛠 Testing | Planned | Alpha |
 | **Windows** | x64 | ✅ Verified | `.msi` (testing) | Beta *1 |
-| **FreeBSD** | x64 | 🛠 Testing | Planned | Alpha |
+| **FreeBSD** | x64 | 💤 TODO | TBD | TBD |
 | **macOS** | arm64 | 🆘 Help Wanted | TBD | On Hold |
 
 *1 **Windows Status:**
@@ -189,7 +189,7 @@ lotus/
 
 ## � STATUS: ALPHA almost BETA (BUT IT WORKS WELL!)
 We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core@0.3.3`).
-Mac support is missing (because their ecosystem needs someone who nows it, please feel free to help!). BSD and SUSE support is planned (because I know the pain points over there, see Roadmap). Right now there are builds for BSD and SUSE so you can use it though it does not have an installer builder for them yet. I plan to add that in future releases.
+Mac support is missing (because their ecosystem needs someone who knows it, please feel free to help!). SUSE support is planned (because I know the pain points over there, see Roadmap). BSD support has been temporarily dropped and moved to the TODO list with a TBD target. Previously we had experimental BSD builds, but due to compilation and patching complexities, we are pausing support.
 
 ## ## Version 0.3.3 (Current) 
 * **Status:** Beta? I'm not sure what to call it, but it works way better than any alpha ive seen! but hasnt been around long enough to call it stable yet. This is a big release and brings with it support for linux and windows installers for apps built with lotus. This allows you to build apps with lotus and just npx lotus build and it will build the app installer for you for your platform. It is still a bit early so any feedback is appreciated! I plan to be a continued project for a while and I'm excited to see what we can do with it.
@@ -204,7 +204,7 @@ Mac support is missing (because their ecosystem needs someone who nows it, pleas
 * **Linux:** Arch, Debian, Fedora, openSUSE, Ubuntu
 * **Mac:** None (yet! please feel free to contribute!)
 
-In general linux, bsd, and windows are supported. Mac is not supported because I don't have a mac. I dont know enough about bsd or suse to automate building installers for them yet but it should fully run there and if not please feel free to open an issue and i will do my best to resolve it!
+In general linux and windows are supported. Mac is not supported because I don't have a mac. BSD support is currently a TODO with a TBD target. I dont know enough about suse to automate building installers for it yet but it should fully run there and if not please feel free to open an issue and i will do my best to resolve it!
 
 ---
 
@@ -571,10 +571,10 @@ Your app is now a real installed application with a binary in `/usr/bin/` and ev
 
 ## 🛠️ Prerequisites
 
-If you want to run this from source it should build on linux, windows, BSD and SUSE though the processes are not fully verified, i dont know those systems well and i mainly work on linux and use the github actions to do the builds for the other platforms and just grab the artifacts to test on those.... so if you do build anywhere else please let me know how it goes and feel free to send a pr to update the docs to add that build process :D
+If you want to run this from source it should build on linux, windows, and SUSE (BSD is currently a TODO with a TBD target) though the processes are not fully verified, i dont know those systems well and i mainly work on linux and use the github actions to do the builds for the other platforms and just grab the artifacts to test on those.... so if you do build anywhere else please let me know how it goes and feel free to send a pr to update the docs to add that build process :D
 
 ### Linux (Debian/Ubuntu/Fedora)
-This is where development happens. I do all the dev work from here so i sadly only have build instructions for linux, though i have tested the builds on windows and BSD and SUSE and they work fine, i just have my own preferences for linux... and im honestly horrible at dev on windows... though everything is tested over there, this is just for dev of lotus purposes.
+This is where development happens. I do all the dev work from here so i sadly only have build instructions for linux, though i have tested the builds on windows and SUSE (BSD support is currently a TODO/TBD) and they work fine, i just have my own preferences for linux... and im honestly horrible at dev on windows... though everything is tested over there, this is just for dev of lotus purposes.
 
 *   **Node.js:** v22+. Don't come at me with v14, we legit require it, we are using N-API 4 so anything lower WILL BREAK.
 *   **System Libraries:** You need these or things will scream at you.
@@ -672,6 +672,9 @@ PRs are welcome. If you break the `winit` or `glutin` version requirements, I wi
 *   **Build optimization:** See what we can strip out of the servo build. right now its fully support everything a browser does on the js and html side. so that includes things like VR support and XR support which i would say we probably dont need and probably many other things we can trim out. since its and open source project if someone wants to add them back i want to keep it as simple as a change to the build file to add it back in if they want.
 *   **Debugger:** Servo does support remote debugging through firefox. Though right now it is not exposed, i plan to have it exposed but only triggered by the dev package being used and if you use the encrypted VFS for a closed source app it will fully disable it on build for end users in lotus-dev
 *   **Open to suggestions:** I'm open to suggestions for the future. If you have an idea, let me know. Right now v0.4.0 is just a rough tenative plan for what I might do in the future.
+
+### TODO / TBD Targets
+*   [ ] **FreeBSD Support:** Re-add BSD support once upstream builds and N-API compilation complexity are resolved.
 
 ---
 **License:** MIT. Do whatever you want, just don't blame me if your computer achieves sentience and takes flight.

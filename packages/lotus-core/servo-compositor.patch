@@ -24,51 +24,6 @@ index 37ee5313bf1..704e94ef7fe 100644
  rustls-pki-types = "1.14"
  rustls-platform-verifier = "0.7.0"
  sea-query = { version = "=1.0.0-rc.31", default-features = false, features = ["backend-sqlite", "derive"] }
-diff --git a/components/allocator/Cargo.toml b/components/allocator/Cargo.toml
-index 8af83fb658e..2e8a1251d8a 100644
---- a/components/allocator/Cargo.toml
-+++ b/components/allocator/Cargo.toml
-@@ -21,7 +21,7 @@ backtrace = { workspace = true, optional = true }
- log = { workspace = true, optional = true }
- rustc-hash = { workspace = true, optional = true }
- 
--[target.'cfg(not(any(windows, target_env = "ohos")))'.dependencies]
-+[target.'cfg(not(any(windows, target_os = "freebsd", target_env = "ohos")))'.dependencies]
- libc = { workspace = true, optional = true }
- tikv-jemalloc-sys = { workspace = true }
- tikv-jemallocator = { workspace = true }
-@@ -31,3 +31,6 @@ windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
- 
- [target.'cfg(target_env = "ohos")'.dependencies]
- libc = { workspace = true }
-+
-+[target.'cfg(target_os = "freebsd")'.dependencies]
-+libc = { workspace = true }
-diff --git a/components/allocator/lib.rs b/components/allocator/lib.rs
-index a64ff560cc6..100edc38576 100644
---- a/components/allocator/lib.rs
-+++ b/components/allocator/lib.rs
-@@ -53,7 +53,7 @@ pub static enclosing_size: Option<EnclosingSizeFn> = Some(crate::enclosing_size_
- #[cfg(not(feature = "allocation-tracking"))]
- pub static enclosing_size: Option<EnclosingSizeFn> = None;
- 
--#[cfg(not(any(windows, feature = "use-system-allocator", target_env = "ohos")))]
-+#[cfg(not(any(windows, target_os = "freebsd", feature = "use-system-allocator", target_env = "ohos")))]
- mod platform {
-     use std::os::raw::c_void;
- 
-@@ -77,10 +77,7 @@ mod platform {
-     }
- }
- 
--#[cfg(all(
--    not(windows),
--    any(feature = "use-system-allocator", target_env = "ohos")
--))]
-+#[cfg(all(not(windows), any(feature = "use-system-allocator", target_os = "freebsd", target_env = "ohos")))]
- mod platform {
-     pub use std::alloc::System as Allocator;
-     use std::os::raw::c_void;
 diff --git a/components/net/Cargo.toml b/components/net/Cargo.toml
 index 170a0e9b15f..97e9908ab3e 100644
 --- a/components/net/Cargo.toml
@@ -122,64 +77,6 @@ index 8fc4bd13fc1..8f67489c3c7 100644
  /// which on my system takes around 30-50ms according to samply, spent in
  /// `tree_jitter_initialize_once`. If we don't call this function, then
  /// the initialization will happen much later, on a tokio runtime thread.
-diff --git a/components/profile/Cargo.toml b/components/profile/Cargo.toml
-index 7f8d3847524..a6b4fef44da 100644
---- a/components/profile/Cargo.toml
-+++ b/components/profile/Cargo.toml
-@@ -32,5 +32,5 @@ regex = { workspace = true }
- [target.'cfg(not(target_os = "windows"))'.dependencies]
- libc = { workspace = true }
- 
--[target.'cfg(not(any(target_os = "windows", target_env = "ohos")))'.dependencies]
-+[target.'cfg(not(any(target_os = "windows", target_os = "freebsd", target_env = "ohos")))'.dependencies]
- tikv-jemalloc-sys = { workspace = true }
-diff --git a/components/profile/system_reporter.rs b/components/profile/system_reporter.rs
-index 97996d3f532..48353ab3678 100644
---- a/components/profile/system_reporter.rs
-+++ b/components/profile/system_reporter.rs
-@@ -2,16 +2,16 @@
-  * License, v. 2.0. If a copy of the MPL was not distributed with this
-  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
- 
--#[cfg(not(any(target_os = "windows", target_env = "ohos")))]
-+#[cfg(not(any(target_os = "windows", target_os = "freebsd", target_env = "ohos")))]
- use std::ffi::CString;
--#[cfg(not(any(target_os = "windows", target_env = "ohos")))]
-+#[cfg(not(any(target_os = "windows", target_os = "freebsd", target_env = "ohos")))]
- use std::mem::size_of;
--#[cfg(not(any(target_os = "windows", target_env = "ohos")))]
-+#[cfg(not(any(target_os = "windows", target_os = "freebsd", target_env = "ohos")))]
- use std::ptr::null_mut;
- 
- #[cfg(all(target_os = "linux", target_env = "gnu"))]
- use libc::c_int;
--#[cfg(not(any(target_os = "windows", target_env = "ohos")))]
-+#[cfg(not(any(target_os = "windows", target_os = "freebsd", target_env = "ohos")))]
- use libc::{c_void, size_t};
- use profile_traits::mem::{ProcessReports, Report, ReportKind, ReporterRequest};
- use profile_traits::path;
-@@ -164,10 +164,10 @@ fn system_heap_info() -> SystemHeapInfo {
-     }
- }
- 
--#[cfg(not(any(target_os = "windows", target_env = "ohos")))]
-+#[cfg(not(any(target_os = "windows", target_os = "freebsd", target_env = "ohos")))]
- use tikv_jemalloc_sys::mallctl;
- 
--#[cfg(not(any(target_os = "windows", target_env = "ohos")))]
-+#[cfg(not(any(target_os = "windows", target_os = "freebsd", target_env = "ohos")))]
- fn jemalloc_stat(value_name: &str) -> Option<usize> {
-     // Before we request the measurement of interest, we first send an "epoch"
-     // request. Without that jemalloc gives cached statistics(!) which can be
-@@ -214,7 +214,7 @@ fn jemalloc_stat(value_name: &str) -> Option<usize> {
-     Some(value as usize)
- }
- 
--#[cfg(any(target_os = "windows", target_env = "ohos"))]
-+#[cfg(any(target_os = "windows", target_os = "freebsd", target_env = "ohos"))]
- fn jemalloc_stat(_value_name: &str) -> Option<usize> {
-     None
- }
 diff --git a/components/script/Cargo.toml b/components/script/Cargo.toml
 index 9c1c72a2cd2..ccea3db5c4c 100644
 --- a/components/script/Cargo.toml

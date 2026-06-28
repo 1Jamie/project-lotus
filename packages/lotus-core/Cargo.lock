@@ -8263,6 +8263,7 @@ dependencies = [
  "postcard",
  "rand 0.9.2",
  "regex",
+ "ring",
  "rsa",
  "rustc-hash 2.1.2",
  "sec1",
