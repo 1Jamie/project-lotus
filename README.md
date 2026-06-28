@@ -38,7 +38,7 @@ It's designed for developers who want to build cross-platform desktop applicatio
 
 ---
 
-> **BSD Support Status:** BSD support has been moved to the TODO list with a TBD target. Previously, BSD lacked bluetooth support due to servo using btleplug which does not work on BSD.
+> **BSD Support Status:** BSD support has been moved to the TODO list with a TBD target. Previously, BSD lacked bluetooth support due to servo using btleplug which does not work on BSD. Also because BSD does not utilitize glibc and thus jemalloc is a nightmare of a state to get working at the moment but plan to fix this in a near future release. 
 
 ## 🚀 Quick Start (Usage from NPM)
 
@@ -189,7 +189,7 @@ lotus/
 
 ## � STATUS: ALPHA almost BETA (BUT IT WORKS WELL!)
 We have working **Windows** and **Linux** builds available on npm (`@lotus-gui/core@0.3.3`).
-Mac support is missing (because their ecosystem needs someone who knows it, please feel free to help!). SUSE support is planned (because I know the pain points over there, see Roadmap). BSD support has been temporarily dropped and moved to the TODO list with a TBD target. Previously we had experimental BSD builds, but due to compilation and patching complexities, we are pausing support.
+Mac support is missing (because their ecosystem needs someone who knows it, please feel free to help!). BSD support has been temporarily dropped and moved to the TODO list with a TBD target. Previously we had experimental BSD builds, but due to compilation and patching complexities, we are pausing support while ironing out more of the framework itself.
 
 ## ## Version 0.3.3 (Current) 
 * **Status:** Beta? I'm not sure what to call it, but it works way better than any alpha ive seen! but hasnt been around long enough to call it stable yet. This is a big release and brings with it support for linux and windows installers for apps built with lotus. This allows you to build apps with lotus and just npx lotus build and it will build the app installer for you for your platform. It is still a bit early so any feedback is appreciated! I plan to be a continued project for a while and I'm excited to see what we can do with it.
@@ -571,10 +571,10 @@ Your app is now a real installed application with a binary in `/usr/bin/` and ev
 
 ## 🛠️ Prerequisites
 
-If you want to run this from source it should build on linux, windows, and SUSE (BSD is currently a TODO with a TBD target) though the processes are not fully verified, i dont know those systems well and i mainly work on linux and use the github actions to do the builds for the other platforms and just grab the artifacts to test on those.... so if you do build anywhere else please let me know how it goes and feel free to send a pr to update the docs to add that build process :D
+If you want to run this from source it should build on linux, windows, and SUSE though the processes are not fully verified, i dont know those systems well and i mainly work on linux and use the github actions to do the builds for the other platforms and just grab the artifacts to test on those.... so if you do build anywhere else please let me know how it goes and feel free to send a pr to update the docs to add that build process :D
 
 ### Linux (Debian/Ubuntu/Fedora)
-This is where development happens. I do all the dev work from here so i sadly only have build instructions for linux, though i have tested the builds on windows and SUSE (BSD support is currently a TODO/TBD) and they work fine, i just have my own preferences for linux... and im honestly horrible at dev on windows... though everything is tested over there, this is just for dev of lotus purposes.
+This is where development happens. I do all the dev work from here so i sadly only have build instructions for linux, though i have tested the builds on windows and SUSE and they work fine, i just have my own preferences for linux... and im honestly horrible at dev on windows... though everything is tested over there, this is just for dev of lotus purposes.
 
 *   **Node.js:** v22+. Don't come at me with v14, we legit require it, we are using N-API 4 so anything lower WILL BREAK.
 *   **System Libraries:** You need these or things will scream at you.
