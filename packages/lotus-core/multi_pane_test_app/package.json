@@ -1,5 +1,5 @@
 {
-    "name": "lotus-test-app",
+    "name": "lotus-multi-pane-test-app",
     "version": "1.0.0",
     "description": "Test Application for Lotus",
     "main": "main.js",

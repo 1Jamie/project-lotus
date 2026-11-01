@@ -25,6 +25,7 @@ jobs:
               choco install llvm nasm python311 pkgconfiglite --no-progress -y
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
+              echo "AWS_LC_SYS_PREBUILT_NASM=1" >> $GITHUB_ENV
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc && npm run extract-angle --workspace=@lotus-gui/core
             target: x86_64-pc-windows-msvc
@@ -35,7 +36,7 @@ jobs:
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             setup: |
               sudo apt-get update
-              sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev dpkg-dev fakeroot rpm pkg-config libdbus-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
+              sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev dpkg-dev fakeroot rpm pkg-config libdbus-1-dev clang libclang-dev lld cmake libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
           - host: ubuntu-latest
@@ -71,7 +72,7 @@ jobs:
                 -w /workspace opensuse/tumbleweed /bin/sh -c "
                 set -e
                 zypper --non-interactive refresh
-                zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
+                zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build zip unzip curl clang clang-devel lld cmake gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\"
                 export CC=/tmp/cc-glslopt-shim
@@ -211,13 +212,11 @@ jobs:
       - name: Distribute artifacts
         run: |
           ls -R artifacts
-          mv artifacts/bindings-*/*.node packages/lotus-core/
-          # Copy windows DLLs if they exist
+          find artifacts -name "*.node" -exec cp -v {} packages/lotus-core/ \;
           mkdir -p packages/lotus-core/windows
-          cp artifacts/bindings-x86_64-pc-windows-msvc/windows/*.dll packages/lotus-core/windows/ 2>/dev/null || true
-          # Copy index.js and index.d.ts from one of the artifact folders (they are identical across platforms)
-          cp artifacts/bindings-x86_64-unknown-linux-gnu/index.js packages/lotus-core/
-          cp artifacts/bindings-x86_64-unknown-linux-gnu/index.d.ts packages/lotus-core/
+          find artifacts -name "*.dll" -exec cp -v {} packages/lotus-core/windows/ \; 2>/dev/null || true
+          find artifacts -name "index.js" -exec cp -v {} packages/lotus-core/ \;
+          find artifacts -name "index.d.ts" -exec cp -v {} packages/lotus-core/ \;
           ls -la packages/lotus-core/
       - name: Publish to npm
         run: |

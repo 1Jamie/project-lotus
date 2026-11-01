@@ -979,7 +979,6 @@ struct PaneInstance {
     pub pending_physical_rect: Option<euclid::default::Rect<i32>>,
     pub is_resizing: bool,
     pub pending_visible: bool,
-    pub frames_until_stable: u8,
     pub ghost_tex: Option<glow::NativeTexture>,
     pub ghost_tex_size: Option<winit::dpi::PhysicalSize<u32>>,
 }
@@ -1251,9 +1250,6 @@ impl WindowInstance {
 
                 if size_changed {
                     pane.pending_servo_size = Some(servo_size);
-                } else {
-                    // Position shift only: Join the flip but don't hold it back
-                    pane.frames_until_stable = 0;
                 }
                 
                 pane.last_notified_rect = Some(logical_rect);
@@ -1289,7 +1285,7 @@ impl WindowInstance {
             }
         }
 
-        // --- ANTI-DEADLOCK DISPATCHER ---
+        // --- LOCK-STEP DISPATCHER ---
         // Forces Servo to render exactly what the locked transaction is waiting for.
         for pane in self.panes.values_mut() {
             if !pane.servo_busy {
@@ -1299,18 +1295,20 @@ impl WindowInstance {
                             (staged.rect.size.width as u32).max(1),
                             (staged.rect.size.height as u32).max(1)
                         );
-                        
-                        // THE FIX: We must kickstart Servo if it has no ghost snapshot, 
-                        // or if its last finished frame doesn't match the transaction target.
-                        if pane.current_servo_size != target_size || pane.ghost_tex_size.is_none() {
+                        if pane.current_servo_size != target_size || !pane.first_frame_painted {
                             pane.webview.resize(target_size);
                             pane.requested_servo_size = target_size;
                             pane.servo_busy = true;
                             pane.pending_servo_size = None; // Wipe any spurious queued sizes
+                            pane.is_resizing = true;
                         }
                     }
                 }
             }
+        }
+
+        if self.committed_layout.is_some() && !self.panes.values().any(|p| p.servo_busy) {
+            self.window.request_redraw();
         }
     }
 }
@@ -1866,14 +1864,36 @@ static RESOURCE_READER: ResourceReader = ResourceReader;
 servo::submit_resource_reader!(&RESOURCE_READER);
 
 static RESOURCES_DIR: once_cell::sync::Lazy<PathBuf> = once_cell::sync::Lazy::new(|| {
-    let mut path = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    path.push("resources");
-    if path.exists() {
-        return path;
+    // 1. Check explicit environment variable
+    if let Ok(res_env) = env::var("LOTUS_RESOURCES_PATH") {
+        let p = PathBuf::from(res_env);
+        if p.exists() {
+            return p;
+        }
     }
-    // Fallback?
-    path.pop();
-    path
+
+    // 2. Check current working directory
+    let cur = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let p = cur.join("resources");
+    if p.exists() {
+        return p;
+    }
+
+    // 3. Search upwards through ancestor directories (up to 5 levels)
+    let mut search = cur.clone();
+    for _ in 0..5 {
+        if search.pop() {
+            let candidate = search.join("resources");
+            if candidate.join("debugger.js").exists() || candidate.join("rippy.png").exists() {
+                return candidate;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 4. Default fallback
+    cur.join("resources")
 });
 
 fn resources_dir_path() -> &'static PathBuf {
@@ -2499,7 +2519,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         pending_physical_rect: None,
                         is_resizing: false,
                         pending_visible: true,
-                        frames_until_stable: 0,
                         ghost_tex: None,
                         ghost_tex_size: None,
                     };
@@ -2585,9 +2604,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             pending_physical_rect: None,
                             is_resizing: false,
                             pending_visible: pane_opt.visible,
-                            frames_until_stable: 0,
-                        ghost_tex: None,
-                        ghost_tex_size: None,
+                            ghost_tex: None,
+                            ghost_tex_size: None,
                             };
                         panes.insert(pane_opt.id.clone(), pane);
                     }
@@ -2772,9 +2790,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             EngineCommand::Resize(window_id, size) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
-                    // auto_resize_main is now handled entirely in JS via the throttled 'resize' event.
-                    // This ensures the main pane benefits from the same 25ms resize throttle
-                    // and compositor stretching as manual multi-pane configurations.
+                    let _ = instance.window.request_inner_size(size);
                     instance.rendering_context.resize(size);
                 }
             },
@@ -2834,6 +2850,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },            EngineCommand::ShowWindow(window_id) => {
                 if let Some(instance) = self.windows.get(&window_id) {
                     instance.window.set_visible(true);
+                    instance.window.request_redraw();
                 }
             },
             EngineCommand::HideWindow(window_id) => {
@@ -2886,14 +2903,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     if let Some(pane) = instance.panes.get_mut(&pane_id) {
                         trace!("Rust: [Lifecycle] EngineCommand::NewFrameReady for window {} pane {}", window_id, pane_id);
-                        pane.servo_busy = false;
                         
                         // Unlock BEFORE painting to allow Servo to begin preparing the NEXT frame
                         pane.ready_to_repaint.store(true, Ordering::SeqCst);
                         
-                        // THE FIX: Unconditionally accept the frame Servo just spent time rendering!
-                        // This allows the current committed_layout transaction to clear, bringing 
-                        // the UI up to date with this frame before starting the next one.
+                        // Accept the frame Servo just spent time rendering!
                         pane.current_servo_size = pane.requested_servo_size;
                         pane.ready_frame_size = Some(pane.current_servo_size);
                         pane.needs_repaint = true;
@@ -2903,40 +2917,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             pane.first_frame_painted_time = Some(std::time::Instant::now());
                         }
                         pane.first_frame_painted = true;
-                        
-                        // ONE-FRAME LATCH: Signal that we need one full paint cycle
-                        if pane.pending_physical_rect.is_some() {
-                            pane.frames_until_stable = 1;
-                        }
-                        
                         pane.is_dirty = false;
-                        let is_locked = instance.committed_layout.is_some();
-                        
-                        // THE FIX: If locked, immediately dispatch the pending transaction target to Servo.
-                        // If unlocked, dispatch any queued resizes (continuous dragging).
-                        if is_locked {
-                            if let Some(committed) = &instance.committed_layout {
-                                if let Some(staged) = committed.panes.get(&pane.id) {
-                                    let target_size = ServoPhysicalSize::new(
-                                        (staged.rect.size.width as u32).max(1),
-                                        (staged.rect.size.height as u32).max(1)
-                                    );
-                                    if pane.current_servo_size != target_size {
-                                        pane.webview.resize(target_size);
-                                        pane.requested_servo_size = target_size;
-                                        pane.servo_busy = true;
-                                        pane.pending_servo_size = None;
-                                    }
-                                }
-                            }
-                        } else {
-                            if let Some(pending) = pane.pending_servo_size.take() {
-                                pane.webview.resize(pending);
-                                pane.requested_servo_size = pending;
-                                pane.servo_busy = true;
-                                pane.is_dirty = true;
-                            }
-                        }
+
+                        // LOCK STEP: Do not dispatch webview.resize here!
+                        // RedrawRequested will paint this frame into the GPU FBO, flip layout, and present.
+                        // Only after presentation is complete will the next queued resize step be dispatched.
+                        instance.window.request_redraw();
 
                         // AGGREGATION FIX: Only emit when all visible panes have painted
                         if !instance.emitted_ready_to_show {
@@ -3069,7 +3055,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         pending_physical_rect: None,
                         is_resizing: false,
                         pending_visible: true,
-                        frames_until_stable: 0,
                         ghost_tex: None,
                         ghost_tex_size: None,
                     };
@@ -3117,10 +3102,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         
                         if size_changed || pane.is_dirty {
                             pane.is_resizing = true;
-                            if !size_changed {
-                                // Position shift only: Join the Nuclear Flip but don't hold it back
-                                pane.frames_until_stable = 0;
-                            } else {
+                            if size_changed {
                                 // Physical resize: Hold the Nuclear Flip until Servo responds
                                 pane.pending_servo_size = Some(servo_size);
                             }
@@ -3206,23 +3188,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 match event {
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                         info!("Rust: Scale factor changed to {}", scale_factor);
-                        // Resize every webview to the new physical dimensions so Servo renders
-                        // at the correct DPI.  Phase 1 of RedrawRequested will sync the FBOs
-                        // but no longer calls webview.resize() itself, so we must do it here.
                         let sf = scale_factor as f32;
                         for pane in instance.panes.values_mut() {
-                            let new_pw = ((pane.rect.size.width  * sf).round() as u32).max(1);
-                            let new_ph = ((pane.rect.size.height * sf).round() as u32).max(1);
-                            if true { // Always valid now since we clamped to >= 1
-                                let new_size = ServoPhysicalSize::new(new_pw, new_ph);
-                                pane.webview.resize(new_size);
-                                pane.current_servo_size = new_size;
-                                pane.servo_busy = true;
-                                pane.pending_servo_size = None;
-                                pane.is_dirty = true;
-                                pane.needs_repaint = false;
-                            }
+                            pane.webview.set_hidpi_scale_factor(euclid::Scale::new(sf));
                         }
+                        instance.recalculate_layout(instance.active_window_size, sf);
                         instance.window.request_redraw();
                     },
                     WindowEvent::CloseRequested => {
@@ -3278,7 +3248,31 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         trace!("Rust: [Lifecycle] RedrawRequested (FBO) for window size {}x{}", window_size.width, window_size.height);
 
                         unsafe {
-                            // 1. Evaluate Integrity against the COMMITTED target
+                            // 1. UNIVERSAL PAINT BLOCK
+                            // Paint any panes that have new rendered frames ready in Servo
+                            for p in instance.panes.values_mut() {
+                                if p.needs_repaint {
+                                    if let Some(target_size) = p.ready_frame_size {
+                                        let safe_size = ServoPhysicalSize::new(target_size.width.max(1), target_size.height.max(1));
+                                        if p.offscreen_ctx.size() != safe_size {
+                                            let _ = p.offscreen_ctx.make_current();
+                                            p.offscreen_ctx.resize(safe_size);
+                                        }
+                                    }
+
+                                    let current_size = p.offscreen_ctx.size();
+                                    if current_size.width > 0 && current_size.height > 0 {
+                                        let _ = p.offscreen_ctx.make_current();
+                                        use glow::HasContext;
+                                        while instance.gl.get_error() != glow::NO_ERROR {}
+                                        p.webview.paint();
+                                        p.first_frame_painted = true;
+                                    }
+                                    p.needs_repaint = false;
+                                }
+                            }
+
+                            // 2. Evaluate Integrity against the COMMITTED target
                             let is_transaction_pending = instance.committed_layout.is_some();
                             let mut transaction_complete = false;
 
@@ -3294,13 +3288,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                                 );
                                                 let current_ready = pane.ready_frame_size.unwrap_or(ServoPhysicalSize::new(0, 0));
                                                 
-                                                // THE FIX: Hold the Nuclear Flip back if the sizes don't match OR 
-                                                // if the pane needs one background paint cycle to stabilize the FBO
-                                                if current_ready.width != target_size.width || current_ready.height != target_size.height || pane.frames_until_stable > 0 {
+                                                if current_ready.width != target_size.width || current_ready.height != target_size.height {
                                                     transaction_complete = false;
                                                     break;
                                                 }
-                                                // THE FIX: For the very first spawn of a pane, hold the lock for 150ms 
+                                                // For the very first spawn of a pane, hold the lock for 150ms 
                                                 // to allow WebRender async texture and display list generation to finish.
                                                 if let Some(first_time) = pane.first_frame_painted_time {
                                                     if first_time.elapsed() < std::time::Duration::from_millis(150) {
@@ -3316,7 +3308,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             }
                             let mut _flip_occurred = false;
 
-                            // 2. THE NUCLEAR GEOMETRY FLIP
+                            // 3. THE NUCLEAR GEOMETRY FLIP
                             if is_transaction_pending && transaction_complete {
                                 if let Some(committed) = instance.committed_layout.take() {
                                     instance.active_layout = committed;
@@ -3335,14 +3327,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     }
                                     trace!("Rust: [Transaction] Nuclear Layout Swap Executed");
                                     _flip_occurred = true;
-                                    
-                                    // CRITICAL RE-ENTRY: Pick up any drag/resize events
-                                    instance.recalculate_layout(window_size, scale_factor);
-
-                                    // THE FIX: Reset transaction_complete. If recalculate_layout just established
-                                    // a NEW transaction, we must ensure is_locked evaluates to true for the rest
-                                    // of this frame to prevent a 1-frame transparency flash.
-                                    transaction_complete = false;
                                 }
                             }
 
@@ -3358,39 +3342,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                             let mut sorted_panes: Vec<_> = instance.panes.values_mut().collect();
                             sorted_panes.sort_by_key(|p| p.z_index);
-
-                            // 3. UNIVERSAL PAINT BLOCK
-                            for p in sorted_panes.iter_mut() {
-                                if p.needs_repaint {
-                                    // THE FIX: Do not use .take() here! Idle panes must retain their 
-                                    // ready_frame_size so subsequent layout transactions know they are stable.
-                                    if let Some(target_size) = p.ready_frame_size {
-                                        let safe_size = ServoPhysicalSize::new(target_size.width.max(1), target_size.height.max(1));
-                                        if p.offscreen_ctx.size() != safe_size {
-                                            let _ = p.offscreen_ctx.make_current();
-                                            p.offscreen_ctx.resize(safe_size);
-                                        }
-                                    }
-
-                                    let current_size = p.offscreen_ctx.size();
-                                    if current_size.width > 0 && current_size.height > 0 {
-                                        let _ = p.offscreen_ctx.make_current();
-                                        use glow::HasContext;
-                                        while instance.gl.get_error() != glow::NO_ERROR {}
-                                        p.webview.paint();
-                                        p.first_frame_painted = true;
-
-                                        // THE FIX: Decrement the latch and request the final atomic layout flip
-                                        if p.frames_until_stable > 0 {
-                                            p.frames_until_stable -= 1;
-                                            if p.frames_until_stable == 0 {
-                                                instance.window.request_redraw();
-                                            }
-                                        }
-                                    }
-                                    p.needs_repaint = false;
-                                }
-                            }
 
                             // ---------------------------------------------------------
                             // FBO ALLOCATION (Strictly bound to active_window_size)
@@ -3443,29 +3394,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 instance.gl.clear_color(0.0, 0.0, 0.0, 1.0);
                             }
                             instance.gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
-
-                            if let (Some(radius), Some(program)) = (instance.corner_radius, instance.stencil_program) {
-                                if radius > 0.0 {
-                                    instance.gl.enable(glow::STENCIL_TEST);
-                                    instance.gl.stencil_func(glow::ALWAYS, 1, 0xFF);
-                                    instance.gl.stencil_op(glow::REPLACE, glow::REPLACE, glow::REPLACE);
-                                    instance.gl.color_mask(false, false, false, false);
-
-                                    instance.gl.use_program(Some(program));
-                                    instance.gl.bind_vertex_array(instance.stencil_vao);
-                                    instance.gl.uniform_2_f32(instance.u_stencil_size_loc.as_ref(), active_w as f32, active_h as f32);
-                                    instance.gl.uniform_1_f32(instance.u_stencil_radius_loc.as_ref(), radius as f32 * scale_factor);
-
-                                    instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-                                    
-                                    instance.gl.bind_vertex_array(None);
-                                    instance.gl.use_program(None);
-
-                                    instance.gl.color_mask(true, true, true, true);
-                                    instance.gl.stencil_func(glow::EQUAL, 1, 0xFF);
-                                    instance.gl.stencil_op(glow::KEEP, glow::KEEP, glow::KEEP);
-                                }
-                            }
 
                             for pane in sorted_panes.iter_mut() {
                                 if !pane.is_visible { continue; } 
@@ -3569,7 +3497,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             }
                             
                             instance.gl.color_mask(true, true, true, true);
-                            instance.gl.disable(glow::STENCIL_TEST);
 
                             // ---------------------------------------------------------
                             // PASS 2: BLIT SCENE FBO TO LIVE WINDOW
@@ -3600,6 +3527,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             }
 
                             instance.rendering_context.present();
+
+                            // LOCK STEP: The current frame is now fully presented to the GPU and screen.
+                            if instance.committed_layout.is_none() {
+                                for pane in instance.panes.values_mut() {
+                                    pane.servo_busy = false;
+                                }
+                                let window_size = instance.window.inner_size();
+                                let scale_factor = instance.window.scale_factor() as f32;
+                                instance.recalculate_layout(window_size, scale_factor);
+                            }
+
                             trace!("Rust: [Lifecycle] RedrawRequested DONE");
                         }
                     },            WindowEvent::Resized(size) => {
@@ -3624,6 +3562,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 instance.recalculate_layout(size, scale_factor);
                 
                 instance.rendering_context.resize(size);
+                instance.window.request_redraw();
 
                 let mut msg = Vec::new();
                 let logical_w = size.width as f32 / scale_factor;
@@ -3837,9 +3776,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             winit::event::ElementState::Released => MouseButtonAction::Up,
                         };
                         let servo_button = match button {
-                            winit::event::MouseButton::Left => ServoMouseButton::Left,
-                            winit::event::MouseButton::Right => ServoMouseButton::Right,
-                            winit::event::MouseButton::Middle => ServoMouseButton::Middle,
+                            winit::event::MouseButton::Left => ServoMouseButton::Primary,
+                            winit::event::MouseButton::Right => ServoMouseButton::Secondary,
+                            winit::event::MouseButton::Middle => ServoMouseButton::Auxiliary,
                             winit::event::MouseButton::Back => ServoMouseButton::Back,
                             winit::event::MouseButton::Forward => ServoMouseButton::Forward,
                             winit::event::MouseButton::Other(v) => ServoMouseButton::Other(v),

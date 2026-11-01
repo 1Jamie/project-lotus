@@ -62,8 +62,9 @@ win.on('resize', (payload) => {
 // 3. IPC Orchestration
 ipcMain.on('sidebar-navigate', (data) => {
     console.log(`[Showcase] Navigation requested: ${data ? data.view : 'unknown'}`);
-    // Route message to content pane - ensure data is at least an empty object
+    // Route message to content pane and update active selection on sidebar
     win.sendToPaneRenderer('content', 'update-view', data || {});
+    win.sendToPaneRenderer('sidebar', 'sync-active-view', data || {});
 });
 
 ipcMain.on('toggle-terminal', () => {
@@ -83,7 +84,12 @@ ipcMain.on('toggle-palette', () => {
         paletteVisible = !paletteVisible;
         console.log(`[Showcase] Toggling palette visibility to: ${paletteVisible}`);
         pal.setVisible(paletteVisible);
-        if (paletteVisible) pal.focus();
+        if (paletteVisible) {
+            pal.focus();
+            win.sendToPaneRenderer('palette', 'palette-opened', {});
+        } else {
+            win.panes.get('content')?.focus();
+        }
     }
 });
 

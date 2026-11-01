@@ -1,14 +1,14 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Outfit:wght@500;700&display=swap" rel="stylesheet">
+    
+    
+    
     <style>
         :root { --bg: #0f172a; --accent: #3b82f6; --text: #f8fafc; --muted: #64748b; --hover: #1e293b; }
         body { 
-            background: var(--bg); 
-            color: var(--text); 
+            background: #0f172a; 
+            color: #f8fafc; 
             font-family: 'Inter', sans-serif; 
             margin: 0; 
             padding: 24px; 
@@ -23,7 +23,7 @@
         h2 { font-family: 'Outfit', sans-serif; font-size: 1.5rem; margin-bottom: 32px; background: linear-gradient(to right, #60a5fa, #a855f7); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         ul { list-style: none; padding: 0; margin: 0; flex-grow: 1; }
         li { padding: 12px 16px; margin-bottom: 8px; border-radius: 8px; cursor: pointer; transition: all 0.2s ease; color: var(--muted); font-weight: 500; }
-        li:hover { background: var(--hover); color: var(--text); transform: translateX(4px); }
+        li:hover { background: var(--hover); color: #f8fafc; transform: translateX(4px); }
         li.active { background: rgba(59, 130, 246, 0.1); color: var(--accent); }
         button { background: var(--accent); color: white; border: none; padding: 10px; border-radius: 8px; cursor: pointer; font-weight: bold; width: 100%; margin-top: 10px; }
         button:hover { opacity: 0.9; }
@@ -69,10 +69,20 @@
         });
 
         document.addEventListener('keydown', (e) => {
-            if (e.ctrlKey && e.key === 'p') {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
+                e.preventDefault();
                 if (window.lotus) window.lotus.send('toggle-palette');
             }
         });
+
+        if (window.lotus) {
+            window.lotus.on('sync-active-view', (data) => {
+                if (!data || !data.view) return;
+                document.querySelectorAll('#nav li').forEach(li => {
+                    li.classList.toggle('active', li.dataset.view === data.view);
+                });
+            });
+        }
     </script>
 </body>
 </html>

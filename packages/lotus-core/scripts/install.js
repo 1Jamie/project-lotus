@@ -5,8 +5,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 
 // Configuration
-// TODO: Update this to your actual repository
-const REPO = 'autumn/lotus';
+const REPO = '1Jamie/project-lotus';
 const VERSION = 'v' + require('../package.json').version;
 
 function getPlatform() {

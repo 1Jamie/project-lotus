@@ -1,4 +1,14 @@
 const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+// Ensure LOTUS_RESOURCES_PATH points to the packaged resources directory
+if (!process.env.LOTUS_RESOURCES_PATH) {
+    const resourcesPath = path.join(__dirname, 'resources');
+    if (fs.existsSync(resourcesPath)) {
+        process.env.LOTUS_RESOURCES_PATH = resourcesPath;
+    }
+}
 
 // Auto-fix for Linux TLS allocation issue (ERR_DLOPEN_FAILED)
 // This must run BEFORE loading the native module in index.js

@@ -6,7 +6,12 @@
     ],
     "scripts": {
         "build": "npm run build --workspaces",
-        "test": "npm run test --workspaces"
+        "build:debug": "npm run build:debug --workspace=@lotus-gui/core",
+        "clean": "npm run clean --workspace=@lotus-gui/core",
+        "test": "npm run test-app",
+        "test-app": "npm run test-app --workspace=@lotus-gui/core",
+        "multipane-test-app": "npm run multipane-test-app --workspace=@lotus-gui/core",
+        "benchmark": "npm run benchmark --workspace=@lotus-gui/core"
     },
     "devDependencies": {
         "lerna": "^8.0.0"

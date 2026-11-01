@@ -51,12 +51,14 @@
     "patch": "bash ./scripts/apply-patches.sh",
     "clean": "node scripts/clean.js",
     "artifacts": "echo 'Artifacts moved by CI workflow'",
-    "test": "npm run test:base",
-    "test:base": "GLIBC_TUNABLES=glibc.rtld.optional_static_tls=4096 node example.js",
     "postinstall": "node scripts/install.js",
-    "start": "RUST_LOG=info LOTUS_DEV_REQ=../ node test_app/main.js",
-    "benchmark": "RUST_LOG=info LOTUS_DEV_REQ=../ node ipc-benchmark/main.js",
-    "test-app": "RUST_LOG=debug LOTUS_DEV_REQ=../ node test_app/main.js"
+    "test": "npm run test-app",
+    "test-app": "RUST_LOG=info LOTUS_DEV_REQ=../ node test_app/main.js",
+    "multipane-test-app": "RUST_LOG=info LOTUS_DEV_REQ=../ node multi_pane_test_app/main.js",
+    "test-app:multi": "npm run multipane-test-app",
+    "start": "npm run test-app",
+    "start:multi": "npm run multipane-test-app",
+    "benchmark": "RUST_LOG=info LOTUS_DEV_REQ=../ node ipc-benchmark/main.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.16.0"

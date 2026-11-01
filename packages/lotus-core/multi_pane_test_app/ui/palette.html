@@ -1,84 +1,281 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --bg-palette: rgba(30, 41, 59, 0.96);
+            --border-palette: rgba(255, 255, 255, 0.1);
+            --bg-input: #0f172a;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --item-hover: #334155;
+            --accent: #3b82f6;
+        }
+        * { box-sizing: border-box; }
         body { 
             background: transparent; 
             margin: 0; 
             padding: 20px; /* Space for the shadow */
             height: 100vh; 
-            box-sizing: border-box; 
-            font-family: 'Inter', sans-serif; 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
             display: flex; 
             flex-direction: column;
             overflow: hidden;
+            user-select: none;
+            -webkit-user-select: none;
         }
         .palette { 
-            background: rgba(30, 41, 59, 0.95); 
+            background: var(--bg-palette); 
             backdrop-filter: blur(10px);
             width: 100%; 
             height: 100%;
             overflow: hidden; 
             display: flex; 
             flex-direction: column;
-            border-radius: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            border: 1px solid var(--border-palette);
             box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.4);
         }
         input { 
-            background: #0f172a; 
+            background: var(--bg-input); 
             border: none; 
-            padding: 20px; 
-            color: white; 
-            font-size: 1.2rem; 
+            padding: 16px 20px; 
+            color: var(--text-main); 
+            font-size: 1.1rem; 
             width: 100%; 
             outline: none; 
-            box-sizing: border-box; 
-            border-bottom: 1px solid rgba(255,255,255,0.05); 
-            font-family: 'Inter', sans-serif;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08); 
+            font-family: inherit;
         }
-        .results { padding: 10px; color: #94a3b8; font-size: 0.9rem; flex-grow: 1; }
-        .result-item { padding: 12px; cursor: pointer; }
-        .result-item:hover, .result-item.selected { background: #334155; color: white; }
-        
-        .tip {
-            padding: 10px;
-            font-size: 0.7rem;
+        input::placeholder {
             color: #64748b;
+        }
+        .results { 
+            padding: 8px; 
+            color: var(--text-muted); 
+            font-size: 0.9rem; 
+            flex-grow: 1; 
+            overflow-y: auto;
+        }
+        .result-item { 
+            padding: 10px 14px; 
+            border-radius: 8px;
+            cursor: pointer; 
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            color: var(--text-muted);
+            transition: background 0.15s ease, color 0.15s ease;
+        }
+        .result-item.selected, .result-item:hover { 
+            background: var(--item-hover); 
+            color: var(--text-main); 
+        }
+        .result-item .item-title {
+            font-weight: 500;
+        }
+        .result-item .item-badge {
+            font-size: 0.75rem;
+            color: #64748b;
+            background: rgba(255, 255, 255, 0.05);
+            padding: 2px 8px;
+            border-radius: 4px;
+        }
+        .result-item.selected .item-badge {
+            color: #94a3b8;
+            background: rgba(255, 255, 255, 0.1);
+        }
+        .empty {
+            padding: 24px 12px;
             text-align: center;
+            color: #64748b;
+            font-size: 0.85rem;
+        }
+        .tip {
+            padding: 10px 16px;
+            font-size: 0.75rem;
+            color: #64748b;
+            display: flex;
+            justify-content: space-between;
             border-top: 1px solid rgba(255,255,255,0.05);
+            background: rgba(15, 23, 42, 0.6);
+        }
+        .tip kbd {
+            background: rgba(255, 255, 255, 0.1);
+            color: #94a3b8;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.7rem;
         }
     </style>
 </head>
 <body>
     <div class="palette">
         <input type="text" id="search" placeholder="Type a command..." autofocus>
-        <div class="results">
-            <div class="result-item selected">Toggle Terminal</div>
-            <div class="result-item">Close Window</div>
-            <div class="result-item">Cancel</div>
+        <div class="results" id="results"></div>
+        <div class="tip">
+            <span>Navigate <kbd>↑</kbd> <kbd>↓</kbd> · Select <kbd>↵</kbd> · Dismiss <kbd>Esc</kbd></span>
+            <span>Native Compositor</span>
         </div>
-        <div class="tip">Native Compositing Path: Enabled</div>
     </div>
 
     <script>
+        const COMMANDS = [
+            { id: 'toggle-terminal', title: 'Toggle Terminal', badge: 'Action', run: () => { window.lotus?.send('toggle-terminal'); } },
+            { id: 'view-dashboard', title: 'Switch View: Dashboard', badge: 'Navigation', run: () => { window.lotus?.send('sidebar-navigate', { view: 'Dashboard' }); } },
+            { id: 'view-metrics', title: 'Switch View: Metrics', badge: 'Navigation', run: () => { window.lotus?.send('sidebar-navigate', { view: 'Metrics' }); } },
+            { id: 'view-settings', title: 'Switch View: Settings', badge: 'Navigation', run: () => { window.lotus?.send('sidebar-navigate', { view: 'Settings' }); } },
+            { id: 'minimize-window', title: 'Minimize Window', badge: 'Window', run: () => { window.lotus?.send('window-minimize'); } },
+            { id: 'maximize-window', title: 'Maximize Window', badge: 'Window', run: () => { window.lotus?.send('window-maximize'); } },
+            { id: 'close-window', title: 'Close Window', badge: 'Window', run: () => { window.lotus?.send('window-close'); }, keepOpen: true },
+            { id: 'cancel', title: 'Cancel / Dismiss Palette', badge: 'Palette', run: () => {} },
+        ];
+
+        let filteredCommands = [...COMMANDS];
+        let selectedIndex = 0;
+
         const input = document.getElementById('search');
-        
-        window.addEventListener('focus', () => {
-            input.focus();
+        const resultsEl = document.getElementById('results');
+
+        function executeCommand(cmd) {
+            if (!cmd) return;
+            try {
+                cmd.run();
+            } finally {
+                if (!cmd.keepOpen) {
+                    window.lotus?.send('palette-close');
+                }
+            }
+        }
+
+        function scrollToSelected() {
+            const selectedEl = resultsEl.querySelector('.result-item.selected');
+            if (selectedEl) {
+                selectedEl.scrollIntoView({ block: 'nearest' });
+            }
+        }
+
+        function updateSelection() {
+            const items = resultsEl.querySelectorAll('.result-item');
+            items.forEach((item, idx) => {
+                item.classList.toggle('selected', idx === selectedIndex);
+            });
+            scrollToSelected();
+        }
+
+        function renderList() {
+            resultsEl.innerHTML = '';
+            if (filteredCommands.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'empty';
+                empty.textContent = 'No matching commands';
+                resultsEl.appendChild(empty);
+                return;
+            }
+            filteredCommands.forEach((cmd, idx) => {
+                const item = document.createElement('div');
+                item.className = 'result-item' + (idx === selectedIndex ? ' selected' : '');
+                item.dataset.index = idx;
+
+                const title = document.createElement('span');
+                title.className = 'item-title';
+                title.textContent = cmd.title;
+
+                const badge = document.createElement('span');
+                badge.className = 'item-badge';
+                badge.textContent = cmd.badge;
+
+                item.appendChild(title);
+                item.appendChild(badge);
+                resultsEl.appendChild(item);
+            });
+            scrollToSelected();
+        }
+
+        // Filtering
+        input.addEventListener('input', () => {
+            const query = input.value.trim().toLowerCase();
+            filteredCommands = COMMANDS.filter(cmd => cmd.title.toLowerCase().includes(query));
+            selectedIndex = 0;
+            renderList();
         });
 
-        document.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') {
-                if (window.lotus) window.lotus.send('palette-close');
-            } else if (e.key === 'Enter') {
-                if (window.lotus) {
-                    window.lotus.send('toggle-terminal');
-                    window.lotus.send('palette-close');
+        // Click on item
+        resultsEl.addEventListener('click', (e) => {
+            const item = e.target.closest('.result-item');
+            if (item) {
+                const idx = parseInt(item.dataset.index, 10);
+                if (!isNaN(idx) && filteredCommands[idx]) {
+                    selectedIndex = idx;
+                    executeCommand(filteredCommands[idx]);
                 }
             }
         });
+
+        // Sync hover with selection
+        resultsEl.addEventListener('mousemove', (e) => {
+            const item = e.target.closest('.result-item');
+            if (item) {
+                const idx = parseInt(item.dataset.index, 10);
+                if (!isNaN(idx) && idx !== selectedIndex) {
+                    selectedIndex = idx;
+                    updateSelection();
+                }
+            }
+        });
+
+        // Click outside closes palette
+        document.body.addEventListener('click', (e) => {
+            if (!e.target.closest('.palette')) {
+                window.lotus?.send('palette-close');
+            }
+        });
+
+        // Keyboard navigation
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                window.lotus?.send('palette-close');
+            } else if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
+                e.preventDefault();
+                window.lotus?.send('palette-close');
+            } else if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (filteredCommands.length > 0) {
+                    selectedIndex = (selectedIndex + 1) % filteredCommands.length;
+                    updateSelection();
+                }
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (filteredCommands.length > 0) {
+                    selectedIndex = (selectedIndex - 1 + filteredCommands.length) % filteredCommands.length;
+                    updateSelection();
+                }
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                if (filteredCommands.length > 0 && filteredCommands[selectedIndex]) {
+                    executeCommand(filteredCommands[selectedIndex]);
+                }
+            }
+        });
+
+        function resetPalette() {
+            input.value = '';
+            filteredCommands = [...COMMANDS];
+            selectedIndex = 0;
+            renderList();
+            setTimeout(() => input.focus(), 10);
+        }
+
+        window.addEventListener('focus', resetPalette);
+
+        if (window.lotus) {
+            window.lotus.on('palette-opened', resetPalette);
+        }
+
+        // Initialize on load
+        resetPalette();
     </script>
 </body>
 </html>

@@ -31,6 +31,7 @@ jobs:
               choco install llvm nasm python311 pkgconfiglite --no-progress -y
               echo "LIBCLANG_PATH=C:/Program Files/LLVM/lib" >> $GITHUB_ENV
               echo "PYTHON=python" >> $GITHUB_ENV
+              echo "AWS_LC_SYS_PREBUILT_NASM=1" >> $GITHUB_ENV
             build: |
               npm run build --workspace=@lotus-gui/core && npm run extract-angle --workspace=@lotus-gui/core
           - host: ubuntu-latest
@@ -40,7 +41,7 @@ jobs:
               sudo apt-get update && sudo apt-get install -y --fix-missing \
                 libfontconfig1-dev libgl1-mesa-dev libssl-dev \
                 libdbus-1-dev pkg-config \
-                clang libclang-dev lld \
+                clang libclang-dev lld cmake \
                 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
                 libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
             build: |
@@ -89,7 +90,7 @@ jobs:
                 -w /workspace opensuse/tumbleweed /bin/sh -c "
                 set -e
                 zypper --non-interactive refresh
-                zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build curl clang clang-devel lld gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
+                zypper --non-interactive install -y nodejs-npm gcc gcc-c++ fontconfig-devel Mesa-libGL-devel libopenssl-devel dbus-1-devel pkgconf-pkg-config python311 git gzip tar dpkg rpm-build curl clang clang-devel lld cmake gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\"
                 export CC=/tmp/cc-glslopt-shim
