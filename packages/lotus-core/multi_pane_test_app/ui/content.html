@@ -26,6 +26,24 @@
         <h1 id="view-title">Dashboard</h1>
         <p id="view-desc">Select an item from the sidebar to test IPC message routing.</p>
         <p>Try opening the terminal or command palette from the sidebar to see the native layout algorithm dynamically un-fill this pane in real-time, with zero IPC lag.</p>
+        <div style="margin-top: 24px;">
+            <label style="display:block; margin-bottom:8px; font-weight:600; color:#3b82f6;">Native &lt;select&gt; in Split Pane:</label>
+            <select id="pane-select" style="background:#020617; color:#f8fafc; border:1px solid rgba(255,255,255,0.2); padding:8px 12px; border-radius:8px; font-size:14px; outline:none; cursor:pointer;" onchange="document.getElementById('pane-select-res').textContent = 'Selected: ' + this.value">
+                <option value="dash">Dashboard View</option>
+                <option value="analytics">Real-Time Analytics</option>
+                <optgroup label="System Settings">
+                    <option value="profile">User Profile</option>
+                    <option value="security">Security & Keys</option>
+                    <option value="notifications">Push Notifications</option>
+                </optgroup>
+                <optgroup label="Environments">
+                    <option value="production">Production (AWS)</option>
+                    <option value="staging">Staging (GCP)</option>
+                    <option value="local">Local Development</option>
+                </optgroup>
+            </select>
+            <span id="pane-select-res" style="margin-left: 12px; color: #94a3b8; font-size: 13px;"></span>
+        </div>
     </div>
 
     <script>

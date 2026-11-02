@@ -103,6 +103,11 @@ ipcMain.on('calculate', (data) => {
     });
 });
 
+ipcMain.on('set-select-theme', (theme) => {
+    console.log('[ipcMain] Updating select menu theme to:', theme);
+    win.setSelectMenuTheme(theme);
+});
+
 ipcMain.on('open-secondary-window', () => {
     console.log('[ipcMain] Opening secondary window...');
     const win2 = new ServoWindow({

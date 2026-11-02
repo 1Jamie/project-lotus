@@ -20,7 +20,8 @@ if (process.platform === 'linux') {
     if (!alreadyFixed && !currentTunables.includes('optional_static_tls=')) {
         console.log(`[LOTUS] Detected Linux. Respawning with ${requiredTunable} to prevent TLS allocation issues...`);
         const { spawnSync } = require('child_process');
-        const result = spawnSync(process.execPath, process.argv.slice(1), {
+        const childArgs = process.execArgv.concat(process.argv.slice(1));
+        const result = spawnSync(process.execPath, childArgs, {
             stdio: 'inherit',
             env: {
                 ...process.env,
@@ -144,7 +145,10 @@ class MessageAssembler {
         this.onComplete = onComplete;
         this.CLEANUP_INTERVAL = 10000; // 10s
         
-        setInterval(() => this.cleanup(), this.CLEANUP_INTERVAL);
+        const timer = setInterval(() => this.cleanup(), this.CLEANUP_INTERVAL);
+        if (timer && typeof timer.unref === 'function') {
+            timer.unref();
+        }
     }
 
     handleChunk(clientId, data, unpacker) {
@@ -199,10 +203,62 @@ if (isProfiling) {
 
 const ipcMain = new IpcMain();
 let globalApp = null;
+let systemTheme = 'light';
 const windows = new Map();
 const eventQueue = new Map(); // windowId -> Array of pending events
 const globalPackers = new Map();
 const globalUnpackers = new Map();
+
+ipcMain.on('__lotus_select_toggle', (payload, clientId) => {
+    if (!clientId) return;
+    const windowId = clientId.split(':')[0];
+    const win = windows.get(windowId);
+    if (win && win.handle && payload) {
+        win.handle.updateSelectControl(payload.id || '', payload.selectedIndices || []);
+    }
+});
+
+ipcMain.on('__lotus_select_choice', (payload, clientId) => {
+    if (!clientId) return;
+    const windowId = clientId.split(':')[0];
+    const win = windows.get(windowId);
+    if (win && win.handle && payload) {
+        win.handle.submitSelectControl(payload.id || '', payload.selectedIndices || []);
+        win._hideSelectOverlay();
+    }
+});
+
+ipcMain.on('__lotus_select_dismiss', (payload, clientId) => {
+    if (!clientId) return;
+    const windowId = clientId.split(':')[0];
+    const win = windows.get(windowId);
+    if (win && win.handle && payload) {
+        win.handle.dismissSelectControl(payload.id || '');
+        win._hideSelectOverlay();
+    }
+});
+
+ipcMain.on('__lotus_select_resize', (payload, clientId) => {
+    if (!clientId) return;
+    const windowId = clientId.split(':')[0];
+    const win = windows.get(windowId);
+    if (win && payload && payload.height) {
+        win._resizeSelectOverlay(payload.height, payload.id);
+    }
+});
+
+ipcMain.on('__lotus_select_ready', (_payload, clientId) => {
+    if (!clientId) return;
+    const windowId = clientId.split(':')[0];
+    const win = windows.get(windowId);
+    if (win) {
+        win._selectOverlayReady = true;
+        if (win._pendingSelectPayload) {
+            win.sendToPaneRenderer('__lotus_select_overlay', 'populate-select', win._pendingSelectPayload, true);
+            win._pendingSelectPayload = null;
+        }
+    }
+});
 
 function ensureApp() {
     if (!globalApp) {
@@ -365,6 +421,25 @@ function processEvent(win, msg) {
     const windowId = msg.window_id;
     const paneId = msg.pane_id;
 
+    if (msg.event === 'app-ready') {
+        if (msg.system_theme) {
+            systemTheme = msg.system_theme;
+        }
+        return;
+    }
+
+    if (msg.event === 'theme-changed') {
+        if (msg.theme) {
+            systemTheme = msg.theme;
+            for (const w of windows.values()) {
+                if (w.selectMenuOptions && (w.selectMenuOptions.theme === 'auto' || !w.selectMenuOptions.theme)) {
+                    w.setSelectMenuTheme('auto');
+                }
+            }
+        }
+        return;
+    }
+
     if (msg.event === '_internal-created') {
         if (isProfiling) {
             const time = Date.now() - startTime;
@@ -375,6 +450,8 @@ function processEvent(win, msg) {
             // the window handle is created. This corrects stale pane rects when restoreState
             // restores the window to a different size than the hardcoded initial values.
             if (msg.logicalWidth && msg.logicalHeight) {
+                win._logicalWidth = msg.logicalWidth;
+                win._logicalHeight = msg.logicalHeight;
                 const resizePayload = {
                     width: msg.width,
                     height: msg.height,
@@ -384,6 +461,20 @@ function processEvent(win, msg) {
                 win.emit('resize', resizePayload);
                 win.emit('resized', resizePayload);
             }
+        }
+        return;
+    }
+
+    if (msg.event === 'select-element-open') {
+        if (win) {
+            win._handleSelectOpen(msg);
+        }
+        return;
+    }
+
+    if (msg.event === 'select-element-close') {
+        if (win) {
+            win._handleSelectClose(msg);
         }
         return;
     }
@@ -416,8 +507,14 @@ function processEvent(win, msg) {
 
     if (msg.event === 'window-closed') {
         if (win) {
+            win.emit('close');
             win.emit('closed');
             windows.delete(windowId);
+        }
+        if (windows.size === 0) {
+            if (globalApp && typeof globalApp.quit === 'function') {
+                globalApp.quit();
+            }
         }
         return;
     }
@@ -454,6 +551,10 @@ function processEvent(win, msg) {
 
     if (msg.event === 'resized') {
         if (win) {
+            if (msg.logicalWidth && msg.logicalHeight) {
+                win._logicalWidth = msg.logicalWidth;
+                win._logicalHeight = msg.logicalHeight;
+            }
             const payload = { width: msg.width, height: msg.height, logicalWidth: msg.logicalWidth, logicalHeight: msg.logicalHeight };
             
             // Resize throttle: emit immediately (leading edge), then at most once
@@ -669,22 +770,6 @@ class ServoWindow extends EventEmitter {
         };
 
         const finalOptions = { ...defaultOptions, ...options };
-        
-        // If the user provided panes, ensure they are in the format Rust expects
-        if (finalOptions.panes && Array.isArray(finalOptions.panes)) {
-            finalOptions.panes = finalOptions.panes.map(p => ({
-                id: p.id,
-                url: p.url || 'about:blank',
-                x: p.x || 0,
-                y: p.y || 0,
-                width: p.width || 0,
-                height: p.height || 0,
-                zIndex: p.zIndex || 0,
-                visible: p.visible !== false,
-                anchor: p.anchor,
-                dockOrder: p.dockOrder
-            }));
-        }
 
         if (finalOptions.root) {
             // Validate root path
@@ -700,6 +785,58 @@ class ServoWindow extends EventEmitter {
             // If using root, initialUrl is automatically set to our custom protocol
             finalOptions.initialUrl = `lotus-resource://localhost/${finalOptions.index}`;
         }
+        
+        // If the user provided panes, ensure they are in the format Rust expects
+        if (finalOptions.panes && Array.isArray(finalOptions.panes) && finalOptions.panes.length > 0) {
+            finalOptions.panes = finalOptions.panes.map(p => ({
+                id: p.id,
+                url: p.url || 'about:blank',
+                x: p.x || 0,
+                y: p.y || 0,
+                width: p.width || 0,
+                height: p.height || 0,
+                zIndex: p.zIndex || 0,
+                visible: p.visible !== false,
+                anchor: p.anchor !== undefined ? p.anchor : Anchor.None,
+                dockOrder: p.dockOrder || 0
+            }));
+        } else {
+            // UNIFIED PIPELINE: A single window is just a multi-pane layout with 1 Fill pane ('main').
+            finalOptions.panes = [{
+                id: 'main',
+                url: finalOptions.initialUrl || 'about:blank',
+                x: 0,
+                y: 0,
+                width: finalOptions.width || 0,
+                height: finalOptions.height || 0,
+                zIndex: 0,
+                visible: true,
+                anchor: finalOptions.autoResizeMain ? Anchor.Fill : Anchor.None,
+                dockOrder: 0
+            }];
+        }
+
+        // Parse & normalize scrollbars options
+        let scrollbarsEnabled = true;
+        let scrollbarTheme = 'auto';
+        let scrollbarAutoHide = true;
+        let scrollbarWidth = 8;
+
+        if (finalOptions.scrollbars === false) {
+            scrollbarsEnabled = false;
+        } else if (typeof finalOptions.scrollbars === 'object' && finalOptions.scrollbars !== null) {
+            if (finalOptions.scrollbars.enabled === false) {
+                scrollbarsEnabled = false;
+            }
+            if (finalOptions.scrollbars.theme) scrollbarTheme = String(finalOptions.scrollbars.theme);
+            if (finalOptions.scrollbars.autoHide !== undefined) scrollbarAutoHide = Boolean(finalOptions.scrollbars.autoHide);
+            if (finalOptions.scrollbars.width !== undefined) scrollbarWidth = Math.max(2, parseInt(finalOptions.scrollbars.width, 10) || 8);
+        }
+
+        finalOptions.scrollbarsEnabled = scrollbarsEnabled;
+        finalOptions.scrollbarTheme = scrollbarTheme;
+        finalOptions.scrollbarAutoHide = scrollbarAutoHide;
+        finalOptions.scrollbarWidth = scrollbarWidth;
 
         this.handle = createWindow(finalOptions);
         this.id = this.handle.getId();
@@ -718,18 +855,44 @@ class ServoWindow extends EventEmitter {
         this._batchTimer = null;
 
         
-        // The 'main' pane is always created by Rust
-        this.panes.set('main', new Pane(this, 'main'));
-        
-        // Register any other panes that were created atomically
+        // Register all panes created atomically with the window
         if (finalOptions.panes) {
             finalOptions.panes.forEach(p => {
-                if (p.id !== 'main') {
-                    this.panes.set(p.id, new Pane(this, p.id));
-                }
+                this.panes.set(p.id, new Pane(this, p.id));
             });
         }
 
+        this._logicalWidth = finalOptions.width;
+        this._logicalHeight = finalOptions.height;
+        this._selectOverlayReady = false;
+        this._pendingSelectPayload = null;
+
+        let initialSelectTheme = 'auto';
+        if (finalOptions.selectMenu && finalOptions.selectMenu.theme !== undefined) {
+            initialSelectTheme = finalOptions.selectMenu.theme;
+        } else if (globalApp && typeof globalApp.getSystemTheme === 'function') {
+            systemTheme = globalApp.getSystemTheme();
+        }
+
+        this.selectMenuOptions = Object.assign({
+            enabled: true,
+            url: 'lotus-resource://localhost/select-menu.html',
+            css: '',
+            theme: initialSelectTheme
+        }, finalOptions.selectMenu || {});
+
+        // Pre-warm the system select overlay pane if enabled
+        if (this.selectMenuOptions.enabled !== false) {
+            this.createPane('__lotus_select_overlay', {
+                url: this.selectMenuOptions.url,
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 100,
+                zIndex: 2147483647,
+                visible: false
+            });
+        }
 
         windows.set(this.id, this);
 
@@ -759,11 +922,15 @@ class ServoWindow extends EventEmitter {
         if (this.panes.has(id)) {
             throw new Error(`Pane with id '${id}' already exists`);
         }
-        const { url = 'about:blank', x = 0, y = 0, width = 0, height = 0, zIndex = 0, anchor = 0, dockOrder = 0 } = options;
-        this.handle.createPane(id, url, x, y, width, height, zIndex, anchor, dockOrder);
+        const { url = 'about:blank', x = 0, y = 0, width = 0, height = 0, zIndex = 0, anchor = 0, dockOrder = 0, visible = true } = options;
+        this.handle.createPane(id, url, x, y, width, height, zIndex, anchor, dockOrder, visible);
         const pane = new Pane(this, id);
         this.panes.set(id, pane);
         return pane;
+    }
+
+    addPane(id, options = {}) {
+        return this.createPane(id, options);
     }
 
     removePane(id) {
@@ -778,6 +945,210 @@ class ServoWindow extends EventEmitter {
 
     getPane(id) {
         return this.panes.get(id);
+    }
+
+    _resolveSelectTheme(theme) {
+        let t = theme;
+        if (t === undefined || t === 'auto' || !t) {
+            if (globalApp && typeof globalApp.getSystemTheme === 'function') {
+                systemTheme = globalApp.getSystemTheme();
+            }
+            return systemTheme || 'light';
+        }
+        if (typeof t === 'object') {
+            let base = t.base;
+            if (!base || base === 'auto') {
+                if (globalApp && typeof globalApp.getSystemTheme === 'function') {
+                    systemTheme = globalApp.getSystemTheme();
+                }
+                base = systemTheme || 'light';
+            }
+            return { ...t, base };
+        }
+        return t;
+    }
+
+    setSelectMenuTheme(theme) {
+        this.selectMenuOptions.theme = theme;
+        if (this.panes.has('__lotus_select_overlay')) {
+            this.sendToPaneRenderer('__lotus_select_overlay', 'update-theme', {
+                theme: this._resolveSelectTheme(this.selectMenuOptions.theme),
+                customCss: this.selectMenuOptions.css
+            }, true);
+        }
+    }
+
+    setSelectMenuCss(css) {
+        this.selectMenuOptions.css = css || '';
+        if (this.panes.has('__lotus_select_overlay')) {
+            this.sendToPaneRenderer('__lotus_select_overlay', 'update-theme', {
+                theme: this.selectMenuOptions.theme,
+                customCss: this.selectMenuOptions.css
+            }, true);
+        }
+    }
+
+    _handleSelectOpen(msg) {
+        let defaultPrevented = false;
+        const selectEvent = {
+            preventDefault: () => { defaultPrevented = true; },
+            get defaultPrevented() { return defaultPrevented; },
+            id: msg.id,
+            paneId: msg.pane_id,
+            rect: msg.rect,
+            options: msg.options,
+            selectedOptions: msg.selectedOptions,
+            allowMultiple: msg.allowMultiple,
+            submit: (indices) => {
+                this.handle.submitSelectControl(msg.id, indices || []);
+                this._hideSelectOverlay();
+            },
+            update: (indices) => {
+                this.handle.updateSelectControl(msg.id, indices || []);
+            },
+            dismiss: () => {
+                this.handle.dismissSelectControl(msg.id);
+                this._hideSelectOverlay();
+            }
+        };
+
+        this.emit('select-menu', selectEvent);
+
+        if (defaultPrevented || this.selectMenuOptions.enabled === false) {
+            return;
+        }
+
+        // Parse configured max-height if specified in theme
+        let configuredMaxHeight = 280;
+        const theme = this.selectMenuOptions.theme;
+        if (theme && typeof theme === 'object' && theme.maxHeight) {
+            const parsed = parseInt(theme.maxHeight, 10);
+            if (!isNaN(parsed) && parsed > 0) {
+                configuredMaxHeight = parsed + 10;
+            }
+        }
+
+        const targetWidth = Math.max(160, Math.round(msg.rect.width));
+        const winHeight = this._logicalHeight || 768;
+        const winWidth = this._logicalWidth || 1024;
+
+        // Estimate content height accounting for line wrapping
+        // Available width for option text: targetWidth minus horizontal padding/borders/icon
+        const availableTextWidth = Math.max(60, targetWidth - 58);
+        const charsPerLine = Math.max(8, Math.floor(availableTextWidth / 7.5));
+        const baseItemHeight = 28;
+        const extraLineHeight = 18;
+
+        let estimatedContentHeight = 0;
+        for (const item of (msg.options || [])) {
+            if (item.type === 'optgroup') {
+                estimatedContentHeight += 24;
+                for (const opt of (item.options || [])) {
+                    const labelLen = (opt.label || '').length;
+                    const lines = Math.max(1, Math.ceil(labelLen / charsPerLine));
+                    estimatedContentHeight += baseItemHeight + (lines - 1) * extraLineHeight;
+                }
+            } else {
+                const labelLen = (item.label || '').length;
+                const lines = Math.max(1, Math.ceil(labelLen / charsPerLine));
+                estimatedContentHeight += baseItemHeight + (lines - 1) * extraLineHeight;
+            }
+        }
+        const estimatedHeight = Math.min(configuredMaxHeight, Math.max(36, estimatedContentHeight + 18));
+
+        let targetX = Math.round(msg.rect.x);
+        let targetY = Math.round(msg.rect.y + msg.rect.height);
+
+        let flippedUpwards = false;
+        // Check clearance below
+        if (targetY + estimatedHeight > winHeight) {
+            const roomAbove = msg.rect.y;
+            const roomBelow = winHeight - (msg.rect.y + msg.rect.height);
+            if (roomAbove > roomBelow) {
+                // Flip upwards
+                targetY = Math.max(0, Math.round(msg.rect.y - estimatedHeight));
+                flippedUpwards = true;
+            }
+        }
+
+        if (targetX + targetWidth > winWidth) {
+            targetX = Math.max(0, winWidth - targetWidth);
+        }
+
+        this._activeSelectContext = {
+            id: msg.id,
+            rect: msg.rect,
+            configuredMaxHeight,
+            targetWidth,
+            targetX,
+            flippedUpwards
+        };
+
+        const overlay = this.panes.get('__lotus_select_overlay');
+        if (overlay) {
+            overlay.setRect(targetX, targetY, targetWidth, estimatedHeight);
+            overlay.setVisible(true);
+            overlay.focus();
+        }
+
+        this._pendingSelectPayload = {
+            id: msg.id,
+            options: msg.options,
+            selectedOptions: msg.selectedOptions,
+            allowMultiple: msg.allowMultiple,
+            theme: this._resolveSelectTheme(this.selectMenuOptions.theme),
+            customCss: this.selectMenuOptions.css
+        };
+
+        this.sendToPaneRenderer('__lotus_select_overlay', 'populate-select', this._pendingSelectPayload, true);
+    }
+
+    _resizeSelectOverlay(measuredHeight, promptId) {
+        if (!this._activeSelectContext) return;
+        if (promptId && this._activeSelectContext.id !== promptId) return;
+
+        const ctx = this._activeSelectContext;
+        const overlay = this.panes.get('__lotus_select_overlay');
+        if (!overlay) return;
+
+        const winHeight = this._logicalHeight || 768;
+        const winWidth = this._logicalWidth || 1024;
+        const maxHeight = ctx.configuredMaxHeight || 280;
+
+        const finalHeight = Math.min(maxHeight, Math.max(36, Math.round(measuredHeight)));
+
+        let targetX = ctx.targetX;
+        let targetY = Math.round(ctx.rect.y + ctx.rect.height);
+        const targetWidth = ctx.targetWidth;
+
+        const roomBelow = winHeight - (ctx.rect.y + ctx.rect.height);
+        const roomAbove = ctx.rect.y;
+
+        if (ctx.flippedUpwards || (targetY + finalHeight > winHeight && roomAbove > roomBelow)) {
+            targetY = Math.max(0, Math.round(ctx.rect.y - finalHeight));
+            ctx.flippedUpwards = true;
+        } else {
+            ctx.flippedUpwards = false;
+        }
+
+        if (targetX + targetWidth > winWidth) {
+            targetX = Math.max(0, winWidth - targetWidth);
+        }
+
+        overlay.setRect(targetX, targetY, targetWidth, finalHeight);
+    }
+
+    _handleSelectClose(msg) {
+        this._hideSelectOverlay();
+    }
+
+    _hideSelectOverlay() {
+        this._pendingSelectPayload = null;
+        this._activeSelectContext = null;
+        const overlay = this.panes.get('__lotus_select_overlay');
+        if (overlay) {
+            overlay.setVisible(false);
+        }
     }
 
     _flushBatches() {
@@ -1009,8 +1380,35 @@ module.exports = {
     Anchor,
     ipcMain,
     app: {
-        quit: () => globalApp && globalApp.quit(),
+        quit: () => {
+            if (globalApp && typeof globalApp.quit === 'function') {
+                globalApp.quit();
+            }
+            const fallbackTimer = setTimeout(() => {
+                if (globalApp && typeof globalApp.exit === 'function') {
+                    globalApp.exit(0);
+                } else {
+                    process.exit(0);
+                }
+            }, 1000);
+            if (fallbackTimer && typeof fallbackTimer.unref === 'function') {
+                fallbackTimer.unref();
+            }
+        },
+        exit: (code = 0) => {
+            if (globalApp && typeof globalApp.exit === 'function') {
+                globalApp.exit(code);
+            } else {
+                process.exit(code);
+            }
+        },
         warmup: ensureApp,
+        getSystemTheme: () => {
+            if (globalApp && typeof globalApp.getSystemTheme === 'function') {
+                systemTheme = globalApp.getSystemTheme();
+            }
+            return systemTheme;
+        },
         initVfs: () => {
             ensureApp();
             if (globalApp) globalApp.initVfs();

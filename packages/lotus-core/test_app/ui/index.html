@@ -159,6 +159,22 @@
             font-weight: bold;
         }
 
+        .demo-select {
+            background: #1e1e2f;
+            color: #ffffff;
+            border: 1px solid rgba(118, 185, 0, 0.5);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 14px;
+            margin: 8px;
+            outline: none;
+            cursor: pointer;
+        }
+        .demo-select:focus {
+            border-color: #76b900;
+            box-shadow: 0 0 5px rgba(118, 185, 0, 0.5);
+        }
+
         @keyframes fadeIn {
             from {
                 opacity: 0;
@@ -228,6 +244,53 @@
             <div id="script-target" class="result-box"
                 style="background: rgba(255, 0, 0, 0.3); transition: background 0.5s;">
                 <em>Waiting for `executeScript` from Main Process...</em>
+            </div>
+        </div>
+
+        <div class="demo-section">
+            <h2>🔽 Native HTML &lt;select&gt; Controls</h2>
+            <p>Testing System Overlay Pane dropdown menus, optgroups, wheel scrolling, and multi-select.</p>
+            <div style="display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; margin-bottom: 12px;">
+                <div>
+                    <label style="display: block; margin-bottom: 4px; font-weight: bold; color: #76b900;">Standard Select:</label>
+                    <select id="select-standard" class="demo-select" onchange="document.getElementById('select-choice').textContent = 'Selected: ' + this.value">
+                        <option value="lotus-core">Lotus Core Engine</option>
+                        <option value="servo">Servo Web Engine</option>
+                        <optgroup label="Supported Platforms">
+                            <option value="linux">Linux (X11 / Wayland)</option>
+                            <option value="windows">Windows 10 / 11</option>
+                            <option value="macos">macOS</option>
+                        </optgroup>
+                        <optgroup label="Graphics Backends">
+                            <option value="gl">OpenGL / EGL</option>
+                            <option value="angle">ANGLE (Direct3D 11)</option>
+                        </optgroup>
+                    </select>
+                </div>
+                <div>
+                    <label style="display: block; margin-bottom: 4px; font-weight: bold; color: #76b900;">Long Scrollable (30 items):</label>
+                    <select id="select-long" class="demo-select" onchange="document.getElementById('select-choice').textContent = 'Selected: ' + this.value">
+                        <!-- Populated by JS -->
+                    </select>
+                </div>
+                <div>
+                    <label style="display: block; margin-bottom: 4px; font-weight: bold; color: #76b900;">Multi-Select:</label>
+                    <select id="select-multi" class="demo-select" multiple onchange="const opts = Array.from(this.selectedOptions).map(o => o.value).join(', '); document.getElementById('select-choice').textContent = 'Multi-Selected: ' + opts">
+                        <option value="item-1">Feature Alpha</option>
+                        <option value="item-2">Feature Beta</option>
+                        <option value="item-3">Feature Gamma</option>
+                        <option value="item-4">Feature Delta</option>
+                        <option value="item-5">Feature Epsilon</option>
+                    </select>
+                </div>
+            </div>
+            <div id="select-choice" class="result-box">
+                <em>No option selected yet...</em>
+            </div>
+            <div style="margin-top: 10px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+                <button class="demo-button" style="padding: 6px 12px; font-size: 12px; background: #64748b;" onclick="window.lotus.send('set-select-theme', 'light'); document.getElementById('select-choice').textContent = 'Applied Light Theme Preset';">☀️ Light Theme</button>
+                <button class="demo-button" style="padding: 6px 12px; font-size: 12px; background: #334155;" onclick="window.lotus.send('set-select-theme', 'dark'); document.getElementById('select-choice').textContent = 'Applied Dark Theme Preset';">🌙 Dark Preset</button>
+                <button class="demo-button" style="padding: 6px 12px; font-size: 12px; background: #10b981;" onclick="window.lotus.send('set-select-theme', { base: 'dark', active: '#10b981', borderRadius: '16px' }); document.getElementById('select-choice').textContent = 'Applied Custom Emerald Theme';">💎 Custom Emerald</button>
             </div>
         </div>
 
@@ -365,6 +428,17 @@
         if (keyboardInput) {
             keyboardInput.addEventListener('keydown', logKeyEvent);
             keyboardInput.addEventListener('keyup', logKeyEvent);
+        }
+
+        // Populate long select demo
+        const longSelect = document.getElementById('select-long');
+        if (longSelect) {
+            for (let i = 1; i <= 30; i++) {
+                const opt = document.createElement('option');
+                opt.value = 'option-' + i;
+                opt.textContent = 'Long Option Item #' + i;
+                longSelect.appendChild(opt);
+            }
         }
 
         // Set up IPC listeners

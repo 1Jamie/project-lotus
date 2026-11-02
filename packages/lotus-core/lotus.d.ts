@@ -33,6 +33,66 @@ export interface PaneOptions {
   dockOrder?: number;
 }
 
+export interface SelectMenuTheme {
+  base?: 'light' | 'dark';
+  bg?: string;
+  border?: string;
+  text?: string;
+  textMuted?: string;
+  hover?: string;
+  active?: string;
+  activeText?: string;
+  groupLabel?: string;
+  fontFamily?: string;
+  fontSize?: string | number;
+  borderRadius?: string | number;
+  boxShadow?: string;
+  maxHeight?: string | number;
+}
+
+export interface SelectMenuOptions {
+  url?: string;
+  css?: string;
+  theme?: 'light' | 'dark' | SelectMenuTheme;
+  enabled?: boolean;
+}
+
+export interface SelectMenuItemOption {
+  type: 'option';
+  id: number;
+  label: string;
+  is_disabled: boolean;
+}
+
+export interface SelectMenuItemOptgroup {
+  type: 'optgroup';
+  label: string;
+  options: Array<{ id: number; label: string; is_disabled: boolean }>;
+}
+
+export type SelectMenuItem = SelectMenuItemOption | SelectMenuItemOptgroup;
+
+export interface SelectMenuEvent {
+  preventDefault(): void;
+  readonly defaultPrevented: boolean;
+  readonly id: string;
+  readonly paneId: string;
+  readonly rect: { x: number; y: number; width: number; height: number };
+  readonly options: SelectMenuItem[];
+  readonly selectedOptions: number[];
+  readonly allowMultiple: boolean;
+  submit(selectedIndices: number[]): void;
+  update(selectedIndices: number[]): void;
+  dismiss(): void;
+}
+
+export interface ScrollbarOptions {
+  enabled?: boolean;
+  theme?: 'auto' | 'light' | 'dark';
+  autoHide?: boolean;
+  width?: number;
+}
+
 export interface WindowOptions {
   width?: number;
   height?: number;
@@ -55,6 +115,8 @@ export interface WindowOptions {
   wmClass?: string;
   /** Alias for !frameless */
   frame?: boolean;
+  selectMenu?: SelectMenuOptions;
+  scrollbars?: boolean | ScrollbarOptions;
 }
 
 export interface ResizePayload {
@@ -98,6 +160,9 @@ export declare class ServoWindow extends EventEmitter {
   getPane(id: string): Pane | undefined;
   removePane(id: string): void;
 
+  setSelectMenuTheme(theme: 'light' | 'dark' | SelectMenuTheme): void;
+  setSelectMenuCss(css: string): void;
+
   show(): void;
   hide(): void;
   close(): void;
@@ -123,7 +188,7 @@ export declare class ServoWindow extends EventEmitter {
    * - 'resize' / 'resized': (payload: ResizePayload)
    * - 'moved': (pos: { x: number, y: number })
    * - 'focus' / 'blur': Window focus state
-   * - 'closed': Window destroyed
+   * - 'close' / 'closed': Window destroyed
    * - 'load-status': (status: string, paneId: string)
    * - 'title-changed': (title: string, paneId: string)
    * - 'file-drop': (data: { path: string })
@@ -132,9 +197,10 @@ export declare class ServoWindow extends EventEmitter {
   on(event: 'ready' | 'dom-ready', listener: (data: any) => void): this;
   on(event: 'resize' | 'resized', listener: (payload: ResizePayload) => void): this;
   on(event: 'moved', listener: (pos: { x: number, y: number }) => void): this;
-  on(event: 'focus' | 'blur' | 'closed' | 'ready-to-show', listener: () => void): this;
+  on(event: 'focus' | 'blur' | 'close' | 'closed' | 'ready-to-show', listener: () => void): this;
   on(event: 'load-status', listener: (status: string, paneId: string) => void): this;
   on(event: 'title-changed', listener: (title: string, paneId: string) => void): this;
+  on(event: 'select-menu', listener: (e: SelectMenuEvent) => void): this;
   on(event: 'file-drop' | 'file-hover', listener: (data: { path: string }) => void): this;
   on(event: string | symbol, listener: (...args: any[]) => void): this;
 }
@@ -149,6 +215,7 @@ export const ipcMain: IpcMain;
 
 export const app: {
   quit(): void;
+  exit(code?: number): void;
   warmup(): void;
   initVfs(): void;
 };

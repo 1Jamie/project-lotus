@@ -87,6 +87,16 @@ const WS_PENDING_MAX_FRAMES: usize = 1024;
 const MSG_TYPE_CONTROL: u8 = 0x01;
 const MSG_TYPE_DATA: u8 = 0x02;
 
+#[inline]
+pub(crate) fn fast_exit(code: i32) -> ! {
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(code);
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code);
+}
+
 #[cfg(target_os = "linux")]
 fn detect_linux_theme_robust() -> dark_light::Mode {
     // 1. Try standard crate
@@ -342,6 +352,8 @@ struct AppState {
     vfs: Option<Arc<EncryptedVfs>>,
     resource_cache: ByteLimitedLruCache,
 }
+
+const SELECT_MENU_HTML: &str = include_str!("../resources/select-menu.html");
 
 // IPC bootstrap script injected into every page
 const IPC_BOOTSTRAP_BASE: &str = r#"
@@ -725,6 +737,468 @@ const DRAG_REGION_SCRIPT: &str = r#"
 })();
 "#;
 
+const SCROLLBAR_SCRIPT: &str = r#"
+(function() {
+    if (window.__lotus_scrollbar_initialized) return;
+    window.__lotus_scrollbar_initialized = true;
+
+    const config = window.__LOTUS_SCROLLBAR_CONFIG__ || {
+        theme: 'auto',
+        autoHide: true,
+        width: 10
+    };
+
+    const width = Math.max(2, config.width || 10);
+    const autoHide = config.autoHide !== false;
+    const theme = config.theme || 'auto';
+
+    let trackY = null;
+    let thumbY = null;
+    let trackX = null;
+    let thumbX = null;
+    let dragBlocker = null;
+
+    let isDraggingY = false;
+    let isDraggingX = false;
+    let fadeTimeout = null;
+    let resizeObserver = null;
+
+    function enableDragBlocker() {
+        if (!dragBlocker) {
+            dragBlocker = document.createElement('div');
+            dragBlocker.id = '__lotus_scroll_drag_blocker';
+            dragBlocker.style.cssText = 'position:fixed!important;top:0!important;left:0!important;width:100%!important;height:100%!important;z-index:2147483647!important;background:transparent!important;cursor:default!important;-webkit-app-region:no-drag!important;pointer-events:auto!important;';
+            dragBlocker.setAttribute('data-lotus-drag', 'false');
+        }
+        if (!dragBlocker.parentNode && document.documentElement) {
+            document.documentElement.appendChild(dragBlocker);
+        }
+        document.documentElement.classList.add('__lotus_scrolling_active');
+    }
+
+    function disableDragBlocker() {
+        if (dragBlocker && dragBlocker.parentNode) {
+            dragBlocker.parentNode.removeChild(dragBlocker);
+        }
+        if (document.documentElement) {
+            document.documentElement.classList.remove('__lotus_scrolling_active');
+        }
+    }
+
+    function showScrollbars() {
+        if (trackY && trackY.style.display !== 'none') trackY.style.opacity = '1';
+        if (trackX && trackX.style.display !== 'none') trackX.style.opacity = '1';
+    }
+
+    function scheduleFade() {
+        if (!autoHide || isDraggingY || isDraggingX) return;
+        clearTimeout(fadeTimeout);
+        fadeTimeout = setTimeout(() => {
+            if (!isDraggingY && !isDraggingX) {
+                if (trackY) trackY.style.opacity = '0';
+                if (trackX) trackX.style.opacity = '0';
+            }
+        }, 800);
+    }
+
+    function updateGeometry() {
+        if (!trackY || !trackX) return;
+        const scrollEl = document.scrollingElement || document.documentElement;
+        if (!scrollEl) return;
+
+        const clientH = window.innerHeight;
+        const clientW = window.innerWidth;
+        const scrollH = scrollEl.scrollHeight;
+        const scrollW = scrollEl.scrollWidth;
+
+        const hasOverflowY = scrollH > clientH + 1;
+        const hasOverflowX = scrollW > clientW + 1;
+
+        // Collision avoidance when both scrollbars appear
+        if (hasOverflowY && hasOverflowX) {
+            trackY.style.height = `calc(100% - ${width}px)`;
+            trackX.style.width = `calc(100% - ${width}px)`;
+        } else {
+            trackY.style.height = '100%';
+            trackX.style.width = '100%';
+        }
+
+        // Vertical scrollbar geometry
+        if (!hasOverflowY) {
+            trackY.style.display = 'none';
+        } else {
+            trackY.style.display = 'block';
+            const availableTrackH = hasOverflowX ? clientH - width : clientH;
+            const thumbH = Math.max(24, Math.round((availableTrackH / scrollH) * availableTrackH));
+            const maxScrollTop = scrollH - clientH;
+            const maxThumbTop = Math.max(0, availableTrackH - thumbH);
+            const thumbTop = maxScrollTop > 0 ? Math.round((scrollEl.scrollTop / maxScrollTop) * maxThumbTop) : 0;
+
+            thumbY.dataset.top = String(thumbTop);
+            thumbY.dataset.height = String(thumbH);
+            thumbY.style.height = `${thumbH}px`;
+            thumbY.style.transform = `translate3d(0, ${thumbTop}px, 0)`;
+        }
+
+        // Horizontal scrollbar geometry
+        if (!hasOverflowX) {
+            trackX.style.display = 'none';
+        } else {
+            trackX.style.display = 'block';
+            const availableTrackW = hasOverflowY ? clientW - width : clientW;
+            const thumbW = Math.max(24, Math.round((availableTrackW / scrollW) * availableTrackW));
+            const maxScrollLeft = scrollW - clientW;
+            const maxThumbLeft = Math.max(0, availableTrackW - thumbW);
+            const thumbLeft = maxScrollLeft > 0 ? Math.round((scrollEl.scrollLeft / maxScrollLeft) * maxThumbLeft) : 0;
+
+            thumbX.dataset.left = String(thumbLeft);
+            thumbX.dataset.width = String(thumbW);
+            thumbX.style.width = `${thumbW}px`;
+            thumbX.style.transform = `translate3d(${thumbLeft}px, 0, 0)`;
+        }
+    }
+
+    function initScrollbars() {
+        const root = document.documentElement;
+        if (!root) {
+            document.addEventListener('DOMContentLoaded', initScrollbars, { once: true });
+            return;
+        }
+
+        if (document.getElementById('__lotus_scroll_track_y')) return;
+
+        // Scoped Overlay Scrollbar Styles
+        const style = document.createElement('style');
+        style.id = '__lotus_scrollbar_styles';
+        style.textContent = `
+            #__lotus_scroll_track_y, #__lotus_scroll_track_x {
+                position: fixed !important;
+                z-index: 2147483646 !important;
+                pointer-events: auto !important;
+                user-select: none !important;
+                -webkit-user-select: none !important;
+                -webkit-app-region: no-drag !important;
+                background: transparent !important;
+                box-sizing: border-box !important;
+                opacity: 0;
+                transition: opacity 0.25s ease-out;
+            }
+            #__lotus_scroll_track_y {
+                top: 0 !important;
+                right: 0 !important;
+                width: ${width}px !important;
+                height: 100% !important;
+                transition: width 0.15s ease, opacity 0.25s ease-out;
+            }
+            #__lotus_scroll_track_y:hover,
+            #__lotus_scroll_track_y.active {
+                width: ${Math.max(width, 12)}px !important;
+            }
+            #__lotus_scroll_track_x {
+                bottom: 0 !important;
+                left: 0 !important;
+                height: ${width}px !important;
+                width: 100% !important;
+                transition: height 0.15s ease, opacity 0.25s ease-out;
+            }
+            #__lotus_scroll_track_x:hover,
+            #__lotus_scroll_track_x.active {
+                height: ${Math.max(width, 12)}px !important;
+            }
+            #__lotus_scroll_thumb_y, #__lotus_scroll_thumb_x {
+                position: absolute !important;
+                border-radius: ${width}px !important;
+                box-sizing: border-box !important;
+                -webkit-app-region: no-drag !important;
+                pointer-events: auto !important;
+                cursor: default !important;
+                will-change: transform;
+                transition: width 0.15s ease, height 0.15s ease, background 0.15s ease;
+            }
+            #__lotus_scroll_thumb_y {
+                top: 0 !important;
+                right: 2px !important;
+                left: auto !important;
+                width: ${Math.max(4, width - 4)}px !important;
+            }
+            #__lotus_scroll_track_y:hover #__lotus_scroll_thumb_y,
+            #__lotus_scroll_track_y.active #__lotus_scroll_thumb_y {
+                width: ${Math.max(width - 2, 8)}px !important;
+            }
+            #__lotus_scroll_thumb_x {
+                left: 0 !important;
+                bottom: 2px !important;
+                top: auto !important;
+                height: ${Math.max(4, width - 4)}px !important;
+            }
+            #__lotus_scroll_track_x:hover #__lotus_scroll_thumb_x,
+            #__lotus_scroll_track_x.active #__lotus_scroll_thumb_x {
+                height: ${Math.max(width - 2, 8)}px !important;
+            }
+
+            /* Disable iframes pointer events while dragging scrollbars */
+            .__lotus_scrolling_active iframe {
+                pointer-events: none !important;
+            }
+
+            /* Light theme */
+            [data-theme="light"] #__lotus_scroll_thumb_y,
+            [data-theme="light"] #__lotus_scroll_thumb_x,
+            .__lotus_theme_light #__lotus_scroll_thumb_y,
+            .__lotus_theme_light #__lotus_scroll_thumb_x {
+                background: rgba(0, 0, 0, 0.35) !important;
+            }
+            [data-theme="light"] #__lotus_scroll_thumb_y:hover,
+            [data-theme="light"] #__lotus_scroll_track_y.active #__lotus_scroll_thumb_y,
+            [data-theme="light"] #__lotus_scroll_thumb_x:hover,
+            [data-theme="light"] #__lotus_scroll_track_x.active #__lotus_scroll_thumb_x {
+                background: rgba(0, 0, 0, 0.65) !important;
+            }
+
+            /* Dark theme */
+            [data-theme="dark"] #__lotus_scroll_thumb_y,
+            [data-theme="dark"] #__lotus_scroll_thumb_x,
+            .__lotus_theme_dark #__lotus_scroll_thumb_y,
+            .__lotus_theme_dark #__lotus_scroll_thumb_x {
+                background: rgba(255, 255, 255, 0.35) !important;
+            }
+            [data-theme="dark"] #__lotus_scroll_thumb_y:hover,
+            [data-theme="dark"] #__lotus_scroll_track_y.active #__lotus_scroll_thumb_y,
+            [data-theme="dark"] #__lotus_scroll_thumb_x:hover,
+            [data-theme="dark"] #__lotus_scroll_track_x.active #__lotus_scroll_thumb_x {
+                background: rgba(255, 255, 255, 0.65) !important;
+            }
+
+            /* Neutral fallback */
+            #__lotus_scroll_thumb_y, #__lotus_scroll_thumb_x {
+                background: rgba(127, 127, 127, 0.45) !important;
+            }
+            #__lotus_scroll_thumb_y:hover,
+            #__lotus_scroll_track_y.active #__lotus_scroll_thumb_y,
+            #__lotus_scroll_thumb_x:hover,
+            #__lotus_scroll_track_x.active #__lotus_scroll_thumb_x {
+                background: rgba(127, 127, 127, 0.8) !important;
+            }
+        `;
+        root.appendChild(style);
+
+        // Vertical Track & Thumb
+        trackY = document.createElement('div');
+        trackY.id = '__lotus_scroll_track_y';
+        trackY.setAttribute('data-lotus-drag', 'false');
+
+        thumbY = document.createElement('div');
+        thumbY.id = '__lotus_scroll_thumb_y';
+        thumbY.setAttribute('data-lotus-drag', 'false');
+        trackY.appendChild(thumbY);
+
+        // Horizontal Track & Thumb
+        trackX = document.createElement('div');
+        trackX.id = '__lotus_scroll_track_x';
+        trackX.setAttribute('data-lotus-drag', 'false');
+
+        thumbX = document.createElement('div');
+        thumbX.id = '__lotus_scroll_thumb_x';
+        thumbX.setAttribute('data-lotus-drag', 'false');
+        trackX.appendChild(thumbX);
+
+        if (theme === 'light') {
+            trackY.classList.add('__lotus_theme_light');
+            trackX.classList.add('__lotus_theme_light');
+        } else if (theme === 'dark') {
+            trackY.classList.add('__lotus_theme_dark');
+            trackX.classList.add('__lotus_theme_dark');
+        }
+
+        root.appendChild(trackY);
+        root.appendChild(trackX);
+
+        // Thumb Y Drag Handling
+        thumbY.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const scrollEl = document.scrollingElement || document.documentElement;
+            const clientH = window.innerHeight;
+            const scrollH = scrollEl.scrollHeight;
+            const hasOverflowX = scrollEl.scrollWidth > window.innerWidth + 1;
+            const availableTrackH = hasOverflowX ? clientH - width : clientH;
+            const thumbH = Math.max(24, Math.round((availableTrackH / scrollH) * availableTrackH));
+            const maxThumbTop = Math.max(0, availableTrackH - thumbH);
+            const maxScrollTop = scrollH - clientH;
+            if (maxThumbTop <= 0 || maxScrollTop <= 0) return;
+
+            const startMouseY = e.clientY;
+            const startScrollTop = scrollEl.scrollTop;
+            const ratio = maxScrollTop / maxThumbTop;
+
+            isDraggingY = true;
+            clearTimeout(fadeTimeout);
+            trackY.classList.add('active');
+            showScrollbars();
+            enableDragBlocker();
+
+            function onMouseMove(moveEvent) {
+                const deltaY = moveEvent.clientY - startMouseY;
+                scrollEl.scrollTop = startScrollTop + deltaY * ratio;
+            }
+
+            function onMouseUp() {
+                isDraggingY = false;
+                trackY.classList.remove('active');
+                disableDragBlocker();
+                window.removeEventListener('mousemove', onMouseMove, true);
+                window.removeEventListener('mouseup', onMouseUp, true);
+                scheduleFade();
+            }
+
+            window.addEventListener('mousemove', onMouseMove, true);
+            window.addEventListener('mouseup', onMouseUp, true);
+        });
+
+        // Track Y Click (Deadzone checked jump)
+        trackY.addEventListener('mousedown', (e) => {
+            if (e.target === thumbY) return;
+            e.preventDefault();
+            e.stopPropagation();
+
+            const scrollEl = document.scrollingElement || document.documentElement;
+            const clientH = window.innerHeight;
+            const clickY = e.clientY;
+            const currentThumbTop = parseFloat(thumbY.dataset.top || '0');
+            const thumbH = parseFloat(thumbY.dataset.height || '24');
+
+            if (clickY < currentThumbTop - 2) {
+                scrollEl.scrollTop -= clientH * 0.9;
+            } else if (clickY > currentThumbTop + thumbH + 2) {
+                scrollEl.scrollTop += clientH * 0.9;
+            }
+        });
+
+        // Thumb X Drag Handling
+        thumbX.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            const scrollEl = document.scrollingElement || document.documentElement;
+            const clientW = window.innerWidth;
+            const scrollW = scrollEl.scrollWidth;
+            const hasOverflowY = scrollEl.scrollHeight > window.innerHeight + 1;
+            const availableTrackW = hasOverflowY ? clientW - width : clientW;
+            const thumbW = Math.max(24, Math.round((availableTrackW / scrollW) * availableTrackW));
+            const maxThumbLeft = Math.max(0, availableTrackW - thumbW);
+            const maxScrollLeft = scrollW - clientW;
+            if (maxThumbLeft <= 0 || maxScrollLeft <= 0) return;
+
+            const startMouseX = e.clientX;
+            const startScrollLeft = scrollEl.scrollLeft;
+            const ratio = maxScrollLeft / maxThumbLeft;
+
+            isDraggingX = true;
+            clearTimeout(fadeTimeout);
+            trackX.classList.add('active');
+            showScrollbars();
+            enableDragBlocker();
+
+            function onMouseMove(moveEvent) {
+                const deltaX = moveEvent.clientX - startMouseX;
+                scrollEl.scrollLeft = startScrollLeft + deltaX * ratio;
+            }
+
+            function onMouseUp() {
+                isDraggingX = false;
+                trackX.classList.remove('active');
+                disableDragBlocker();
+                window.removeEventListener('mousemove', onMouseMove, true);
+                window.removeEventListener('mouseup', onMouseUp, true);
+                scheduleFade();
+            }
+
+            window.addEventListener('mousemove', onMouseMove, true);
+            window.addEventListener('mouseup', onMouseUp, true);
+        });
+
+        // Track X Click (Deadzone checked jump)
+        trackX.addEventListener('mousedown', (e) => {
+            if (e.target === thumbX) return;
+            e.preventDefault();
+            e.stopPropagation();
+
+            const scrollEl = document.scrollingElement || document.documentElement;
+            const clientW = window.innerWidth;
+            const clickX = e.clientX;
+            const currentThumbLeft = parseFloat(thumbX.dataset.left || '0');
+            const thumbW = parseFloat(thumbX.dataset.width || '24');
+
+            if (clickX < currentThumbLeft - 2) {
+                scrollEl.scrollLeft -= clientW * 0.9;
+            } else if (clickX > currentThumbLeft + thumbW + 2) {
+                scrollEl.scrollLeft += clientW * 0.9;
+            }
+        });
+
+        // Hover & Edge detection
+        trackY.addEventListener('mouseenter', showScrollbars);
+        trackY.addEventListener('mouseleave', scheduleFade);
+        trackX.addEventListener('mouseenter', showScrollbars);
+        trackX.addEventListener('mouseleave', scheduleFade);
+
+        window.addEventListener('mousemove', (e) => {
+            if (window.innerWidth - e.clientX <= Math.max(20, width + 10) ||
+                window.innerHeight - e.clientY <= Math.max(20, width + 10)) {
+                showScrollbars();
+                scheduleFade();
+            }
+        }, { passive: true });
+
+        // Scroll listener
+        window.addEventListener('scroll', () => {
+            updateGeometry();
+            showScrollbars();
+            scheduleFade();
+        }, { passive: true });
+
+        // Window resize
+        window.addEventListener('resize', () => {
+            updateGeometry();
+            showScrollbars();
+            scheduleFade();
+        }, { passive: true });
+
+        // Observers
+        if (window.ResizeObserver) {
+            resizeObserver = new ResizeObserver(() => {
+                updateGeometry();
+            });
+            resizeObserver.observe(root);
+            if (document.body) {
+                resizeObserver.observe(document.body);
+            }
+        }
+
+        updateGeometry();
+        if (!autoHide) {
+            showScrollbars();
+        } else {
+            showScrollbars();
+            scheduleFade();
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => {
+            initScrollbars();
+            if (document.body && resizeObserver) {
+                resizeObserver.observe(document.body);
+            }
+            updateGeometry();
+        }, { once: true });
+    } else {
+        initScrollbars();
+    }
+})();
+"#;
+
 const STENCIL_VS: &str = r#"
 #version 330 core
 const vec2 verts[4] = vec2[4](vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0), vec2(1.0, 1.0));
@@ -997,6 +1471,24 @@ struct StagedLayout {
     scale_factor: f32,
 }
 
+pub struct ActiveSelectPrompt {
+    pub control_id: servo::EmbedderControlId,
+    pub control_id_str: String,
+    pub pane_id: String,
+    pub previous_active_pane_id: String,
+    pub initial_selected_options: Vec<usize>,
+    pub prompt: servo::SelectElement,
+    pub allow_multiple: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScrollbarConfig {
+    pub enabled: bool,
+    pub theme: String,
+    pub auto_hide: bool,
+    pub width: u32,
+}
+
 struct WindowInstance {
     pub panes: HashMap<String, PaneInstance>,
     pub active_layout: StagedLayout,
@@ -1037,6 +1529,8 @@ struct WindowInstance {
     pub committed_layout: Option<StagedLayout>,
     pub active_window_size: winit::dpi::PhysicalSize<u32>,
     pub committed_window_size: Option<winit::dpi::PhysicalSize<u32>>,
+    pub active_select: Option<ActiveSelectPrompt>,
+    pub scrollbar_config: ScrollbarConfig,
 }
 
 impl WindowInstance {
@@ -1307,7 +1801,7 @@ impl WindowInstance {
             }
         }
 
-        if self.committed_layout.is_some() && !self.panes.values().any(|p| p.servo_busy) {
+        if self.committed_layout.is_some() {
             self.window.request_redraw();
         }
     }
@@ -1336,6 +1830,10 @@ pub struct WindowOptions {
     pub panes: Vec<PaneOptions>,
     pub id: Option<String>,
     pub wm_class: Option<String>,
+    pub scrollbars_enabled: Option<bool>,
+    pub scrollbar_theme: Option<String>,
+    pub scrollbar_auto_hide: Option<bool>,
+    pub scrollbar_width: Option<u32>,
 }
 
 #[napi(object)]
@@ -1374,6 +1872,10 @@ impl Default for WindowOptions {
             panes: Vec::new(),
             id: None,
             wm_class: None,
+            scrollbars_enabled: None,
+            scrollbar_theme: None,
+            scrollbar_auto_hide: None,
+            scrollbar_width: None,
         }
     }
 }
@@ -1435,6 +1937,14 @@ fn dispatch_to_renderer(window_id: String, pane_id: Option<String>, data: axum::
     }
 }
 
+pub struct SelectPromptWrapper(pub servo::SelectElement);
+
+impl std::fmt::Debug for SelectPromptWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SelectElement(id={:?})", self.0.id())
+    }
+}
+
 #[derive(Debug)]
 pub enum EngineCommand {
     Wake,
@@ -1468,11 +1978,36 @@ pub enum EngineCommand {
     SetMaxInnerSize(String, Option<winit::dpi::PhysicalSize<u32>>), // window_id, size (None = remove constraint)
 
     // Pane-specific commands
-    CreatePane(String, String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>, i32, PaneAnchor, u32), // window_id, pane_id, url, rect, z_index, anchor, dock_order
+    CreatePane(String, String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>, i32, PaneAnchor, u32, bool), // window_id, pane_id, url, rect, z_index, anchor, dock_order, visible
     RemovePane(String, String), // window_id, pane_id
     SetPaneRect(String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>), // window_id, pane_id, rect
     SetPaneVisible(String, String, bool), // window_id, pane_id, visible
     FocusPane(String, String), // window_id, pane_id
+
+    // Embedder control commands
+    ShowSelectControl {
+        window_id: String,
+        pane_id: String,
+        prompt: SelectPromptWrapper,
+    },
+    HideSelectControl {
+        window_id: String,
+        control_id: servo::EmbedderControlId,
+    },
+    UpdateSelectControl {
+        window_id: String,
+        control_id: String,
+        selected_indices: Vec<u32>,
+    },
+    SubmitSelectControl {
+        window_id: String,
+        control_id: String,
+        selected_indices: Vec<u32>,
+    },
+    DismissSelectControl {
+        window_id: String,
+        control_id: String,
+    },
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1722,7 +2257,7 @@ impl WindowHandle {
     }
 
     #[napi]
-    pub fn create_pane(&self, pane_id: String, url: String, x: f64, y: f64, width: f64, height: f64, z_index: i32, anchor: Option<u32>, dock_order: Option<u32>) {
+    pub fn create_pane(&self, pane_id: String, url: String, x: f64, y: f64, width: f64, height: f64, z_index: i32, anchor: Option<u32>, dock_order: Option<u32>, visible: Option<bool>) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let rect: euclid::Rect<f32, servo::DeviceIndependentPixel> = euclid::Rect::new(euclid::Point2D::new(x as f32, y as f32), euclid::Size2D::new(width as f32, height as f32));
             let _ = proxy.send_event(EngineCommand::CreatePane(
@@ -1732,8 +2267,41 @@ impl WindowHandle {
                 rect, 
                 z_index, 
                 PaneAnchor::from(anchor.unwrap_or(0)), 
-                dock_order.unwrap_or(0)
+                dock_order.unwrap_or(0),
+                visible.unwrap_or(true),
             ));
+        }
+    }
+
+    #[napi]
+    pub fn update_select_control(&self, control_id: String, selected_indices: Vec<u32>) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::UpdateSelectControl {
+                window_id: self.id.clone(),
+                control_id,
+                selected_indices,
+            });
+        }
+    }
+
+    #[napi]
+    pub fn submit_select_control(&self, control_id: String, selected_indices: Vec<u32>) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SubmitSelectControl {
+                window_id: self.id.clone(),
+                control_id,
+                selected_indices,
+            });
+        }
+    }
+
+    #[napi]
+    pub fn dismiss_select_control(&self, control_id: String) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::DismissSelectControl {
+                window_id: self.id.clone(),
+                control_id,
+            });
         }
     }
 
@@ -1914,6 +2482,23 @@ struct LotusPaneDelegate {
 }
 
 impl WebViewDelegate for LotusPaneDelegate {
+    fn show_embedder_control(&self, _webview: servo::WebView, embedder_control: servo::EmbedderControl) {
+        if let servo::EmbedderControl::SelectElement(select_element) = embedder_control {
+            let _ = self.proxy.send_event(EngineCommand::ShowSelectControl {
+                window_id: self.window_id.clone(),
+                pane_id: self.pane_id.clone(),
+                prompt: SelectPromptWrapper(select_element),
+            });
+        }
+    }
+
+    fn hide_embedder_control(&self, _webview: servo::WebView, control_id: servo::EmbedderControlId) {
+        let _ = self.proxy.send_event(EngineCommand::HideSelectControl {
+            window_id: self.window_id.clone(),
+            control_id,
+        });
+    }
+
     fn notify_load_status_changed(&self, _webview: servo::WebView, status: LoadStatus) {
         let (profiling, window_start) = if let Some(state) = APP_STATE.get() {
             if let Ok(s) = state.lock() {
@@ -2000,6 +2585,18 @@ impl WebViewDelegate for LotusPaneDelegate {
             let path_in_url = url.path();
             let relative_path = path_in_url.trim_start_matches('/');
             let path_buf = PathBuf::from(relative_path);
+
+            if relative_path == "select-menu.html" || relative_path == "__lotus_select_menu.html" {
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+                let response = WebResourceResponse::new(url)
+                    .headers(headers)
+                    .status_code(StatusCode::OK);
+                let mut intercepted = load.intercept(response);
+                intercepted.send_body_data(SELECT_MENU_HTML.as_bytes().to_vec());
+                intercepted.finish();
+                return;
+            }
 
             // 1. Check LRU Cache
             if let Some(state) = APP_STATE.get() {
@@ -2446,169 +3043,124 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     } else { ("".to_string(), 0, "".to_string()) }
                 } else { ("".to_string(), 0, "".to_string()) };
 
-                if options.panes.is_empty() {
-                    // LEGACY MODE: Create 'main' automatically
-                    let main_url_str = options.initial_url.clone().unwrap_or_else(|| "about:blank".to_string());
-                    let main_rect = euclid::Rect::new(
-                        euclid::Point2D::new(0.0, 0.0),
-                        euclid::Size2D::new(size.width as f32 / hidpi_scale_factor_val, size.height as f32 / hidpi_scale_factor_val)
+                let scrollbar_config = ScrollbarConfig {
+                    enabled: options.scrollbars_enabled.unwrap_or(true),
+                    theme: options.scrollbar_theme.unwrap_or_else(|| "auto".to_string()),
+                    auto_hide: options.scrollbar_auto_hide.unwrap_or(true),
+                    width: options.scrollbar_width.unwrap_or(8),
+                };
+
+                // UNIFIED PIPELINE: Every window is a multi-pane layout.
+                // If options.panes is empty, synthesize a single 'main' fill pane.
+                let mut effective_panes = options.panes.clone();
+                if effective_panes.is_empty() {
+                    effective_panes.push(PaneOptions {
+                        id: "main".to_string(),
+                        url: options.initial_url.clone().unwrap_or_else(|| "about:blank".to_string()),
+                        x: 0.0,
+                        y: 0.0,
+                        width: size.width as f64 / hidpi_scale_factor_val as f64,
+                        height: size.height as f64 / hidpi_scale_factor_val as f64,
+                        z_index: 0,
+                        visible: true,
+                        anchor: Some(if options.auto_resize_main { 1 } else { 0 }),
+                        dock_order: Some(0),
+                    });
+                }
+
+                for (i, pane_opt) in effective_panes.iter().enumerate() {
+                    if i == 0 { primary_pane_id = pane_opt.id.clone(); }
+                    
+                    let p_rect = euclid::Rect::new(
+                        euclid::Point2D::new(pane_opt.x as f32, pane_opt.y as f32),
+                        euclid::Size2D::new(pane_opt.width as f32, pane_opt.height as f32)
                     );
                     
-                    let main_offscreen = Rc::new(rendering_context.offscreen_context(ServoPhysicalSize::new(size.width, size.height)));
-                    let ready_to_repaint = Arc::new(AtomicBool::new(true));
-                    let main_delegate = Rc::new(LotusPaneDelegate {
+                    let p_physical_w = (p_rect.width() * hidpi_scale_factor_val).round() as u32;
+                    let p_physical_h = (p_rect.height() * hidpi_scale_factor_val).round() as u32;
+                    // OpenGL requires at least 1x1 for framebuffer completeness
+                    let p_physical_w = p_physical_w.max(1);
+                    let p_physical_h = p_physical_h.max(1);
+
+                    let p_offscreen = Rc::new(rendering_context.offscreen_context(ServoPhysicalSize::new(p_physical_w, p_physical_h)));
+                    let p_ready_to_repaint = Arc::new(AtomicBool::new(true));
+                    let p_delegate = Rc::new(LotusPaneDelegate {
                         window: window.clone(),
                         window_id: window_id.clone(),
-                        pane_id: "main".to_string(),
+                        pane_id: pane_opt.id.clone(),
                         proxy: self.proxy.clone(),
-                        ready_to_repaint: ready_to_repaint.clone(),
+                        ready_to_repaint: p_ready_to_repaint.clone(),
                     });
                     
-                    let main_ucm = Rc::new(UserContentManager::new(&servo));
-                    main_ucm.add_script(Rc::new(UserScript::from(msgpackr_source.as_str())));
-                    main_ucm.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP_BASE)));
-                    let main_port_script = format!("window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = 'main';", port, token, window_id);
-                    main_ucm.add_script(Rc::new(UserScript::from(main_port_script.as_str())));
+                    let p_ucm = Rc::new(UserContentManager::new(&servo));
+                    p_ucm.add_script(Rc::new(UserScript::from(msgpackr_source.as_str())));
+                    p_ucm.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP_BASE)));
+                    let p_port_script = format!("window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = '{}';", port, token, window_id, pane_opt.id);
+                    p_ucm.add_script(Rc::new(UserScript::from(p_port_script.as_str())));
                     
                     let theme_str = match mode { dark_light::Mode::Dark => "dark", _ => "light" };
                     let theme_script = format!(r#"
                         window.lotus.theme = '{}';
                         try {{ document.documentElement.dataset.theme = window.lotus.theme; }} catch(e) {{}}
                     "#, theme_str);
-                    main_ucm.add_script(Rc::new(UserScript::from(theme_script.as_str())));
-                    main_ucm.add_script(Rc::new(UserScript::from(DRAG_REGION_SCRIPT)));
+                    p_ucm.add_script(Rc::new(UserScript::from(theme_script.as_str())));
+                    p_ucm.add_script(Rc::new(UserScript::from(DRAG_REGION_SCRIPT)));
                     
-                    let mut main_builder = WebViewBuilder::new(&servo, main_offscreen.clone())
-                        .delegate(main_delegate)
+                    if !pane_opt.id.starts_with("__lotus_") && scrollbar_config.enabled {
+                        let cfg_script = format!(
+                            "window.__LOTUS_SCROLLBAR_CONFIG__ = {{ theme: '{}', autoHide: {}, width: {} }};",
+                            scrollbar_config.theme,
+                            scrollbar_config.auto_hide,
+                            scrollbar_config.width
+                        );
+                        p_ucm.add_script(Rc::new(UserScript::from(cfg_script.as_str())));
+                        p_ucm.add_script(Rc::new(UserScript::from(SCROLLBAR_SCRIPT)));
+                    }
+                    
+                    let mut p_builder = WebViewBuilder::new(&servo, p_offscreen.clone())
+                        .delegate(p_delegate)
                         .hidpi_scale_factor(hidpi_scale_factor)
-                        .user_content_manager(main_ucm);
+                        .user_content_manager(p_ucm);
                     
-                    if let Ok(u) = url::Url::parse(&main_url_str) {
-                        main_builder = main_builder.url(u);
+                    if let Ok(u) = url::Url::parse(&pane_opt.url) {
+                        p_builder = p_builder.url(u);
                     }
 
-                    let main_initial_size = ServoPhysicalSize::new(size.width, size.height);
-                    let main_pane = PaneInstance {
-                        id: "main".to_string(),
-                        webview: main_builder.build(),
-                        rect: main_rect,
+                    let p_initial_size = ServoPhysicalSize::new(p_physical_w, p_physical_h);
+                    let pane = PaneInstance {
+                        id: pane_opt.id.clone(),
+                        webview: p_builder.build(),
+                        rect: p_rect,
                         last_notified_rect: None,
                         last_physical_rect: euclid::default::Rect::new(
                             euclid::default::Point2D::new(0, 0),
-                            euclid::default::Size2D::new(size.width as i32, size.height as i32)
+                            euclid::default::Size2D::new(p_physical_w as i32, p_physical_h as i32)
                         ),
-                        z_index: 0,
-                        anchor: if options.auto_resize_main { PaneAnchor::Fill } else { PaneAnchor::None },
-                        dock_order: 0,
+                        z_index: pane_opt.z_index,
+                        anchor: PaneAnchor::from(pane_opt.anchor.unwrap_or(0)),
+                        dock_order: pane_opt.dock_order.unwrap_or(0),
                         animating: false,
                         is_dirty: true,
                         needs_repaint: false,
                         is_visible: false,
                         drag_regions: Vec::new(),
-
                         no_drag_regions: Vec::new(),
-                        offscreen_ctx: main_offscreen,
+                        offscreen_ctx: p_offscreen,
                         servo_busy: false,
                         pending_servo_size: None,
-                        requested_servo_size: main_initial_size,
-                        current_servo_size: main_initial_size,
-                        ready_to_repaint,
+                        requested_servo_size: p_initial_size,
+                        current_servo_size: p_initial_size,
+                        ready_to_repaint: p_ready_to_repaint,
                         ready_frame_size: None,
                         first_frame_painted: false,
                         first_frame_painted_time: None,
                         pending_physical_rect: None,
                         is_resizing: false,
-                        pending_visible: true,
+                        pending_visible: pane_opt.visible,
                         ghost_tex: None,
                         ghost_tex_size: None,
                     };
-                    panes.insert("main".to_string(), main_pane);
-                    primary_pane_id = "main".to_string();
-                } else {
-                    // PRO MODE: Use absolute source of truth from panes array
-                    for (i, pane_opt) in options.panes.iter().enumerate() {
-                        if i == 0 { primary_pane_id = pane_opt.id.clone(); }
-                        
-                        let p_rect = euclid::Rect::new(
-                            euclid::Point2D::new(pane_opt.x as f32, pane_opt.y as f32),
-                            euclid::Size2D::new(pane_opt.width as f32, pane_opt.height as f32)
-                        );
-                        
-                        let p_physical_w = (p_rect.width() * hidpi_scale_factor_val).round() as u32;
-                        let p_physical_h = (p_rect.height() * hidpi_scale_factor_val).round() as u32;
-                        // OpenGL requires at least 1x1 for framebuffer completeness
-                        let p_physical_w = p_physical_w.max(1);
-                        let p_physical_h = p_physical_h.max(1);
-
-                        let p_offscreen = Rc::new(rendering_context.offscreen_context(ServoPhysicalSize::new(p_physical_w, p_physical_h)));
-                        let p_ready_to_repaint = Arc::new(AtomicBool::new(true));
-                        let p_delegate = Rc::new(LotusPaneDelegate {
-                            window: window.clone(),
-                            window_id: window_id.clone(),
-                            pane_id: pane_opt.id.clone(),
-                            proxy: self.proxy.clone(),
-                            ready_to_repaint: p_ready_to_repaint.clone(),
-                        });
-                        
-                        let p_ucm = Rc::new(UserContentManager::new(&servo));
-                        p_ucm.add_script(Rc::new(UserScript::from(msgpackr_source.as_str())));
-                        p_ucm.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP_BASE)));
-                        let p_port_script = format!("window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = '{}';", port, token, window_id, pane_opt.id);
-                        p_ucm.add_script(Rc::new(UserScript::from(p_port_script.as_str())));
-                        
-                        let theme_str = match mode { dark_light::Mode::Dark => "dark", _ => "light" };
-                        let theme_script = format!(r#"
-                            window.lotus.theme = '{}';
-                            try {{ document.documentElement.dataset.theme = window.lotus.theme; }} catch(e) {{}}
-                        "#, theme_str);
-                        p_ucm.add_script(Rc::new(UserScript::from(theme_script.as_str())));
-                        p_ucm.add_script(Rc::new(UserScript::from(DRAG_REGION_SCRIPT)));
-                        
-                        let mut p_builder = WebViewBuilder::new(&servo, p_offscreen.clone())
-                            .delegate(p_delegate)
-                            .hidpi_scale_factor(hidpi_scale_factor)
-                            .user_content_manager(p_ucm);
-                        
-                        if let Ok(u) = url::Url::parse(&pane_opt.url) {
-                            p_builder = p_builder.url(u);
-                        }
-
-                        let p_initial_size = ServoPhysicalSize::new(p_physical_w, p_physical_h);
-                        let pane = PaneInstance {
-                            id: pane_opt.id.clone(),
-                            webview: p_builder.build(),
-                            rect: p_rect,
-                            last_notified_rect: None,
-                            last_physical_rect: euclid::default::Rect::new(
-                                euclid::default::Point2D::new(0, 0),
-                                euclid::default::Size2D::new(p_physical_w as i32, p_physical_h as i32)
-                            ),
-                            z_index: pane_opt.z_index,
-                            anchor: PaneAnchor::from(pane_opt.anchor.unwrap_or(0)),
-                            dock_order: pane_opt.dock_order.unwrap_or(0),
-                            animating: false,
-                            is_dirty: true,
-                            needs_repaint: false,
-                            is_visible: false,
-                            drag_regions: Vec::new(),
-                            no_drag_regions: Vec::new(),
-                            offscreen_ctx: p_offscreen,
-                            servo_busy: false,
-                            pending_servo_size: None,
-                            requested_servo_size: p_initial_size,
-                            current_servo_size: p_initial_size,
-                            ready_to_repaint: p_ready_to_repaint,
-                            ready_frame_size: None,
-                            first_frame_painted: false,
-                        first_frame_painted_time: None,
-                            pending_physical_rect: None,
-                            is_resizing: false,
-                            pending_visible: pane_opt.visible,
-                            ghost_tex: None,
-                            ghost_tex_size: None,
-                            };
-                        panes.insert(pane_opt.id.clone(), pane);
-                    }
+                    panes.insert(pane_opt.id.clone(), pane);
                 }
 
                 let mut id_shifters = Vec::new();
@@ -2663,6 +3215,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     committed_layout: None,
                     active_window_size: winit::dpi::PhysicalSize::new(size.width, size.height),
                     committed_window_size: None,
+                    active_select: None,
+                    scrollbar_config,
                 };
 
                 instance.init_stencil_program();
@@ -2716,12 +3270,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 info!("Window created successfully: {}", window_id);
             },
             EngineCommand::Quit => {
-                info!("Rust: [Teardown] Quit command received. Starting 3s safety watchdog.");
+                info!("Rust: [Teardown] Quit command received. Starting 1s safety watchdog.");
                 // Start a watchdog immediately in case the event loop hangs during teardown
                 std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(3000));
-                    eprintln!("Rust: [Teardown] Watchdog timeout. Forcing exit.");
-                    std::process::exit(0);
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    eprintln!("Rust: [Teardown] Watchdog timeout. Forcing fast exit.");
+                    fast_exit(0);
                 });
                 event_loop.exit();
             },
@@ -2815,6 +3369,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 }
             },
             EngineCommand::CloseWindow(window_id) => {
+                self.winit_id_to_uuid.retain(|_, v| v != &window_id);
                 self.windows.remove(&window_id);
                 // Clean up per-window metadata so long-running apps don't leak.
                 if let Some(state) = APP_STATE.get() {
@@ -2826,6 +3381,23 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 // Drop any buffered outgoing frames for this window.
                 if let Some(p) = WS_PENDING.get() { p.remove(&window_id); }
                 info!("Closed window: {}", window_id);
+
+                let mut close_msg = Vec::new();
+                if rmp_serde::encode::write(&mut close_msg, &serde_json::json!({"event": "window-closed", "window_id": window_id})).is_ok() {
+                    let mut wrapped = Vec::with_capacity(close_msg.len() + 1);
+                    wrapped.push(MSG_TYPE_DATA);
+                    wrapped.extend(close_msg);
+                    self.callback.call((window_id.clone(), vec![wrapped.into()]), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+
+                if self.windows.is_empty() {
+                    info!("Rust: Last window closed via CloseWindow command, exiting event loop");
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                        fast_exit(0);
+                    });
+                    event_loop.exit();
+                }
             },
             EngineCommand::SetDecorations(window_id, decorations) => {
                 if let Some(instance) = self.windows.get(&window_id) {
@@ -2926,7 +3498,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                         // AGGREGATION FIX: Only emit when all visible panes have painted
                         if !instance.emitted_ready_to_show {
-                                let all_ready = instance.panes.values().all(|p| !p.is_visible || p.first_frame_painted);
+                                let all_ready = instance.panes.values().all(|p| !p.pending_visible || p.first_frame_painted);
                                 
                                 if all_ready {
                                     instance.emitted_ready_to_show = true;
@@ -2957,7 +3529,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.window.set_max_inner_size(size);
                 }
             },
-            EngineCommand::CreatePane(window_id, pane_id, url, rect, z_index, anchor, dock_order) => {
+            EngineCommand::CreatePane(window_id, pane_id, url, rect, z_index, anchor, dock_order, visible) => {
                 let servo = self.ensure_servo().clone();
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     if pane_id == "main" {
@@ -2993,6 +3565,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     let port_script = format!("window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = '{}';", port, token, window_id, pane_id);
                     user_content_manager.add_script(Rc::new(UserScript::from(port_script.as_str())));
                     user_content_manager.add_script(Rc::new(UserScript::from(DRAG_REGION_SCRIPT)));
+
+                    if !pane_id.starts_with("__lotus_") && instance.scrollbar_config.enabled {
+                        let cfg_script = format!(
+                            "window.__LOTUS_SCROLLBAR_CONFIG__ = {{ theme: '{}', autoHide: {}, width: {} }};",
+                            instance.scrollbar_config.theme,
+                            instance.scrollbar_config.auto_hide,
+                            instance.scrollbar_config.width
+                        );
+                        user_content_manager.add_script(Rc::new(UserScript::from(cfg_script.as_str())));
+                        user_content_manager.add_script(Rc::new(UserScript::from(SCROLLBAR_SCRIPT)));
+                    }
 
                     let servo_size = ServoPhysicalSize::new(
                         (rect.size.width * hidpi_scale_factor_val).round() as u32,
@@ -3054,11 +3637,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         first_frame_painted_time: None,
                         pending_physical_rect: None,
                         is_resizing: false,
-                        pending_visible: true,
+                        pending_visible: visible,
                         ghost_tex: None,
                         ghost_tex_size: None,
                     };
                     instance.panes.insert(pane_id, pane);
+                    let physical_size = instance.window.inner_size();
+                    let scale_factor = instance.window.scale_factor() as f32;
+                    instance.recalculate_layout(physical_size, scale_factor);
+                    instance.window.request_redraw();
                 }
             },
             EngineCommand::RemovePane(window_id, pane_id) => {
@@ -3137,6 +3724,203 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.active_pane_id = pane_id;
                 }
             },
+            EngineCommand::ShowSelectControl { window_id, pane_id, prompt } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    // If an existing select control was open, submit or dismiss it
+                    if let Some(mut prev_active) = instance.active_select.take() {
+                        instance.active_pane_id = prev_active.previous_active_pane_id;
+                        if prev_active.allow_multiple {
+                            prev_active.prompt.submit();
+                        } else {
+                            prev_active.prompt.select(prev_active.initial_selected_options.clone());
+                            prev_active.prompt.submit();
+                        }
+                    }
+
+                    let scale_factor = instance.window.scale_factor() as f32;
+                    let (pane_px, pane_py) = if let Some(pane) = instance.panes.get(&pane_id) {
+                        if pane.anchor != PaneAnchor::None {
+                            (pane.last_physical_rect.origin.x as f32, pane.last_physical_rect.origin.y as f32)
+                        } else {
+                            let physical_rect = pane.rect.scale(scale_factor, scale_factor);
+                            (physical_rect.origin.x.round(), physical_rect.origin.y.round())
+                        }
+                    } else {
+                        (0.0, 0.0)
+                    };
+
+                    let control_id = prompt.0.id();
+                    let control_id_str = format!("{:?}", control_id);
+                    let pos = prompt.0.position();
+                    let window_phys_x = pane_px + pos.min.x as f32;
+                    let window_phys_y = pane_py + pos.min.y as f32;
+                    let window_phys_w = pos.width() as f32;
+                    let window_phys_h = pos.height() as f32;
+
+                    let logical_x = window_phys_x / scale_factor;
+                    let logical_y = window_phys_y / scale_factor;
+                    let logical_w = window_phys_w / scale_factor;
+                    let logical_h = window_phys_h / scale_factor;
+
+                    let formatted_options: Vec<serde_json::Value> = prompt.0.options().iter().map(|item| {
+                        match item {
+                            servo::SelectElementOptionOrOptgroup::Option(opt) => {
+                                serde_json::json!({
+                                    "type": "option",
+                                    "id": opt.id,
+                                    "label": opt.label,
+                                    "is_disabled": opt.is_disabled,
+                                })
+                            },
+                            servo::SelectElementOptionOrOptgroup::Optgroup { label, options } => {
+                                let opts: Vec<serde_json::Value> = options.iter().map(|opt| {
+                                    serde_json::json!({
+                                        "id": opt.id,
+                                        "label": opt.label,
+                                        "is_disabled": opt.is_disabled,
+                                    })
+                                }).collect();
+                                serde_json::json!({
+                                    "type": "optgroup",
+                                    "label": label,
+                                    "options": opts,
+                                })
+                            }
+                        }
+                    }).collect();
+
+                    let selected_options = prompt.0.selected_options();
+                    let allow_multiple = prompt.0.allow_select_multiple();
+
+                    let previous_active_pane_id = instance.active_pane_id.clone();
+                    instance.active_pane_id = "__lotus_select_overlay".to_string();
+
+                    instance.active_select = Some(ActiveSelectPrompt {
+                        control_id,
+                        control_id_str: control_id_str.clone(),
+                        pane_id: pane_id.clone(),
+                        previous_active_pane_id,
+                        initial_selected_options: selected_options.clone(),
+                        prompt: prompt.0,
+                        allow_multiple,
+                    });
+
+                    let payload = serde_json::json!({
+                        "event": "select-element-open",
+                        "window_id": window_id,
+                        "pane_id": pane_id,
+                        "id": control_id_str,
+                        "rect": {
+                            "x": logical_x,
+                            "y": logical_y,
+                            "width": logical_w,
+                            "height": logical_h
+                        },
+                        "options": formatted_options,
+                        "selectedOptions": selected_options,
+                        "allowMultiple": allow_multiple
+                    });
+
+                    if let Ok(msg) = rmp_serde::encode::to_vec(&payload) {
+                        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                            let _ = proxy.send_event(EngineCommand::IpcMessage(window_id.clone(), msg));
+                        }
+                    }
+                }
+            },
+            EngineCommand::HideSelectControl { window_id, control_id } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if let Some(active) = &instance.active_select {
+                        if active.control_id == control_id {
+                            let mut active = instance.active_select.take().unwrap();
+                            instance.active_pane_id = active.previous_active_pane_id;
+                            if active.allow_multiple {
+                                active.prompt.submit();
+                            } else {
+                                active.prompt.select(active.initial_selected_options.clone());
+                                active.prompt.submit();
+                            }
+                            if let Some(overlay) = instance.panes.get_mut("__lotus_select_overlay") {
+                                overlay.pending_visible = false;
+                                overlay.is_dirty = true;
+                                let physical_size = instance.window.inner_size();
+                                let scale_factor = instance.window.scale_factor() as f32;
+                                instance.recalculate_layout(physical_size, scale_factor);
+                                instance.window.request_redraw();
+                            }
+                            if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
+                                "event": "select-element-close",
+                                "window_id": window_id,
+                            })) {
+                                if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                                    let _ = proxy.send_event(EngineCommand::IpcMessage(window_id.clone(), msg));
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            EngineCommand::UpdateSelectControl { window_id, control_id, selected_indices } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if let Some(active) = &mut instance.active_select {
+                        if active.control_id_str == control_id || control_id.is_empty() {
+                            let indices: Vec<usize> = selected_indices.into_iter().map(|i| i as usize).collect();
+                            active.prompt.select(indices);
+                        }
+                    }
+                }
+            },
+            EngineCommand::SubmitSelectControl { window_id, control_id: _, selected_indices } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if let Some(mut active) = instance.active_select.take() {
+                        instance.active_pane_id = active.previous_active_pane_id;
+                        let indices: Vec<usize> = selected_indices.into_iter().map(|i| i as usize).collect();
+                        active.prompt.select(indices);
+                        active.prompt.submit();
+                    }
+                    if let Some(overlay) = instance.panes.get_mut("__lotus_select_overlay") {
+                        overlay.pending_visible = false;
+                        overlay.is_dirty = true;
+                        let physical_size = instance.window.inner_size();
+                        let scale_factor = instance.window.scale_factor() as f32;
+                        instance.recalculate_layout(physical_size, scale_factor);
+                        instance.window.request_redraw();
+                    }
+                    if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
+                        "event": "select-element-close",
+                        "window_id": window_id,
+                    })) {
+                        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                            let _ = proxy.send_event(EngineCommand::IpcMessage(window_id.clone(), msg));
+                        }
+                    }
+                }
+            },
+            EngineCommand::DismissSelectControl { window_id, control_id: _ } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if let Some(mut active) = instance.active_select.take() {
+                        instance.active_pane_id = active.previous_active_pane_id;
+                        active.prompt.select(active.initial_selected_options.clone());
+                        active.prompt.submit();
+                    }
+                    if let Some(overlay) = instance.panes.get_mut("__lotus_select_overlay") {
+                        overlay.pending_visible = false;
+                        overlay.is_dirty = true;
+                        let physical_size = instance.window.inner_size();
+                        let scale_factor = instance.window.scale_factor() as f32;
+                        instance.recalculate_layout(physical_size, scale_factor);
+                        instance.window.request_redraw();
+                    }
+                    if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
+                        "event": "select-element-close",
+                        "window_id": window_id,
+                    })) {
+                        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                            let _ = proxy.send_event(EngineCommand::IpcMessage(window_id.clone(), msg));
+                        }
+                    }
+                }
+            },
         }
         
         if let Some(servo) = &self.servo {
@@ -3172,6 +3956,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                          for pane in instance.panes.values() {
                             pane.webview.evaluate_javascript(&script, |_| {});
                          }
+                    }
+
+                    let mut theme_msg = Vec::new();
+                    if rmp_serde::encode::write(&mut theme_msg, &serde_json::json!({
+                        "event": "theme-changed",
+                        "theme": theme_str
+                    })).is_ok() {
+                        let mut wrapped = Vec::with_capacity(theme_msg.len() + 1);
+                        wrapped.push(MSG_TYPE_DATA);
+                        wrapped.extend(theme_msg);
+                        self.callback.call(("global".to_string(), vec![wrapped.into()]), ThreadsafeFunctionCallMode::NonBlocking);
                     }
                 }
             },
@@ -3237,6 +4032,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         if let Some(p) = WS_PENDING.get() { p.remove(&uuid); }
                         if self.windows.is_empty() {
                             info!("Rust: Last window closed, exiting event loop");
+                            std::thread::spawn(|| {
+                                std::thread::sleep(std::time::Duration::from_millis(1000));
+                                fast_exit(0);
+                            });
                             event_loop.exit();
                         }
                     },
@@ -3281,25 +4080,23 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 for (id, staged_pane) in &committed.panes {
                                     if staged_pane.visible {
                                         if let Some(pane) = instance.panes.get(id) {
-                                            if pane.is_resizing {
-                                                let target_size = ServoPhysicalSize::new(
-                                                    (staged_pane.rect.size.width as u32).max(1), 
-                                                    (staged_pane.rect.size.height as u32).max(1)
-                                                );
-                                                let current_ready = pane.ready_frame_size.unwrap_or(ServoPhysicalSize::new(0, 0));
-                                                
-                                                if current_ready.width != target_size.width || current_ready.height != target_size.height {
+                                            let target_size = ServoPhysicalSize::new(
+                                                (staged_pane.rect.size.width as u32).max(1), 
+                                                (staged_pane.rect.size.height as u32).max(1)
+                                            );
+                                            let current_ready = pane.ready_frame_size.unwrap_or(ServoPhysicalSize::new(0, 0));
+                                            
+                                            if current_ready.width != target_size.width || current_ready.height != target_size.height {
+                                                transaction_complete = false;
+                                                break;
+                                            }
+                                            // For the very first spawn of a pane, hold the lock for 150ms 
+                                            // to allow WebRender async texture and display list generation to finish.
+                                            if let Some(first_time) = pane.first_frame_painted_time {
+                                                if first_time.elapsed() < std::time::Duration::from_millis(150) {
                                                     transaction_complete = false;
+                                                    instance.window.request_redraw(); // Keep pumping the event loop
                                                     break;
-                                                }
-                                                // For the very first spawn of a pane, hold the lock for 150ms 
-                                                // to allow WebRender async texture and display list generation to finish.
-                                                if let Some(first_time) = pane.first_frame_painted_time {
-                                                    if first_time.elapsed() < std::time::Duration::from_millis(150) {
-                                                        transaction_complete = false;
-                                                        instance.window.request_redraw(); // Keep pumping the event loop
-                                                        break;
-                                                    }
                                                 }
                                             }
                                         }
@@ -3364,6 +4161,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     );
                                     instance.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
                                     instance.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                                    instance.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                                    instance.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
                                     
                                     instance.gl.bind_framebuffer(glow::FRAMEBUFFER, instance.scene_fbo);
                                     instance.gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
@@ -3398,28 +4197,27 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             for pane in sorted_panes.iter_mut() {
                                 if !pane.is_visible { continue; } 
                                 
-                                let (layout_pw, layout_ph, _layout_px, _layout_py, tex_pw, tex_ph, tex_px, tex_py) = {
+                                let (layout_pw, layout_ph, layout_px, layout_py) = {
                                     let x_start = pane.last_physical_rect.origin.x;
                                     let y_start = pane.last_physical_rect.origin.y;
                                     let layout_pw = pane.last_physical_rect.size.width;
                                     let layout_ph = pane.last_physical_rect.size.height;
                                     
                                     let layout_py = active_h as i32 - (y_start + layout_ph);
-                                    let tex_size = pane.offscreen_ctx.size();
-                                    let tex_pw = tex_size.width as i32;
-                                    let tex_ph = tex_size.height as i32;
-                                    let tex_py = active_h as i32 - y_start - tex_ph;
-
-                                    (layout_pw, layout_ph, x_start, layout_py, tex_pw, tex_ph, x_start, tex_py)
+                                    (layout_pw, layout_ph, x_start, layout_py)
                                 };
+
+                                let tex_size = pane.offscreen_ctx.size();
+                                let tex_pw = tex_size.width as i32;
+                                let tex_ph = tex_size.height as i32;
 
                                 if layout_pw <= 0 || layout_ph <= 0 || tex_pw <= 0 || tex_ph <= 0 { continue; }
 
                                 let is_locked = is_transaction_pending && !transaction_complete;
                                 let is_hiding = pending_hides.contains(&pane.id);
                                 
-                                // Force the use of ghost_tex if the pane is marked for removal in the active transaction
-                                let freeze_this_pane = is_locked && pane.ghost_tex_size.is_some() && (pane.is_resizing || is_hiding);
+                                // Force the use of ghost_tex if the pane is marked for removal or resizing in the active transaction
+                                let freeze_this_pane = (is_locked || pane.is_resizing || is_hiding) && pane.ghost_tex_size.is_some();
 
                                 if let Some(callback) = pane.offscreen_ctx.render_to_parent_callback() {
                                     if let (Some(comp_fbo), Some(comp_tex)) = (instance.comp_fbo, instance.comp_tex) {
@@ -3457,9 +4255,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                             instance.gl.clear_color(0.0, 0.0, 0.0, 0.0);
                                             instance.gl.clear(glow::COLOR_BUFFER_BIT);
 
+                                            // Stretch the pane's current framebuffer to fill its full layout bounds
                                             let target_rect = euclid::default::Rect::new(
-                                                euclid::default::Point2D::new(tex_px, tex_py),
-                                                euclid::default::Size2D::new(tex_pw, tex_ph)
+                                                euclid::default::Point2D::new(layout_px, layout_py),
+                                                euclid::default::Size2D::new(layout_pw, layout_ph)
                                             );
                                             callback(&instance.gl, target_rect, comp_fbo.0.get());
 
@@ -3499,18 +4298,25 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             instance.gl.color_mask(true, true, true, true);
 
                             // ---------------------------------------------------------
-                            // PASS 2: BLIT SCENE FBO TO LIVE WINDOW
+                            // PASS 2: BLIT SCENE FBO TO LIVE WINDOW (TEXTURE STRETCHING)
                             // ---------------------------------------------------------
-                            let _live_w = window_size.width.max(1) as i32;
+                            let live_w = window_size.width.max(1) as i32;
                             let live_h = window_size.height.max(1) as i32;
 
-                            instance.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                            let _ = instance.rendering_context.make_current();
+                            instance.rendering_context.prepare_for_rendering();
+
                             instance.gl.disable(glow::SCISSOR_TEST);
                             instance.gl.disable(glow::DEPTH_TEST);
                             instance.gl.disable(glow::BLEND); 
                             
-                            // Anchor the Scene FBO to the Top-Left of the expanding Winit window
-                            instance.gl.viewport(0, live_h - active_h as i32, active_w as i32, active_h as i32);
+                            // Stretch the Scene FBO quad across the entire live window surface.
+                            // During asynchronous resize desync (before Servo completes layout
+                            // and rasterization into the FBO at the new size), hardware bilinear
+                            // scaling stretches the existing frame quad to fill the expanded surface,
+                            // completely eliminating black or uninitialized gutters (the technique
+                            // used by Wayland compositors like Gamescope/Sway and macOS).
+                            instance.gl.viewport(0, 0, live_w, live_h);
 
                             if let Some(program) = instance.comp_program {
                                 instance.gl.use_program(Some(program));
@@ -3518,8 +4324,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 instance.gl.active_texture(glow::TEXTURE0);
                                 instance.gl.bind_texture(glow::TEXTURE_2D, instance.scene_tex);
                                 
-                                instance.gl.uniform_2_f32(instance.u_comp_size_loc.as_ref(), active_w as f32, active_h as f32);
-                                instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), 0.0);
+                                instance.gl.uniform_2_f32(instance.u_comp_size_loc.as_ref(), live_w as f32, live_h as f32);
+                                let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
+                                instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), radius);
 
                                 instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                                 instance.gl.bind_vertex_array(None);
@@ -3542,6 +4349,28 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
                     },            WindowEvent::Resized(size) => {
                 let scale_factor = instance.window.scale_factor() as f32;
+
+                if let Some(mut active) = instance.active_select.take() {
+                    instance.active_pane_id = active.previous_active_pane_id;
+                    if active.allow_multiple {
+                        active.prompt.submit();
+                    } else {
+                        active.prompt.select(active.initial_selected_options.clone());
+                        active.prompt.submit();
+                    }
+                    if let Some(overlay) = instance.panes.get_mut("__lotus_select_overlay") {
+                        overlay.pending_visible = false;
+                        overlay.is_dirty = true;
+                    }
+                    if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
+                        "event": "select-element-close",
+                        "window_id": uuid,
+                    })) {
+                        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                            let _ = proxy.send_event(EngineCommand::IpcMessage(uuid.clone(), msg));
+                        }
+                    }
+                }
                 
                 // 1. Guard against feedback loops: only process if size actually changed
                 // (Using a small threshold for floating point stability)
@@ -3562,6 +4391,42 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 instance.recalculate_layout(size, scale_factor);
                 
                 instance.rendering_context.resize(size);
+
+                // SYNCHRONOUS PRESENTATION ON RESIZE:
+                // Instantly stretch the last known good scene quad across the entire expanded window surface.
+                // This eliminates any asynchronous gap between Mutter/Xwayland surface resize and Winit RedrawRequested.
+                unsafe {
+                    let live_w = size.width.max(1) as i32;
+                    let live_h = size.height.max(1) as i32;
+
+                    let _ = instance.rendering_context.make_current();
+                    instance.rendering_context.prepare_for_rendering();
+
+                    instance.gl.disable(glow::SCISSOR_TEST);
+                    instance.gl.disable(glow::DEPTH_TEST);
+                    instance.gl.disable(glow::BLEND); 
+                    instance.gl.viewport(0, 0, live_w, live_h);
+
+                    if let Some(program) = instance.comp_program {
+                        if let Some(tex) = instance.scene_tex {
+                            instance.gl.use_program(Some(program));
+                            instance.gl.bind_vertex_array(instance.comp_vao);
+                            instance.gl.active_texture(glow::TEXTURE0);
+                            instance.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                            
+                            instance.gl.uniform_2_f32(instance.u_comp_size_loc.as_ref(), live_w as f32, live_h as f32);
+                            let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
+                            instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), radius);
+
+                            instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                            instance.gl.bind_vertex_array(None);
+                            instance.gl.use_program(None);
+                        }
+                    }
+
+                    instance.rendering_context.present();
+                }
+
                 instance.window.request_redraw();
 
                 let mut msg = Vec::new();
@@ -3670,21 +4535,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                      }
                                  }
                                 
-                                if hit_no_drag {
-                                    if instance.in_resize_border {
-                                        instance.window.set_cursor(CursorIcon::Default);
-                                        instance.in_resize_border = false;
-                                    }
-                                } else {
-                                    // Only check for resize borders if NOT in a no-drag zone
+                                // 1. In frameless windows, check window resize borders first
+                                let resize_cursor = if instance.frameless {
                                     let size = instance.window.inner_size();
                                     let x = position.x;
                                     let y = position.y;
                                     let w = size.width as f64;
                                     let h = size.height as f64;
-                                    let border = 8.0;
+                                    let border = (6.0 * scale_factor as f64).round().max(4.0);
                                     
-                                    let resize_cursor = if x < border && y < border {
+                                    if x < border && y < border {
                                         Some(CursorIcon::NwResize)
                                     } else if x > w - border && y < border {
                                         Some(CursorIcon::NeResize)
@@ -3702,21 +4562,22 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         Some(CursorIcon::SResize)
                                     } else {
                                         None
-                                    };
-                                    
-                                    if let Some(icon) = resize_cursor {
-                                         instance.window.set_cursor(icon);
-                                         instance.in_resize_border = true;
-                                     } else {
-                                         if hit_drag {
-                                             instance.window.set_cursor(winit::window::CursorIcon::Move);
-                                         } else {
-                                             if instance.in_resize_border {
-                                                 instance.window.set_cursor(winit::window::CursorIcon::Default);
-                                             }
-                                         }
-                                         instance.in_resize_border = false;
-                                     }
+                                    }
+                                } else {
+                                    None
+                                };
+                                
+                                if let Some(icon) = resize_cursor {
+                                    instance.window.set_cursor(icon);
+                                    instance.in_resize_border = true;
+                                } else {
+                                    if instance.in_resize_border {
+                                        instance.window.set_cursor(winit::window::CursorIcon::Default);
+                                        instance.in_resize_border = false;
+                                    }
+                                    if hit_drag {
+                                        instance.window.set_cursor(winit::window::CursorIcon::Move);
+                                    }
                                 }
 
                                 // Route MouseMove to the hovered pane with translated physical coordinates
@@ -3770,6 +4631,60 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         let is_pressed = state == winit::event::ElementState::Pressed;
                         instance.is_mouse_down = is_pressed;
                         let scale_factor = instance.window.scale_factor() as f32;
+
+                        if is_pressed {
+                            if let Some(_) = &instance.active_select {
+                                let overlay_pane = instance.panes.get("__lotus_select_overlay");
+                                let is_inside_overlay = overlay_pane.map(|p| {
+                                    if !p.is_visible { return false; }
+                                    let (px, py, pw, ph) = if p.anchor != PaneAnchor::None {
+                                        (
+                                            p.last_physical_rect.origin.x as f32,
+                                            p.last_physical_rect.origin.y as f32,
+                                            p.last_physical_rect.size.width as f32,
+                                            p.last_physical_rect.size.height as f32,
+                                        )
+                                    } else {
+                                        let physical_rect = p.rect.scale(scale_factor, scale_factor);
+                                        (
+                                            physical_rect.origin.x.round(),
+                                            physical_rect.origin.y.round(),
+                                            physical_rect.size.width.round(),
+                                            physical_rect.size.height.round(),
+                                        )
+                                    };
+                                    let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
+                                    rect.contains(instance.last_mouse_pos)
+                                }).unwrap_or(false);
+
+                                if !is_inside_overlay {
+                                    let mut active = instance.active_select.take().unwrap();
+                                    instance.active_pane_id = active.previous_active_pane_id;
+                                    if active.allow_multiple {
+                                        active.prompt.submit();
+                                    } else {
+                                        active.prompt.select(active.initial_selected_options.clone());
+                                        active.prompt.submit();
+                                    }
+                                    if let Some(overlay) = instance.panes.get_mut("__lotus_select_overlay") {
+                                        overlay.pending_visible = false;
+                                        overlay.is_dirty = true;
+                                        let physical_size = instance.window.inner_size();
+                                        instance.recalculate_layout(physical_size, scale_factor);
+                                        instance.window.request_redraw();
+                                    }
+                                    if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
+                                        "event": "select-element-close",
+                                        "window_id": uuid,
+                                    })) {
+                                        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                                            let _ = proxy.send_event(EngineCommand::IpcMessage(uuid.clone(), msg));
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                        }
                         
                         let action = match state {
                             winit::event::ElementState::Pressed => MouseButtonAction::Down,
@@ -3834,6 +4749,45 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
 
                                     if is_pressed && button == winit::event::MouseButton::Left && instance.frameless {
+                                        let size = instance.window.inner_size();
+                                        let x = instance.last_mouse_pos.x as f64;
+                                        let y = instance.last_mouse_pos.y as f64;
+                                        let w = size.width as f64;
+                                        let h = size.height as f64;
+                                        let border = (6.0 * scale_factor as f64).round().max(4.0);
+                                        
+                                        let mut resize_dir = None;
+                                        if x < border && y < border {
+                                            resize_dir = Some(winit::window::ResizeDirection::NorthWest);
+                                        } else if x > w - border && y < border {
+                                            resize_dir = Some(winit::window::ResizeDirection::NorthEast);
+                                        } else if x < border && y > h - border {
+                                            resize_dir = Some(winit::window::ResizeDirection::SouthWest);
+                                        } else if x > w - border && y > h - border {
+                                            resize_dir = Some(winit::window::ResizeDirection::SouthEast);
+                                        } else if x < border {
+                                            resize_dir = Some(winit::window::ResizeDirection::West);
+                                        } else if x > w - border {
+                                            resize_dir = Some(winit::window::ResizeDirection::East);
+                                        } else if y < border {
+                                            resize_dir = Some(winit::window::ResizeDirection::North);
+                                        } else if y > h - border {
+                                            resize_dir = Some(winit::window::ResizeDirection::South);
+                                        }
+                                        
+                                        if let Some(dir) = resize_dir {
+                                            let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+                                            pane.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                                                MouseButtonAction::Up,
+                                                servo_button,
+                                                servo::WebViewPoint::Device(translated_point)
+                                            )));
+                                            instance.is_mouse_down = false;
+                                            instance.last_mouse_down_pane_id = None;
+                                            let _ = instance.window.drag_resize_window(dir);
+                                            return;
+                                        }
+
                                         let mut hit_no_drag = false;
                                         for no_drag_region in &pane.no_drag_regions {
                                             if no_drag_region.contains(translated_point) {
@@ -3841,71 +4795,32 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                                 break;
                                             }
                                         }
-                                        
-                                        if !hit_no_drag {
-                                            let size = instance.window.inner_size();
-                                            let x = instance.last_mouse_pos.x as f64;
-                                            let y = instance.last_mouse_pos.y as f64;
-                                            let w = size.width as f64;
-                                            let h = size.height as f64;
-                                            let border = 8.0;
-                                            
-                                            let mut resize_dir = None;
-                                            if x < border && y < border {
-                                                resize_dir = Some(winit::window::ResizeDirection::NorthWest);
-                                            } else if x > w - border && y < border {
-                                                resize_dir = Some(winit::window::ResizeDirection::NorthEast);
-                                            } else if x < border && y > h - border {
-                                                resize_dir = Some(winit::window::ResizeDirection::SouthWest);
-                                            } else if x > w - border && y > h - border {
-                                                resize_dir = Some(winit::window::ResizeDirection::SouthEast);
-                                            } else if x < border {
-                                                resize_dir = Some(winit::window::ResizeDirection::West);
-                                            } else if x > w - border {
-                                                resize_dir = Some(winit::window::ResizeDirection::East);
-                                            } else if y < border {
-                                                resize_dir = Some(winit::window::ResizeDirection::North);
-                                            } else if y > h - border {
-                                                resize_dir = Some(winit::window::ResizeDirection::South);
-                                            }
-                                            
-                                            if let Some(dir) = resize_dir {
-                                                let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
-                                                pane.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                                                    MouseButtonAction::Up,
-                                                    servo_button,
-                                                    servo::WebViewPoint::Device(translated_point)
-                                                )));
-                                                instance.is_mouse_down = false;
-                                                instance.last_mouse_down_pane_id = None;
-                                                let _ = instance.window.drag_resize_window(dir);
-                                                return;
-                                            }
 
-                                            let mut hit_drag = false;
+                                        let mut hit_drag = false;
+                                        if !hit_no_drag {
                                             for region in &pane.drag_regions {
                                                 if region.contains(translated_point) {
                                                     hit_drag = true;
                                                     break;
                                                 }
                                             }
-                                            
-                                            if hit_drag {
-                                                info!("Rust: Hit Drag Region at {:?} in pane '{}'", translated_point, pane.id);
-                                                let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
-                                                pane.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                                                    MouseButtonAction::Up,
-                                                    servo_button,
-                                                    servo::WebViewPoint::Device(translated_point)
-                                                )));
-                                                instance.is_mouse_down = false;
-                                                instance.last_mouse_down_pane_id = None;
-                                                let _ = instance.window.drag_window();
-                                                return;
-                                            } else {
-                                                trace!("Rust: Drag check FAILED at {:?} for pane '{}'. Drag regions count: {}. No-drag: {}", 
-                                                    translated_point, pane.id, pane.drag_regions.len(), pane.no_drag_regions.len());
-                                            }
+                                        }
+                                        
+                                        if hit_drag {
+                                            info!("Rust: Hit Drag Region at {:?} in pane '{}'", translated_point, pane.id);
+                                            let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+                                            pane.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                                                MouseButtonAction::Up,
+                                                servo_button,
+                                                servo::WebViewPoint::Device(translated_point)
+                                            )));
+                                            instance.is_mouse_down = false;
+                                            instance.last_mouse_down_pane_id = None;
+                                            let _ = instance.window.drag_window();
+                                            return;
+                                        } else {
+                                            trace!("Rust: Drag check FAILED at {:?} for pane '{}'. Drag regions count: {}. No-drag: {}", 
+                                                translated_point, pane.id, pane.drag_regions.len(), pane.no_drag_regions.len());
                                         }
                                     }
 
@@ -3924,10 +4839,14 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
                     },
                     WindowEvent::MouseWheel { delta, .. } => {
-                        let scroll_multiplier = 20.0;
+                        let scale_factor = instance.window.scale_factor() as f32;
+                        // Standard browsers (Chromium/Firefox) scroll ~100 CSS px per wheel notch (approx. 4-5 text lines).
+                        // Scale by scale_factor so HiDPI displays maintain the intended CSS scroll distance.
+                        // Precision touchpads and smooth wheels emit PixelDelta, which is already in physical pixels.
+                        let line_scroll = 100.0 * scale_factor as f64;
                         let (x, y) = match delta {
-                            MouseScrollDelta::LineDelta(x, y) => (x as f64 * scroll_multiplier, y as f64 * scroll_multiplier),
-                            MouseScrollDelta::PixelDelta(pos) => (pos.x * scroll_multiplier, pos.y * scroll_multiplier),
+                            MouseScrollDelta::LineDelta(x, y) => (x as f64 * line_scroll, y as f64 * line_scroll),
+                            MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
                         };
                         let wheel_delta = WheelDelta {
                             x,
@@ -3935,7 +4854,57 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             z: 0.0,
                             mode: WheelMode::DeltaPixel,
                         };
-                        let scale_factor = instance.window.scale_factor() as f32;
+
+                        if let Some(_) = &instance.active_select {
+                            let overlay_pane = instance.panes.get("__lotus_select_overlay");
+                            let is_inside_overlay = overlay_pane.map(|p| {
+                                if !p.is_visible { return false; }
+                                let (px, py, pw, ph) = if p.anchor != PaneAnchor::None {
+                                    (
+                                        p.last_physical_rect.origin.x as f32,
+                                        p.last_physical_rect.origin.y as f32,
+                                        p.last_physical_rect.size.width as f32,
+                                        p.last_physical_rect.size.height as f32,
+                                    )
+                                } else {
+                                    let physical_rect = p.rect.scale(scale_factor, scale_factor);
+                                    (
+                                        physical_rect.origin.x.round(),
+                                        physical_rect.origin.y.round(),
+                                        physical_rect.size.width.round(),
+                                        physical_rect.size.height.round(),
+                                    )
+                                };
+                                let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
+                                rect.contains(instance.last_mouse_pos)
+                            }).unwrap_or(false);
+
+                            if !is_inside_overlay {
+                                let mut active = instance.active_select.take().unwrap();
+                                instance.active_pane_id = active.previous_active_pane_id;
+                                if active.allow_multiple {
+                                    active.prompt.submit();
+                                } else {
+                                    active.prompt.select(active.initial_selected_options.clone());
+                                    active.prompt.submit();
+                                }
+                                if let Some(overlay) = instance.panes.get_mut("__lotus_select_overlay") {
+                                    overlay.pending_visible = false;
+                                    overlay.is_dirty = true;
+                                    let physical_size = instance.window.inner_size();
+                                    instance.recalculate_layout(physical_size, scale_factor);
+                                    instance.window.request_redraw();
+                                }
+                                if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
+                                    "event": "select-element-close",
+                                    "window_id": uuid,
+                                })) {
+                                    if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                                        let _ = proxy.send_event(EngineCommand::IpcMessage(uuid.clone(), msg));
+                                    }
+                                }
+                            }
+                        }
 
                         if instance.is_mouse_down {
                             if let Some(pane_id) = &instance.last_mouse_down_pane_id {
@@ -4218,7 +5187,7 @@ impl App {
             let _ = event_loop.run_app(&mut lotus_app);
             
             info!("Rust: Event loop stopped naturally.");
-            std::process::exit(0);
+            fast_exit(0);
         });
 
         // 3. Wait for proxy to be ready
@@ -4576,11 +5545,20 @@ impl App {
         let port = port_rx.recv_timeout(std::time::Duration::from_millis(1000)).unwrap_or(0);
 
         thread::spawn(move || {
+            let mode = {
+                #[cfg(target_os = "linux")]
+                { detect_linux_theme_robust() }
+                #[cfg(not(target_os = "linux"))]
+                { dark_light::detect() }
+            };
+            let theme_str = match mode { dark_light::Mode::Dark => "dark", _ => "light" };
+
             let mut ready_msg = Vec::new();
             if rmp_serde::encode::write(&mut ready_msg, &serde_json::json!({
                 "event": "app-ready", 
                 "ipc_port": port, 
-                "ipc_token": ready_token
+                "ipc_token": ready_token,
+                "system_theme": theme_str
             })).is_ok() {
                 let mut wrapped = Vec::with_capacity(ready_msg.len() + 1);
                 wrapped.push(MSG_TYPE_DATA);
@@ -4613,6 +5591,25 @@ impl App {
     pub fn quit(&self) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::Quit);
+        }
+    }
+
+    #[napi]
+    pub fn exit(&self, code: Option<i32>) {
+        fast_exit(code.unwrap_or(0));
+    }
+
+    #[napi]
+    pub fn get_system_theme(&self) -> String {
+        let mode = {
+            #[cfg(target_os = "linux")]
+            { detect_linux_theme_robust() }
+            #[cfg(not(target_os = "linux"))]
+            { dark_light::detect() }
+        };
+        match mode {
+            dark_light::Mode::Dark => "dark".to_string(),
+            _ => "light".to_string(),
         }
     }
 }
