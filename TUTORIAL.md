@@ -348,6 +348,7 @@ You can split a single window into multiple independent web views (`Pane`s) that
 const { ServoWindow, LayoutBuilder, ipcMain, app } = require('@lotus-gui/core');
 const path = require('path');
 
+app.initVfs(); // Always call before warmup() so --encrypt production builds unlock the VFS
 app.warmup();
 
 // Define how your panes dock inside the window (order matters)

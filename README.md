@@ -53,7 +53,7 @@ For a full walkthrough, follow [**TUTORIAL.md: Building Your First Lotus App**](
 ## What's New in v0.4.0
 
 * **Multi-Pane OpenGL Compositor:** Split a single window into multiple docked or floating web views (`Pane`s) on one shared OpenGL surface using `LayoutBuilder` (`Left`, `Right`, `Top`, `Bottom`, `Fill`, `Absolute`). Hiding or showing a docked pane automatically reflows the rest of the layout in Rust on the next frame.
-* **Servo v0.7.0 Submodule:** Tracks upstream Servo v0.7.0 in-tree with a minimal 5-line patch ([`servo-compositor.patch`](./packages/lotus-core/servo-compositor.patch)) that passes a `target_fbo` parameter to `OffscreenRenderingContext` so multiple panes can blit into a single window's framebuffer.
+* **Servo v0.7.0 Submodule:** Tracks upstream Servo v0.7.0 in-tree with a minimal 5-changed-line diff (33-line patch file: [`servo-compositor.patch`](./packages/lotus-core/servo-compositor.patch)) that passes a `target_fbo` parameter to `OffscreenRenderingContext` so multiple panes can blit into a single window's framebuffer.
 * **Native `<select>` Overlays:** HTML `<select>` dropdowns render in a pre-warmed, high-z-index overlay pane above split panes so they never clip. Supports single-select, multi-select, `<optgroup>`, and runtime theming (`'auto'`, `'dark'`, `'light'`, or custom CSS/tokens).
 * **Injected Overlay Scrollbars:** Auto-fading, GPU-positioned (`translate3d`) overlay scrollbars that expand on hover while staying decoupled from frameless window resize borders.
 * **Encrypted VFS (`--encrypt`):** Package your `ui/` directory into an AEAD-encrypted (AES-256-GCM) virtual file system with native key sharding across ELF/PE binary sections and a 128MB byte-limited LRU cache.
@@ -69,25 +69,16 @@ For a full walkthrough, follow [**TUTORIAL.md: Building Your First Lotus App**](
 
 ## Architecture & Performance
 
-* **Startup & Memory Footprint:**
-  * Cold start from process launch to `ready-to-show` (first painted frame) measures **~350 to 400ms on Linux** (release build, x86_64, timed with `--profile` from Node start to first frame callback). Windows is slower on first launch while compiling ANGLE shaders.
-  * All windows in a process share a single Servo constellation and rendering thread. Opening an additional window adds **~80MB RSS** (measured via `/proc/<pid>/status` `VmRSS` delta when spawning a secondary `ServoWindow` in `test_app`).
-* **Hybrid Mode (`lotus-resource://`):**
-  * Serves local `ui/` files directly from disk (or memory VFS) through a custom Rust protocol handler, avoiding a local HTTP file server or open static asset port.
-  * Enforces directory jailing at the protocol layer so `../../` traversal outside your configured `root` directory is rejected.
-* **IPC Throughput & Latency (`window.lotus` ↔ `ipcMain`):**
-  * Uses a local `tokio` + `axum` WebSocket bridge with binary **MsgPack** (`msgpackr`) serialization, adaptive batching (up to 800 messages or 1MB per tick), and 128KB chunked streaming for multi-megabyte transfers.
-  * Supports both Promise-based request/reply (`await window.lotus.invoke()` ↔ `ipcMain.handle()`) and fire-and-forget messaging (`window.lotus.send()` ↔ `ipcMain.on()` / `win.sendToRenderer()`).
+Cold start from process launch to `ready-to-show` (first painted frame) measures **~350 to 400ms on Linux** (release build, x86_64, timed with `--profile` from Node start to first frame callback). Windows is slower on first launch while compiling ANGLE shaders. Because all windows in a process share a single Servo constellation and rendering thread, opening an additional window adds **~80MB RSS** (measured via `/proc/<pid>/status` `VmRSS` delta when spawning a secondary `ServoWindow` in `test_app`).
 
-![IPC Benchmark](ipc-bench-linux.png)
-*Measured in [`packages/lotus-core/ipc-benchmark`](./packages/lotus-core/ipc-benchmark) (`npm run benchmark`, release build on Linux x86_64): 100,000 pipelined 1KB string round-trips (~18,000 messages/sec total across both directions) completed in 11,085.5ms: **9,021 round-trips/s** (17.62 MiB/s) at **0.111ms** amortized per-round-trip time.*
+In **Hybrid Mode (`lotus-resource://`)**, Lotus serves local `ui/` files directly from disk (or the in-memory Encrypted VFS) through a custom Rust protocol handler, avoiding a local HTTP file server or open static asset port. Directory jailing is enforced at the protocol layer so `../../` traversal outside your configured `root` directory is rejected.
 
-* **Transparency, Frameless Chrome & Resize Borders:**
-  * Built on `winit` 0.30 and `window-vibrancy` 0.5. By clearing the OpenGL surface to `0x00000000` and waiting for `ready-to-show` before calling `win.show()`, windows never flash a white rectangle during startup.
-  * Set `frameless: true` and mark any header with `-webkit-app-region: drag` (or `data-lotus-drag="true"`) to let the OS window manager handle dragging natively.
-  * Frameless windows automatically get **DPI-scaled 6px resize borders** around their perimeter in Rust with native directional resize cursors.
-* **Window State Persistence:**
-  * Pass a static `id` to `new ServoWindow({ id: 'main' })` and Lotus automatically saves and restores window coordinates, dimensions, and maximized state in `~/.config/<app-name>/window-state.json`.
+For **IPC (`window.lotus` ↔ `ipcMain`)**, a local `tokio` + `axum` WebSocket bridge uses binary **MsgPack** (`msgpackr`) serialization, adaptive batching (up to 800 messages or 1MB per tick), and 128KB chunked streaming for multi-megabyte transfers. It supports both Promise-based request/reply (`await window.lotus.invoke()` ↔ `ipcMain.handle()`) and fire-and-forget messaging (`window.lotus.send()` ↔ `ipcMain.on()` / `win.sendToRenderer()`).
+
+![IPC Benchmark](https://raw.githubusercontent.com/1Jamie/project-lotus/main/ipc-bench-linux.png)
+*Throughput benchmark in [`packages/lotus-core/ipc-benchmark`](./packages/lotus-core/ipc-benchmark) (`npm run benchmark`, release build on Linux x86_64): 100,000 pipelined 1KB string round-trips (~18,000 messages/sec total across both directions) completed in 11,085.5ms: **9,021 round-trips/s** (17.62 MiB/s) at **0.111ms** amortized pipelined time per round-trip. Note: this screenshot measures batched/pipelined throughput; single-in-flight sequential latency (accessible via the "Latency" tab in `npm run benchmark`) is higher as each hop waits for a full WebSocket + event-loop wakeup.*
+
+Window rendering is built on `winit` 0.30 and `window-vibrancy` 0.5. By clearing the OpenGL surface to `0x00000000` and waiting for `ready-to-show` before calling `win.show()`, windows never flash a white rectangle during startup. Setting `frameless: true` removes OS chrome and attaches **DPI-scaled 6px resize borders** around the window perimeter in Rust with native directional resize cursors, while any HTML header marked with `-webkit-app-region: drag` (or `data-lotus-drag="true"`) lets the OS window manager handle dragging natively. Passing a static `id` to `new ServoWindow({ id: 'main' })` automatically saves and restores window coordinates, dimensions, and maximized state in `~/.config/<app-name>/window-state.json`.
 
 ---
 
@@ -96,7 +87,7 @@ For a full walkthrough, follow [**TUTORIAL.md: Building Your First Lotus App**](
 Because Lotus runs your Node.js code directly on the host OS without a browser sandbox, the localhost WebSocket bridge (`127.0.0.1:<ephemeral-port>`) enforces several layers of access control in Rust (`handle_ws_upgrade` in [`src/lib.rs`](./packages/lotus-core/src/lib.rs)):
 
 1. **Per-Session Ephemeral UUID Token (Primary Defense):** On startup, Rust generates a random UUID v4 token in memory. Any local process or WebSocket upgrade request on `127.0.0.1` that does not provide the exact session token is rejected with `401 Unauthorized`.
-2. **Origin-Scoped Token Injection:** The `UserScript` that populates `window.lotus.token` and `window.lotus.port` is gated on `window.location` in the renderer: it only initializes credentials when the page protocol is `lotus-resource:` or the hostname is `localhost` / `127.0.0.1`. If a window or pane loads or navigates to an external URL (e.g., `https://example.com`), `window.lotus.token` and `window.lotus.port` remain `null` and never enter that page's JS context.
+2. **Origin-Scoped Token Injection:** The `UserScript` that populates `window.lotus.token` and `window.lotus.port` is gated on `window.location` in the renderer: it only initializes credentials when the page protocol is `lotus-resource:` or the hostname is `localhost` / `127.0.0.1` (on any port, so local dev servers like Vite or Next.js work out of the box; this also means any page a pane loads from `http://localhost:<port>` receives IPC access). If a window or pane loads or navigates to a non-local URL (e.g., `https://example.com`), `window.lotus.token` and `window.lotus.port` remain `null` and IPC methods are unavailable on that page.
 3. **`Host` and `Origin` Header Validation:** The WebSocket upgrade handler validates that the `Host` header is `127.0.0.1` or `localhost` (blocking DNS-rebinding requests from external domains pointed at `127.0.0.1`). It also checks the `Origin` header, allowing only `http://127.0.0.1`, `http://localhost`, or `Origin: null` (which Servo sends for `lotus-resource://` custom-protocol pages). Because browser contexts like sandboxed iframes or `data:` URLs also send `Origin: null`, the `Origin` check is strictly secondary; the random session token and origin-gated script injection do the actual work.
 
 ---
@@ -332,7 +323,7 @@ PRs, bug reports, and ideas are welcome. Please keep the `winit` 0.30 and `gluti
 
 ## Pieces of the Puzzle
 
-* **[Servo](https://servo.org/) ([GitHub](https://github.com/servo/servo)):** The memory-safe, parallel browser engine written in Rust. Tracked directly at upstream v0.7.0 as a git submodule (not a custom fork), with a single 5-line diff ([`servo-compositor.patch`](./packages/lotus-core/servo-compositor.patch)) exposing the target FBO ID for multi-pane blitting.
+* **[Servo](https://servo.org/) ([GitHub](https://github.com/servo/servo)):** The memory-safe, parallel browser engine written in Rust. Tracked directly at upstream v0.7.0 as a git submodule (not a custom fork), with 5 changed lines (33-line diff in [`servo-compositor.patch`](./packages/lotus-core/servo-compositor.patch)) exposing the target FBO ID for multi-pane blitting.
 * **[Node.js](https://nodejs.org/) ([GitHub](https://github.com/nodejs/node)):** The JavaScript runtime that drives your application logic and OS integration.
 * **[Winit](https://winit.rs/) ([GitHub](https://github.com/rust-windowing/winit)):** Cross-platform window creation, input handling, and event loop management in Rust.
 * **[window-vibrancy](https://github.com/tauri-apps/window-vibrancy):** Native OS window transparency and vibrancy effects.
@@ -342,7 +333,7 @@ PRs, bug reports, and ideas are welcome. Please keep the `winit` 0.30 and `gluti
 
 ## P.S. Why Lotus Exists
 
-This spot used to brag that the entire framework was ~1,800 lines of code. Well... I added a full multi-pane OpenGL compositor, native `<select>` overlays, GPU scrollbars, and an encrypted VFS, so the line count climbed a bit to **~7,500 lines of code** (`~5,700` lines of Rust and `~1,700` lines of JS). It's still pretty tiny for a desktop runtime, and it massively opened up what you can actually build with it.
+This spot used to brag that the entire framework was ~1,800 lines of code. Well... I added a full multi-pane OpenGL compositor, native `<select>` overlays, GPU scrollbars, and an encrypted VFS, so the line count climbed a bit to **roughly 7,500 lines of code** (`~5,700` lines of Rust and `~1,800` lines of JS). It's still pretty tiny for a desktop runtime, and it massively opened up what you can actually build with it.
 
 I didn't try to build an operating system inside your operating system; I just gave Node.js a window and cut the fat until there was nothing left but speed.
 

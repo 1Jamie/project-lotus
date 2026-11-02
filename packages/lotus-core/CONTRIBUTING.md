@@ -51,7 +51,7 @@ npm run benchmark
 
 ## Patching the Servo Submodule
 
-Lotus tracks upstream Servo v0.7.0 directly in `packages/lotus-core/servo` (not a custom fork). Before building, Lotus applies a minimal 5-line diff (`servo-compositor.patch`) to `components/shared/paint/rendering_context.rs` that passes a `target_fbo` ID into `OffscreenRenderingContext`'s blit callback so multiple panes can composite onto a single window surface.
+Lotus tracks upstream Servo v0.7.0 directly in `packages/lotus-core/servo` (not a custom fork). Before building, Lotus applies a minimal patch with 5 changed lines (33-line diff in `servo-compositor.patch`) to `components/shared/paint/rendering_context.rs` that passes a `target_fbo` ID into `OffscreenRenderingContext`'s blit callback so multiple panes can composite onto a single window surface.
 
 * The patch is applied automatically before `npm run build` via `scripts/apply-patches.js`.
 * You can also apply it manually at any time with:

@@ -25,6 +25,7 @@
   "files": [
     "README.md",
     "lotus.js",
+    "lotus.d.ts",
     "index.js",
     "index.d.ts",
     "package.json",

@@ -4,9 +4,9 @@ The runtime engine for Lotus desktop applications.
 
 `@lotus-gui/core` embeds the **Servo** rendering engine, native OS window management (`winit` + OpenGL/ANGLE), and a binary-packed WebSocket IPC bridge into Node.js as a native addon. Node.js runs your application logic and OS integrations directly, while Servo renders your HTML, CSS, and browser JavaScript.
 
-* [**Step-by-Step Tutorial (Building Your First Lotus App)**](../../TUTORIAL.md)
-* [**What's New in v0.4.0 & Architecture Overview**](../../README.md#whats-new-in-v040)
-* [**`@lotus-gui/dev` CLI & Packager Docs**](../lotus-dev/README.md)
+* [**Step-by-Step Tutorial (Building Your First Lotus App)**](https://github.com/1Jamie/project-lotus/blob/main/TUTORIAL.md)
+* [**What's New in v0.4.0 & Architecture Overview**](https://github.com/1Jamie/project-lotus/blob/main/README.md#whats-new-in-v040)
+* [**`@lotus-gui/dev` CLI & Packager Docs**](https://github.com/1Jamie/project-lotus/blob/main/packages/lotus-dev/README.md)
 
 ---
 
@@ -16,7 +16,7 @@ The runtime engine for Lotus desktop applications.
 npm install @lotus-gui/core
 ```
 
-Pre-built native `.node` binaries are included for **Linux (`x86_64`)** and **Windows (`x64`)**. See the [root README platform notes](../../README.md#linux-runtime-notes) for details on Linux `GLIBC_TUNABLES` handling and Windows ANGLE setup.
+Pre-built native `.node` binaries are included for **Linux (`x86_64`)** and **Windows (`x64`)**. See the [root README platform notes](https://github.com/1Jamie/project-lotus/blob/main/README.md#linux-runtime-notes) for details on Linux `GLIBC_TUNABLES` handling and Windows ANGLE setup.
 
 ---
 
@@ -83,6 +83,8 @@ const win = new ServoWindow(options);
 // Or pass a URL string directly:
 // const win = new ServoWindow('https://servo.org');
 ```
+
+> **Note on Remote URLs & IPC:** For security, the `window.lotus` IPC credentials (`token` and `port`) are only populated on `lotus-resource://` pages and `localhost` / `127.0.0.1` origins. When a window or pane loads an external remote URL (such as `https://servo.org`), `window.lotus.token` and `window.lotus.port` are `null` and IPC methods are disabled on that page.
 
 #### Constructor Options (`WindowOptions`)
 
@@ -224,7 +226,7 @@ When you call `pane.setVisible(false)` or `pane.toggleVisible()` on a docked pan
 
 ### 4. `ipcMain` & `window.lotus`: IPC Reference
 
-Lotus pairs a local WebSocket server (`tokio` + `axum`, authenticated via per-session UUID tokens and header checks; see [IPC Security Model](../../README.md#ipc-security-model)) with **MsgPack** binary serialization, adaptive batching (up to 800 messages or 1MB per burst), and 128KB chunked streaming for large transfers.
+Lotus pairs a local WebSocket server (`tokio` + `axum`, authenticated via per-session UUID tokens and header checks; see [IPC Security Model](https://github.com/1Jamie/project-lotus/blob/main/README.md#ipc-security-model)) with **MsgPack** binary serialization, adaptive batching (up to 800 messages or 1MB per burst), and 128KB chunked streaming for large transfers.
 
 #### IPC Patterns
 
@@ -299,13 +301,13 @@ win.on('select-menu', (event) => {
 
 When packaging with `npx lotus build --encrypt` (via `@lotus-gui/dev`), your `ui/` directory is packed into an **AES-256-GCM (AEAD)** encrypted binary blob injected into the executable, while the 32-byte master key is sharded across Rust constants and native ELF/PE sections.
 
-Call `app.initVfs()` before `app.warmup()` in your `main.js`. At runtime, Rust reconstructs the key in native memory and serves decrypted assets through a **128MB byte-limited LRU cache**, so the decryption key never touches the Node.js V8 heap or disk. See [A Note on Encrypted VFS & Security](../../README.md#a-note-on-encrypted-vfs--security) for details on threat models.
+Call `app.initVfs()` before `app.warmup()` in your `main.js`. At runtime, Rust reconstructs the key in native memory and serves decrypted assets through a **128MB byte-limited LRU cache**, so the decryption key never touches the Node.js V8 heap or disk. See [A Note on Encrypted VFS & Security](https://github.com/1Jamie/project-lotus/blob/main/README.md#a-note-on-encrypted-vfs--security) for details on threat models.
 
 ---
 
 ## Building From Source
 
-For contributor build instructions and Linux/Windows system prerequisites, see [Building the Engine from Source in the root README](../../README.md#building-the-engine-from-source-for-contributors) and [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+For contributor build instructions and Linux/Windows system prerequisites, see [Building the Engine from Source in the root README](https://github.com/1Jamie/project-lotus/blob/main/README.md#building-the-engine-from-source-for-contributors) and [`CONTRIBUTING.md`](https://github.com/1Jamie/project-lotus/blob/main/packages/lotus-core/CONTRIBUTING.md).
 
 ## Package Structure
 

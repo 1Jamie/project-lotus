@@ -4,8 +4,8 @@ The CLI toolkit for scaffolding, live-reloading, and packaging Lotus desktop app
 
 `@lotus-gui/dev` provides the `lotus` command-line tool. It handles creating new projects with `lotus init`, running a debounced hot-reload loop during development with `lotus dev`, and compiling your application into a standalone Node.js Single Executable Application (SEA) wrapped in native OS installers (`deb`, `rpm`, `appimage`, `pacman`, `flatpak`, `msi`, `exe`) with `lotus build`.
 
-* [**Step-by-Step Tutorial (Building Your First Lotus App)**](../../TUTORIAL.md)
-* [**`@lotus-gui/core` Runtime API Reference**](../lotus-core/README.md)
+* [**Step-by-Step Tutorial (Building Your First Lotus App)**](https://github.com/1Jamie/project-lotus/blob/main/TUTORIAL.md)
+* [**`@lotus-gui/core` Runtime API Reference**](https://github.com/1Jamie/project-lotus/blob/main/packages/lotus-core/README.md)
 
 ---
 
