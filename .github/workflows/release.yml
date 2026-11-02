@@ -30,16 +30,17 @@ jobs:
               npm run build --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc && npm run extract-angle --workspace=@lotus-gui/core
             target: x86_64-pc-windows-msvc
             build_id: x86_64-pc-windows-msvc
-          - host: ubuntu-latest
+          - host: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             build_id: x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             setup: |
               sudo apt-get update
-              sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev dpkg-dev fakeroot rpm pkg-config libdbus-1-dev clang libclang-dev lld cmake libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-good1.0-dev libgstreamer-plugins-bad1.0-dev
+              sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev dpkg-dev fakeroot rpm pkg-config libdbus-1-dev clang libclang-dev lld cmake libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
+              sudo apt-get install -y libgstreamer-plugins-good1.0-dev || sudo apt-get install -y libgstreamer-plugins-extra1.0-dev || true
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
-          - host: ubuntu-latest
+          - host: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             build_id: x86_64-unknown-linux-suse
             setup: |
@@ -190,7 +191,7 @@ jobs:
 
   publish:
     name: Publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
