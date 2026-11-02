@@ -124,16 +124,20 @@ export interface ResizePayload {
   height: number;
   logicalWidth: number;
   logicalHeight: number;
+  maximized?: boolean;
 }
 
 export declare class Pane extends EventEmitter {
   id: string;
   window: ServoWindow;
+  visible: boolean;
   
   loadUrl(url: string): void;
   executeScript(script: string): void;
   setRect(x: number, y: number, width: number, height: number): void;
   setVisible(visible: boolean): void;
+  isVisible(): boolean;
+  toggleVisible(): boolean;
   focus(): void;
   updateDragRegions(rects: any[]): void;
   remove(): void;
@@ -150,6 +154,7 @@ export declare class Pane extends EventEmitter {
 
 export declare class ServoWindow extends EventEmitter {
   id: string;
+  maximized: boolean;
   panes: Map<string, Pane>;
   
   constructor(options?: string | WindowOptions);
@@ -157,10 +162,11 @@ export declare class ServoWindow extends EventEmitter {
   loadUrl(url: string): void;
   executeScript(script: string): void;
   createPane(id: string, options?: Partial<PaneOptions>): Pane;
+  addPane(id: string, options?: Partial<PaneOptions>): Pane;
   getPane(id: string): Pane | undefined;
   removePane(id: string): void;
 
-  setSelectMenuTheme(theme: 'light' | 'dark' | SelectMenuTheme): void;
+  setSelectMenuTheme(theme: 'auto' | 'light' | 'dark' | SelectMenuTheme): void;
   setSelectMenuCss(css: string): void;
 
   show(): void;
@@ -173,6 +179,8 @@ export declare class ServoWindow extends EventEmitter {
   setPosition(x: number, y: number): void;
   maximize(): void;
   unmaximize(): void;
+  isMaximized(): boolean;
+  toggleMaximize(): boolean;
   minimize(): void;
   unminimize(): void;
   focus(): void;
@@ -207,7 +215,7 @@ export declare class ServoWindow extends EventEmitter {
 
 export interface IpcMain extends EventEmitter {
   send(channel: string, data: any): void;
-  sendTo(windowId: string, channel: string, data: any): void;
+  sendTo(clientId: string, channel: string, data: any): void;
   handle(channel: string, handler: (data: any) => any | Promise<any>): void;
 }
 
@@ -217,5 +225,6 @@ export const app: {
   quit(): void;
   exit(code?: number): void;
   warmup(): void;
+  getSystemTheme(): 'light' | 'dark';
   initVfs(): void;
 };

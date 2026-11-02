@@ -3095,7 +3095,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     let p_ucm = Rc::new(UserContentManager::new(&servo));
                     p_ucm.add_script(Rc::new(UserScript::from(msgpackr_source.as_str())));
                     p_ucm.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP_BASE)));
-                    let p_port_script = format!("window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = '{}';", port, token, window_id, pane_opt.id);
+                    let p_port_script = format!(
+                        r#"if (window.location.protocol === 'lotus-resource:' || window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') {{ window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = '{}'; }}"#,
+                        port, token, window_id, pane_opt.id
+                    );
                     p_ucm.add_script(Rc::new(UserScript::from(p_port_script.as_str())));
                     
                     let theme_str = match mode { dark_light::Mode::Dark => "dark", _ => "light" };
@@ -3259,7 +3262,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     "height": actual_size.height,
                     "scale_factor": actual_scale,
                     "logicalWidth": actual_size.width as f32 / actual_scale,
-                    "logicalHeight": actual_size.height as f32 / actual_scale
+                    "logicalHeight": actual_size.height as f32 / actual_scale,
+                    "maximized": window.is_maximized()
                 })) {
                     let mut wrapped = Vec::with_capacity(msg.len() + 1);
                     wrapped.push(MSG_TYPE_DATA);
@@ -3562,7 +3566,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     user_content_manager.add_script(Rc::new(UserScript::from(msgpackr_source.as_str())));
                     user_content_manager.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP_BASE)));
 
-                    let port_script = format!("window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = '{}';", port, token, window_id, pane_id);
+                    let port_script = format!(
+                        r#"if (window.location.protocol === 'lotus-resource:' || window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') {{ window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = '{}'; }}"#,
+                        port, token, window_id, pane_id
+                    );
                     user_content_manager.add_script(Rc::new(UserScript::from(port_script.as_str())));
                     user_content_manager.add_script(Rc::new(UserScript::from(DRAG_REGION_SCRIPT)));
 
@@ -4442,7 +4449,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     "height": size.height,
                     "scale_factor": scale_factor,
                     "logicalWidth": logical_w,
-                    "logicalHeight": logical_h
+                    "logicalHeight": logical_h,
+                    "maximized": instance.window.is_maximized()
                 })).is_ok() {
                         let mut wrapped = Vec::with_capacity(msg.len() + 1);
                         wrapped.push(MSG_TYPE_DATA);
@@ -5410,14 +5418,25 @@ impl App {
                         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
                     }
 
-                    // Validate that the request originates from localhost.
-                    // Servo sends lotus-resource:// pages with Origin: null; plain http pages
-                    // from 127.0.0.1 send Origin: http://127.0.0.1:<port>.
-                    // Anything else (third-party site navigated inside the webview) is rejected.
+                    // Validate the Host header to prevent DNS rebinding attacks against 127.0.0.1.
+                    let host_ok = headers.get("host")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|h| h == "127.0.0.1" || h.starts_with("127.0.0.1:") || h == "localhost" || h.starts_with("localhost:"))
+                        .unwrap_or(false);
+
+                    if !host_ok {
+                        warn!("Rust: Rejected WebSocket upgrade with invalid Host header");
+                        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+                    }
+
+                    // Secondary check: validate the Origin header when present.
+                    // Note: Servo sends Origin: null for lotus-resource:// pages (as do sandboxed
+                    // iframes or data: URLs), so the random per-session token and origin-gated
+                    // script injection are the primary defenses.
                     let origin_ok = headers.get("origin")
                         .and_then(|v| v.to_str().ok())
                         .map(|o| o == "null" || o.starts_with("http://127.0.0.1") || o.starts_with("http://localhost"))
-                        .unwrap_or(true); // absent Origin (same-origin non-browser fetch) is fine
+                        .unwrap_or(true);
 
                     if !origin_ok {
                         warn!("Rust: Rejected WebSocket upgrade from untrusted origin");

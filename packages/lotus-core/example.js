@@ -1,25 +1,32 @@
-const { ServoWindow, app } = require('./lotus.js');
+const { ServoWindow, ipcMain, app } = require('./lotus.js');
+const path = require('path');
 
-console.log("Initializing Lotus Runtime...");
+console.log('[Lotus] Initializing runtime...');
 
-// Initialize Backend
+// 1. Initialize encrypted VFS if built with --encrypt, then pre-warm Servo
+app.initVfs();
 app.warmup();
 
+// 2. Create a frameless, transparent window pointing at the test_app UI
 const win = new ServoWindow({
-    width: 800,
-    height: 600,
-    title: "Lotus Example"
+    id: 'example-window',
+    root: path.join(__dirname, 'test_app', 'ui'),
+    index: 'index.html',
+    width: 1024,
+    height: 768,
+    title: 'Lotus Example',
+    frameless: true,
+    transparent: true,
+    visible: false
 });
 
-win.on('ready', () => {
-    console.log("Window is ready!");
-
-    // Demo: Load URL after 1 second
-    setTimeout(() => {
-        console.log("Navigating to Google...");
-        win.loadUrl("https://google.com");
-    }, 1000);
+// 3. Reveal the window only once the first frame has painted (zero white flash)
+win.once('ready-to-show', () => {
+    console.log('[Lotus] First frame ready — showing window.');
+    win.show();
 });
 
-// Keep Node alive
-setInterval(() => { }, 1000);
+// 4. Handle promise-based IPC calls from the renderer (`await window.lotus.invoke('ping', ...)`)
+ipcMain.handle('ping', async ({ msg }) => {
+    return { pong: true, echo: msg, timestamp: Date.now(), pid: process.pid };
+});

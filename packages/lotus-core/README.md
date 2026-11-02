@@ -1,27 +1,12 @@
 # @lotus-gui/core
 
-**The high-performance, low-latency runtime engine at the heart of the Lotus ecosystem.**
+The runtime engine for Lotus desktop applications.
 
-`@lotus-gui/core` provides the Servo rendering engine, window management, and IPC system as a Node.js native addon. It is designed to be the "steering wheel" for your application, allowing Node.js to own the OS logic while Servo paints the pixels.
+`@lotus-gui/core` embeds the **Servo** rendering engine, native OS window management (`winit` + OpenGL/ANGLE), and a binary-packed WebSocket IPC bridge into Node.js as a native addon. Node.js runs your application logic and OS integrations directly, while Servo renders your HTML, CSS, and browser JavaScript.
 
----
-
-> ### ⚠️ IMPORTANT
->
-> **NEW SUPPORT FOR ENCRYPTED APPS with AEAD-ENCRYPTED (AES-256-GCM) VFS**
-> The latest version adds support for packaging your app in a VFS with a natively derived key. This allows developers to ship closed-source applications while still leveraging web-based frontends. The decryption key is sharded across the native binary and never touches the V8 heap or the Node.js environment.
->
-> **Disclaimer about Encryption and Closed-Source Software**: Lotus supports encryption to protect your intellectual property. However, the encryption layer relies on secrets injected during the build process. Anyone with access to the decrypted application in memory (e.g., using debugging tools like WinDbg, Frida, or manual memory inspection) may eventually extract these secrets. Users should be aware that client-side encryption is primarily a deterrent against casual reverse engineering and unauthorized distribution, not a guarantee of absolute security against determined adversaries. As always, security in distributed binaries is a game of making extraction difficult enough that most people won't bother. It is fundamentally impossible to keep assets perfectly secure in the presence of a dedicated reverse engineer.
-
-## 🚀 What’s New in v0.3.2 (Encrypted VFS & Stability)
-
-This release brings support for strictly closed-source applications and significant stability improvements to the Lotus runtime.
-
-*   **🔒 Asset Protection (Encrypted VFS):** Want to ship a closed-source app? Lotus uses an AEAD-encrypted (AES-256-GCM) Virtual File System where the decryption key **never touches JavaScript or the V8 heap**. 
-*   **⚡ Native Key Sharding:** The CLI shards the master key across compiled Rust constants and native binary sections (ELF/PE). The Rust core autonomously derives the key in protected memory.
-*   **🧊 Byte-Limited LRU Cache:** We mitigate decryption overhead with a strict 128MB byte-limited LRU cache. Once an asset is loaded, it's served from memory at blistering speeds without risking an Out-Of-Memory (OOM) panic on heavy media files.
-*   **🎨 Ghost-Mode Transparency:** True OS-level transparency with zero white-flash on startup. If your CSS is transparent, your window is transparent.
-*   **⚡ Fast IPC:** The WebSocket bridge ensures the UI thread remains responsive even under heavy loads with MsgPack batching and opportunistic flushing.
+* [**Step-by-Step Tutorial (Building Your First Lotus App)**](../../TUTORIAL.md)
+* [**What's New in v0.4.0 & Architecture Overview**](../../README.md#whats-new-in-v040)
+* [**`@lotus-gui/dev` CLI & Packager Docs**](../lotus-dev/README.md)
 
 ---
 
@@ -31,351 +16,312 @@ This release brings support for strictly closed-source applications and signific
 npm install @lotus-gui/core
 ```
 
-> **Note:** Pre-built binaries are available for **Linux (x86_64)** and **Windows (x64)**. Manual compilation is typically not required.
+Pre-built native `.node` binaries are included for **Linux (`x86_64`)** and **Windows (`x64`)**. See the [root README platform notes](../../README.md#linux-runtime-notes) for details on Linux `GLIBC_TUNABLES` handling and Windows ANGLE setup.
+
+---
+
+## 30-Second Quick Start
+
+```javascript
+const { ServoWindow, ipcMain, app } = require('@lotus-gui/core');
+const path = require('path');
+
+// 1. Unlock encrypted VFS (safe no-op if not built with --encrypt) and pre-warm Servo
+app.initVfs();
+app.warmup();
+
+// 2. Open a transparent, frameless window serving local UI files
+const win = new ServoWindow({
+    id: 'main-window',                // Automatically saves & restores window position/size
+    root: path.join(__dirname, 'ui'), // Serves files via lotus-resource://localhost/
+    index: 'index.html',
+    width: 1024,
+    height: 768,
+    title: 'My Lotus App',
+    frameless: true,
+    transparent: true,
+    visible: false                    // Wait until the first frame is painted before showing
+});
+
+// 3. Reveal the window with zero white-flash
+win.once('ready-to-show', () => win.show());
+
+// 4. Respond to `await window.lotus.invoke('ping', { msg: 'hello' })` from the webpage
+ipcMain.handle('ping', async ({ msg }) => {
+    return { reply: `Pong: ${msg}`, pid: process.pid };
+});
+```
 
 ---
 
 ## API Reference
 
-### Exports
-
 ```javascript
-const { ServoWindow, ipcMain, app } = require('@lotus-gui/core');
+const { ServoWindow, LayoutBuilder, Anchor, ipcMain, app } = require('@lotus-gui/core');
 ```
 
-### `app`
+### 1. `app`: Application Lifecycle
 
-The application lifecycle controller.
+`app` controls global engine initialization, VFS mounting, and shutdown.
 
-| Method | Description |
-|--------|-------------|
-| `app.initVfs()` | Initialize the Encrypted VFS natively. Must be called before `warmup()`. If the app wasn't built with `--encrypt`, this safely skips itself. |
-| `app.warmup()` | Pre-initialize the Servo engine. Call before creating windows for faster startup. |
-| `app.quit()` | Shut down the application and close all windows. |
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `app.initVfs()` | `void` | Initializes the native Encrypted VFS. **Must be called before `app.warmup()`.** If your app was not packaged with `--encrypt`, this safely skips itself. |
+| `app.warmup()` | `void` | Pre-initializes the Servo rendering thread and IPC server before you create your first window. |
+| `app.getSystemTheme()` | `'light' \| 'dark'` | Returns the current OS color scheme preference. |
+| `app.quit()` | `void` | Requests a graceful shutdown, closing open windows before exiting (with a 1s fallback exit timer). |
+| `app.exit(code = 0)` | `void` | Immediately terminates the application process with the given exit code. |
 
-```javascript
-app.initVfs(); // Initialize secure VFS (if present)
-app.warmup();  // Pre-warm the engine
-```
+---
 
-### `ServoWindow`
+### 2. `ServoWindow`: Window Management
 
-Creates and manages a native window powered by the Servo rendering engine. Extends `EventEmitter`.
-
-#### Constructor Options
+Creates and manages a native OS window backed by Servo. Extends Node's `EventEmitter`.
 
 ```javascript
 const win = new ServoWindow(options);
+// Or pass a URL string directly:
+// const win = new ServoWindow('https://servo.org');
 ```
+
+#### Constructor Options (`WindowOptions`)
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `id` | `string` | Random UUID | Unique identifier for the window. **Required for state persistence.** |
-| `root` | `string` | `undefined` | Absolute path to the UI directory. Enables Hybrid Mode (`lotus-resource://`). If using an encrypted build, this path will map to the VFS internally. |
+| `id` | `string` | Random UUID | Unique identifier for the window. **Pass a static ID (e.g. `'main'`) to enable automatic window position & size persistence.** |
+| `root` | `string` | `undefined` | Absolute path to your local UI directory (e.g. `path.join(__dirname, 'ui')`). Enables Hybrid Mode (`lotus-resource://localhost/`) and maps automatically to the Encrypted VFS in `--encrypt` builds. |
 | `index` | `string` | `'index.html'` | Entry HTML file relative to `root`. |
-| `initialUrl` | `string` | -- | URL to load (alternative to `root` + `index`). |
-| `width` | `number` | `1024` | Initial window width in pixels. |
-| `height` | `number` | `768` | Initial window height in pixels. |
-| `title` | `string` | `'Lotus'` | Window title. |
-| `transparent` | `boolean` | `false` | Enable OS-level window transparency. |
-| `visible` | `boolean` | `true` | Show window immediately. Set to `false` and show after `ready-to-show` to avoid a white flash during loading. |
-| `frameless` | `boolean` | `false` | Remove the native window frame to enable custom title bars and drag regions. |
-| `resizable` | `boolean` | `true` | Allow the user to resize the window. |
-| `maximized` | `boolean` | `false` | Start the window in a maximized state. |
+| `initialUrl` | `string` | `'about:blank'` | Direct URL to load (used when `root` is not set). |
+| `width` | `number` | `1024` | Initial window width in logical pixels. |
+| `height` | `number` | `768` | Initial window height in logical pixels. |
+| `title` | `string` | `'Lotus'` | Native window title. |
+| `frameless` | `boolean` | `false` | Removes the native OS title bar and window frame so you can build custom chrome (`frame: false` is also supported as an alias). |
+| `transparent` | `boolean` | `false` | Enables OS-level window transparency (`0x00000000` clear color). |
+| `cornerRadius` | `number` | `undefined` | Corner radius hint for rounded transparent windows. |
+| `visible` | `boolean` | `true` | Whether to show the window immediately. Set to `false` and call `win.show()` inside `win.once('ready-to-show', ...)` for zero white-flash. |
+| `resizable` | `boolean` | `true` | Whether the user can resize the window. |
+| `maximized` | `boolean` | `false` | Start the window maximized. |
 | `fullscreen` | `boolean` | `false` | Start the window in fullscreen mode. |
-| `alwaysOnTop` | `boolean` | `false` | Keep the window above all other windows. |
-| `restoreState` | `boolean` | `true` | Automatically restore previous position and size (requires `id`). |
+| `alwaysOnTop` | `boolean` | `false` | Keep the window floating above other OS windows. |
+| `restoreState` | `boolean` | `true` | Restore previous position, size, and maximized state when `id` is provided. |
+| `wmClass` | `string` | `undefined` | Linux Window Manager class for taskbar grouping. |
+| `autoResizeMain` | `boolean` | `true` | Automatically anchor the default `'main'` pane to `Anchor.Fill` when using a single-pane window. Set to `false` when passing custom `panes`. |
+| `panes` | `PaneOptions[]` | `[]` | Array of panes to initialize atomically with the window (typically generated via `layout.config().panes`). |
+| `selectMenu` | `SelectMenuOptions` | `{ enabled: true, theme: 'auto' }` | Customize or disable the native `<select>` dropdown overlay pane. |
+| `scrollbars` | `boolean \| ScrollbarOptions` | `true` | Configure or disable injected overlay scrollbars (`{ enabled, theme: 'auto' \| 'light' \| 'dark', autoHide: true, width: 8 }`). |
 
-#### Methods
+#### Window Methods
 
 | Method | Description |
-|--------|-----------|
-| `win.loadUrl(url)` | Navigate the window to a new URL. |
-| `win.executeScript(js)` | Execute arbitrary JavaScript in the renderer context. |
-| `win.sendToRenderer(channel, data)` | Send a message to the renderer on a named channel. |
-| `win.setTitle(title)` | Update the window title. |
-| `win.setDecorations(bool)` | Toggle native window decorations at runtime. |
+|--------|-------------|
+| `win.show()` / `win.hide()` | Show or hide the window. |
+| `win.focus()` | Bring the window to the front and focus input. |
+| `win.minimize()` / `win.unminimize()` | Minimize or restore the window. |
+| `win.maximize()` / `win.unmaximize()` | Maximize or unmaximize the window. |
+| `win.isMaximized()` | Returns `true` if the window is currently maximized (updated automatically on OS/window resize events). |
+| `win.toggleMaximize()` | Maximizes or unmaximizes the window based on `win.isMaximized()` and returns the new boolean state. |
+| `win.close()` | Close and destroy the window. When the last open window closes, Lotus quits automatically. |
+| `win.setTitle(title)` | Change the window title at runtime. |
 | `win.setSize(width, height)` | Resize the window programmatically. |
-| `win.setMinSize(width, height)` | Set a minimum window size. Pass `0, 0` to remove constraints. |
-| `win.setMaxSize(width, height)` | Set a maximum window size. Pass `0, 0` to remove constraints. |
+| `win.setMinSize(width, height)` | Enforce minimum window dimensions (pass `0, 0` to clear). |
+| `win.setMaxSize(width, height)` | Enforce maximum window dimensions (pass `0, 0` to clear). |
 | `win.setPosition(x, y)` | Move the window to specific screen coordinates. |
-| `win.minimize()` | Minimize the window. |
-| `win.unminimize()` | Restore the window from a minimized state. |
-| `win.maximize()` | Maximize the window. |
-| `win.unmaximize()` | Restore the window from a maximized state. |
-| `win.focus()` | Bring the window to the front and request input focus. |
-| `win.show()` | Make the window visible. |
-| `win.hide()` | Hide the window. |
-| `win.close()` | Close and destroy the window instance. |
+| `win.loadUrl(url)` | Navigate the window's `'main'` pane to a new URL. |
+| `win.executeScript(js)` | Execute arbitrary JavaScript inside the `'main'` pane's DOM context. |
+| `win.sendToRenderer(channel, data, immediate?)` | Send an IPC message to the `'main'` pane (`window.lotus.on(channel, ...)`). |
+| `win.sendToPaneRenderer(paneId, channel, data, immediate?)` | Send an IPC message to a specific named pane inside this window. |
+| `win.createPane(id, options?)` | Create and attach a new `Pane` web view (`win.addPane` is an alias). Returns the `Pane` instance. |
+| `win.getPane(id)` | Retrieve a `Pane` instance by its ID (or via the `win.panes` Map). |
+| `win.removePane(id)` | Destroy a custom pane and free its Servo web view resources (note: `'main'` cannot be removed). |
+| `win.setSelectMenuTheme(theme)` | Change the `<select>` overlay theme at runtime (`'auto'`, `'light'`, `'dark'`, or a `SelectMenuTheme` object). |
+| `win.setSelectMenuCss(css)` | Inject custom CSS rules into the `<select>` dropdown overlay. |
 
-#### Events
+#### Window Events
 
-| Event | Callback | Description |
-|-------|----------|-------------|
-| `'ready'` | `()` | The renderer (webpage) has finished loading and is ready for IPC. (Alias for `dom-ready`) |
-| `'ready-to-show'` | `()` | The first frame has been rendered. Recommended time to call `show()`. (Alias for `frame-ready`) |
-| `'load-status'` | `(status: string)` | Page load status changed (`'loading'`, `'complete'`). |
-| `'moved'` | `({ x: number, y: number })` | Window position has changed. |
-| `'resize'` | `({ width: number, height: number })` | Window size has changed. |
-| `'focus'` | `()` | Window gained focus. |
-| `'blur'` | `()` | Window lost focus. |
-| `'closed'` | `()` | Window was closed and destroyed. |
-| `'file-hover'` | `({ path: string })` | A file is being dragged over the window. Fires once per file. |
-| `'file-hover-cancelled'` | `()` | A drag operation left the window without dropping. |
-| `'file-drop'` | `({ path: string })` | A file was dropped onto the window. Fires once per file -- accumulate multiple events if you need multi-file support. |
+| Event | Callback Signature | When It Fires |
+|-------|--------------------|---------------|
+| `'ready-to-show'` | `()` | **First frame painted.** Best moment to call `win.show()` when starting with `visible: false`. (Alias: `'frame-ready'`) |
+| `'ready'` | `(data)` | The webpage DOM and IPC bridge have initialized. (Alias: `'dom-ready'`) |
+| `'load-status'` | `(status: 'started' \| 'head-parsed' \| 'complete', paneId: string)` | Navigation lifecycle updates for any pane in the window. |
+| `'title-changed'` | `(title: string, paneId: string)` | `<title>` changed in one of the window's panes. |
+| `'resize'` | `({ width, height, logicalWidth, logicalHeight, maximized })` | Window resized or maximized state changed. Includes physical (`width`/`height`) and DPI-scaled logical (`logicalWidth`/`logicalHeight`) dimensions. Throttled to 25ms. (Alias: `'resized'`) |
+| `'moved'` | `({ x, y })` | Window moved on screen. |
+| `'focus'` / `'blur'` | `()` | Window gained or lost input focus. |
+| `'close'` / `'closed'` | `()` | Window was closed. |
+| `'select-menu'` | `(event: SelectMenuEvent)` | A `<select>` element was clicked. Call `event.preventDefault()` if you want to render your own custom dropdown UI. |
+| `'file-hover'` | `({ path: string })` | An OS file is being dragged over the window (fires once per file). |
+| `'file-hover-cancelled'` | `()` | A file drag left the window without dropping. |
+| `'file-drop'` | `({ path: string })` | A file was dropped onto the window from the OS file manager. |
+
+---
+
+### 3. `LayoutBuilder`, `Pane` & `Anchor`: Multi-Pane Compositor
+
+Lotus lets you run multiple independent web views (`Pane`s) inside a single OS window on a single shared OpenGL context. Every pane has its own DOM, URL, and `window.lotus` IPC bridge, without OS child-window positioning lag.
+
+#### Declarative Layouts with `LayoutBuilder`
+
+`LayoutBuilder` computes dock order automatically. Docked panes claim space from the edges inward in the order you declare them, and `.fill()` takes the remaining center rectangle:
 
 ```javascript
+const { ServoWindow, LayoutBuilder } = require('@lotus-gui/core');
+const path = require('path');
+
+const layout = new LayoutBuilder()
+    .top('controls', 40, { url: 'lotus-resource://localhost/controls.html' })
+    .left('sidebar', 260, { url: 'lotus-resource://localhost/sidebar.html' })
+    .bottom('terminal', 220, { url: 'lotus-resource://localhost/terminal.html', visible: false })
+    .fill('content', { url: 'lotus-resource://localhost/content.html' })
+    .absolute('palette', 300, 150, 600, 400, {
+        url: 'lotus-resource://localhost/palette.html',
+        zIndex: 100,
+        visible: false
+    });
+
 const win = new ServoWindow({
-    id: 'main',
+    id: 'workspace',
     root: path.join(__dirname, 'ui'),
+    width: 1200,
+    height: 800,
+    frameless: true,
     transparent: true,
-    visible: false // Don't show until ready
+    visible: false,
+    autoResizeMain: false,
+    ...layout.config() // Passes `{ panes: [...] }`
 });
-
-// Show only after first frame (prevents white flash)
-win.once('ready-to-show', () => win.show());
 ```
+
+| `LayoutBuilder` Method | Description |
+|------------------------|-------------|
+| `.left(id, width, options?)` | Dock a pane to the left edge with a fixed width (`Anchor.Left`). |
+| `.right(id, width, options?)` | Dock a pane to the right edge with a fixed width (`Anchor.Right`). |
+| `.top(id, height, options?)` | Dock a pane to the top edge with a fixed height (`Anchor.Top`). |
+| `.bottom(id, height, options?)` | Dock a pane to the bottom edge with a fixed height (`Anchor.Bottom`). |
+| `.fill(id, options?)` | Fill all remaining space after docked panes are placed (`Anchor.Fill`). |
+| `.absolute(id, x, y, width, height, options?)` | Position a floating/overlay pane at explicit logical coordinates (`Anchor.None`). Use `zIndex` in `options` to layer above docked panes. |
+| `.config()` | Returns `{ panes: PaneOptions[] }` ready to spread into `new ServoWindow({ ... })`. |
+
+#### Managing Individual `Pane` Instances
+
+Every pane created via `LayoutBuilder` or `win.createPane(id, options)` is stored in `win.panes` and accessible via `win.getPane(id)`.
+
+When you call `pane.setVisible(false)` or `pane.toggleVisible()` on a docked pane (such as a collapsible sidebar or bottom terminal), the Rust compositor automatically recalculates the remaining space and expands or shrinks your `Fill` pane on the next frame.
+
+| `Pane` Method / Event | Description |
+|-----------------------|-------------|
+| `pane.setVisible(bool)` | Show or hide the pane. Triggers an automatic native layout reflow for docked panes. |
+| `pane.isVisible()` | Returns `true` if the pane is currently visible, `false` otherwise (also accessible via `pane.visible`). |
+| `pane.toggleVisible()` | Flips the pane's visibility state (`!pane.isVisible()`) and returns the new boolean state. |
+| `pane.setRect(x, y, width, height)` | Reposition and resize an `Anchor.None` (floating/absolute) pane in logical pixels. |
+| `pane.focus()` | Direct keyboard input focus to this pane. |
+| `pane.loadUrl(url)` | Navigate this specific pane to a new URL. |
+| `pane.executeScript(js)` | Run JavaScript inside this pane's DOM context. |
+| `pane.remove()` | Destroy this pane and remove it from the window (`win.removePane(pane.id)`). |
+| `pane.on('load-status', (status) => ...)` | Listen for `'started'`, `'head-parsed'`, or `'complete'` on this pane. |
+| `pane.on('title-changed', (title) => ...)` | Listen for document title changes on this pane. |
 
 ---
 
-### `ipcMain`
+### 4. `ipcMain` & `window.lotus`: IPC Reference
 
-Handles communication between the Node.js main process and the Servo renderer.
+Lotus pairs a local WebSocket server (`tokio` + `axum`, authenticated via per-session UUID tokens and header checks; see [IPC Security Model](../../README.md#ipc-security-model)) with **MsgPack** binary serialization, adaptive batching (up to 800 messages or 1MB per burst), and 128KB chunked streaming for large transfers.
 
-#### Main Process
+#### IPC Patterns
+
+| Pattern | Renderer (`window.lotus`) | Main Process (`ipcMain` / `win`) | Best Used For |
+|---------|---------------------------|----------------------------------|---------------|
+| **Request / Reply** | `const res = await window.lotus.invoke(ch, data)` | `ipcMain.handle(ch, async (data) => ...)` | Queries, reading files, OS calls, or any async operation that returns a value or throws an error. |
+| **Renderer → Node** | `window.lotus.send(ch, data)` | `ipcMain.on(ch, (data, clientId) => ...)` | Fire-and-forget UI events, button clicks, window control commands, binary `Blob` uploads. |
+| **Node → Window/Pane** | `window.lotus.on(ch, (data) => ...)` | `win.sendToRenderer(ch, data)` or `win.sendToPaneRenderer(paneId, ch, data)` | Pushing live updates to a specific window or pane. |
+| **Node → Broadcast** | `window.lotus.on(ch, (data) => ...)` | `ipcMain.send(ch, data)` | Broadcasting a global state update to every open window. |
+| **Node → Client ID** | `window.lotus.on(ch, (data) => ...)` | `ipcMain.sendTo(clientId, ch, data)` | Replying directly to whichever `windowId` or `windowId:paneId` sent an `ipcMain.on` message. |
+
+#### Multi-Pane & Multi-Window IPC Routing
+
+When a pane sends a message via `window.lotus.send('my-event', payload)`, `ipcMain.on` passes the sender's `clientId` (`"windowId"` or `"windowId:paneId"`) as the second argument:
 
 ```javascript
-const { ipcMain } = require('@lotus-gui/core');
-
-// Listen for messages from the renderer (fire-and-forget)
-ipcMain.on('my-channel', (data) => {
-    console.log('Received:', data);
-});
-
-// Push data to all open windows
-ipcMain.send('status-update', { online: true });
-
-// Handle requests from the renderer (request/reply)
-ipcMain.handle('get-data', async ({ id }) => {
-    return await database.fetch(id); 
+ipcMain.on('my-event', (data, clientId) => {
+    console.log(`Message from ${clientId}:`, data);
+    // Reply only to the exact window/pane that sent the message:
+    ipcMain.sendTo(clientId, 'my-ack', { received: true });
 });
 ```
 
-#### Renderer (Webpage)
-
-The `window.lotus` bridge is automatically available in every page.
-
-```javascript
-// Send a message to the main process
-window.lotus.send('my-channel', { message: 'Hello!' });
-
-// Send binary data
-window.lotus.send('upload', new Blob(['data']));
-
-// Listen for messages from the main process
-window.lotus.on('status-update', (data) => {
-    console.log('Server status:', data.online);
-});
-
-// Invoke a remote method and await the result
-const user = await window.lotus.invoke('get-user', { id: 42 });
-console.log(user.name);
-```
-
-#### IPC Pattern Reference
-
-| Pattern | Renderer | Node.js | Use when |
-|---------|----------|---------|----------|
-| Fire-and-forget | `lotus.send(ch, data)` | `ipcMain.on(ch, fn)` | Notifications, events |
-| Push from Node | `lotus.on(ch, fn)` | `ipcMain.send(ch, data)` | Server-initiated updates |
-| **Request/reply** | `await lotus.invoke(ch, data)` | `ipcMain.handle(ch, async fn)` | **Queries, CRUD, any async call** |
-
-> **Note:** `handle` and `on` can coexist on the same channel. `handle` only fires when the message includes a `_replyId` (i.e., sent via `invoke`). Plain `send` calls still reach `on` listeners.
+When using `ipcMain.handle(channel, async (data) => ...)`, Lotus automatically routes the resolved value (or thrown error) back to the exact originating window and pane.
 
 ---
 
-## Core Concepts
+## Core Concepts & UI Customization
 
 ### Hybrid Mode (`lotus-resource://`)
 
-Lotus serves your UI files directly from disk via a custom protocol, eliminating the need for a local web server.
+When you pass `root: path.join(__dirname, 'ui')` to `ServoWindow`, Lotus serves your frontend assets directly through a custom `lotus-resource://localhost/` protocol handler in Rust:
+* **No local HTTP server:** Avoids port binding and firewall prompts.
+* **Directory jailing:** Path traversal (`../../`) outside `root` is blocked at the Rust protocol layer.
+* **VFS integration:** Switching between unencrypted dev mode and `--encrypt` production builds requires no changes to your asset URLs.
 
-*   **Performance:** Zero network overhead for local file serving.
-*   **Security:** Enforces strict directory jailing; files outside the specified `root` cannot be accessed.
-*   **Reliability:** Avoids port collisions and local firewall issues.
+### Frameless Windows, Drag Regions & Resize Borders
 
-```javascript
-const win = new ServoWindow({
-    root: path.join(__dirname, 'ui'),  // Files served from here
-    index: 'index.html'               // Entry point
-});
-// Internally loads: lotus-resource://localhost/index.html
-```
+When `frameless: true` is enabled:
+1. **Drag Regions:** Mark any titlebar or header element with `-webkit-app-region: drag` in CSS or `data-lotus-drag="true"` in HTML. Add `-webkit-app-region: no-drag` (or `data-lotus-drag="false"`) to buttons inside that region so they remain clickable.
+2. **DPI-Scaled Resize Borders:** Lotus creates a 6px (DPI-scaled, 4px minimum) hit zone around all edges and corners of the window in Rust. Hovering the perimeter displays native OS directional resize cursors and click-dragging resizes the window, even when an overlay scrollbar or header sits flush against the edge.
 
-### 🔒 The Encrypted VFS
+### Customizing Native `<select>` Dropdowns
 
-If you are building proprietary software and don't want users simply unzipping your binary to steal your assets, use the `--encrypt` flag during build (see `@lotus-gui/dev`).
-
-When encrypted, Lotus packs your `ui/` folder into a high-entropy binary blob injected directly into the executable. Decryption happens entirely in native memory, ensuring your code is never exposed to the JavaScript environment or the OS filesystem.
-
-**Implementation:**
-```javascript
-const { ServoWindow, app } = require('@lotus-gui/core');
-const path = require('path');
-
-// 1. Initialize the Encrypted VFS natively (Must happen before warmup)
-app.initVfs(); 
-
-// 2. Wake up the engine
-app.warmup(); 
-
-const win = new ServoWindow({
-    id: 'secure-window',
-    root: path.join(__dirname, 'ui'), // Maps to the encrypted VFS!
-    index: 'index.html',
-    width: 1024,
-    height: 768
-});
-```
-
-### Transparency & "White Flash" Elimination
-
-By default, the window remains transparent until the content finishes loading and tells the engine to show the window.
+Because Servo does not open OS-native popup menus for `<select>` tags on its own, Lotus creates a high-z-index overlay pane (`__lotus_select_overlay`) that pops up at the screen coordinates of any clicked `<select>` element and flips upward automatically if the dropdown is near the bottom of the window.
 
 ```javascript
 const win = new ServoWindow({
-    transparent: true,
-    visible: false
+    selectMenu: {
+        theme: {
+            base: 'dark',           // 'light', 'dark', or 'auto'
+            bg: '#0f172a',
+            border: '#334155',
+            text: '#f8fafc',
+            hover: '#1e293b',
+            active: '#38bdf8',
+            activeText: '#0f172a',
+            borderRadius: 8,
+            maxHeight: 300
+        }
+    }
 });
-win.once('ready-to-show', () => win.show());
-```
 
-The window background is fully transparent until your CSS paints it. Combined with `visible: false`, this entirely eliminates the white flash that often plagues web-based GUI apps.
-
-```css
-body { background: transparent; }
-.app { background: rgba(0, 0, 0, 0.9); }
-```
-
-### Frameless Windows & Drag Regions
-
-Implement your own design language by removing OS decorations. Lotus automatically detects and handles drag regions defined in your CSS or HTML.
-
-```html
-<!-- Option 1: CSS property (same as macOS/Electron convention) -->
-<div style="-webkit-app-region: drag; cursor: grab; height: 36px;">
-    Drag to move window
-</div>
-
-<!-- Option 2: Data attribute -->
-<div data-lotus-drag="true" style="cursor: grab; height: 36px;">
-    Drag to move window
-</div>
-```
-
-**How it works:**
-1. Injected JS scans the DOM for matching elements using `MutationObserver` + `ResizeObserver`.
-2. Their bounding rects are sent to Rust via the IPC batch channel (`lotus:set-drag-regions`).
-3. On `MouseDown` inside a registered region, Lotus calls `drag_window()` on the OS.
-4. On `MouseDown` on the 8px resize border, Lotus calls `drag_resize_window()` on the OS.
-5. Servo handles all other mouse events and cursor changes normally.
-
-#### Resize Borders
-
-Frameless windows automatically get 8px invisible hit-zones on every edge and corner. No configuration needed. Move the mouse to any edge to see the resize cursor and click-drag to resize.
-
-#### Cursor Behavior
-
-| Zone | Who controls the cursor |
-|------|--------------------------|
-| 8px resize border | Rust (shows directional resize cursors) |
-| Drag region | Servo/CSS (`cursor: grab`, etc.) |
-| Content area | Servo/CSS (`cursor: pointer`, `cursor: text`, etc.) |
-
-CSS cursors work normally inside the window -- `cursor: grab`, `cursor: pointer`, `cursor: text`, `cursor: wait` all function exactly as expected on hover.
-
-### Window State Persistence
-
-Windows with an `id` automatically save their position, size, and maximized state to `~/.config/<app-name>/window-state.json`.
-
-*   **No ID?** A random UUID is generated for the session, and the window starts with the default or specified size.
-*   **With ID?** Previous state is checked on launch. If found, the window is restored to its last known position immediately.
-
-```javascript
-const win = new ServoWindow({
-    id: 'main-window',    // Required for state saving
-    restoreState: true     // Default
+// Or intercept the event to render your own custom UI:
+win.on('select-menu', (event) => {
+    // event.preventDefault();
+    // event.submit([selectedIndex]);
 });
 ```
 
-### Multi-Window
+### Protecting Assets with the Encrypted VFS
 
-Each window costs ~80MB (shared renderer). No new browser instances. We don't spawn a whole new universe (or download more RAM) just for a popup.
+When packaging with `npx lotus build --encrypt` (via `@lotus-gui/dev`), your `ui/` directory is packed into an **AES-256-GCM (AEAD)** encrypted binary blob injected into the executable, while the 32-byte master key is sharded across Rust constants and native ELF/PE sections.
 
-```javascript
-const win1 = new ServoWindow({ id: 'editor', title: 'Editor' });
-const win2 = new ServoWindow({ id: 'preview', title: 'Preview' });
-```
-
-## Architecture
-
-| Component | Responsibility |
-|-----------|----------------|
-| **Rust Layer** | Servo engine management, native window creation (`winit`/`glutin`), IPC server (`tokio`+`axum`), protocol handling, and binary event dispatch via MsgPack. |
-| **JS Layer** | High-level API (`ServoWindow`, `ipcMain`, `app`), binding management, auto-fixing Linux TLS allocation issues, and profiling support. |
+Call `app.initVfs()` before `app.warmup()` in your `main.js`. At runtime, Rust reconstructs the key in native memory and serves decrypted assets through a **128MB byte-limited LRU cache**, so the decryption key never touches the Node.js V8 heap or disk. See [A Note on Encrypted VFS & Security](../../README.md#a-note-on-encrypted-vfs--security) for details on threat models.
 
 ---
 
-## Building from Source
+## Building From Source
 
-### Prerequisites
-- **Rust** stable toolchain.
-- **Node.js** v22+.
-- System libraries: OpenGL, OpenSSL, fontconfig, dbus-1, and pkg-config.
-
-### Build Commands
-```bash
-# From the monorepo root
-cd packages/lotus-core
-
-# Debug build
-npm run build:debug
-
-# Release build (optimized)
-npm run build
-```
-
-> **Note:** The first build compiles the entire Servo rendering engine and may take a significant amount of time. Subsequent builds are incremental and much faster.
-
----
-
-## Runtime Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `msgpackr` | MsgPack serialization for high-performance IPC. |
-
-These are installed automatically when you `npm install @lotus-gui/core`.
+For contributor build instructions and Linux/Windows system prerequisites, see [Building the Engine from Source in the root README](../../README.md#building-the-engine-from-source-for-contributors) and [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ## Package Structure
 
-```
+```text
 @lotus-gui/core
-├── src/lib.rs           # Rust N-API bindings, Servo event loop, IPC
-├── src/window_state.rs  # Window position/size persistence
-├── src/platform.rs      # OS-specific integrations (themes, cursors)
-├── lotus.js             # High-level JS API (ServoWindow, IpcMain, App)
-├── index.js             # Native .node binary loader
-└── resources/           # IPC bridge injection scripts
+├── src/lib.rs               # Rust N-API bindings, Servo compositor, winit loop & Axum IPC
+├── src/window_state.rs      # Automatic window position/size persistence
+├── src/platform.rs          # OS-specific theme & cursor integrations
+├── lotus.js                 # High-level JS API (ServoWindow, LayoutBuilder, Pane, IpcMain, app)
+├── lotus.d.ts               # TypeScript definitions
+├── index.js                 # Native .node binary loader
+├── resources/               # Injected IPC bridge, scrollbar, and <select> overlay UI
+├── test_app/                # Single-window showcase app
+└── multi_pane_test_app/     # Multi-pane workspace & command palette showcase
 ```
-
----
 
 ## License
 
 MIT
-
-
-**AI DISCLAIMER**
-
-I have used ai in the project for templating, troubleshooting, diving through source code to find the reference i needed to read and learn how worked, and documentation originally while i was rapidly itteratting and have since rewrote the documentation myself now the api is more stable. I have tried my best and spent countless hours and days to ensure that the code is correct and that the documentation is accurate, its not a huge code base so i have touched and worked with every line of code in this repo. I will tell you that this is not some BS "vibe coded" system or project. I have worked in IT, Programming and Engineering for going on 11 years. I spent the last 7 years as a Linux enterprise dev/ Linux systems engineer. I have spent a lot of time designing, testing working and griding my hard hours on this project and ensuring this is not some garbage that a unexpirenced person whipped together without actually knowing and understand the way computers work and how to practice proper programing hygene, testing and safe software lifecyle practices. I know what is where, why what works what way, i decided how each and every piece works, written a large amount of it, i have tested different setups and dependancies like the ipc system. I spent a lot of time researching takio, readind the docs figuring out exactly how to use it with my use case and axum so i can web socket the world of my ipc. I dumped so many hours into learning winit 0.30 (which btw, it is a pain to use by its features and layout are amazing, i do recomend the time to learn the new conventions of 0.30), i have poured over so much of the servo repo trying to get the best pieces integrated as nicely as possible and spent so much time fighting with the windows rendering pipeline. i do understand that there is a lot of worries around it and people vibe coding stuff but this is not "vibe coded", this is hundreads of my hours, nights and nights of deep coffee pots and genuine passion for this project. It was involved in this project but it is not running, planning, testing, integrating, designing or any of that, it was just a tool used to speed up piece here and there. There are way too many moving parts here and i have spent way too much time on this to have it reduced down to that.

@@ -21,7 +21,7 @@ const program = new Command();
 program
     .name('lotus')
     .description('Lotus Project CLI')
-    .version('0.1.0');
+    .version('0.4.0');
 
 program
     .command('dev [entry]')
@@ -143,7 +143,7 @@ program
     .command('build')
     .description('Build the application for production')
     .option('--platform <platform>', 'Target platform (linux, win32)', process.platform)
-    .option('--target <target>', 'Target format (deb, appimage, msi, nsis)', 'deb')
+    .option('--target <target>', 'Target format (deb, rpm, appimage, pacman, flatpak, msi, exe)', 'deb')
     .option('--encrypt', 'Enable application encryption and VFS')
     .action(async (cmdOptions) => {
         const platform = cmdOptions.platform;
@@ -1000,82 +1000,85 @@ program
 
         // main.js
         const mainJs = `const { ServoWindow, app, ipcMain } = require('@lotus-gui/core');
-                            const path = require('path');
+const path = require('path');
 
-                            app.warmup();
+app.initVfs();
+app.warmup();
 
-                            const win = new ServoWindow({
-                                id: 'main-window',
-                                root: path.join(__dirname, 'ui'),
-                                index: 'index.html',
-                                width: 1024,
-                                height: 768,
-                                title: "${metadata.name}",
-                                transparent: true,
-                                visible: false
-                            });
+const win = new ServoWindow({
+    id: 'main-window',
+    root: path.join(__dirname, 'ui'),
+    index: 'index.html',
+    width: 1024,
+    height: 768,
+    title: "${metadata.name}",
+    transparent: true,
+    visible: false
+});
 
-                            win.once('frame-ready', () => win.show());
+win.once('ready-to-show', () => win.show());
 
-                            ipcMain.on('hello', (data) => {
-                                console.log('Received from renderer:', data);
-                                ipcMain.send('reply', { message: 'Hello from Node.js!' });
-                            });
-                            `;
+ipcMain.on('hello', (data) => {
+    console.log('Received from renderer:', data);
+    win.sendToRenderer('reply', { message: 'Hello from Node.js!' });
+});
+`;
         fs.writeFileSync(path.join(projectPath, 'main.js'), mainJs);
 
         // UI Directory
         const uiDir = path.join(projectPath, 'ui');
-        fs.mkdirSync(uiDir);
+        fs.mkdirSync(uiDir, { recursive: true });
 
         // ui/index.html
-        const indexHtml = `< !DOCTYPE html >
-                                <html>
-                                    <head>
-                                        <title>${metadata.name}</title>
-                                        <style>
-                                            body {margin: 0; padding: 0; background: transparent; font-family: sans-serif; }
-                                            .app {
-                                                background: rgba(30, 30, 30, 0.95);
-                                            color: white;
-                                            height: 100vh;
-                                            display: flex;
-                                            flex-direction: column;
-                                            align-items: center;
-                                            justify-content: center;
-                                            border-radius: 8px; /* Optional rounded corners for the view */
+        const indexHtml = `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>${metadata.name}</title>
+    <style>
+        body { margin: 0; padding: 0; background: transparent; font-family: system-ui, sans-serif; }
+        .app {
+            background: rgba(30, 30, 30, 0.95);
+            color: white;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            border-radius: 8px;
         }
-                                            button {
-                                                padding: 10px 20px;
-                                            font-size: 16px;
-                                            cursor: pointer;
-                                            background: #646cff;
-                                            color: white;
-                                            border: none;
-                                            border-radius: 4px;
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background: #646cff;
+            color: white;
+            border: none;
+            border-radius: 4px;
         }
-                                            button:hover {background: #535bf2; }
-                                        </style>
-                                    </head>
-                                    <body>
-                                        <div class="app">
-                                            <h1>Welcome to ${metadata.name} 🪷</h1>
-                                            <p>Powered by Lotus (Servo + Node.js)</p>
-                                            <button onclick="sendMessage()">Ping Node.js</button>
-                                            <p id="response"></p>
-                                        </div>
+        button:hover { background: #535bf2; }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <h1>Welcome to ${metadata.name} 🪷</h1>
+        <p>Powered by Lotus (Servo + Node.js)</p>
+        <button onclick="sendMessage()">Ping Node.js</button>
+        <p id="response"></p>
+    </div>
 
-                                        <script>
-                                            function sendMessage() {
-                                                window.lotus.send('hello', { timestamp: Date.now() });
+    <script>
+        function sendMessage() {
+            window.lotus.send('hello', { timestamp: Date.now() });
         }
 
         window.lotus.on('reply', (data) => {
-                                                document.getElementById('response').innerText = data.message;
+            document.getElementById('response').innerText = data.message;
         });
-                                        </script>
-                                    </body>
-                                </html>`;
+    </script>
+</body>
+</html>
+`;
         fs.writeFileSync(path.join(uiDir, 'index.html'), indexHtml);
 
         console.log(`\n✅ Project initialized in ${projectPath} `);

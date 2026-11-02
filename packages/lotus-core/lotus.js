@@ -446,6 +446,9 @@ function processEvent(win, msg) {
             console.log(`[PROFILE] Window ${windowId} NATIVE CREATED event received by JS after ${time}ms`);
         }
         if (win) {
+            if (typeof msg.maximized === 'boolean') {
+                win.maximized = msg.maximized;
+            }
             // Emit a synthetic resize with the ACTUAL window dimensions immediately after
             // the window handle is created. This corrects stale pane rects when restoreState
             // restores the window to a different size than the hardcoded initial values.
@@ -456,7 +459,8 @@ function processEvent(win, msg) {
                     width: msg.width,
                     height: msg.height,
                     logicalWidth: msg.logicalWidth,
-                    logicalHeight: msg.logicalHeight
+                    logicalHeight: msg.logicalHeight,
+                    maximized: win.maximized
                 };
                 win.emit('resize', resizePayload);
                 win.emit('resized', resizePayload);
@@ -551,11 +555,20 @@ function processEvent(win, msg) {
 
     if (msg.event === 'resized') {
         if (win) {
+            if (typeof msg.maximized === 'boolean') {
+                win.maximized = msg.maximized;
+            }
             if (msg.logicalWidth && msg.logicalHeight) {
                 win._logicalWidth = msg.logicalWidth;
                 win._logicalHeight = msg.logicalHeight;
             }
-            const payload = { width: msg.width, height: msg.height, logicalWidth: msg.logicalWidth, logicalHeight: msg.logicalHeight };
+            const payload = {
+                width: msg.width,
+                height: msg.height,
+                logicalWidth: msg.logicalWidth,
+                logicalHeight: msg.logicalHeight,
+                maximized: win.maximized
+            };
             
             // Resize throttle: emit immediately (leading edge), then at most once
             // per THROTTLE_MS during active resizing, plus a final flush when resizing stops.
@@ -699,10 +712,11 @@ class LayoutBuilder {
 }
 
 class Pane extends EventEmitter {
-    constructor(window, id) {
+    constructor(window, id, visible = true) {
         super();
         this.window = window;
         this.id = id;
+        this.visible = Boolean(visible);
     }
 
     loadUrl(url) {
@@ -722,7 +736,17 @@ class Pane extends EventEmitter {
     }
 
     setVisible(visible) {
-        this.window.handle.setPaneVisible(this.id, visible);
+        this.visible = Boolean(visible);
+        this.window.handle.setPaneVisible(this.id, this.visible);
+    }
+
+    isVisible() {
+        return this.visible;
+    }
+
+    toggleVisible() {
+        this.setVisible(!this.visible);
+        return this.visible;
     }
 
     focus() {
@@ -858,12 +882,13 @@ class ServoWindow extends EventEmitter {
         // Register all panes created atomically with the window
         if (finalOptions.panes) {
             finalOptions.panes.forEach(p => {
-                this.panes.set(p.id, new Pane(this, p.id));
+                this.panes.set(p.id, new Pane(this, p.id, p.visible !== false));
             });
         }
 
         this._logicalWidth = finalOptions.width;
         this._logicalHeight = finalOptions.height;
+        this.maximized = Boolean(finalOptions.maximized);
         this._selectOverlayReady = false;
         this._pendingSelectPayload = null;
 
@@ -924,7 +949,7 @@ class ServoWindow extends EventEmitter {
         }
         const { url = 'about:blank', x = 0, y = 0, width = 0, height = 0, zIndex = 0, anchor = 0, dockOrder = 0, visible = true } = options;
         this.handle.createPane(id, url, x, y, width, height, zIndex, anchor, dockOrder, visible);
-        const pane = new Pane(this, id);
+        const pane = new Pane(this, id, visible);
         this.panes.set(id, pane);
         return pane;
     }
@@ -1356,15 +1381,30 @@ class ServoWindow extends EventEmitter {
     }
 
     maximize() {
+        this.maximized = true;
         if (this.handle && this.handle.maximize) {
             this.handle.maximize();
         }
     }
 
     unmaximize() {
+        this.maximized = false;
         if (this.handle && this.handle.unmaximize) {
             this.handle.unmaximize();
         }
+    }
+
+    isMaximized() {
+        return Boolean(this.maximized);
+    }
+
+    toggleMaximize() {
+        if (this.isMaximized()) {
+            this.unmaximize();
+        } else {
+            this.maximize();
+        }
+        return this.maximized;
     }
 
     focus() {

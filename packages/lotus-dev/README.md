@@ -1,143 +1,116 @@
 # @lotus-gui/dev
 
-**The CLI toolkit for building, debugging, and packaging Lotus applications.**
+The CLI toolkit for scaffolding, live-reloading, and packaging Lotus desktop applications.
 
-`@lotus-gui/dev` provides the tools necessary to initialize projects, run a development server with hot-reload, and package your application into native installers for multiple platforms.
+`@lotus-gui/dev` provides the `lotus` command-line tool. It handles creating new projects with `lotus init`, running a debounced hot-reload loop during development with `lotus dev`, and compiling your application into a standalone Node.js Single Executable Application (SEA) wrapped in native OS installers (`deb`, `rpm`, `appimage`, `pacman`, `flatpak`, `msi`, `exe`) with `lotus build`.
 
----
-
-> ### ⚠️ IMPORTANT
->
-> **NEW SUPPORT FOR ENCRYPTED APPS with AEAD-ENCRYPTED (AES-256-GCM) VFS**
-> The latest version adds support for packaging your app in a VFS with a natively derived key. This allows developers to ship closed-source applications while still leveraging web-based frontends. The decryption key is sharded across the native binary and never touches the V8 heap or the Node.js environment.
->
-> **Disclaimer about Encryption and Closed-Source Software**: Lotus supports encryption to protect your intellectual property. However, the encryption layer relies on secrets injected during the build process. Anyone with access to the decrypted application in memory (e.g., using debugging tools like WinDbg, Frida, or manual memory inspection) may eventually extract these secrets. Users should be aware that client-side encryption is primarily a deterrent against casual reverse engineering and unauthorized distribution, not a guarantee of absolute security against determined adversaries. As always, security in distributed binaries is a game of making extraction difficult enough that most people won't bother. It is fundamentally impossible to keep assets perfectly secure in the presence of a dedicated reverse engineer.
-
-## 📦 What’s New in v0.3.2 (Encrypted Packaging)
-
-The v0.3.2 release introduces support for strictly closed-source applications via native VFS encryption.
-
-*   **🔒 Closed-Source App Support:** Use the `--encrypt` flag to pack your UI files into an AEAD-encrypted (AES-256-GCM) binary blob.
-*   **🏗️ Native Key Injection:** The build pipeline automatically generates encryption shards and injects them into ELF/PE binary sections.
-*   **🏗️ One-Command Build:** Generate professional installers (DEB, RPM, MSI, NSIS) tailored for your target platform using `lotus build`.
-*   **🪟 Windows Support (MSI/EXE):** Fully integrated WiX-based MSI and NSIS-based EXE generation.
-*   **🐧 Linux Distribution:** Native support for DEB, RPM, AppImage, Pacman, and Flatpak.
+* [**Step-by-Step Tutorial (Building Your First Lotus App)**](../../TUTORIAL.md)
+* [**`@lotus-gui/core` Runtime API Reference**](../lotus-core/README.md)
 
 ---
 
 ## Installation
 
 ```bash
-npm install @lotus-gui/dev
+npm install --save-dev @lotus-gui/dev
 ```
 
-This installation provides the `lotus` CLI command.
+Once installed in your project, you can run commands via `npx lotus <command>` or inside your `package.json` scripts. You can also scaffold a brand-new project anywhere without installing first:
+
+```bash
+npx @lotus-gui/dev init my-app
+```
 
 ---
 
 ## CLI Commands
 
-### `lotus dev [entry]`
+### 1. `lotus init [projectName]`: Scaffold a New App
 
-Launch your application with hot-reloading. The CLI watches for file changes and automatically restarts the process.
-
-```bash
-lotus dev              # Uses index.js or entry in package.json
-lotus dev main.js      # Uses custom entry point
-```
-
-*   **Watch Mode:** Monitors all source files while ignoring `node_modules` and `dist`.
-*   **Clean Lifecycle:** Processes are terminated cleanly before restart to avoid resource leaks.
-
-**What it does:**
-- Starts your app with Node.js.
-- Watches all files for changes.
-- Auto-restarts on any file change.
-- Kills the previous process before starting the new one.
-
-### `lotus init [projectName]`
-
-Initialize a new Lotus project with interactive prompts for metadata.
+Creates a new Lotus project directory complete with `package.json`, `lotus.config.json`, a pre-configured `main.js` entry point, and a starter `ui/index.html`.
 
 ```bash
-lotus init my-app        # Creates 'my-app' directory
+# Interactive mode (prompts for app name, version, author, license, etc.)
+npx lotus init my-app
+
+# Non-interactive mode (pass flags directly for CI or scripts)
+npx lotus init my-app \
+  --name "My App" \
+  --app-version 1.0.0 \
+  --description "Fast desktop utility" \
+  --author "Your Name" \
+  --homepage "https://github.com/you/my-app" \
+  --license MIT
 ```
 
-**Interactive Prompts:**
-If flags are not provided, the CLI will ask for:
-- Project Name (directory)
-- Application Name
-- Version
-- Description
-- Author
-- Homepage / Repository URL
-- License
-
-**Non-Interactive Flags:**
-```bash
-lotus init my-app --name "My App" --app-version 1.0.0 --homepage "https://example.com"
-```
-
-| Flag | Description |
-|------|-------------|
-| `--name` | Application display name. |
-| `--app-version` | Application version (Semver). |
-| `--description` | Short project description. |
-| `--author` | Author name. |
-| `--homepage` | Project homepage or repository URL. |
-| `--license` | License identifier (default: `MIT`). |
-
-### `lotus build`
-
-Bundle your application using Node SEA and `@crabnebula/packager` to create native installers.
-
-```bash
-# Example Linux Targets
-lotus build --target deb
-lotus build --target appimage
-
-# Example Windows Targets (must run on Windows)
-lotus build --target msi --platform win32
-lotus build --target exe --platform win32
-
-# Build a strictly Closed-Source encrypted application
-lotus build --platform win32 --target exe --encrypt
-```
-
-| Flag | Values | Default | Description |
-|------|--------|---------|-------------|
-| `--target` | `deb`, `appimage`, `pacman`, `rpm`, `flatpak`, `msi`, `exe` | `deb` | Target installer format. |
-| `--platform` | `linux`, `win32` | Current OS | Target OS platform. |
-| `--encrypt` | (none) | `false` | Enable AEAD encryption for UI resources. |
-
-**System Requirements:**
-- `lotus.config.json` in the current directory.
-- Modern Node.js (v20+ with SEA support).
-- **Windows (`msi`/`exe`)**: WiX Toolset v3 must be installed and builds must run on a Windows host.
-
-### `lotus clean`
-
-Remove the `dist/` directory and all build artifacts.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--name <name>` | `<projectName>` | Display name of the application (`lotus.config.json` `name`). |
+| `--app-version <ver>` | `0.1.0` | Initial SemVer version string. |
+| `--description <desc>` | `"A Lotus desktop application"` | Short summary used in `package.json` and Linux/Windows installer metadata. |
+| `--author <author>` | `""` | Maintainer or publisher name. |
+| `--homepage <url>` | `""` | Project homepage or repository URL. |
+| `--license <spdx>` | `MIT` | SPDX license identifier. |
 
 ---
 
-## 🔒 Closed-Source Apps: The Encrypted VFS
+### 2. `lotus dev [entry]`: Live-Reloading Development Runner
 
-If you are building proprietary software and don't want users simply unzipping your binary to steal your assets, use the `--encrypt` flag during the build process.
+Starts your application with `LOTUS_DEV=true` and watches your project files for changes using `chokidar`.
 
-When you pass the `--encrypt` flag, Lotus completely skips copying your `ui/` folder into the application library directory. Instead, it:
-1. Generates a random 32-byte Master Key.
-2. Shards the key into three parts (one hardcoded in Rust, two injected as ELF/PE sections).
-3. Packs your `ui/` directory into an AEAD-encrypted (AES-256-GCM) VFS blob.
-4. Injects the VFS blob directly into the binary.
+```bash
+npx lotus dev            # Defaults to index.js
+npx lotus dev main.js    # Run a custom entry point
+```
 
-Because the architecture relies on native key derivation, the decryption key **never touches JavaScript or the V8 heap**, making it extremely difficult for casual reverse engineers to extract your source code.
+**How `lotus dev` works:**
+* **File Watching:** Monitors your code and `ui/` files while ignoring `node_modules/`, `dist/`, `.git/`, lockfiles, and hidden dotfiles.
+* **Debounced Restarts (200ms):** If you save multiple files at once, `lotus dev` waits 200ms so it only restarts your app once.
+* **Graceful Shutdown + Force-Kill Fallback:** Sends `SIGTERM` to your running Lotus process and waits up to 2 seconds for windows to close cleanly (saving window state) before falling back to `SIGKILL` to prevent orphaned processes.
 
 ---
 
-## `lotus.config.json`
+### 3. `lotus build`: Package Native Installers
 
-The build system as well as the runtime utilize `lotus.config.json` for application metadata.
+Bundles your JavaScript and native addons into a standalone executable and packages it into an OS installer inside `dist/installers/`.
+
+```bash
+# Linux Installer Targets
+npx lotus build --target deb        # Debian / Ubuntu (.deb) [default]
+npx lotus build --target rpm        # Fedora / RHEL / openSUSE (.rpm)
+npx lotus build --target appimage   # Portable Linux AppImage (.AppImage)
+npx lotus build --target pacman     # Arch Linux (.pkg.tar.zst)
+npx lotus build --target flatpak    # Flatpak bundle (.flatpak)
+
+# Windows Installer Targets (run on a Windows host or CI runner)
+npx lotus build --platform win32 --target msi   # WiX MSI installer (.msi)
+npx lotus build --platform win32 --target exe   # NSIS setup executable (.exe)
+
+# Closed-Source Encrypted Build (packs ui/ into an AES-256-GCM VFS inside the binary)
+npx lotus build --target deb --encrypt
+```
+
+| Flag | Supported Values | Default | Description |
+|------|------------------|---------|-------------|
+| `--target <format>` | `deb`, `rpm`, `appimage`, `pacman`, `flatpak`, `msi` (`wix`), `exe` (`nsis`) | `deb` | Target installer format to generate. |
+| `--platform <os>` | `linux`, `win32` | Current OS (`process.platform`) | Target operating system. Because Lotus bundles native `.node` binaries and patches host executables, build on the target OS (or matching CI runner). |
+| `--encrypt` | *(boolean flag)* | `false` | Encrypts your frontend UI assets into an AEAD (AES-256-GCM) Virtual File System injected directly into the binary. |
+
+---
+
+### 4. `lotus clean`: Clean Build Artifacts
+
+Removes the `dist/` staging and installer directory.
+
+```bash
+npx lotus clean
+```
+
+---
+
+## Configuring `lotus.config.json`
+
+`lotus.config.json` sits in your project root and controls how `@lotus-gui/dev` bundles and packages your application.
 
 ### Full Example
 
@@ -145,6 +118,7 @@ The build system as well as the runtime utilize `lotus.config.json` for applicat
 {
     "name": "MyApp",
     "version": "1.0.0",
+    "appId": "com.example.myapp",
     "license": "MIT",
     "description": "A desktop application built with Lotus",
     "main": "main.js",
@@ -152,13 +126,16 @@ The build system as well as the runtime utilize `lotus.config.json` for applicat
     "icon": "./assets/icon.png",
     "author": "Your Name",
     "homepage": "https://github.com/you/my-app",
-    "resources": ["./ui"],
+    "resources": ["./ui", "./assets"],
     "build": {
         "linux": {
             "wmClass": "my-app",
             "section": "utils",
             "categories": ["Utility", "Development"]
-        }
+        },
+        "windows": {},
+        "wix": {},
+        "nsis": {}
     }
 }
 ```
@@ -167,135 +144,71 @@ The build system as well as the runtime utilize `lotus.config.json` for applicat
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `name` | Yes | Application display name used as `productName` in installers. |
-| `version` | Yes | Semver version string (e.g., `"1.0.0"`). |
+| `name` | **Yes** | Display name of your application (`productName` in installers and desktop entries). |
+| `version` | **Yes** | SemVer version string (`Major.Minor.Patch`, e.g., `"1.0.0"`). |
+| `main` | No | Entry point script. Falls back to `package.json` `main`, then `index.js`. |
+| `executableName` | No | Output binary name (e.g., `my-app` → `/usr/bin/my-app` or `my-app.exe`). Defaults to lowercase hyphenated `name`. |
+| `appId` | No | Reverse-DNS identifier (e.g., `com.company.myapp`). Defaults to `com.lotus.<executableName>` (or `org.lotus.<executableName>` for Flatpak). |
+| `description` | No | Package description shown in OS package managers. |
+| `author` | No | Maintainer / Publisher name (used in Windows Registry and Linux package metadata). |
 | `license` | No | SPDX license identifier. Defaults to `"Proprietary"`. |
-| `description` | No | Short description shown in package managers. |
-| `main` | No | Entry point file. Defaults to `package.json` `main`. |
-| `executableName`| No | Binary name (e.g., `my-app`). Defaults to lowercase `name`. |
-| `icon` | No | Path to application icon (relative to project root). |
-| `author` | No | Maintainer name. Highly recommended for Windows installers. |
-| `homepage` | No | Project URL for package metadata. |
-| `appId` | No | Reverse domain identifier (e.g., `com.company.app`). |
-| `resources` | **Rec.** | Array of paths to bundle (e.g., `["./ui"]`). Required for UI files. |
-
-### OS-Specific Options
-
-#### Windows Build Options (`build.windows`, `build.wix`, `build.nsis`)
-
-| Field | Description |
-|-------|-------------|
-| `build.windows` | Configures signing: `certificateThumbprint`, `signCommand`, etc. |
-| `build.wix` | Configures MSI options: `fipsCompliant`, `languages`, `template`. |
-| `build.nsis` | Configures EXE options: `installMode`, `compression`, `languages`. |
-
-#### Linux Build Options (`build.linux`)
-
-| Field | Description |
-|-------|-------------|
-| `wmClass` | Window manager class identifier for taskbar grouping. |
-| `section` | Package section (default: `"utils"`). |
-| `categories` | Desktop entry categories (e.g., `["Utility"]`). |
-
-### Windows Packaging Requirements
-
-When building for Windows, the following rules are strictly enforced:
-1. **Version Format**: Version must be `Major.Minor.Patch`. Pre-release tags are automatically stripped for installer compatibility.
-2. **`appId` / UpgradeCode**: The `appId` determines the MSI `UpgradeCode`. Changing it in the future will prevent Windows from recognizing the update as the same application.
-3. **`author` / Publisher**: Acts as the Windows Registry Manufacturer. Defaults to `"Lotus Dev"` if omitted.
+| `homepage` | No | Project URL included in package metadata. |
+| `icon` | No | Path to your application icon (`.png`, `.jpg`, or `.ico`). On Windows, PNG/JPG icons are automatically wrapped into `.ico` containers; on Linux Flatpak/RPM builds, icons are resized to `512x512` in `/usr/share/icons/hicolor/`. |
+| `resources` | Recommended | Array of extra directories/files to copy into the packaged app (e.g. `["./ui"]`). Note: `lotus build` also auto-detects `ui/`, `public/`, `assets/`, `static/`, `web/`, and `renderer/` if present. |
+| `build.linux` | No | Linux desktop integration options: `wmClass`, `section`, `categories`. |
+| `build.windows` | No | Passed through to CrabNebula packager `windows` config (e.g., code signing `certificateThumbprint`, `signCommand`). |
+| `build.wix` | No | Passed through to CrabNebula WiX (`.msi`) configuration (`languages`, `template`, `fragments`). |
+| `build.nsis` | No | Passed through to CrabNebula NSIS (`.exe`) configuration (`installMode`, `compression`, `preinstallSection`). |
 
 ---
 
-## Build Pipeline
+## How the `lotus build` Pipeline Works
 
-The `lotus build` command follows these steps:
-1.  **Read Config:** Reads `lotus.config.json` from the current directory.
-2.  **Bundling:** Uses `esbuild` to bundle application JS into a single file and proxies native modules.
-3.  **Discovery:** Discovers native `.node` modules and copies them out for the installer.
-4.  **SEA Generation:** Creates a Node.js Single Executable Application blob.
-5.  **Encryption (Optional):** If `--encrypt` is set, generates encryption shards and packs resources into the encrypted VFS.
-6.  **Injection:** Injects the VFS, shards, and SEA payload into the binary using `objcopy` and `postject`.
-7.  **Packaging:** Invokes CrabNebula to wrap the binary, native modules, and resources into the final installer format.
+When you run `npx lotus build`, `@lotus-gui/dev` runs six steps:
 
-## Build Output
+1. **JS Bundling & FHS Path Shimming (`esbuild`):**
+   Bundles your `main.js` dependency tree into a single file (`bundle.js`) while keeping `.node` addons external. It injects a `__dirname` shim that locates native `.node` files and `msgpackr-renderer.js` whether the app is running from `/usr/bin/<app>` (looking in `/usr/lib/<app>/`), inside a Flatpak (`/app/lib/<app>/`), or next to a Windows `.exe`.
+2. **Native Addon & ANGLE Extraction:**
+   Crawls `node_modules` (including monorepo parent folders) to extract the `.node` binary and `msgpackr-renderer.js`. On Windows builds, it also extracts `libEGL.dll`, `libGLESv2.dll`, and `d3dcompiler_47.dll` for hardware-accelerated ANGLE rendering.
+3. **Node SEA (Single Executable Application) Compilation:**
+   Generates a V8 SEA blob (`node --experimental-sea-config`) and injects it into a copy of the Node.js binary via `postject`.
+4. **Encrypted VFS & Key Sharding (when `--encrypt` is passed):**
+   Generates a random 32-byte master key, shards it into three parts (`s1 ^ s2 ^ s3 = masterKey` where Shard 1 lives in compiled Rust and Shards 2 & 3 are injected as native binary sections `LOTUS_APP_S1` and `LOTUS_APP_S2`), encrypts every file in `ui/` with **AES-256-GCM**, and embeds the `LOTUS_VFS` section into the executable via `objcopy` before stripping raw `ui/` files from the installer.
+5. **Windows PE Header Patching & Silent VC++ Redistributable:**
+   On Windows, `node.exe` is compiled as a console subsystem binary (`IMAGE_SUBSYSTEM_WINDOWS_CUI`), which normally opens a black command prompt window behind GUI apps. `lotus build` patches the PE header subsystem byte to `IMAGE_SUBSYSTEM_WINDOWS_GUI` (`2`) so your app launches without a console window. It also downloads and embeds `vc_redist.x64.exe` into the MSI/NSIS installer.
+6. **OS Packaging:**
+   * **`deb`, `pacman`, `msi`, `exe`:** Packaged via `@crabnebula/packager`.
+   * **`appimage`:** Downloads `appimagetool` to `~/.lotus-gui/tools/` (once) and builds a self-contained `.AppImage` with an FHS-compliant `AppDir` and `AppRun` wrapper.
+   * **`rpm`:** Generates a `.spec` file and invokes `rpmbuild` to package `/usr/bin/<app>`, `/usr/lib/<app>/*`, `.desktop` entries, and icons.
+   * **`flatpak`:** Generates an `org.freedesktop.Platform` manifest (with X11, Wayland, DRI, and IPC permissions) and invokes `flatpak-builder` + `flatpak build-bundle`.
 
-After running `lotus build`, the `dist/` directory contains:
+### Host System Requirements for Building Installers
 
-```
+* **All Platforms:** Node.js v22+ (with SEA support) and a `lotus.config.json` file.
+* **Linux (`.deb`):** `dpkg-dev` and `fakeroot` (`sudo apt install dpkg-dev fakeroot`).
+* **Linux (`.rpm`):** `rpm-build` (`sudo dnf install rpm-build`).
+* **Linux (`.flatpak`):** `flatpak` and `flatpak-builder` with `org.freedesktop.Platform//24.08` and `org.freedesktop.Sdk//24.08`.
+* **Linux (`--encrypt`):** `binutils` (`objcopy`).
+* **Windows (`.msi` / `.exe`):** Must run on Windows; requires WiX Toolset v3 (for `.msi`) or NSIS (for `.exe`). Keep your `version` in `Major.Minor.Patch` format (e.g. `1.0.0`) and keep `appId` constant across releases so Windows MSI upgrades recognize your existing installation.
+
+---
+
+## Build Output Structure
+
+After running `lotus build`, your `dist/` directory contains:
+
+```text
 dist/
-├── app/                    # Staged application components
-│   ├── my-app              # Node SEA Single Executable Binary
-│   └── lotus.node          # Extracted native bindings
-└── installers/             # Generated OS-specific installers
-    ├── my-app-1.0.0.AppImage 
-    └── my-app_1.0.0_amd64.deb
+├── app/                                  # Staged SEA binary & extracted native dependencies
+│   ├── my-app                            # Standalone executable (with SEA + optional VFS)
+│   ├── lotus.linux-x64-gnu.node          # Native Servo/Rust runtime addon
+│   └── msgpackr-renderer.js              # Renderer IPC serialization script
+└── installers/                           # Generated OS installers
+    ├── my-app-1.0.0-x86_64.AppImage
+    ├── my-app_1.0.0_amd64.deb
+    └── my-app-1.0.0-1.x86_64.rpm
 ```
-
-## Project Setup Example
-
-A minimal Lotus project follows this structure:
-
-```
-my-lotus-app/
-├── lotus.config.json    # Build configuration
-├── package.json         # Dependencies (@lotus-gui/core, @lotus-gui/dev)
-├── main.js              # Entry point
-└── ui/
-    └── index.html       # Application UI
-```
-
-### Development Workflow
-
-```bash
-# Run with hot-reload
-npx lotus dev main.js
-
-# Build an AppImage for Linux
-npx lotus build --target appimage
-
-# Clean build artifacts
-npx lotus clean
-```
-
-### Install the Built Package
-
-```bash
-# DEB (Ubuntu/Debian)
-sudo apt install ./dist/installers/my-app_1.0.0_amd64.deb
-
-# Run it
-my-app
-
-# Or use the portable AppImage directly!
-./dist/installers/my-app-1.0.0-x86_64.AppImage
-```
-
-## Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `commander` | CLI argument parsing. |
-| `chokidar` | File watching for hot-reload. |
-| `esbuild` | JS bundling and code transformation. |
-| `@crabnebula/packager` | Installer generation for DEB, RPM, MSI, etc. |
-| `postject` | SEA binary injection. |
-
-## Package Structure
-
-```
-@lotus-gui/dev
-├── bin/lotus.js          # CLI entry point (commander-based build pipeline)
-├── index.js              # Package entry (exports CLI path)
-└── package.json
-```
-
----
 
 ## License
 
 MIT
-
-
-**AI DISCLAIMER**
-
-I have used ai in the project for templating, troubleshooting, diving through source code to find the reference i needed to read and learn how worked, and documentation originally while i was rapidly itteratting and have since rewrote the documentation myself now the api is more stable. I have tried my best and spent countless hours and days to ensure that the code is correct and that the documentation is accurate, its not a huge code base so i have touched and worked with every line of code in this repo. I will tell you that this is not some BS "vibe coded" system or project. I have worked in IT, Programming and Engineering for going on 11 years. I spent the last 7 years as a Linux enterprise dev/ Linux systems engineer. I have spent a lot of time designing, testing working and griding my hard hours on this project and ensuring this is not some garbage that a unexpirenced person whipped together without actually knowing and understand the way computers work and how to practice proper programing hygene, testing and safe software lifecyle practices. I know what is where, why what works what way, i decided how each and every piece works, written a large amount of it, i have tested different setups and dependancies like the ipc system. I spent a lot of time researching takio, readind the docs figuring out exactly how to use it with my use case and axum so i can web socket the world of my ipc. I dumped so many hours into learning winit 0.30 (which btw, it is a pain to use by its features and layout are amazing, i do recomend the time to learn the new conventions of 0.30), i have poured over so much of the servo repo trying to get the best pieces integrated as nicely as possible and spent so much time fighting with the windows rendering pipeline. i do understand that there is a lot of worries around it and people vibe coding stuff but this is not "vibe coded", this is hundreads of my hours, nights and nights of deep coffee pots and genuine passion for this project. It was involved in this project but it is not running, planning, testing, integrating, designing or any of that, it was just a tool used to speed up piece here and there. There are way too many moving parts here and i have spent way too much time on this to have it reduced down to that.
