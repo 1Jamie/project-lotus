@@ -76,6 +76,8 @@ jobs:
                 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 export PATH=\"\$HOME/.cargo/bin:\$PATH\"
                 export CC=/tmp/cc-glslopt-shim
+                git config --global --add safe.directory '*'
+                git config --global gitoxide.objects.allocLimitIfReducedTrust 0
                 npm install
                 npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
                 mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
