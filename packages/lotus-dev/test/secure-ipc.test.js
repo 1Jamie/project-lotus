@@ -385,3 +385,53 @@ test('Client Bridge Generator - produces hardened bridge script with subframe pr
     assert.match(script, /9876/);
     assert.match(script, /window\.lotus = Object\.freeze/);
 });
+
+test('IpcMain.register - dispatches invoke requests and replies with projection or error', async () => {
+    const { ipcMain, hostIpcRouter } = require('@lotus-gui/core');
+
+    const surface = hostIpcRouter.surfaceTracker.createSurface('test-win-client', {
+        secure: true,
+        allowedChannels: ['vault']
+    });
+
+    ipcMain.register('vault.testSecret', async () => {
+        return { secret: 'secret-xyz', extra: 'drop-me' };
+    }, {
+        channel: 'vault',
+        schema: { secret: 'string' }
+    });
+
+    ipcMain.register('forbidden.action', async () => {
+        return { done: true };
+    }, {
+        channel: 'forbidden'
+    });
+
+    // 1. Authorized invoke returns projected output
+    let receivedReply = null;
+    ipcMain.sendTo = (clientId, replyId, data) => {
+        receivedReply = { clientId, replyId, data };
+    };
+
+    ipcMain.emit('vault.testSecret', { _replyId: 'reply-1', param: 'abc' }, 'test-win-client');
+    await new Promise(r => setTimeout(r, 20));
+
+    assert.ok(receivedReply, 'Should receive reply');
+    assert.strictEqual(receivedReply.replyId, 'reply-1');
+    assert.strictEqual(receivedReply.data.secret, 'secret-xyz');
+    assert.strictEqual(receivedReply.data.extra, undefined);
+    assert.strictEqual(Object.getPrototypeOf(receivedReply.data), null);
+
+    // 2. Unauthorized invoke returns immediate error without timeout
+    let errorReply = null;
+    ipcMain.sendTo = (clientId, replyId, data) => {
+        errorReply = { clientId, replyId, data };
+    };
+
+    ipcMain.emit('forbidden.action', { _replyId: 'reply-2' }, 'test-win-client');
+    await new Promise(r => setTimeout(r, 20));
+
+    assert.ok(errorReply, 'Should receive error reply');
+    assert.strictEqual(errorReply.replyId, 'reply-2');
+    assert.match(errorReply.data._error, /E_CHANNEL_FORBIDDEN/);
+});

@@ -61,6 +61,9 @@ try {
     console.warn('msgpackr not found, IPC will fail if binary');
 }
 
+const hostIpcPolicy = require('./host_ipc_policy.js');
+const hostIpcRouter = new hostIpcPolicy.HostIpcPolicyRouter();
+
 class IpcMain extends EventEmitter {
     constructor() {
         super();
@@ -128,7 +131,70 @@ class IpcMain extends EventEmitter {
     }
 
     register(method, handler, options) {
-        return hostIpcRouter.registerSecureMethod(method, handler, options);
+        const unregisterFromRouter = hostIpcRouter.registerSecureMethod(method, handler, options);
+
+        const onMethodCall = async (data, fromClientId) => {
+            const replyId = data && data._replyId;
+            if (!replyId) return;
+
+            const payload = Object.assign({}, data);
+            delete payload._replyId;
+
+            try {
+                const surfaceId = fromClientId ? fromClientId.split(':')[0] : 'main-window';
+                let surface = hostIpcRouter.surfaceTracker.getSurface(surfaceId);
+                if (!surface) {
+                    const win = windows.get(surfaceId);
+                    surface = hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
+                        secure: true,
+                        allowedChannels: (win && win._allowedChannels) || ['vault', 'telemetry']
+                    });
+                }
+
+                // Execute Track 2 inbound validation
+                const envelope = {
+                    method,
+                    documentId: surface.activeDocumentId,
+                    payload
+                };
+                const wireBytes = JSON.stringify(payload).length;
+                const regEntry = hostIpcRouter.validateTrack2Inbound(surface, envelope, wireBytes);
+                const reqDocId = surface.activeDocumentId;
+                const reqGenId = regEntry.generationId;
+
+                // Execute handler
+                const rawResult = await regEntry.handler(payload);
+
+                // Execute Track 2 post-await validation
+                if (!hostIpcRouter.validateTrack2PostAwait(surface, regEntry, reqDocId, reqGenId)) {
+                    return; // Dropped post-await
+                }
+
+                // Two-phase output projection
+                const safeResult = hostIpcPolicy.validateAndProjectOutput(options ? options.schema : undefined, rawResult);
+
+                // Reply to originating client
+                if (fromClientId) {
+                    this.sendTo(fromClientId, replyId, safeResult);
+                } else {
+                    this.send(replyId, safeResult);
+                }
+            } catch (err) {
+                const errPayload = { _error: err?.message ?? String(err) };
+                if (fromClientId) {
+                    this.sendTo(fromClientId, replyId, errPayload);
+                } else {
+                    this.send(replyId, errPayload);
+                }
+            }
+        };
+
+        this.on(method, onMethodCall);
+
+        return () => {
+            unregisterFromRouter();
+            this.off(method, onMethodCall);
+        };
     }
 
     registerEvent(eventName, options) {
@@ -136,12 +202,10 @@ class IpcMain extends EventEmitter {
     }
 
     unregister(method) {
+        this.removeAllListeners(method);
         return hostIpcRouter.unregisterSecureMethod(method);
     }
 }
-
-const hostIpcPolicy = require('./host_ipc_policy.js');
-const hostIpcRouter = new hostIpcPolicy.HostIpcPolicyRouter();
 
 const isProfiling = process.argv.includes('--profile');
 
@@ -1039,6 +1103,13 @@ class ServoWindow extends EventEmitter {
                 visible: false
             });
         }
+
+        this._allowedChannels = finalOptions.allowedChannels || ['vault', 'telemetry'];
+        hostIpcRouter.surfaceTracker.createSurface(this.id, {
+            secure: finalOptions.secure === true,
+            allowedChannels: this._allowedChannels,
+            trustedOrigins: finalOptions.trustedOrigins || []
+        });
 
         windows.set(this.id, this);
 

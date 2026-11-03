@@ -64,6 +64,8 @@ const win = new ServoWindow({
     width: 1080,
     height: 720,
     title: 'Lotus Process-Isolated Sandbox & Track 2 Showcase',
+    secure: true,
+    allowedChannels: ['vault', 'telemetry'],
     visible: false
 });
 
@@ -89,3 +91,4 @@ win.on('load-status', (status) => {
         }, 1500);
     }
 });
+
