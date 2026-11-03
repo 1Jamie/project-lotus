@@ -7,7 +7,7 @@
         "lotus": "./bin/lotus.js"
     },
     "scripts": {
-        "test": "echo \"Error: no test specified\" && exit 1"
+        "test": "node --test test/*.test.js"
     },
     "keywords": [
         "gui",
@@ -28,6 +28,7 @@
         "esbuild": "^0.27.3",
         "jimp": "^1.6.0",
         "postject": "^1.0.0-alpha.6",
-        "prompts": "^2.4.2"
+        "prompts": "^2.4.2",
+        "resedit": "^3.1.0"
     }
 }

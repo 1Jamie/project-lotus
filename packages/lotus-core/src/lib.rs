@@ -87,6 +87,45 @@ const WS_PENDING_MAX_FRAMES: usize = 1024;
 const MSG_TYPE_CONTROL: u8 = 0x01;
 const MSG_TYPE_DATA: u8 = 0x02;
 
+static TRUSTED_ORIGINS: OnceCell<Arc<dashmap::DashSet<String>>> = OnceCell::new();
+
+fn get_trusted_origins() -> Arc<dashmap::DashSet<String>> {
+    TRUSTED_ORIGINS.get_or_init(|| {
+        let set = Arc::new(dashmap::DashSet::new());
+        set.insert("lotus-resource://localhost".to_string());
+        set
+    }).clone()
+}
+
+fn normalize_origin(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with("lotus-resource:") {
+        let after_scheme = trimmed.trim_start_matches("lotus-resource:").trim_start_matches('/');
+        let host = after_scheme.split(&['/', '?', '#'][..]).next().unwrap_or("");
+        let host = if host.is_empty() { "localhost" } else { host };
+        return Some(format!("lotus-resource://{}", host));
+    }
+
+    if let Ok(parsed) = url::Url::parse(trimmed) {
+        let scheme = parsed.scheme();
+        if scheme == "http" || scheme == "https" || scheme == "ws" || scheme == "wss" {
+            if let Some(host) = parsed.host_str() {
+                let port_suffix = match parsed.port() {
+                    Some(p) => format!(":{}", p),
+                    None => String::new(),
+                };
+                return Some(format!("{}://{}{}", scheme, host, port_suffix));
+            }
+        }
+    }
+
+    None
+}
+
 #[inline]
 pub(crate) fn fast_exit(code: i32) -> ! {
     #[cfg(unix)]
@@ -195,6 +234,12 @@ impl AutonomousKeyDeriver {
         Some(key)
     }
 
+    fn has_encrypted_sections() -> bool {
+        Self::read_shard_from_binary("LOTUS_APP_S1").is_some()
+            || Self::read_shard_from_binary("LOTUS_APP_S2").is_some()
+            || Self::read_shard_from_binary("LOTUS_VFS").is_some()
+    }
+
     fn read_shard_from_binary(name: &str) -> Option<Vec<u8>> {
         eprintln!("[DEBUG] Reading shard: {}", name);
         #[cfg(target_os = "windows")]
@@ -281,13 +326,16 @@ struct EncryptedVfs {
 }
 
 impl EncryptedVfs {
-    fn init() -> Option<Self> {
-        eprintln!("[DEBUG] Initializing EncryptedVfs...");
+    fn init() -> Result<Option<Self>, String> {
+        if !AutonomousKeyDeriver::has_encrypted_sections() {
+            return Ok(None);
+        }
+
+        eprintln!("[DEBUG] Initializing EncryptedVfs (detected encrypted sections)...");
         let key = match AutonomousKeyDeriver::derive_key() {
             Some(k) => k,
             None => {
-                eprintln!("[DEBUG] Key derivation failed in VFS init.");
-                return None;
+                return Err("Failed to derive VFS master key: shards missing or invalid length".to_string());
             }
         };
         let cipher = Aes256Gcm::new(&key.into());
@@ -295,36 +343,37 @@ impl EncryptedVfs {
         let vfs_data = match AutonomousKeyDeriver::read_shard_from_binary("LOTUS_VFS") {
             Some(d) => d,
             None => {
-                eprintln!("[DEBUG] Failed to read VFS blob.");
-                return None;
+                return Err("Failed to read LOTUS_VFS section/resource from executable".to_string());
             }
         };
         
         if vfs_data.len() < 12 || &vfs_data[0..8] != b"LOTUSVFS" {
-            eprintln!("[DEBUG] Invalid VFS magic or size.");
-            return None;
+            return Err("Invalid VFS magic or size (corrupted VFS payload)".to_string());
         }
         
         let index_size = u32::from_le_bytes(vfs_data[8..12].try_into().unwrap()) as usize;
+        if vfs_data.len() < 12 + index_size {
+            return Err("Corrupted VFS payload: index size exceeds binary data length".to_string());
+        }
+
         eprintln!("[DEBUG] VFS Index size: {}", index_size);
         let index_json = &vfs_data[12..12+index_size];
         let index: HashMap<String, (usize, usize)> = match serde_json::from_slice(index_json) {
             Ok(idx) => idx,
             Err(e) => {
-                eprintln!("[DEBUG] Failed to parse VFS index JSON: {}", e);
-                return None;
+                return Err(format!("Failed to parse VFS index JSON: {}", e));
             }
         };
         
         let data_offset = 12 + index_size;
         eprintln!("[DEBUG] VFS initialized with {} entries.", index.len());
         
-        Some(Self {
+        Ok(Some(Self {
             data: vfs_data,
             index,
             data_offset,
             cipher,
-        })
+        }))
     }
 
     fn read_file(&self, path: &str) -> Option<Vec<u8>> {
@@ -1531,6 +1580,7 @@ struct WindowInstance {
     pub committed_window_size: Option<winit::dpi::PhysicalSize<u32>>,
     pub active_select: Option<ActiveSelectPrompt>,
     pub scrollbar_config: ScrollbarConfig,
+    pub trusted_origins: Vec<String>,
 }
 
 impl WindowInstance {
@@ -1834,6 +1884,7 @@ pub struct WindowOptions {
     pub scrollbar_theme: Option<String>,
     pub scrollbar_auto_hide: Option<bool>,
     pub scrollbar_width: Option<u32>,
+    pub trusted_origins: Option<Vec<String>>,
 }
 
 #[napi(object)]
@@ -1876,6 +1927,7 @@ impl Default for WindowOptions {
             scrollbar_theme: None,
             scrollbar_auto_hide: None,
             scrollbar_width: None,
+            trusted_origins: None,
         }
     }
 }
@@ -3050,6 +3102,37 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     width: options.scrollbar_width.unwrap_or(8),
                 };
 
+                let mut effective_trusted_origins: Vec<String> = Vec::new();
+                if let Some(list) = &options.trusted_origins {
+                    for o in list {
+                        if let Some(norm) = normalize_origin(o) {
+                            if !effective_trusted_origins.contains(&norm) {
+                                effective_trusted_origins.push(norm);
+                            }
+                        }
+                    }
+                    if options.root.is_some() && !effective_trusted_origins.contains(&"lotus-resource://localhost".to_string()) {
+                        effective_trusted_origins.push("lotus-resource://localhost".to_string());
+                    }
+                } else {
+                    effective_trusted_origins.push("lotus-resource://localhost".to_string());
+                    if let Some(initial) = &options.initial_url {
+                        if let Some(norm) = normalize_origin(initial) {
+                            if !effective_trusted_origins.contains(&norm) {
+                                effective_trusted_origins.push(norm);
+                            }
+                        }
+                    }
+                }
+
+                let trusted_set = get_trusted_origins();
+                for o in &effective_trusted_origins {
+                    trusted_set.insert(o.clone());
+                }
+
+                let origins_json = serde_json::to_string(&effective_trusted_origins)
+                    .unwrap_or_else(|_| "[\"lotus-resource://localhost\"]".to_string());
+
                 // UNIFIED PIPELINE: Every window is a multi-pane layout.
                 // If options.panes is empty, synthesize a single 'main' fill pane.
                 let mut effective_panes = options.panes.clone();
@@ -3096,8 +3179,19 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     p_ucm.add_script(Rc::new(UserScript::from(msgpackr_source.as_str())));
                     p_ucm.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP_BASE)));
                     let p_port_script = format!(
-                        r#"if (window.location.protocol === 'lotus-resource:' || window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') {{ window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = '{}'; }}"#,
-                        port, token, window_id, pane_opt.id
+                        r#"(function() {{
+                            const trusted = {};
+                            const loc = window.location;
+                            const effectiveOrigin = (loc.origin && loc.origin !== 'null') ? loc.origin : (loc.protocol + '//' + (loc.host || 'localhost'));
+                            if (trusted.indexOf(effectiveOrigin) !== -1 || (loc.protocol === 'lotus-resource:' && trusted.indexOf('lotus-resource://localhost') !== -1)) {{
+                                window.lotus = window.lotus || {{}};
+                                window.lotus.port = {};
+                                window.lotus.token = '{}';
+                                window.lotus.id = '{}';
+                                window.lotus.paneId = '{}';
+                            }}
+                        }})();"#,
+                        origins_json, port, token, window_id, pane_opt.id
                     );
                     p_ucm.add_script(Rc::new(UserScript::from(p_port_script.as_str())));
                     
@@ -3220,6 +3314,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     committed_window_size: None,
                     active_select: None,
                     scrollbar_config,
+                    trusted_origins: effective_trusted_origins,
                 };
 
                 instance.init_stencil_program();
@@ -3566,9 +3661,23 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     user_content_manager.add_script(Rc::new(UserScript::from(msgpackr_source.as_str())));
                     user_content_manager.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP_BASE)));
 
+                    let origins_json = serde_json::to_string(&instance.trusted_origins)
+                        .unwrap_or_else(|_| "[\"lotus-resource://localhost\"]".to_string());
+
                     let port_script = format!(
-                        r#"if (window.location.protocol === 'lotus-resource:' || window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') {{ window.lotus.port = {}; window.lotus.token = '{}'; window.lotus.id = '{}'; window.lotus.paneId = '{}'; }}"#,
-                        port, token, window_id, pane_id
+                        r#"(function() {{
+                            const trusted = {};
+                            const loc = window.location;
+                            const effectiveOrigin = (loc.origin && loc.origin !== 'null') ? loc.origin : (loc.protocol + '//' + (loc.host || 'localhost'));
+                            if (trusted.indexOf(effectiveOrigin) !== -1 || (loc.protocol === 'lotus-resource:' && trusted.indexOf('lotus-resource://localhost') !== -1)) {{
+                                window.lotus = window.lotus || {{}};
+                                window.lotus.port = {};
+                                window.lotus.token = '{}';
+                                window.lotus.id = '{}';
+                                window.lotus.paneId = '{}';
+                            }}
+                        }})();"#,
+                        origins_json, port, token, window_id, pane_id
                     );
                     user_content_manager.add_script(Rc::new(UserScript::from(port_script.as_str())));
                     user_content_manager.add_script(Rc::new(UserScript::from(DRAG_REGION_SCRIPT)));
@@ -5332,6 +5441,22 @@ impl App {
                         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
                     }
 
+                    if let Some(origin_val) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+                        let trusted_set = get_trusted_origins();
+                        let is_trusted = if origin_val == "null" {
+                            trusted_set.contains("lotus-resource://localhost")
+                        } else if let Some(norm) = normalize_origin(origin_val) {
+                            trusted_set.contains(&norm)
+                        } else {
+                            false
+                        };
+
+                        if !is_trusted {
+                            warn!("Rust: Rejected batch IPC request from untrusted origin: {}", origin_val);
+                            return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+                        }
+                    }
+
                     let window_id = headers.get("x-lotus-window-id")
                         .and_then(|h| h.to_str().ok())
                         .unwrap_or("unknown")
@@ -5351,6 +5476,22 @@ impl App {
                 ) -> impl IntoResponse {
                     if headers.get("x-lotus-auth").and_then(|h| h.to_str().ok()) != Some(&state.token) {
                         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+                    }
+
+                    if let Some(origin_val) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+                        let trusted_set = get_trusted_origins();
+                        let is_trusted = if origin_val == "null" {
+                            trusted_set.contains("lotus-resource://localhost")
+                        } else if let Some(norm) = normalize_origin(origin_val) {
+                            trusted_set.contains(&norm)
+                        } else {
+                            false
+                        };
+
+                        if !is_trusted {
+                            warn!("Rust: Rejected IPC request from untrusted origin: {}", origin_val);
+                            return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+                        }
                     }
 
                     let window_id = headers.get("x-lotus-window-id")
@@ -5433,14 +5574,20 @@ impl App {
                     // Note: Servo sends Origin: null for lotus-resource:// pages (as do sandboxed
                     // iframes or data: URLs), so the random per-session token and origin-gated
                     // script injection are the primary defenses.
-                    let origin_ok = headers.get("origin")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|o| o == "null" || o.starts_with("http://127.0.0.1") || o.starts_with("http://localhost"))
-                        .unwrap_or(true);
+                    if let Some(origin_val) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+                        let trusted_set = get_trusted_origins();
+                        let is_trusted = if origin_val == "null" {
+                            trusted_set.contains("lotus-resource://localhost")
+                        } else if let Some(norm) = normalize_origin(origin_val) {
+                            trusted_set.contains(&norm)
+                        } else {
+                            false
+                        };
 
-                    if !origin_ok {
-                        warn!("Rust: Rejected WebSocket upgrade from untrusted origin");
-                        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+                        if !is_trusted {
+                            warn!("Rust: Rejected WebSocket upgrade from untrusted origin: {}", origin_val);
+                            return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+                        }
                     }
 
                     let full_id = match query.pane_id {
@@ -5590,20 +5737,30 @@ impl App {
     }
 
     #[napi]
-    pub fn init_vfs(&self) -> napi::Result<()> {
+    pub fn init_vfs(&self) -> napi::Result<bool> {
         if let Some(state) = APP_STATE.get() {
             if let Ok(mut s) = state.lock() {
-                if s.vfs.is_none() {
-                    if let Some(vfs) = EncryptedVfs::init() {
+                if s.vfs.is_some() {
+                    return Ok(true);
+                }
+                match EncryptedVfs::init() {
+                    Ok(Some(vfs)) => {
                         s.vfs = Some(Arc::new(vfs));
                         info!("Rust: Encrypted VFS initialized successfully.");
-                    } else {
-                        warn!("Rust: Encrypted VFS initialization skipped (no VFS or shards found).");
+                        return Ok(true);
+                    }
+                    Ok(None) => {
+                        info!("Rust: Encrypted VFS initialization skipped (no VFS or shards found).");
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        error!("Rust: Fatal error during Encrypted VFS initialization: {}", e);
+                        return Err(napi::Error::from_reason(format!("Encrypted VFS initialization failed: {}", e)));
                     }
                 }
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     #[napi]

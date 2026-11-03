@@ -16,6 +16,123 @@ try {
     if (fs.existsSync(pj)) postjectPath = `node "${pj}"`;
 } catch (e) {}
 
+function stripGlob(p) {
+    const idx = p.search(/[*?[\]{}]/);
+    if (idx === -1) return p;
+    const prefix = p.slice(0, idx);
+    if (prefix.endsWith('/') || prefix.endsWith('\\')) {
+        return prefix.slice(0, -1) || '.';
+    }
+    return path.dirname(prefix);
+}
+
+function classifyResourceVsAssetDir(resEntry, resolvedAssetDir, projectRoot = process.cwd()) {
+    if (!resolvedAssetDir) return 'unrelated';
+    const basePath = path.resolve(projectRoot, stripGlob(resEntry));
+    const assetPath = path.resolve(resolvedAssetDir);
+    const relToAsset = path.relative(assetPath, basePath);
+    if (relToAsset === '' || (!relToAsset.startsWith('..') && !path.isAbsolute(relToAsset))) {
+        return 'same_or_inside';
+    }
+    const relFromBase = path.relative(basePath, assetPath);
+    if (relFromBase !== '' && !relFromBase.startsWith('..') && !path.isAbsolute(relFromBase)) {
+        return 'parent_of_asset';
+    }
+    return 'unrelated';
+}
+
+function resolveAssetDir(config, projectRoot = process.cwd(), { encrypt = false } = {}) {
+    const explicitDir = config.uiDir || config.assetDir || config.build?.uiDir || config.build?.assetDir;
+    if (explicitDir) {
+        const resolved = path.resolve(projectRoot, explicitDir);
+        if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+            throw new Error(`Configured asset directory "${explicitDir}" (${resolved}) does not exist or is not a directory.`);
+        }
+        console.log(`Resolved authoritative asset directory: ${resolved}`);
+        return resolved;
+    }
+
+    const primaryCandidates = ['ui', 'dist/renderer', 'renderer'];
+    const existingPrimary = primaryCandidates
+        .map(dir => ({ rel: dir, abs: path.resolve(projectRoot, dir) }))
+        .filter(c => fs.existsSync(c.abs) && fs.statSync(c.abs).isDirectory());
+
+    if (existingPrimary.length > 1) {
+        console.warn(
+            `\x1b[33mWarning: Multiple candidate asset directories found (${existingPrimary.map(c => c.rel).join(', ')}). ` +
+            `Using "${existingPrimary[0].rel}". Set "uiDir" in lotus.config.json to disambiguate.\x1b[0m`
+        );
+    }
+
+    if (existingPrimary.length >= 1) {
+        console.log(`Resolved authoritative asset directory: ${existingPrimary[0].abs}`);
+        return existingPrimary[0].abs;
+    }
+
+    const pkgPath = path.join(projectRoot, 'package.json');
+    const hasBuildScript = fs.existsSync(pkgPath) &&
+        Boolean(JSON.parse(fs.readFileSync(pkgPath, 'utf8'))?.scripts?.build);
+    const publicDir = path.resolve(projectRoot, 'public');
+    if (fs.existsSync(publicDir) && fs.statSync(publicDir).isDirectory()) {
+        if (hasBuildScript && encrypt) {
+            throw new Error(
+                'No built frontend directory (ui, dist/renderer, renderer) found, only "public/". ' +
+                'Run your frontend build first, or explicitly set "uiDir": "public" in lotus.config.json.'
+            );
+        }
+        console.warn('\x1b[33mWarning: Falling back to "public/" as asset directory. Set "uiDir" in lotus.config.json if this is unintended.\x1b[0m');
+        console.log(`Resolved authoritative asset directory: ${publicDir}`);
+        return publicDir;
+    }
+
+    if (encrypt) {
+        throw new Error('Could not find a frontend asset directory (ui, dist/renderer, renderer) to pack into the Encrypted VFS.');
+    }
+    return null;
+}
+
+function verifyInjectedData(binPath, isWindows, expectedSizes) {
+    console.log('Verifying injected sections and resources in shipping binary...');
+    if (isWindows) {
+        const ResEdit = require('resedit');
+        const exeBuf = fs.readFileSync(binPath);
+        const exe = ResEdit.NtExecutable.from(exeBuf, { ignoreCert: true });
+        const res = ResEdit.NtExecutableResource.from(exe);
+
+        const entries = res.entries || [];
+        const seaEntry = entries.find(e => (e.id === 'NODE_SEA_BLOB' || e.name === 'NODE_SEA_BLOB'));
+        if (!seaEntry) {
+            throw new Error('Verification failed: Final PE binary is missing NODE_SEA_BLOB resource.');
+        }
+
+        if (expectedSizes) {
+            for (const [name, minSize] of Object.entries(expectedSizes)) {
+                const match = entries.find(e => (e.id === name || e.name === name) && e.type === 10);
+                if (!match) {
+                    throw new Error(`Verification failed: Final PE binary is missing ${name} RT_RCDATA resource.`);
+                }
+                const byteLength = match.bin ? (match.bin.byteLength || match.bin.length) : 0;
+                if (byteLength < minSize) {
+                    throw new Error(`Verification failed: ${name} resource size (${byteLength}) is smaller than expected (${minSize}).`);
+                }
+            }
+        }
+    } else {
+        const readelfOut = execSync(`readelf -S "${binPath}"`, { encoding: 'utf8' });
+        if (!readelfOut.includes('NODE_SEA_BLOB')) {
+            throw new Error('Verification failed: Final ELF binary is missing NODE_SEA_BLOB section.');
+        }
+        if (expectedSizes) {
+            for (const [name, minSize] of Object.entries(expectedSizes)) {
+                if (!readelfOut.includes(name)) {
+                    throw new Error(`Verification failed: Final ELF binary is missing ${name} section.`);
+                }
+            }
+        }
+    }
+    console.log('✅ Final binary verification passed.');
+}
+
 const program = new Command();
 
 program
@@ -158,6 +275,7 @@ program
         }
 
         const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        const resolvedAssetDir = resolveAssetDir(config, process.cwd(), { encrypt });
         const distDir = path.resolve('dist');
         const appDir = path.join(distDir, 'app');
 
@@ -195,6 +313,7 @@ if (fs.existsSync(path.join(libDir, 'msgpackr-renderer.js'))) {
     macroDir = flatpakLibDir;
 }
 export const __dirname_macro = macroDir;
+globalThis.__LOTUS_ENCRYPTED_BUILD__ = ${encrypt ? 'true' : 'false'};
             `.trim());
 
             // We use esbuild to bundle, and specifically override __dirname so native modules
@@ -342,6 +461,8 @@ export const __dirname_macro = macroDir;
             fs.copyFileSync(process.execPath, binPath);
             if (!isWindows) fs.chmodSync(binPath, 0o755);
 
+            let shardSizes = null;
+            let winShards = null;
             if (encrypt) {
                 console.log('Generating encryption shards and VFS...');
                 const masterKey = crypto.randomBytes(32);
@@ -351,7 +472,13 @@ export const __dirname_macro = macroDir;
                 // Generate shards 2 & 3 such that s1 ^ s2 ^ s3 = masterKey
                 const { s2, s3 } = generateShards(masterKey, s1);
                 
-                const vfsBlob = vfsPack(path.join(process.cwd(), 'ui'), masterKey);
+                const vfsBlob = vfsPack(resolvedAssetDir, masterKey);
+                shardSizes = {
+                    LOTUS_APP_S1: s2.length,
+                    LOTUS_APP_S2: s3.length,
+                    LOTUS_VFS: vfsBlob.length
+                };
+                winShards = { s2, s3, vfsBlob };
                 
                 console.log('Injecting Lotus Data into binary...');
                 const vfsPath = path.join(appDir, 'lotus.vfs');
@@ -363,19 +490,17 @@ export const __dirname_macro = macroDir;
                 fs.writeFileSync(vfsPath, vfsBlob);
 
                 if (platform === 'linux') {
+                    console.log('Injecting Lotus Data via objcopy...');
+                    // IMPORTANT: On Linux, we run objcopy BEFORE postject.
+                    // objcopy can safely add sections to the raw ELF binary.
                     try {
-                        console.log('Injecting Lotus Data via objcopy...');
-                        // IMPORTANT: We run objcopy BEFORE postject.
-                        // objcopy can safely add sections to the raw node binary.
                         execSync(`objcopy --add-section LOTUS_APP_S1="${s1Path}" "${binPath}"`, { stdio: 'inherit' });
                         execSync(`objcopy --add-section LOTUS_APP_S2="${s2Path}" "${binPath}"`, { stdio: 'inherit' });
                         execSync(`objcopy --add-section LOTUS_VFS="${vfsPath}" "${binPath}"`, { stdio: 'inherit' });
                     } catch (e) {
-                        console.error('objcopy failed:', e.message);
+                        console.error('objcopy section injection failed:', e.message);
+                        process.exit(1);
                     }
-                } else {
-                    // Windows / other (postject will be run later if we can make it work, 
-                    // but for now Windows encryption is secondary to fixing Linux segfault)
                 }
 
                 // Cleanup temp files
@@ -389,9 +514,30 @@ export const __dirname_macro = macroDir;
             console.log('Injecting Node SEA blob...');
             execSync(`${postjectPath} "${binPath}" NODE_SEA_BLOB "${seaConfig.output}" --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2`, { env: { ...process.env }, stdio: 'inherit' });
 
+            // On Windows: inject LOTUS_* resources with resedit AFTER postject, then patch PE subsystem
+            if (isWindows && encrypt && winShards) {
+                console.log('Injecting Lotus Data into Windows PE binary via resedit...');
+                try {
+                    const ResEdit = require('resedit');
+                    const exeBuf = fs.readFileSync(binPath);
+                    const exe = ResEdit.NtExecutable.from(exeBuf, { ignoreCert: true });
+                    const res = ResEdit.NtExecutableResource.from(exe);
+
+                    res.entries.push({ type: 10, id: 'LOTUS_APP_S1', lang: 1033, bin: winShards.s2 });
+                    res.entries.push({ type: 10, id: 'LOTUS_APP_S2', lang: 1033, bin: winShards.s3 });
+                    res.entries.push({ type: 10, id: 'LOTUS_VFS', lang: 1033, bin: winShards.vfsBlob });
+
+                    res.outputResource(exe);
+                    const newBuf = Buffer.from(exe.generate());
+                    fs.writeFileSync(binPath, newBuf);
+                    console.log('Windows PE resource injection completed successfully.');
+                } catch (e) {
+                    console.error('Windows PE resource injection failed:', e.message);
+                    process.exit(1);
+                }
+            }
+
             // On Windows, patch the PE header subsystem field from CONSOLE (3) to WINDOWS GUI (2).
-            // node.exe is built as a console app; this prevents the black console window from
-            // appearing when the packaged app is launched.
             if (isWindows) {
                 console.log('Patching PE header to suppress console window...');
                 const exeBuf = fs.readFileSync(binPath);
@@ -408,6 +554,9 @@ export const __dirname_macro = macroDir;
                     console.log('PE subsystem patched: CONSOLE → WINDOWS GUI');
                 }
             }
+
+            // Verify final binary has SEA blob and all required sections/resources
+            verifyInjectedData(binPath, isWindows, encrypt ? shardSizes : null);
 
             // Cleanup temp SEA files
             fs.unlinkSync(bundlePath);
@@ -453,6 +602,23 @@ export const __dirname_macro = macroDir;
             for (const res of config.resources) {
                 const resPath = path.resolve(process.cwd(), res);
                 if (fs.existsSync(resPath)) {
+                    if (encrypt) {
+                        const classification = classifyResourceVsAssetDir(res, resolvedAssetDir, process.cwd());
+                        if (classification === 'same_or_inside') {
+                            console.log(`[ENCRYPTION] Excluding VFS asset path from installer resources: ${res}`);
+                            continue;
+                        } else if (classification === 'parent_of_asset') {
+                            console.log(`[ENCRYPTION] Staging parent resource with VFS subtree filtered: ${res}`);
+                            const stagedParent = path.join(appDir, 'staged_resources', path.basename(resPath));
+                            fs.mkdirSync(stagedParent, { recursive: true });
+                            fs.cpSync(resPath, stagedParent, {
+                                recursive: true,
+                                filter: (src) => classifyResourceVsAssetDir(src, resolvedAssetDir, process.cwd()) !== 'same_or_inside'
+                            });
+                            packagerConfig.resources.push(stagedParent);
+                            continue;
+                        }
+                    }
                     packagerConfig.resources.push(resPath);
                 }
             }
@@ -470,9 +636,12 @@ export const __dirname_macro = macroDir;
                 // Skip if already listed in config.resources
                 !packagerConfig.resources.some(r => r === dirPath || r === dir || r === `./${dir}`)
             ) {
-                if (encrypt && (dir === 'ui' || dir === 'renderer' || dir === 'dist/renderer')) {
-                    console.log(`Encrypting asset directory into VFS: ${dir}/ (Skipping raw copy)`);
-                    continue;
+                if (encrypt) {
+                    const classification = classifyResourceVsAssetDir(dir, resolvedAssetDir, process.cwd());
+                    if (classification === 'same_or_inside') {
+                        console.log(`[ENCRYPTION] Auto-detected asset directory "${dir}/" is packaged into VFS (skipping raw copy).`);
+                        continue;
+                    }
                 }
                 packagerConfig.resources.push(dirPath);
                 console.log(`Auto-including asset directory: ${dir}/`);
@@ -601,16 +770,23 @@ export const __dirname_macro = macroDir;
             // Copy extra resources into usr/lib/<binName>/
             if (config.resources && Array.isArray(config.resources)) {
                 for (const res of config.resources) {
-                    // If encrypting, skip the 'ui' directory as it's already in the VFS
-                    if (encrypt && (res === 'ui' || res === './ui')) {
-                        console.log('Skipping "ui" resource (already in VFS)...');
+                    const classification = encrypt ? classifyResourceVsAssetDir(res, resolvedAssetDir, process.cwd()) : 'unrelated';
+                    if (classification === 'same_or_inside') {
+                        console.log(`[ENCRYPTION] Skipping "${res}" in AppDir (already in VFS)...`);
                         continue;
                     }
                     const resPath = path.resolve(process.cwd(), res);
                     if (fs.existsSync(resPath)) {
                         const destPath = path.join(libDir, path.basename(res));
                         if (fs.statSync(resPath).isDirectory()) {
-                            fs.cpSync(resPath, destPath, { recursive: true });
+                            if (classification === 'parent_of_asset') {
+                                fs.cpSync(resPath, destPath, {
+                                    recursive: true,
+                                    filter: (src) => classifyResourceVsAssetDir(src, resolvedAssetDir, process.cwd()) !== 'same_or_inside'
+                                });
+                            } else {
+                                fs.cpSync(resPath, destPath, { recursive: true });
+                            }
                         } else {
                             fs.copyFileSync(resPath, destPath);
                         }
@@ -988,10 +1164,7 @@ program
                     wmClass: metadata.name.toLowerCase().replace(/ /g, '-'),
                     categories: ["Utility"]
                 }
-            },
-            // UI/web assets to include in the installer.
-            // On install, these are placed next to the executable.
-            resources: ["./ui"]
+            }
         };
         // Remove undefined keys
         Object.keys(lotusConfig).forEach(key => lotusConfig[key] === undefined && delete lotusConfig[key]);
@@ -1088,6 +1261,31 @@ ipcMain.on('hello', (data) => {
         console.log(`  npx lotus dev\n`);
     });
 
+program
+    .command('fetch')
+    .description('Download or update the native Lotus binary for the current platform')
+    .option('--force', 'Force re-download even if binary already exists')
+    .action(async (cmdOptions) => {
+        try {
+            let installPath;
+            try {
+                installPath = require.resolve('@lotus-gui/core/scripts/install.js', { paths: [process.cwd(), __dirname, path.join(__dirname, '..', '..', 'lotus-core')] });
+            } catch (e) {
+                const fallback = path.join(__dirname, '..', '..', 'lotus-core', 'scripts', 'install.js');
+                if (fs.existsSync(fallback)) installPath = fallback;
+            }
+            if (!installPath || !fs.existsSync(installPath)) {
+                throw new Error('Could not locate @lotus-gui/core/scripts/install.js');
+            }
+            const { runInstall } = require(installPath);
+            await runInstall({ force: !!cmdOptions.force });
+            console.log('✅ Lotus native binary fetch completed.');
+        } catch (err) {
+            console.error('❌ Failed to fetch Lotus native binary:', err.message);
+            process.exit(1);
+        }
+    });
+
 function generateShards(masterKey, s1) {
     const s2 = crypto.randomBytes(32);
     const s3 = Buffer.alloc(32);
@@ -1097,7 +1295,6 @@ function generateShards(masterKey, s1) {
     return { s2, s3 };
 }
 
-program.parse();
 function vfsPack(sourceDir, key) {
     const files = [];
     const index = {};
@@ -1134,3 +1331,16 @@ function vfsPack(sourceDir, key) {
 
     return Buffer.concat([header, indexJson, ...files]);
 }
+
+if (require.main === module) {
+    program.parse();
+}
+
+module.exports = {
+    stripGlob,
+    classifyResourceVsAssetDir,
+    resolveAssetDir,
+    verifyInjectedData,
+    generateShards,
+    vfsPack
+};

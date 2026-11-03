@@ -204,6 +204,7 @@ if (isProfiling) {
 const ipcMain = new IpcMain();
 let globalApp = null;
 let systemTheme = 'light';
+let vfsInitialized = false;
 const windows = new Map();
 const eventQueue = new Map(); // windowId -> Array of pending events
 const globalPackers = new Map();
@@ -862,6 +863,10 @@ class ServoWindow extends EventEmitter {
         finalOptions.scrollbarAutoHide = scrollbarAutoHide;
         finalOptions.scrollbarWidth = scrollbarWidth;
 
+        if (typeof globalThis !== 'undefined' && globalThis.__LOTUS_ENCRYPTED_BUILD__ && !vfsInitialized) {
+            app.initVfs({ required: true });
+        }
+
         this.handle = createWindow(finalOptions);
         this.id = this.handle.getId();
         
@@ -1449,9 +1454,29 @@ module.exports = {
             }
             return systemTheme;
         },
-        initVfs: () => {
+        initVfs: (options = {}) => {
             ensureApp();
-            if (globalApp) globalApp.initVfs();
-        }
+            const required = !!(options?.required || (typeof globalThis !== 'undefined' && globalThis.__LOTUS_ENCRYPTED_BUILD__));
+            if (globalApp) {
+                const initialized = globalApp.initVfs();
+                if (initialized) {
+                    vfsInitialized = true;
+                } else if (required) {
+                    throw new Error(
+                        'Fatal: Encrypted VFS initialization is required for this build, ' +
+                        'but VFS sections/resources were not found in the executable.'
+                    );
+                }
+                return !!initialized;
+            }
+            if (required) {
+                throw new Error(
+                    'Fatal: Encrypted VFS initialization is required for this build, ' +
+                    'but native application core is unavailable.'
+                );
+            }
+            return false;
+        },
+        isVfsInitialized: () => vfsInitialized
     }
 };

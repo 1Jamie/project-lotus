@@ -53,7 +53,7 @@ export interface SelectMenuTheme {
 export interface SelectMenuOptions {
   url?: string;
   css?: string;
-  theme?: 'light' | 'dark' | SelectMenuTheme;
+  theme?: 'auto' | 'light' | 'dark' | SelectMenuTheme;
   enabled?: boolean;
 }
 
@@ -117,6 +117,7 @@ export interface WindowOptions {
   frame?: boolean;
   selectMenu?: SelectMenuOptions;
   scrollbars?: boolean | ScrollbarOptions;
+  trustedOrigins?: string[];
 }
 
 export interface ResizePayload {
@@ -226,5 +227,6 @@ export const app: {
   exit(code?: number): void;
   warmup(): void;
   getSystemTheme(): 'light' | 'dark';
-  initVfs(): void;
+  initVfs(options?: { required?: boolean }): boolean;
+  isVfsInitialized(): boolean;
 };

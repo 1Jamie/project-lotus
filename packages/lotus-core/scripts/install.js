@@ -1,6 +1,6 @@
-
 const fs = require('fs');
 const https = require('https');
+const http = require('http');
 const path = require('path');
 const { execSync } = require('child_process');
 
@@ -41,55 +41,137 @@ function getPlatform() {
     return null;
 }
 
+function isValidBinary(filePath) {
+    if (!fs.existsSync(filePath)) return false;
+    const stat = fs.statSync(filePath);
+    if (stat.size < 1024) return false;
+
+    const fd = fs.openSync(filePath, 'r');
+    const header = Buffer.alloc(4);
+    fs.readSync(fd, header, 0, 4, 0);
+    fs.closeSync(fd);
+
+    // ELF: 0x7f 'E' 'L' 'F'
+    const isElf = header[0] === 0x7f && header[1] === 0x45 && header[2] === 0x4c && header[3] === 0x46;
+    // PE: 'M' 'Z'
+    const isPe = header[0] === 0x4d && header[1] === 0x5a;
+    // Mach-O: 0xFEEDFACF / 0xFEEDFACE / 0xCAFEBABE / 0xCFFAEDFE
+    const isMacho = (header[0] === 0xcf && header[1] === 0xfa && header[2] === 0xed && header[3] === 0xfe) ||
+                    (header[0] === 0xfe && header[1] === 0xed && header[2] === 0xfa && header[3] === 0xcf) ||
+                    (header[0] === 0xca && header[1] === 0xfe && header[2] === 0xba && header[3] === 0xbe);
+
+    return isElf || isPe || isMacho;
+}
+
 function download(url, dest) {
+    const tempDest = `${dest}.tmp.${process.pid}.${Date.now()}`;
+
+    const cleanup = () => {
+        try {
+            if (fs.existsSync(tempDest)) fs.unlinkSync(tempDest);
+        } catch (e) {}
+    };
+
     return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(dest);
-        const request = https.get(url, (response) => {
-            if (response.statusCode === 302 || response.statusCode === 301) {
-                download(response.headers.location, dest).then(resolve).catch(reject);
-                return;
+        const getClient = (targetUrl) => (targetUrl.startsWith('http:') ? http : https);
+
+        const fetchUrl = (currentUrl, redirectCount = 0) => {
+            if (redirectCount > 10) {
+                cleanup();
+                return reject(new Error('Too many HTTP redirects'));
             }
-            if (response.statusCode !== 200) {
-                reject(new Error(`Failed to download: ${response.statusCode}`));
-                return;
-            }
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close(resolve);
+
+            const req = getClient(currentUrl).get(currentUrl, (response) => {
+                if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                    const redirectUrl = new URL(response.headers.location, currentUrl).toString();
+                    response.resume(); // Consume stream to free memory
+                    return fetchUrl(redirectUrl, redirectCount + 1);
+                }
+
+                if (response.statusCode !== 200) {
+                    cleanup();
+                    response.resume();
+                    return reject(new Error(`Failed to download: HTTP ${response.statusCode}`));
+                }
+
+                const file = fs.createWriteStream(tempDest);
+                response.pipe(file);
+
+                file.on('finish', () => {
+                    file.close(() => {
+                        try {
+                            if (!isValidBinary(tempDest)) {
+                                cleanup();
+                                return reject(new Error('Downloaded binary failed validation (corrupted or invalid binary header)'));
+                            }
+                            fs.renameSync(tempDest, dest);
+                            resolve();
+                        } catch (err) {
+                            cleanup();
+                            reject(err);
+                        }
+                    });
+                });
+
+                file.on('error', (err) => {
+                    cleanup();
+                    reject(err);
+                });
             });
-        });
-        request.on('error', (err) => {
-            fs.unlink(dest, () => reject(err));
-        });
+
+            req.on('error', (err) => {
+                cleanup();
+                reject(err);
+            });
+        };
+
+        fetchUrl(url);
     });
 }
 
-function main() {
+async function runInstall({ force = false } = {}) {
     const filename = getPlatform();
     if (!filename) {
-        console.error(`Unsupported platform: ${process.platform}-${process.arch}`);
-        process.exit(1);
+        throw new Error(`Unsupported platform: ${process.platform}-${process.arch}`);
     }
 
     const dest = path.join(__dirname, '..', filename);
     if (fs.existsSync(dest)) {
-        console.log('Binary already exists, skipping download.');
-        return;
+        if (force) {
+            try { fs.unlinkSync(dest); } catch (e) {}
+        } else {
+            const stat = fs.statSync(dest);
+            if (stat.size > 0 && isValidBinary(dest)) {
+                console.log('Binary already exists and is valid, skipping download.');
+                return;
+            }
+            console.warn('Existing binary is invalid or 0 bytes, re-downloading...');
+            try { fs.unlinkSync(dest); } catch (e) {}
+        }
     }
 
     const url = `https://github.com/${REPO}/releases/download/${VERSION}/${filename}`;
     console.log(`Downloading ${url}...`);
 
-    download(url, dest)
-        .then(() => console.log('Download complete.'))
+    await download(url, dest);
+    console.log('Download complete.');
+}
+
+function main() {
+    runInstall()
         .catch((err) => {
             console.error('Download failed:', err.message);
             console.error('Run "lotus fetch" to try again.');
-            // Don't fail the build, as we might be in a dev environment or have a fallback
-            // actually, for a user install this should logicially fail or warn.
-            // The plan says "Fallback: If the download fails, the CLI provides a lotus fetch command to retry."
-            // So we exit 0 but warn.
         });
 }
 
-main();
+if (require.main === module) {
+    main();
+}
+
+module.exports = {
+    getPlatform,
+    isValidBinary,
+    download,
+    runInstall
+};
