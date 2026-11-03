@@ -1590,11 +1590,13 @@ module.exports = {
         validatePlatformSecurityIsolation,
         detectLinuxThemeNode,
         spawnSandboxedEngine: require('./launcher.js').spawnSandboxedEngine,
-        networkBroker: require('./network_broker.js')
+        networkBroker: require('./network_broker.js'),
+        secureConstellation: require('./secure_constellation.js')
     },
     validatePlatformSecurityIsolation,
     detectLinuxThemeNode,
     spawnSandboxedEngine: require('./launcher.js').spawnSandboxedEngine,
     launcher: require('./launcher.js'),
-    networkBroker: require('./network_broker.js')
+    networkBroker: require('./network_broker.js'),
+    secureConstellation: require('./secure_constellation.js')
 };
