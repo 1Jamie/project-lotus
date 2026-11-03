@@ -214,10 +214,24 @@ export declare class ServoWindow extends EventEmitter {
   on(event: string | symbol, listener: (...args: any[]) => void): this;
 }
 
+export interface SecureMethodOptions {
+  channel: string;
+  schema?: Record<string, any>;
+  [key: string]: any;
+}
+
+export interface SecureEventOptions {
+  schema?: Record<string, any>;
+  [key: string]: any;
+}
+
 export interface IpcMain extends EventEmitter {
   send(channel: string, data: any): void;
   sendTo(clientId: string, channel: string, data: any): void;
   handle(channel: string, handler: (data: any) => any | Promise<any>): void;
+  register(method: string, handler: (data: any) => any | Promise<any>, options: SecureMethodOptions): () => void;
+  registerEvent(eventName: string, options: SecureEventOptions): () => void;
+  unregister(method: string): boolean;
 }
 
 export const ipcMain: IpcMain;
@@ -241,3 +255,5 @@ export const launcher: any;
 export const networkBroker: any;
 export const secureConstellation: any;
 export const originDerivation: any;
+export const hostIpcPolicy: any;
+export const hostIpcRouter: any;

@@ -185,3 +185,4 @@ test('Origin Derivation - enforces rules for data:, blob:, about: and Web Worker
     assert.strictEqual(httpsRes.origin, 'https://my-app.io:9000');
     assert.strictEqual(httpsRes.ipcEligible, true);
 });
+

@@ -126,7 +126,22 @@ class IpcMain extends EventEmitter {
             }
         });
     }
+
+    register(method, handler, options) {
+        return hostIpcRouter.registerSecureMethod(method, handler, options);
+    }
+
+    registerEvent(eventName, options) {
+        return hostIpcRouter.registerSecureEvent(eventName, options);
+    }
+
+    unregister(method) {
+        return hostIpcRouter.unregisterSecureMethod(method);
+    }
 }
+
+const hostIpcPolicy = require('./host_ipc_policy.js');
+const hostIpcRouter = new hostIpcPolicy.HostIpcPolicyRouter();
 
 const isProfiling = process.argv.includes('--profile');
 
@@ -1592,7 +1607,9 @@ module.exports = {
         spawnSandboxedEngine: require('./launcher.js').spawnSandboxedEngine,
         networkBroker: require('./network_broker.js'),
         secureConstellation: require('./secure_constellation.js'),
-        originDerivation: require('./origin_derivation.js')
+        originDerivation: require('./origin_derivation.js'),
+        hostIpcPolicy,
+        hostIpcRouter
     },
     validatePlatformSecurityIsolation,
     detectLinuxThemeNode,
@@ -1600,5 +1617,7 @@ module.exports = {
     launcher: require('./launcher.js'),
     networkBroker: require('./network_broker.js'),
     secureConstellation: require('./secure_constellation.js'),
-    originDerivation: require('./origin_derivation.js')
+    originDerivation: require('./origin_derivation.js'),
+    hostIpcPolicy,
+    hostIpcRouter
 };

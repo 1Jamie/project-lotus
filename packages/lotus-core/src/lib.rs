@@ -20,6 +20,7 @@ use log::{info, error, debug, trace, warn};
 
 mod window_state;
 mod platform;
+pub mod ipc_security;
 
 use window_state::WindowStateManager;
 
