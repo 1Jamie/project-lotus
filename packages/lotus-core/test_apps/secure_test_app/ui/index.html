@@ -29,11 +29,12 @@
             background-color: var(--bg);
             color: var(--text-main);
             font-family: var(--font-family);
-            padding: 32px;
+            padding: 24px;
             display: flex;
             flex-direction: column;
-            gap: 24px;
-            min-height: 100vh;
+            gap: 16px;
+            height: 100vh;
+            overflow: hidden;
         }
 
         header {
@@ -41,11 +42,11 @@
             justify-content: space-between;
             align-items: center;
             border-bottom: 1px solid var(--surface-border);
-            padding-bottom: 16px;
+            padding-bottom: 12px;
         }
 
         .title-group h1 {
-            font-size: 24px;
+            font-size: 20px;
             font-weight: 600;
             letter-spacing: -0.5px;
             display: flex;
@@ -77,21 +78,29 @@
         .grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 20px;
+            gap: 16px;
         }
 
         .card {
             background: var(--surface);
             border: 1px solid var(--surface-border);
             border-radius: 8px;
-            padding: 20px;
+            padding: 16px;
             display: flex;
             flex-direction: column;
-            gap: 14px;
+            gap: 10px;
+        }
+
+        .log-card {
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
         }
 
         .card h2 {
-            font-size: 15px;
+            font-size: 13px;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.5px;
@@ -101,7 +110,7 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 8px 0;
+            padding: 6px 0;
             border-bottom: 1px solid rgba(255, 255, 255, 0.05);
             font-size: 13px;
         }
@@ -161,11 +170,12 @@
             background: var(--code-bg);
             border: 1px solid var(--surface-border);
             border-radius: 8px;
-            padding: 16px;
+            padding: 12px 14px;
             font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
             font-size: 12px;
-            line-height: 1.6;
-            height: 240px;
+            line-height: 1.5;
+            flex: 1;
+            min-height: 0;
             overflow-y: auto;
             display: flex;
             flex-direction: column-reverse;
@@ -247,7 +257,7 @@
         </div>
     </div>
 
-    <div class="card" style="flex: 1;">
+    <div class="card log-card">
         <h2>Authoritative Event & Output Log</h2>
         <div class="console-container" id="console"></div>
     </div>
