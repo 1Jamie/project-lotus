@@ -320,8 +320,10 @@ For contributor build instructions and Linux/Windows system prerequisites, see [
 ├── lotus.d.ts               # TypeScript definitions
 ├── index.js                 # Native .node binary loader
 ├── resources/               # Injected IPC bridge, scrollbar, and <select> overlay UI
-├── test_app/                # Single-window showcase app
-└── multi_pane_test_app/     # Multi-pane workspace & command palette showcase
+├── test_apps/
+│   ├── test_app/            # Single-window showcase app
+│   ├── multi_pane_test_app/ # Multi-pane workspace & command palette showcase
+│   └── secure_test_app/     # Process-isolated sandbox & Track 2 showcase
 ```
 
 ## License

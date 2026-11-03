@@ -390,7 +390,7 @@ ipcMain.on('file-selected', (file) => {
 });
 ```
 
-> **Full working example:** Check out [`packages/lotus-core/multi_pane_test_app/`](./packages/lotus-core/multi_pane_test_app/) in the repository, which demonstrates a frameless window with a top bar, collapsible bottom terminal, sidebar navigation, and a floating centered command palette overlay.
+> **Full working example:** Check out [`packages/lotus-core/test_apps/multi_pane_test_app/`](./packages/lotus-core/test_apps/multi_pane_test_app/) in the repository, which demonstrates a frameless window with a top bar, collapsible bottom terminal, sidebar navigation, and a floating centered command palette overlay.
 
 ---
 

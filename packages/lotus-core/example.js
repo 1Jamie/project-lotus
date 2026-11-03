@@ -10,7 +10,7 @@ app.warmup();
 // 2. Create a frameless, transparent window pointing at the test_app UI
 const win = new ServoWindow({
     id: 'example-window',
-    root: path.join(__dirname, 'test_app', 'ui'),
+    root: path.join(__dirname, 'test_apps', 'test_app', 'ui'),
     index: 'index.html',
     width: 1024,
     height: 768,

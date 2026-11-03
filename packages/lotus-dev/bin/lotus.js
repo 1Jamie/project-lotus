@@ -410,9 +410,13 @@ globalThis.__LOTUS_ENCRYPTED_BUILD__ = ${encrypt ? 'true' : 'false'};
                     }
                 }
             } else {
-                // If packaging from within the monorepo itself (e.g. test_app)
-                const localWindowsDir = path.join(process.cwd(), '..', 'windows');
-                if (fs.existsSync(localWindowsDir)) {
+                // If packaging from within the monorepo itself (e.g. test_apps)
+                const candidateDirs = [
+                    path.join(process.cwd(), '..', 'windows'),
+                    path.join(process.cwd(), '..', '..', 'windows')
+                ];
+                const localWindowsDir = candidateDirs.find(d => fs.existsSync(d));
+                if (localWindowsDir) {
                     for (const dll of ['libEGL.dll', 'libGLESv2.dll', 'd3dcompiler_47.dll']) {
                         const dllPath = path.join(localWindowsDir, dll);
                         if (fs.existsSync(dllPath)) {
