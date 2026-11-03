@@ -240,3 +240,4 @@ export function spawnSandboxedEngine(options?: any): Promise<any>;
 export const launcher: any;
 export const networkBroker: any;
 export const secureConstellation: any;
+export const originDerivation: any;

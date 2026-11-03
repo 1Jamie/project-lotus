@@ -166,3 +166,4 @@ class SecureConstellationManager extends EventEmitter {
 module.exports = {
     SecureConstellationManager,
 };
+
