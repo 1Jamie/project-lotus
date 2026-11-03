@@ -657,7 +657,10 @@ function processEvent(win, msg) {
 
     if (msg.event === 'load-status') {
         if (win) {
-            win.emit('load-status', msg.status, paneId);
+            // Do not emit public window-level load-status for internal framework panes (__lotus_select_overlay, etc.)
+            if (!paneId || !paneId.startsWith('__lotus_')) {
+                win.emit('load-status', msg.status, paneId);
+            }
             const pane = win.panes.get(paneId);
             if (pane) pane.emit('load-status', msg.status);
         }
@@ -666,7 +669,9 @@ function processEvent(win, msg) {
 
     if (msg.event === 'title-changed') {
         if (win) {
-            win.emit('title-changed', msg.title, paneId);
+            if (!paneId || !paneId.startsWith('__lotus_')) {
+                win.emit('title-changed', msg.title, paneId);
+            }
             const pane = win.panes.get(paneId);
             if (pane) pane.emit('title-changed', msg.title);
         }

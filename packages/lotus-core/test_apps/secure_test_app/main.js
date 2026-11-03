@@ -78,7 +78,8 @@ win.once('ready-to-show', () => {
     win.show();
 });
 
-win.on('load-status', (status) => {
+win.on('load-status', (status, paneId) => {
+    if (paneId && paneId !== 'main') return;
     console.log(`[Secure App] Load status: ${status}`);
     if (status === 'complete') {
         setTimeout(() => {
