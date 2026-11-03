@@ -16,6 +16,10 @@ const MAX_PENDING_FETCH_BARRIERS_PER_DOC = 32;
 const MAX_PENDING_FETCH_BYTES_PER_DOC = 1048576; // 1 MiB
 const MAX_UNRESOLVED_COOKIE_GAP_MS = 2000; // 2.0s
 const MAX_FETCH_BARRIER_TIMEOUT_MS = 5000; // 5.0s
+const MAX_RESPONSE_BODY_BYTES = 64 * 1024 * 1024; // 64 MiB hard ceiling
+const MAX_CONCURRENT_REQUESTS = 32; // 32 concurrent request limit
+const REQUEST_TIMEOUT_MS = 30000; // 30s per-request timeout
+const MAX_REDIRECT_HOPS = 5; // Up to 5 validated redirect hops
 
 const HOP_BY_HOP_HEADERS = new Set([
     'connection',
@@ -284,11 +288,38 @@ class NetworkBroker {
     constructor(options = {}) {
         this.cookieStore = new HostCookieStore();
         this.allowLocalhost = options.allowLocalhost || false;
-        this._httpAgent = new http.Agent({ keepAlive: true });
-        this._httpsAgent = new https.Agent({ keepAlive: true });
+        this.maxResponseBodyBytes = options.maxResponseBodyBytes || MAX_RESPONSE_BODY_BYTES;
+        this.requestTimeoutMs = options.requestTimeoutMs || REQUEST_TIMEOUT_MS;
+        this.maxConcurrentRequests = options.maxConcurrentRequests || MAX_CONCURRENT_REQUESTS;
+        this.maxRedirectHops = options.maxRedirectHops !== undefined ? options.maxRedirectHops : MAX_REDIRECT_HOPS;
+
+        this._httpAgent = new http.Agent({ keepAlive: true, maxSockets: this.maxConcurrentRequests });
+        this._httpsAgent = new https.Agent({ keepAlive: true, maxSockets: this.maxConcurrentRequests });
+
+        this.activeRequestsCount = 0;
+        this._concurrencyQueue = [];
 
         // Per-document synchronization states: `${surfaceId}:${documentId}` -> DocumentSyncState
         this._docStates = new Map();
+    }
+
+    async _acquireConcurrencySlot() {
+        if (this.activeRequestsCount < this.maxConcurrentRequests) {
+            this.activeRequestsCount++;
+            return;
+        }
+        return new Promise((resolve) => {
+            this._concurrencyQueue.push(resolve);
+        });
+    }
+
+    _releaseConcurrencySlot() {
+        if (this._concurrencyQueue.length > 0) {
+            const next = this._concurrencyQueue.shift();
+            next();
+        } else {
+            this.activeRequestsCount = Math.max(0, this.activeRequestsCount - 1);
+        }
     }
 
     _getDocState(surfaceId, documentId) {
@@ -486,7 +517,7 @@ class NetworkBroker {
             if (state.processedCookieSequence >= item.requiredSequence) {
                 if (item.timer) clearTimeout(item.timer);
                 state.pendingFetchBytes -= item.byteLength;
-                this._executeSingleHopFetch(surface, item.requestEnvelope, item.resolve, item.reject);
+                this._executeFetchWithRedirects(surface, item.requestEnvelope, item.resolve, item.reject);
             } else {
                 remaining.push(item);
             }
@@ -512,7 +543,7 @@ class NetworkBroker {
 
             // Check if already satisfied
             if (state.processedCookieSequence >= requiredSequence) {
-                return this._executeSingleHopFetch(surface, requestEnvelope, resolve, reject);
+                return this._executeFetchWithRedirects(surface, requestEnvelope, resolve, reject);
             }
 
             // Check gap bound
@@ -558,139 +589,225 @@ class NetworkBroker {
     }
 
     /**
-     * Executes a single-hop network fetch with IP pinning, anti-SSRF validation,
-     * header hygiene, and host cookie jar integration.
+     * Executes fetch with bounded redirects (up to 5 hops),
+     * enforcing anti-SSRF validation at every hop and global concurrency caps.
      */
-    async _executeSingleHopFetch(surface, requestEnvelope, resolve, reject) {
-        const { url, method = 'GET', headers = {}, body } = requestEnvelope;
-
-        let u;
+    async _executeFetchWithRedirects(surface, initialRequestEnvelope, resolve, reject) {
+        await this._acquireConcurrencySlot();
         try {
-            u = new URL(url);
-        } catch {
-            return reject(Object.assign(new Error('Invalid request URL'), { code: 'E_BROKER_INVALID_URL' }));
-        }
+            let currentEnvelope = { ...initialRequestEnvelope };
+            let hopsRemaining = this.maxRedirectHops;
 
-        // Scheme check
-        if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-            return reject(Object.assign(new Error(`Forbidden scheme: ${u.protocol}`), { code: 'E_BROKER_SCHEME_DENIED' }));
-        }
+            while (true) {
+                const hopResult = await this._performSingleHop(surface, currentEnvelope);
 
-        // Userinfo check (E_BROKER_USERINFO_FORBIDDEN)
-        if (u.username || u.password) {
-            return reject(Object.assign(new Error('Userinfo (username/password) in URL is forbidden'), { code: 'E_BROKER_USERINFO_FORBIDDEN' }));
-        }
+                const isRedirect = hopResult.status >= 300 && hopResult.status < 400 && hopResult.headers['location'];
+                if (isRedirect) {
+                    if (hopsRemaining <= 0) {
+                        return reject(Object.assign(new Error('Redirect limit exceeded (max 5 hops)'), { code: 'E_BROKER_TOO_MANY_REDIRECTS' }));
+                    }
+                    hopsRemaining--;
 
-        // Destination origin validation against surface policy
-        const destOrigin = normalizeOrigin(url);
-        if (surface.trustedOrigins && !surface.trustedOrigins.has(destOrigin) && surface.trustedOrigins.size > 0) {
-            return reject(Object.assign(new Error(`Destination origin ${destOrigin} denied by surface policy`), { code: 'E_BROKER_ORIGIN_DENIED' }));
-        }
+                    const rawLocation = hopResult.headers['location'];
+                    let nextUrl;
+                    try {
+                        nextUrl = new URL(rawLocation, currentEnvelope.url).toString();
+                    } catch {
+                        return reject(Object.assign(new Error(`Invalid redirect Location: ${rawLocation}`), { code: 'E_BROKER_INVALID_URL' }));
+                    }
 
-        // Resolve DNS and perform IP validation / pinning
-        let resolvedIps;
-        try {
-            resolvedIps = await dns.promises.lookup(u.hostname, { all: true });
+                    // RFC 7231 redirect method rewrites
+                    let nextMethod = currentEnvelope.method || 'GET';
+                    let nextBody = currentEnvelope.body;
+                    if (hopResult.status === 303 || ((hopResult.status === 301 || hopResult.status === 302) && nextMethod === 'POST')) {
+                        nextMethod = 'GET';
+                        nextBody = undefined;
+                    }
+
+                    currentEnvelope = {
+                        ...currentEnvelope,
+                        url: nextUrl,
+                        method: nextMethod,
+                        body: nextBody
+                    };
+                    continue;
+                }
+
+                return resolve(hopResult);
+            }
         } catch (err) {
-            return reject(Object.assign(new Error(`DNS resolution failed for ${u.hostname}: ${err.message}`), { code: 'E_BROKER_DNS_FAILED' }));
+            reject(err);
+        } finally {
+            this._releaseConcurrencySlot();
         }
+    }
 
-        if (!resolvedIps || resolvedIps.length === 0) {
-            return reject(Object.assign(new Error(`No IP addresses found for ${u.hostname}`), { code: 'E_BROKER_DNS_FAILED' }));
-        }
+    /**
+     * Performs a single network hop with IP pinning, anti-SSRF validation,
+     * header hygiene, request timeout, and 64 MiB response body ceiling.
+     */
+    _performSingleHop(surface, requestEnvelope) {
+        return new Promise(async (resolve, reject) => {
+            const { url, method = 'GET', headers = {}, body } = requestEnvelope;
 
-        // Verify every resolved IP
-        for (const item of resolvedIps) {
-            if (!isAllowedPublicIp(item.address, this.allowLocalhost)) {
-                return reject(Object.assign(new Error(`SSRF blocked: address ${item.address} is non-unicast or restricted`), { code: 'E_BROKER_SSRF_BLOCKED' }));
+            let u;
+            try {
+                u = new URL(url);
+            } catch {
+                return reject(Object.assign(new Error('Invalid request URL'), { code: 'E_BROKER_INVALID_URL' }));
             }
-        }
 
-        // Pin first IP
-        const pinned = resolvedIps[0];
-        const isHttps = u.protocol === 'https:';
-        const agent = isHttps ? this._httpsAgent : this._httpAgent;
-
-        // Header hygiene: hop-by-hop stripping & connection nominated token stripping
-        const cleanHeaders = {};
-        let connectionTokens = [];
-        for (const [k, v] of Object.entries(headers)) {
-            const lk = k.toLowerCase();
-            if (lk === 'connection' && typeof v === 'string') {
-                connectionTokens.push(...v.split(',').map(t => t.trim().toLowerCase()));
+            // Scheme check
+            if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+                return reject(Object.assign(new Error(`Forbidden scheme: ${u.protocol}`), { code: 'E_BROKER_SCHEME_DENIED' }));
             }
-        }
 
-        for (const [k, v] of Object.entries(headers)) {
-            const lk = k.toLowerCase();
-            if (HOP_BY_HOP_HEADERS.has(lk)) continue;
-            if (connectionTokens.includes(lk)) continue;
-            cleanHeaders[k] = v;
-        }
-
-        // Attach host authoritative cookies
-        const hostCookies = this.cookieStore.getCookieHeader(surface.id, surface.currentOrigin, url);
-        if (hostCookies) {
-            cleanHeaders['cookie'] = hostCookies;
-        }
-
-        // Host header
-        cleanHeaders['host'] = u.host;
-
-        const reqOptions = {
-            method,
-            agent,
-            headers: cleanHeaders,
-            lookup: (_hostname, _options, cb) => {
-                cb(null, pinned.address, pinned.family);
+            // Userinfo check (E_BROKER_USERINFO_FORBIDDEN)
+            if (u.username || u.password) {
+                return reject(Object.assign(new Error('Userinfo (username/password) in URL is forbidden'), { code: 'E_BROKER_USERINFO_FORBIDDEN' }));
             }
-        };
 
-        if (isHttps) {
-            reqOptions.servername = u.hostname; // Preserve TLS SNI
-        }
+            // Destination origin validation against surface policy
+            const destOrigin = normalizeOrigin(url);
+            if (surface.trustedOrigins && !surface.trustedOrigins.has(destOrigin) && surface.trustedOrigins.size > 0) {
+                return reject(Object.assign(new Error(`Destination origin ${destOrigin} denied by surface policy`), { code: 'E_BROKER_ORIGIN_DENIED' }));
+            }
 
-        const transport = isHttps ? https : http;
-        const req = transport.request(u, reqOptions, (res) => {
-            const chunks = [];
-            res.on('data', c => chunks.push(c));
-            res.on('end', () => {
-                const responseBuffer = Buffer.concat(chunks);
+            // Resolve DNS and perform IP validation / pinning
+            let resolvedIps;
+            try {
+                resolvedIps = await dns.promises.lookup(u.hostname, { all: true });
+            } catch (err) {
+                return reject(Object.assign(new Error(`DNS resolution failed for ${u.hostname}: ${err.message}`), { code: 'E_BROKER_DNS_FAILED' }));
+            }
 
-                // Process Set-Cookie headers from response
-                const setCookieHeaders = res.headers['set-cookie'];
-                const clientSetCookies = [];
-                if (setCookieHeaders) {
-                    const cookieList = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
-                    for (const raw of cookieList) {
-                        const parsed = parseCookieString(raw);
-                        if (parsed) {
-                            this.cookieStore.setCookie(surface.id, surface.currentOrigin, parsed);
-                            if (!parsed.httpOnly) {
-                                clientSetCookies.push(parsed);
+            if (!resolvedIps || resolvedIps.length === 0) {
+                return reject(Object.assign(new Error(`No IP addresses found for ${u.hostname}`), { code: 'E_BROKER_DNS_FAILED' }));
+            }
+
+            // Verify every resolved IP
+            for (const item of resolvedIps) {
+                if (!isAllowedPublicIp(item.address, this.allowLocalhost)) {
+                    return reject(Object.assign(new Error(`SSRF blocked: address ${item.address} is non-unicast or restricted`), { code: 'E_BROKER_SSRF_BLOCKED' }));
+                }
+            }
+
+            // Pin first IP
+            const pinned = resolvedIps[0];
+            const isHttps = u.protocol === 'https:';
+            const agent = isHttps ? this._httpsAgent : this._httpAgent;
+
+            // Header hygiene: hop-by-hop stripping & connection nominated token stripping
+            const cleanHeaders = {};
+            let connectionTokens = [];
+            for (const [k, v] of Object.entries(headers)) {
+                const lk = k.toLowerCase();
+                if (lk === 'connection' && typeof v === 'string') {
+                    connectionTokens.push(...v.split(',').map(t => t.trim().toLowerCase()));
+                }
+            }
+
+            for (const [k, v] of Object.entries(headers)) {
+                const lk = k.toLowerCase();
+                if (HOP_BY_HOP_HEADERS.has(lk)) continue;
+                if (connectionTokens.includes(lk)) continue;
+                cleanHeaders[k] = v;
+            }
+
+            // Attach host authoritative cookies
+            const hostCookies = this.cookieStore.getCookieHeader(surface.id, surface.currentOrigin, url);
+            if (hostCookies) {
+                cleanHeaders['cookie'] = hostCookies;
+            }
+
+            // Host header
+            cleanHeaders['host'] = u.host;
+
+            const reqOptions = {
+                method,
+                agent,
+                headers: cleanHeaders,
+                lookup: (_hostname, _options, cb) => {
+                    cb(null, pinned.address, pinned.family);
+                }
+            };
+
+            if (isHttps) {
+                reqOptions.servername = u.hostname; // Preserve TLS SNI
+            }
+
+            const transport = isHttps ? https : http;
+            let settled = false;
+            const finishReject = (err) => {
+                if (!settled) {
+                    settled = true;
+                    reject(err);
+                }
+            };
+            const finishResolve = (val) => {
+                if (!settled) {
+                    settled = true;
+                    resolve(val);
+                }
+            };
+
+            const req = transport.request(u, reqOptions, (res) => {
+                const chunks = [];
+                let totalBytes = 0;
+
+                res.on('data', (c) => {
+                    totalBytes += c.length;
+                    if (totalBytes > this.maxResponseBodyBytes) {
+                        req.destroy();
+                        finishReject(Object.assign(new Error('Response body exceeded maximum limit of 64 MiB'), { code: 'E_BROKER_BODY_TOO_LARGE' }));
+                        return;
+                    }
+                    chunks.push(c);
+                });
+
+                res.on('end', () => {
+                    const responseBuffer = Buffer.concat(chunks);
+
+                    // Process Set-Cookie headers from response
+                    const setCookieHeaders = res.headers['set-cookie'];
+                    const clientSetCookies = [];
+                    if (setCookieHeaders) {
+                        const cookieList = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
+                        for (const raw of cookieList) {
+                            const parsed = parseCookieString(raw);
+                            if (parsed) {
+                                this.cookieStore.setCookie(surface.id, surface.currentOrigin, parsed);
+                                if (!parsed.httpOnly) {
+                                    clientSetCookies.push(parsed);
+                                }
                             }
                         }
                     }
-                }
 
-                resolve({
-                    status: res.statusCode,
-                    statusText: res.statusMessage,
-                    headers: res.headers,
-                    body: responseBuffer,
-                    clientSetCookies // Non-HttpOnly cookies for Servo local DOM synchronization
+                    finishResolve({
+                        status: res.statusCode,
+                        statusText: res.statusMessage,
+                        headers: res.headers,
+                        body: responseBuffer,
+                        clientSetCookies // Non-HttpOnly cookies for Servo local DOM synchronization
+                    });
                 });
             });
-        });
 
-        req.on('error', (err) => {
-            reject(Object.assign(new Error(`Network request failed: ${err.message}`), { code: 'E_BROKER_NETWORK_ERROR' }));
-        });
+            // Request timeout
+            req.setTimeout(this.requestTimeoutMs, () => {
+                req.destroy(Object.assign(new Error('Broker request timed out'), { code: 'E_BROKER_TIMEOUT' }));
+            });
 
-        if (body) {
-            req.write(body);
-        }
-        req.end();
+            req.on('error', (err) => {
+                finishReject(Object.assign(new Error(`Network request failed: ${err.message}`), { code: err.code || 'E_BROKER_NETWORK_ERROR' }));
+            });
+
+            if (body) {
+                req.write(body);
+            }
+            req.end();
+        });
     }
 }
 
@@ -709,5 +826,9 @@ module.exports = {
     MAX_PENDING_FETCH_BARRIERS_PER_DOC,
     MAX_PENDING_FETCH_BYTES_PER_DOC,
     MAX_UNRESOLVED_COOKIE_GAP_MS,
-    MAX_FETCH_BARRIER_TIMEOUT_MS
+    MAX_FETCH_BARRIER_TIMEOUT_MS,
+    MAX_RESPONSE_BODY_BYTES,
+    MAX_CONCURRENT_REQUESTS,
+    REQUEST_TIMEOUT_MS,
+    MAX_REDIRECT_HOPS
 };

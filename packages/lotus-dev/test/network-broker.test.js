@@ -309,3 +309,113 @@ test('Network Broker - adversarial queue bounds and deterministic overflow fault
     assert.strictEqual(surface.processedCookieSequence, 1);
     assert.strictEqual(surface.cookieSyncFaulted, false);
 });
+
+test('Network Broker - response body quota enforcement (64 MiB cap)', async () => {
+    const server = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+        // Emit 2 KiB chunks continuously to simulate oversized response
+        res.write(Buffer.alloc(2048, 'A'));
+        res.write(Buffer.alloc(2048, 'B'));
+        res.end();
+    });
+
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+
+    try {
+        // Configure broker with 1024 bytes maximum response body cap
+        const broker = new NetworkBroker({ allowLocalhost: true, maxResponseBodyBytes: 1024 });
+        const surface = {
+            id: 'surf-quota',
+            navigationState: 'committed',
+            activeDocumentId: 'doc-quota',
+            currentOrigin: `http://127.0.0.1:${port}`
+        };
+
+        await assert.rejects(
+            broker.handleBrokerFetchRequest(surface, 'doc-quota', {
+                url: `http://127.0.0.1:${port}/large`,
+                requiredCookieSequence: 0
+            }),
+            (err) => {
+                assert.strictEqual(err.code, 'E_BROKER_BODY_TOO_LARGE');
+                return true;
+            }
+        );
+    } finally {
+        server.close();
+    }
+});
+
+test('Network Broker - redirect loop with anti-SSRF validation at every hop', async () => {
+    let redirectCount = 0;
+    const server = http.createServer((req, res) => {
+        if (req.url === '/redirect-1') {
+            res.writeHead(302, { 'Location': '/redirect-2', 'Set-Cookie': 'hop1=ok; Path=/' });
+            res.end();
+        } else if (req.url === '/redirect-2') {
+            res.writeHead(302, { 'Location': '/final', 'Set-Cookie': 'hop2=ok; Path=/' });
+            res.end();
+        } else if (req.url === '/final') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ final: true, cookie: req.headers.cookie || '' }));
+        } else if (req.url === '/redirect-ssrf') {
+            // Malicious redirect to internal RFC 1918 private address
+            res.writeHead(302, { 'Location': 'http://192.168.1.1/secret' });
+            res.end();
+        } else if (req.url.startsWith('/loop')) {
+            redirectCount++;
+            res.writeHead(302, { 'Location': `/loop?n=${redirectCount}` });
+            res.end();
+        }
+    });
+
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+
+    try {
+        const broker = new NetworkBroker({ allowLocalhost: true });
+        const surface = {
+            id: 'surf-redir',
+            navigationState: 'committed',
+            activeDocumentId: 'doc-redir',
+            currentOrigin: `http://127.0.0.1:${port}`
+        };
+
+        // 1. Legitimate multi-hop redirect (up to 5 hops) should resolve and forward cookies
+        const res = await broker.handleBrokerFetchRequest(surface, 'doc-redir', {
+            url: `http://127.0.0.1:${port}/redirect-1`,
+            requiredCookieSequence: 0
+        });
+        assert.strictEqual(res.status, 200);
+        const data = JSON.parse(res.body.toString());
+        assert.strictEqual(data.final, true);
+        assert(data.cookie.includes('hop1=ok'));
+
+        // 2. Malicious redirect to private/restricted IP must be blocked by anti-SSRF at the hop
+        await assert.rejects(
+            broker.handleBrokerFetchRequest(surface, 'doc-redir', {
+                url: `http://127.0.0.1:${port}/redirect-ssrf`,
+                requiredCookieSequence: 0
+            }),
+            (err) => {
+                assert.strictEqual(err.code, 'E_BROKER_SSRF_BLOCKED');
+                return true;
+            }
+        );
+
+        // 3. Infinite redirect loop must abort with E_BROKER_TOO_MANY_REDIRECTS
+        await assert.rejects(
+            broker.handleBrokerFetchRequest(surface, 'doc-redir', {
+                url: `http://127.0.0.1:${port}/loop`,
+                requiredCookieSequence: 0
+            }),
+            (err) => {
+                assert.strictEqual(err.code, 'E_BROKER_TOO_MANY_REDIRECTS');
+                return true;
+            }
+        );
+    } finally {
+        server.close();
+    }
+});

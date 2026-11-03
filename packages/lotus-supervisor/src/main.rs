@@ -372,8 +372,8 @@ fn main() {
         // Close unlisted descriptors against bootstrap allowlist
         fd::sanitize_descriptors_fail_closed(&child_bootstrap_allowlist);
 
-        // Apply Landlock ruleset and close Landlock descriptors
-        landlock::apply_landlock_and_close_descriptors(&landlock_fds);
+        // Apply Landlock ruleset and close Landlock descriptors (ABI >= 4 with network port containment)
+        landlock::apply_landlock_and_close_descriptors(&landlock_fds, Some(bound_port));
 
         // Verify remaining descriptor table strictly matches final allowlist
         let mut child_final_allowlist = [

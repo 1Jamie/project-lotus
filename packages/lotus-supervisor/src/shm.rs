@@ -32,6 +32,8 @@ pub const F_GET_SEALS: libc::c_int = F_LINUX_SPECIFIC_BASE + 10;
 pub const F_SEAL_SEAL: libc::c_int = 0x0001;
 pub const F_SEAL_SHRINK: libc::c_int = 0x0002;
 pub const F_SEAL_GROW: libc::c_int = 0x0004;
+pub const F_SEAL_WRITE: libc::c_int = 0x0008;
+pub const F_SEAL_FUTURE_WRITE: libc::c_int = 0x0010;
 
 #[repr(C, align(64))]
 pub struct ProducerControlHeader {
@@ -106,6 +108,7 @@ pub fn calculate_shm_geometry(width: u32, height: u32) -> Result<ShmGeometry, &'
 pub struct SealedMemfdPlane {
     pub rw_fd: RawFd,
     pub ro_fd: RawFd,
+    pub rw_ptr: *mut u8,
     pub size: usize,
 }
 
@@ -131,10 +134,30 @@ impl SealedMemfdPlane {
             return Err("E_SHM_FTRUNCATE_FAILED");
         }
 
-        // Apply seals: F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL
-        let seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
-        if unsafe { libc::fcntl(rw_fd, F_ADD_SEALS, seals) } != 0 {
+        // Pre-map writable pointer for producer BEFORE applying F_SEAL_FUTURE_WRITE
+        let rw_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                rw_fd,
+                0,
+            ) as *mut u8
+        };
+        if rw_ptr == libc::MAP_FAILED as *mut u8 {
             unsafe { libc::close(rw_fd) };
+            return Err("E_SHM_MMAP_FAILED");
+        }
+
+        // Apply seals: F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE | F_SEAL_SEAL
+        // F_SEAL_FUTURE_WRITE guarantees no subsequent writable mappings can be created by ANY descriptor
+        let seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE | F_SEAL_SEAL;
+        if unsafe { libc::fcntl(rw_fd, F_ADD_SEALS, seals) } != 0 {
+            unsafe {
+                libc::munmap(rw_ptr as *mut libc::c_void, size);
+                libc::close(rw_fd);
+            };
             return Err("E_SHM_SEAL_FAILED");
         }
 
@@ -148,13 +171,17 @@ impl SealedMemfdPlane {
             )
         };
         if ro_fd < 0 {
-            unsafe { libc::close(rw_fd) };
+            unsafe {
+                libc::munmap(rw_ptr as *mut libc::c_void, size);
+                libc::close(rw_fd);
+            };
             return Err("E_SHM_RO_REOPEN_FAILED");
         }
 
         // Strip write mode bits from inode (fchmod 0o400) to block /proc/self/fd re-open escalation
         if unsafe { libc::fchmod(rw_fd, 0o400) } != 0 {
             unsafe {
+                libc::munmap(rw_ptr as *mut libc::c_void, size);
                 libc::close(rw_fd);
                 libc::close(ro_fd);
             }
@@ -166,19 +193,23 @@ impl SealedMemfdPlane {
         let ro_flags = unsafe { libc::fcntl(ro_fd, libc::F_GETFL) };
         if (rw_flags & libc::O_ACCMODE) != libc::O_RDWR || (ro_flags & libc::O_ACCMODE) != libc::O_RDONLY {
             unsafe {
+                libc::munmap(rw_ptr as *mut libc::c_void, size);
                 libc::close(rw_fd);
                 libc::close(ro_fd);
             }
             return Err("E_SHM_ACCESS_MODE_VERIFICATION_FAILED");
         }
 
-        Ok(SealedMemfdPlane { rw_fd, ro_fd, size })
+        Ok(SealedMemfdPlane { rw_fd, ro_fd, rw_ptr, size })
     }
 }
 
 impl Drop for SealedMemfdPlane {
     fn drop(&mut self) {
         unsafe {
+            if !self.rw_ptr.is_null() && self.rw_ptr != libc::MAP_FAILED as *mut u8 {
+                libc::munmap(self.rw_ptr as *mut libc::c_void, self.size);
+            }
             if self.rw_fd >= 0 {
                 libc::close(self.rw_fd);
             }
@@ -472,10 +503,11 @@ mod tests {
     fn test_sealed_memfd_construction_and_read_only_protection() {
         let plane = SealedMemfdPlane::new("lotus_test_pixel", 4096 * 3).expect("memfd plane");
 
-        // Verify seals
+        // Verify seals (including F_SEAL_FUTURE_WRITE)
         let seals = unsafe { libc::fcntl(plane.rw_fd, F_GET_SEALS) };
         assert_eq!(seals & F_SEAL_SHRINK, F_SEAL_SHRINK);
         assert_eq!(seals & F_SEAL_GROW, F_SEAL_GROW);
+        assert_eq!(seals & F_SEAL_FUTURE_WRITE, F_SEAL_FUTURE_WRITE);
         assert_eq!(seals & F_SEAL_SEAL, F_SEAL_SEAL);
 
         // Verify ftruncate fails on sealed descriptors
@@ -499,6 +531,35 @@ mod tests {
             )
         };
         assert_eq!(map_res, libc::MAP_FAILED, "PROT_WRITE mapping on ro_fd must fail");
+
+        // Adversarial verification: Test that F_SEAL_FUTURE_WRITE prevents upgrading descriptor to writable
+        // Even if an attacker outside Stage B manages to fchmod and reopen the fd O_RDWR:
+        unsafe { libc::fchmod(plane.ro_fd, 0o600) };
+        let ro_path = std::ffi::CString::new(format!("/proc/self/fd/{}", plane.ro_fd)).unwrap();
+        let reopened_fd = unsafe { libc::open(ro_path.as_ptr(), libc::O_RDWR) };
+        if reopened_fd >= 0 {
+            let reopened_map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    reopened_fd,
+                    0,
+                )
+            };
+            assert_eq!(
+                reopened_map,
+                libc::MAP_FAILED,
+                "F_SEAL_FUTURE_WRITE must block writable mmap even if reopened O_RDWR after fchmod"
+            );
+            assert_eq!(unsafe { *libc::__errno_location() }, libc::EPERM);
+            unsafe { libc::close(reopened_fd) };
+        }
+
+        // Verify producer pre-mapped pointer remains functional
+        unsafe { *plane.rw_ptr = 0xAA };
+        assert_eq!(unsafe { *plane.rw_ptr }, 0xAA);
     }
 
     #[test]

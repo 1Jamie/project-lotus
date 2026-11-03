@@ -49,6 +49,10 @@ const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 const SECCOMP_DATA_ARG0_LO_OFFSET: u32 = 16;
 const SECCOMP_DATA_ARG0_HI_OFFSET: u32 = 20;
 const SECCOMP_DATA_ARG1_LO_OFFSET: u32 = 24;
+const SECCOMP_DATA_ARG2_LO_OFFSET: u32 = 32;
+const SECCOMP_DATA_ARG2_HI_OFFSET: u32 = 36;
+const SECCOMP_DATA_ARG3_LO_OFFSET: u32 = 40;
+const SECCOMP_DATA_ARG3_HI_OFFSET: u32 = 44;
 
 /// Install supervisor seccomp-bpf filter restricting signaling strictly to `engine_pidfd`.
 pub fn apply_supervisor_seccomp(engine_pidfd: RawFd) -> Result<(), i32> {
@@ -121,11 +125,28 @@ pub fn apply_supervisor_seccomp(engine_pidfd: RawFd) -> Result<(), i32> {
 
     // Inspect arg1_lo (signal): must be SIGTERM, SIGKILL, or 0
     filter.push(SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_ARG1_LO_OFFSET });
-    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 1, k: libc::SIGTERM as u32 });
-    filter.push(SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: allow });
-    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 1, k: libc::SIGKILL as u32 });
-    filter.push(SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: allow });
-    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 0, jf: 1, k: 0 });
+    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 3, jf: 0, k: libc::SIGTERM as u32 });
+    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 2, jf: 0, k: libc::SIGKILL as u32 });
+    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: 0 });
+    filter.push(SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: eperm });
+
+    // Inspect arg2 (siginfo_t pointer must be NULL)
+    filter.push(SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_ARG2_LO_OFFSET });
+    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: 0 });
+    filter.push(SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: eperm });
+    filter.push(SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_ARG2_HI_OFFSET });
+    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: 0 });
+    filter.push(SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: eperm });
+
+    // Inspect arg3 (flags must be 0)
+    filter.push(SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_ARG3_LO_OFFSET });
+    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: 0 });
+    filter.push(SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: eperm });
+    filter.push(SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: SECCOMP_DATA_ARG3_HI_OFFSET });
+    filter.push(SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt: 1, jf: 0, k: 0 });
+    filter.push(SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: eperm });
+
+    // Allowed pidfd_send_signal
     filter.push(SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k: allow });
 
     // Default deny
@@ -192,6 +213,17 @@ mod tests {
             // 4. SYS_pidfd_send_signal with unauthorized signal (e.g. SIGHUP = 1) must be BLOCKED with EPERM
             let sighup_ret = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, libc::SIGHUP, std::ptr::null::<()>(), 0) };
             assert_eq!(sighup_ret, -1);
+            assert_eq!(unsafe { *libc::__errno_location() }, libc::EPERM);
+
+            // 5. SYS_pidfd_send_signal with non-NULL siginfo (arg2 != NULL) must be BLOCKED with EPERM
+            let dummy_val = 1234usize;
+            let info_ret = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, 0, &dummy_val as *const _ as *const libc::c_void, 0) };
+            assert_eq!(info_ret, -1);
+            assert_eq!(unsafe { *libc::__errno_location() }, libc::EPERM);
+
+            // 6. SYS_pidfd_send_signal with non-zero flags (arg3 != 0) must be BLOCKED with EPERM
+            let flags_ret = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd, 0, std::ptr::null::<()>(), 1) };
+            assert_eq!(flags_ret, -1);
             assert_eq!(unsafe { *libc::__errno_location() }, libc::EPERM);
 
             unsafe { libc::close(pidfd) };

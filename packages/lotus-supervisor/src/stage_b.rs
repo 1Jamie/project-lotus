@@ -35,6 +35,7 @@ const BPF_JGE: u16 = 0x30;
 const BPF_K: u16 = 0x00;
 const BPF_RET: u16 = 0x06;
 
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x80000000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff0000;
 const SECCOMP_RET_ERRNO: u32 = 0x00050000;
 
@@ -297,12 +298,123 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             k: SECCOMP_RET_ALLOW,
         });
 
-        // 8. Default: Allow all other standard syscalls
+        // Reload syscall nr for allowlist checks
+        filter.push(SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_NR_OFFSET,
+        });
+
+        // 8. Syscall Allowlist (Phase 1A strace of real Servo + GPU / Mesa stack)
+        let allowed_syscalls = [
+            // Filesystem / IO
+            libc::SYS_read as u32,
+            libc::SYS_write as u32,
+            libc::SYS_open as u32,
+            libc::SYS_openat as u32,
+            libc::SYS_close as u32,
+            libc::SYS_stat as u32,
+            libc::SYS_fstat as u32,
+            libc::SYS_lstat as u32,
+            libc::SYS_newfstatat as u32,
+            libc::SYS_lseek as u32,
+            libc::SYS_dup as u32,
+            libc::SYS_dup2 as u32,
+            libc::SYS_dup3 as u32,
+            libc::SYS_fcntl as u32,
+            libc::SYS_ioctl as u32,
+            libc::SYS_access as u32,
+            libc::SYS_faccessat as u32,
+            libc::SYS_faccessat2 as u32,
+            libc::SYS_readlink as u32,
+            libc::SYS_readlinkat as u32,
+            libc::SYS_getdents64 as u32,
+            libc::SYS_getcwd as u32,
+            libc::SYS_readv as u32,
+            libc::SYS_writev as u32,
+            libc::SYS_pread64 as u32,
+            libc::SYS_pwrite64 as u32,
+            libc::SYS_statx as u32,
+            // Memory management
+            libc::SYS_mmap as u32,
+            libc::SYS_mprotect as u32,
+            libc::SYS_munmap as u32,
+            libc::SYS_brk as u32,
+            libc::SYS_madvise as u32,
+            // Polling / Events / Signals
+            libc::SYS_poll as u32,
+            libc::SYS_ppoll as u32,
+            libc::SYS_select as u32,
+            libc::SYS_pselect6 as u32,
+            libc::SYS_epoll_create1 as u32,
+            libc::SYS_epoll_ctl as u32,
+            libc::SYS_epoll_wait as u32,
+            libc::SYS_epoll_pwait as u32,
+            libc::SYS_pipe2 as u32,
+            libc::SYS_eventfd2 as u32,
+            libc::SYS_rt_sigaction as u32,
+            libc::SYS_rt_sigprocmask as u32,
+            libc::SYS_rt_sigreturn as u32,
+            libc::SYS_sigaltstack as u32,
+            libc::SYS_restart_syscall as u32,
+            // Threading / Synchronization / Clocks / Identity
+            libc::SYS_futex as u32,
+            libc::SYS_set_robust_list as u32,
+            libc::SYS_get_robust_list as u32,
+            libc::SYS_rseq as u32,
+            libc::SYS_sched_yield as u32,
+            libc::SYS_sched_getaffinity as u32,
+            libc::SYS_sched_setaffinity as u32,
+            libc::SYS_nanosleep as u32,
+            libc::SYS_clock_nanosleep as u32,
+            libc::SYS_clock_gettime as u32,
+            libc::SYS_clock_getres as u32,
+            libc::SYS_gettimeofday as u32,
+            libc::SYS_getpid as u32,
+            libc::SYS_gettid as u32,
+            libc::SYS_getuid as u32,
+            libc::SYS_geteuid as u32,
+            libc::SYS_getgid as u32,
+            libc::SYS_getegid as u32,
+            libc::SYS_prctl as u32,
+            libc::SYS_arch_prctl as u32,
+            libc::SYS_exit as u32,
+            libc::SYS_exit_group as u32,
+            // Network Client (TCP communication with supervisor / broker)
+            libc::SYS_connect as u32,
+            libc::SYS_recvfrom as u32,
+            libc::SYS_sendto as u32,
+            libc::SYS_recvmsg as u32,
+            libc::SYS_sendmsg as u32,
+            libc::SYS_getsockopt as u32,
+            libc::SYS_setsockopt as u32,
+            libc::SYS_shutdown as u32,
+        ];
+
+        for &nr in &allowed_syscalls {
+            filter.push(SockFilter {
+                code: BPF_JMP | BPF_JEQ | BPF_K,
+                jt: 0,
+                jf: 1,
+                k: nr,
+            });
+            filter.push(SockFilter {
+                code: BPF_RET | BPF_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            });
+        }
+
+        // 9. Default: KILL_PROCESS for any unlisted syscalls
+        // (blocks userfaultfd, io_uring_*, bpf, perf_event_open, keyctl, open_by_handle_at,
+        // fchmod, fchown, memfd_create, kill, tgkill, ptrace, socketpair, etc.)
         filter.push(SockFilter {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
-            k: SECCOMP_RET_ALLOW,
+            k: SECCOMP_RET_KILL_PROCESS,
         });
 
         let prog = SockFprog {
@@ -416,6 +528,42 @@ mod tests {
                 "Child failed Stage B assertion: exit status = {}",
                 libc::WEXITSTATUS(status)
             );
+        }
+    }
+
+    #[test]
+    fn test_stage_b_seccomp_kills_unlisted_syscalls() {
+        // Verify userfaultfd (SYS 323), io_uring_setup (SYS 425), and fchmod (SYS 91)
+        // are strictly blocked by SECCOMP_RET_KILL_PROCESS
+        let unlisted_syscalls = [
+            (323, "userfaultfd"),
+            (425, "io_uring_setup"),
+            (libc::SYS_fchmod as libc::c_long, "fchmod"),
+            (libc::SYS_bpf as libc::c_long, "bpf"),
+        ];
+
+        for (nr, name) in unlisted_syscalls {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                if let Err(_) = apply_stage_b_seccomp() {
+                    unsafe { libc::_exit(1); }
+                }
+                // Call unlisted syscall - must be killed instantly by SECCOMP_RET_KILL_PROCESS (SIGSYS)
+                unsafe { libc::syscall(nr, 0, 0, 0, 0, 0) };
+                // If it reached here, filter failed
+                unsafe { libc::_exit(2); }
+            } else {
+                let mut status = 0;
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+                assert!(
+                    libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+                    "Expected syscall {} ({}) to be killed with SIGSYS, got status {:x}",
+                    nr,
+                    name,
+                    status
+                );
+            }
         }
     }
 }
