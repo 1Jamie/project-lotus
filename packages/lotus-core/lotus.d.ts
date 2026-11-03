@@ -238,3 +238,4 @@ export function validatePlatformSecurityIsolation(options?: { secure?: boolean; 
 export function detectLinuxThemeNode(): 'light' | 'dark' | null;
 export function spawnSandboxedEngine(options?: any): Promise<any>;
 export const launcher: any;
+export const networkBroker: any;

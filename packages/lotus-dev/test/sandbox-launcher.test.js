@@ -122,3 +122,4 @@ test('Sandboxed Launcher - supervisor death triggers deterministic child termina
 
     assert.strictEqual(engineDead, true, 'Engine child must terminate when supervisor dies unexpectedly');
 });
+

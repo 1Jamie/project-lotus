@@ -1589,10 +1589,12 @@ module.exports = {
         isVfsInitialized: () => vfsInitialized,
         validatePlatformSecurityIsolation,
         detectLinuxThemeNode,
-        spawnSandboxedEngine: require('./launcher.js').spawnSandboxedEngine
+        spawnSandboxedEngine: require('./launcher.js').spawnSandboxedEngine,
+        networkBroker: require('./network_broker.js')
     },
     validatePlatformSecurityIsolation,
     detectLinuxThemeNode,
     spawnSandboxedEngine: require('./launcher.js').spawnSandboxedEngine,
-    launcher: require('./launcher.js')
+    launcher: require('./launcher.js'),
+    networkBroker: require('./network_broker.js')
 };

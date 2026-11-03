@@ -1,7 +1,6 @@
 {
   "name": "@lotus-gui/core",
   "version": "0.4.0",
-
   "main": "lotus.js",
   "types": "lotus.d.ts",
   "repository": {
@@ -65,6 +64,7 @@
     "@napi-rs/cli": "^2.16.0"
   },
   "dependencies": {
+    "ipaddr.js": "^2.5.0",
     "msgpackr": "^1.11.8"
   }
 }
