@@ -210,6 +210,87 @@ const eventQueue = new Map(); // windowId -> Array of pending events
 const globalPackers = new Map();
 const globalUnpackers = new Map();
 
+/**
+ * Host-level robust theme detection for Linux using desktop settings.
+ * Performed in Node Host to avoid subprocess execution inside the sandboxed engine.
+ */
+function detectLinuxThemeNode() {
+    if (process.platform !== 'linux') return null;
+    try {
+        const { execFileSync } = require('node:child_process');
+        try {
+            const out = execFileSync('gsettings', ['get', 'org.gnome.desktop.interface', 'color-scheme'], {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'ignore'],
+                timeout: 500
+            }).toLowerCase();
+            if (out.includes('prefer-dark')) return 'dark';
+            if (out.includes('prefer-light') || out.includes('default')) return 'light';
+        } catch {}
+        try {
+            const out = execFileSync('gsettings', ['get', 'org.gnome.desktop.interface', 'gtk-theme'], {
+                encoding: 'utf8',
+                stdio: ['ignore', 'pipe', 'ignore'],
+                timeout: 500
+            }).toLowerCase();
+            if (out.includes('-dark') || out.includes(':dark')) return 'dark';
+        } catch {}
+    } catch {}
+    return null;
+}
+
+/**
+ * Validates platform security gating for requested isolation parameters.
+ * Fails closed with E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM when secure: true
+ * (separateProcess: true) is requested without verified OS sandbox support.
+ */
+function validatePlatformSecurityIsolation(options = {}) {
+    if (!options || typeof options !== 'object') return;
+    const isSecure = options.secure === true;
+    const separateProcess = options.separateProcess !== false; // defaults to true when secure: true
+    if (!isSecure || !separateProcess) {
+        return;
+    }
+
+    if (process.platform !== 'linux') {
+        const err = new Error(
+            `Process-isolated secure engine is not supported on platform "${process.platform}". ` +
+            `Opt into in-process hosting via { separateProcess: false } or run on a supported platform.`
+        );
+        err.code = 'E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM';
+        throw err;
+    }
+
+    // On Linux, verify that unprivileged user namespaces are not disabled by the kernel or AppArmor
+    try {
+        const fs = require('node:fs');
+        if (fs.existsSync('/proc/sys/kernel/unprivileged_userns_clone')) {
+            const val = fs.readFileSync('/proc/sys/kernel/unprivileged_userns_clone', 'utf8').trim();
+            if (val === '0') {
+                const err = new Error(
+                    'Process-isolated secure engine requires unprivileged user namespaces, ' +
+                    'but /proc/sys/kernel/unprivileged_userns_clone is 0.'
+                );
+                err.code = 'E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM';
+                throw err;
+            }
+        }
+        if (fs.existsSync('/proc/sys/kernel/apparmor_restrict_unprivileged_userns')) {
+            const val = fs.readFileSync('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', 'utf8').trim();
+            if (val === '1') {
+                const err = new Error(
+                    'Process-isolated secure engine requires unprivileged user namespaces, ' +
+                    'but kernel.apparmor_restrict_unprivileged_userns is active.'
+                );
+                err.code = 'E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM';
+                throw err;
+            }
+        }
+    } catch (e) {
+        if (e.code === 'E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM') throw e;
+    }
+}
+
 ipcMain.on('__lotus_select_toggle', (payload, clientId) => {
     if (!clientId) return;
     const windowId = clientId.split(':')[0];
@@ -394,6 +475,17 @@ function ensureApp() {
 
             processEvent(win, msg);
         };
+
+        if (process.platform === 'linux' && !process.env.LOTUS_SYSTEM_THEME) {
+            const detected = detectLinuxThemeNode();
+            if (detected) {
+                process.env.LOTUS_SYSTEM_THEME = detected;
+                systemTheme = detected;
+                if (detected === 'dark' && !process.env.GTK_THEME) {
+                    process.env.GTK_THEME = 'Adwaita:dark';
+                }
+            }
+        }
 
         globalApp = new App((clientId, messages) => {
             if (!msgpackr) return;
@@ -867,6 +959,15 @@ class ServoWindow extends EventEmitter {
             app.initVfs({ required: true });
         }
 
+        validatePlatformSecurityIsolation(finalOptions);
+        if (Array.isArray(finalOptions.panes)) {
+            for (const p of finalOptions.panes) {
+                if (p && typeof p === 'object') {
+                    validatePlatformSecurityIsolation(p);
+                }
+            }
+        }
+
         this.handle = createWindow(finalOptions);
         this.id = this.handle.getId();
         
@@ -949,6 +1050,7 @@ class ServoWindow extends EventEmitter {
 
     /** Create a new named pane */
     createPane(id, options = {}) {
+        validatePlatformSecurityIsolation(options);
         if (this.panes.has(id)) {
             throw new Error(`Pane with id '${id}' already exists`);
         }
@@ -1449,6 +1551,13 @@ module.exports = {
         },
         warmup: ensureApp,
         getSystemTheme: () => {
+            if (process.platform === 'linux') {
+                const detected = detectLinuxThemeNode();
+                if (detected) {
+                    systemTheme = detected;
+                    return systemTheme;
+                }
+            }
             if (globalApp && typeof globalApp.getSystemTheme === 'function') {
                 systemTheme = globalApp.getSystemTheme();
             }
@@ -1477,6 +1586,13 @@ module.exports = {
             }
             return false;
         },
-        isVfsInitialized: () => vfsInitialized
-    }
+        isVfsInitialized: () => vfsInitialized,
+        validatePlatformSecurityIsolation,
+        detectLinuxThemeNode,
+        spawnSandboxedEngine: require('./launcher.js').spawnSandboxedEngine
+    },
+    validatePlatformSecurityIsolation,
+    detectLinuxThemeNode,
+    spawnSandboxedEngine: require('./launcher.js').spawnSandboxedEngine,
+    launcher: require('./launcher.js')
 };

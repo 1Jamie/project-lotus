@@ -229,4 +229,12 @@ export const app: {
   getSystemTheme(): 'light' | 'dark';
   initVfs(options?: { required?: boolean }): boolean;
   isVfsInitialized(): boolean;
+  validatePlatformSecurityIsolation(options?: { secure?: boolean; separateProcess?: boolean }): void;
+  detectLinuxThemeNode(): 'light' | 'dark' | null;
+  spawnSandboxedEngine(options?: any): Promise<any>;
 };
+
+export function validatePlatformSecurityIsolation(options?: { secure?: boolean; separateProcess?: boolean }): void;
+export function detectLinuxThemeNode(): 'light' | 'dark' | null;
+export function spawnSandboxedEngine(options?: any): Promise<any>;
+export const launcher: any;

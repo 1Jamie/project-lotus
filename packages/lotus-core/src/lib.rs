@@ -138,40 +138,23 @@ pub(crate) fn fast_exit(code: i32) -> ! {
 
 #[cfg(target_os = "linux")]
 fn detect_linux_theme_robust() -> dark_light::Mode {
-    // 1. Try standard crate
-    let mode = dark_light::detect();
-    if mode == dark_light::Mode::Dark {
-        return mode;
+    // 1. Check environment variables populated by the Node Host launcher
+    if let Ok(theme) = std::env::var("LOTUS_SYSTEM_THEME") {
+        if theme.eq_ignore_ascii_case("dark") {
+            return dark_light::Mode::Dark;
+        } else if theme.eq_ignore_ascii_case("light") {
+            return dark_light::Mode::Light;
+        }
     }
-
-    // 2. Try gsettings for color-scheme (Modern GNOME)
-    // gsettings get org.gnome.desktop.interface color-scheme
-    if let Ok(output) = Command::new("gsettings")
-        .args(&["get", "org.gnome.desktop.interface", "color-scheme"])
-        .output() 
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        // Output is usually "'prefer-dark'\n"
-        if stdout.contains("prefer-dark") {
+    if let Ok(gtk) = std::env::var("GTK_THEME") {
+        let lower = gtk.to_lowercase();
+        if lower.contains("-dark") || lower.contains(":dark") {
             return dark_light::Mode::Dark;
         }
     }
 
-    // 3. Try gsettings for gtk-theme (Legacy / Fallback)
-    // gsettings get org.gnome.desktop.interface gtk-theme
-    if let Ok(output) = Command::new("gsettings")
-        .args(&["get", "org.gnome.desktop.interface", "gtk-theme"])
-        .output() 
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        // Check for "-dark" suffix
-        if stdout.contains("-dark") || stdout.contains(":dark") {
-            return dark_light::Mode::Dark;
-        }
-    }
-
-    // Default to what we found initially (Light/Default)
-    mode
+    // 2. Delegate to the standard dark_light crate without invoking any external subprocesses (e.g. gsettings)
+    dark_light::detect()
 }
 
 struct ByteLimitedLruCache {
