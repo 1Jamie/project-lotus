@@ -48,10 +48,12 @@ class SecureConstellationManager extends EventEmitter {
             if (!bridgeScript && surface && surface.secure) {
                 const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
                 if (ipcPort > 0) {
+                    const docId = surface.pendingNavigationId || surface.activeDocumentId;
+                    const secret = surface.bootstrapSecret;
                     bridgeScript = lotusCore.hostIpcPolicy.generateSecureBridgeScript({
                         surfaceId,
-                        documentId: surface.activeDocumentId,
-                        bootstrapSecret: surface.bootstrapSecret,
+                        documentId: docId,
+                        bootstrapSecret: secret,
                         enginePort: ipcPort,
                     });
                 }
@@ -111,30 +113,6 @@ class SecureConstellationManager extends EventEmitter {
 
             const passFds = [];
             const engineArgs = [];
-            if (surfaceInfo.shm) {
-                const pixelRwFd = surfaceInfo.shm.pixelRwFd ?? surfaceInfo.shm.rwFd;
-                const ackRoFd = surfaceInfo.shm.ackRoFd;
-                if (typeof pixelRwFd === 'number' && pixelRwFd >= 0) {
-                    passFds.push(pixelRwFd);
-                    engineArgs.push('--shm-fd', pixelRwFd.toString());
-                }
-                if (typeof ackRoFd === 'number' && ackRoFd >= 0) {
-                    passFds.push(ackRoFd);
-                    engineArgs.push('--ack-fd', ackRoFd.toString());
-                }
-                if (surfaceInfo.shm.width) {
-                    engineArgs.push('--width', surfaceInfo.shm.width.toString());
-                }
-                if (surfaceInfo.shm.height) {
-                    engineArgs.push('--height', surfaceInfo.shm.height.toString());
-                }
-            }
-            if (surfaceId) {
-                engineArgs.push('--surface-id', surfaceId);
-            }
-            if (surfaceInfo.url) {
-                engineArgs.push('--url', surfaceInfo.url);
-            }
 
             const lotusCore = require('./lotus.js');
             const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
@@ -187,6 +165,7 @@ class SecureConstellationManager extends EventEmitter {
             const res = await this._spawnPromise;
             this._refCount++;
             this._surfaces.set(surfaceId, surfaceInfo);
+            this._sendCreateSurface(this._activeInstance, surfaceId, surfaceInfo);
             return res;
         } finally {
             this._spawnPromise = null;

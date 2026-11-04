@@ -322,48 +322,58 @@ fn recv_control_msg_with_fds(
     fd: RawFd,
     buf: &mut Vec<u8>,
 ) -> Result<(Vec<String>, Vec<RawFd>), io::Error> {
-    let mut chunk = [0u8; 1024];
-    let mut iov = libc::iovec {
-        iov_base: chunk.as_mut_ptr() as *mut libc::c_void,
-        iov_len: chunk.len(),
-    };
-
-    let cmsg_space = unsafe { libc::CMSG_SPACE((std::mem::size_of::<RawFd>() * 4) as u32) as usize };
-    let mut cmsg_buf = vec![0u8; cmsg_space];
-
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_space;
-
-    let r = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
-    if r < 0 {
-        let err = unsafe { *libc::__errno_location() };
-        if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
-            return Ok((vec![], vec![]));
-        }
-        return Err(io::Error::from_raw_os_error(err));
-    }
-    if r == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "control_fd EOF"));
-    }
-
-    buf.extend_from_slice(&chunk[..r as usize]);
-
     let mut received_fds = Vec::new();
-    unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let data_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
-                let data_len = (*cmsg).cmsg_len - libc::CMSG_LEN(0) as usize;
-                let fd_count = data_len / std::mem::size_of::<RawFd>();
-                for i in 0..fd_count {
-                    received_fds.push(*data_ptr.add(i));
-                }
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        let mut iov = libc::iovec {
+            iov_base: chunk.as_mut_ptr() as *mut libc::c_void,
+            iov_len: chunk.len(),
+        };
+
+        let cmsg_space = unsafe { libc::CMSG_SPACE((std::mem::size_of::<RawFd>() * 4) as u32) as usize };
+        let mut cmsg_buf = vec![0u8; cmsg_space];
+
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_space;
+
+        let r = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+        if r < 0 {
+            let err = unsafe { *libc::__errno_location() };
+            if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+                break;
             }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            return Err(io::Error::from_raw_os_error(err));
+        }
+        if r == 0 {
+            if buf.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "control_fd EOF"));
+            }
+            break;
+        }
+
+        buf.extend_from_slice(&chunk[..r as usize]);
+
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let data_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
+                    let data_len = (*cmsg).cmsg_len - libc::CMSG_LEN(0) as usize;
+                    let fd_count = data_len / std::mem::size_of::<RawFd>();
+                    for i in 0..fd_count {
+                        received_fds.push(*data_ptr.add(i));
+                    }
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+
+        if (r as usize) < chunk.len() {
+            break;
         }
     }
 
@@ -394,6 +404,7 @@ struct EngineConfig {
     height: u32,
     surface_id: String,
     initial_url: String,
+    bridge_script: Option<String>,
 }
 
 fn parse_config() -> EngineConfig {
@@ -407,6 +418,7 @@ fn parse_config() -> EngineConfig {
     let mut height = 600u32;
     let mut surface_id = "default".to_string();
     let mut initial_url = "about:blank".to_string();
+    let mut bridge_script: Option<String> = None;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
@@ -472,6 +484,12 @@ fn parse_config() -> EngineConfig {
                     initial_url = args[i].clone();
                 }
             }
+            "--bridge-script" => {
+                i += 1;
+                if i < args.len() {
+                    bridge_script = Some(args[i].clone());
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -488,6 +506,7 @@ fn parse_config() -> EngineConfig {
         height,
         surface_id,
         initial_url,
+        bridge_script,
     }
 }
 
@@ -650,7 +669,7 @@ fn main() {
             sfd,
             afd,
             Some(config.initial_url.clone()),
-            None,
+            config.bridge_script.clone(),
             primary_rendering_ctx.clone(),
             &servo,
         ) {

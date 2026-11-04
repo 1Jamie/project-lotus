@@ -18,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use once_cell::sync::OnceCell;
 use tokio::sync::mpsc;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use winit::event_loop::EventLoopProxy;
 
 use crate::{get_trusted_origins, normalize_origin, APP_STATE, EngineCommand};
@@ -172,11 +172,7 @@ pub fn start_ipc_server(
             };
 
             let cors = CorsLayer::new()
-                .allow_origin([
-                    "http://127.0.0.1".parse::<HeaderValue>().unwrap(),
-                    "http://localhost".parse::<HeaderValue>().unwrap(),
-                    "null".parse::<HeaderValue>().unwrap(),
-                ])
+                .allow_origin(AllowOrigin::mirror_request())
                 .allow_methods(Any)
                 .allow_headers(vec![
                     header::CONTENT_TYPE,

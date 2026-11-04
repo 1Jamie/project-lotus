@@ -1336,6 +1336,17 @@ class ServoWindow extends EventEmitter {
         pane.surfaceId = surfaceId;
         pane.isRemote = isSecure;
 
+        hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
+            secure: isSecure,
+            allowedChannels: options.allowedChannels || this._allowedChannels || ['vault', 'telemetry'],
+            trustedOrigins: options.trustedOrigins || this._trustedOrigins || []
+        });
+
+        const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
+        pane._pendingNavId = initNavId;
+        pane._pendingUrl = url;
+        hostIpcRouter.surfaceTracker.startNavigation(surfaceId, initNavId, url);
+
         if (isSecure && typeof allocateRemotePaneShm === 'function') {
             const shmWidth = Math.max(1, width || this._logicalWidth || 800);
             const shmHeight = Math.max(1, height || this._logicalHeight || 600);
@@ -1377,17 +1388,6 @@ class ServoWindow extends EventEmitter {
         }
 
         this.panes.set(id, pane);
-
-        hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
-            secure: isSecure,
-            allowedChannels: options.allowedChannels || this._allowedChannels || ['vault', 'telemetry'],
-            trustedOrigins: options.trustedOrigins || this._trustedOrigins || []
-        });
-
-        const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
-        pane._pendingNavId = initNavId;
-        pane._pendingUrl = url;
-        hostIpcRouter.surfaceTracker.startNavigation(surfaceId, initNavId, url);
 
         return pane;
     }

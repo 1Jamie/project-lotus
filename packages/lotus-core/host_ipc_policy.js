@@ -307,6 +307,10 @@ class HostSurfaceTracker {
         surface.pendingNavigationId = navigationId;
         surface.pendingTargetUrl = targetUrl;
         surface.pendingOrigin = normalizeOrigin(targetUrl);
+        if (surface._initialCommitPending) {
+            surface.activeDocumentId = navigationId;
+            syncSurfacePolicyToNative(surface);
+        }
         return surface;
     }
 
@@ -353,15 +357,17 @@ class HostSurfaceTracker {
         surface.pendingTargetUrl = null;
         surface.pendingOrigin = null;
         surface.navigationState = 'committed';
-        surface.bootstrapSecret = crypto.randomBytes(32).toString('hex');
 
-        // Q4: On initial commit that establishes surface origin, preserve initial grants.
-        // On subsequent cross-origin navigation, revoke all granted channels and trusted origins.
+        // Q4: On initial commit that establishes surface origin, preserve initial grants & credentials.
+        // On subsequent cross-origin navigation, revoke all granted channels and rotate bootstrap secret.
         if (surface._initialCommitPending) {
             surface._initialCommitPending = false;
-        } else if (previousOrigin !== surface.currentOrigin) {
-            surface.allowedChannels = new Set();
-            surface.trustedOrigins = new Set();
+        } else {
+            surface.bootstrapSecret = crypto.randomBytes(32).toString('hex');
+            if (previousOrigin !== surface.currentOrigin) {
+                surface.allowedChannels = new Set();
+                surface.trustedOrigins = new Set();
+            }
         }
 
         syncSurfacePolicyToNative(surface);
@@ -713,14 +719,38 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
         if (window.parent !== window || window.top !== window) {
             throwSecurityError();
         }
+        if (window.frames && window.frames.length > 0) {
+            const stack = (new TopError()).stack || '';
+            for (let i = 0; i < window.frames.length; i++) {
+                try {
+                    const subWin = window.frames[i];
+                    if (subWin) {
+                        if (subWin.location && subWin.location.href && stack.includes(subWin.location.href)) {
+                            throwSecurityError();
+                        }
+                        if (payload && subWin.Object && payload instanceof subWin.Object) {
+                            throwSecurityError();
+                        }
+                        if (callback && subWin.Function && callback instanceof subWin.Function) {
+                            throwSecurityError();
+                        }
+                    }
+                } catch (e) {
+                    throwSecurityError();
+                }
+            }
+        }
         if (callback !== undefined && callback !== null) {
             if (typeof callback !== 'function' || !(callback instanceof TopFunction) || Object.getPrototypeOf(callback) !== TopFunction.prototype) {
                 throwSecurityError();
             }
         }
-        if (payload !== undefined && payload !== null && typeof payload === 'object') {
+        if (arguments.length > 0 && callback === undefined) {
+            if (payload === undefined || payload === null || typeof payload !== 'object') {
+                throwSecurityError();
+            }
             const proto = Object.getPrototypeOf(payload);
-            if (proto !== TopObject.prototype && proto !== null && proto !== TopArray.prototype) {
+            if (proto !== TopObject.prototype && proto !== TopArray.prototype) {
                 throwSecurityError();
             }
         }
