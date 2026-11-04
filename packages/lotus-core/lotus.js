@@ -1416,7 +1416,9 @@ class ServoWindow extends EventEmitter {
 
             const pixelRoFd = shm.pixelRoFd ?? shm.roFd;
             const ackRwFd = shm.ackRwFd ?? -1;
-            this.handle.createRemotePane(id, pixelRoFd, shm.totalSize, ackRwFd, x, y, width, height, zIndex, anchor, dockOrder, visible);
+            const paneW = width > 0 ? width : shmWidth;
+            const paneH = height > 0 ? height : shmHeight;
+            this.handle.createRemotePane(id, pixelRoFd, shm.totalSize, ackRwFd, x, y, paneW, paneH, zIndex, anchor, dockOrder, visible);
 
             defaultSecureConstellation.acquireSecureEngine(surfaceId, {
                 pane,

@@ -183,6 +183,7 @@ impl RemotePaneConsumer {
 
         // 3. Upload verified frame to OpenGL texture
         unsafe {
+            let is_new_texture = self.texture.is_none();
             let tex = match self.texture {
                 Some(t) => t,
                 None => {
@@ -202,8 +203,8 @@ impl RemotePaneConsumer {
             let frame_len = validated.stride * (validated.height as usize);
             let slice = std::slice::from_raw_parts(pixel_ptr, frame_len);
 
-            // Reallocate texture surface if dimensions changed
-            if self.tex_width != validated.width || self.tex_height != validated.height {
+            // Reallocate texture surface if dimensions changed or if this is the first upload for this texture
+            if is_new_texture || self.tex_width != validated.width || self.tex_height != validated.height {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,

@@ -52,7 +52,8 @@ async function startShowcase() {
     // 2. Track 1 IPC Handlers (Trusted Pane / In-Process Chrome)
     // -------------------------------------------------------------------------
     // Trusted in-process panes run with full Node.js OS access.
-    ipcMain.handle('system.getHostMetrics', async () => {
+    ipcMain.handle('system.getHostMetrics', async (payload) => {
+        console.log('[Host IPC] Servicing system.getHostMetrics request...', payload);
         const mem = process.memoryUsage();
         return {
             pid: process.pid,

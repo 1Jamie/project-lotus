@@ -220,8 +220,6 @@
             flex: 1;
             min-height: 0;
             overflow-y: auto;
-            display: flex;
-            flex-direction: column-reverse;
         }
 
         .log-entry {
@@ -344,6 +342,8 @@
             entry.innerHTML = `<span class="log-time">[${time}]</span><span class="log-tag tag-${tag}">${tag.toUpperCase()}</span> ${message}`;
             consoleEl.prepend(entry);
         }
+
+        log('Sandboxed Engine initialized (Track 2 unprivileged child).', 'info');
 
         async function computeSha256(str) {
             const enc = new TextEncoder();
