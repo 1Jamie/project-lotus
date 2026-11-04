@@ -79,6 +79,40 @@ pub fn composite_panes_to_scene(
                 (layout_pw, layout_ph, x_start, layout_py)
             };
 
+            if layout_pw <= 0 || layout_ph <= 0 { continue; }
+
+            // Remote Out-Of-Process Pane SHM Compositing Path
+            if pane.is_remote {
+                if let Some(consumer) = &mut pane.remote_consumer {
+                    let _ = consumer.consume_latest_frame(&instance.gl);
+                    if let Some(remote_tex) = consumer.get_texture() {
+                        instance.gl.bind_framebuffer(glow::FRAMEBUFFER, instance.scene_fbo);
+                        instance.gl.viewport(layout_px, layout_py, layout_pw, layout_ph);
+                        instance.gl.enable(glow::SCISSOR_TEST);
+                        instance.gl.scissor(layout_px, layout_py, layout_pw, layout_ph);
+                        instance.gl.enable(glow::BLEND);
+                        instance.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+
+                        if let Some(program) = instance.comp_program {
+                            instance.gl.use_program(Some(program));
+                            instance.gl.bind_vertex_array(instance.comp_vao);
+                            instance.gl.active_texture(glow::TEXTURE0);
+                            instance.gl.bind_texture(glow::TEXTURE_2D, Some(remote_tex));
+
+                            instance.gl.uniform_2_f32(instance.u_comp_size_loc.as_ref(), layout_pw as f32, layout_ph as f32);
+                            let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
+                            instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), radius);
+
+                            instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                            instance.gl.bind_vertex_array(None);
+                            instance.gl.use_program(None);
+                        }
+                        instance.gl.disable(glow::SCISSOR_TEST);
+                    }
+                }
+                continue;
+            }
+
             let tex_size = pane.offscreen_ctx.size();
             let tex_pw = tex_size.width as i32;
             let tex_ph = tex_size.height as i32;

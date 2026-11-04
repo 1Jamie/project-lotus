@@ -4824,6 +4824,7 @@ dependencies = [
  "http",
  "libc",
  "log",
+ "lotus-supervisor",
  "lru",
  "memmap2",
  "mime_guess",
@@ -4847,6 +4848,14 @@ dependencies = [
  "window-vibrancy",
  "windows-sys 0.52.0",
  "winit",
+]
+
+[[package]]
+name = "lotus-supervisor"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "nix",
 ]
 
 [[package]]

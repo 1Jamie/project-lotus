@@ -234,6 +234,8 @@ pub struct PaneInstance {
     pub pending_visible: bool,
     pub ghost_tex: Option<glow::NativeTexture>,
     pub ghost_tex_size: Option<winit::dpi::PhysicalSize<u32>>,
+    pub is_remote: bool,
+    pub remote_consumer: Option<crate::gl::RemotePaneConsumer>,
 }
 
 pub struct ActiveSelectPrompt {

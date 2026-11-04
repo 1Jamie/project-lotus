@@ -1544,6 +1544,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         pending_visible: pane_opt.visible,
                         ghost_tex: None,
                         ghost_tex_size: None,
+                        is_remote: false,
+                        remote_consumer: None,
                     };
                     panes.insert(pane_opt.id.clone(), pane);
                 }
@@ -2044,6 +2046,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         pending_visible: visible,
                         ghost_tex: None,
                         ghost_tex_size: None,
+                        is_remote: false,
+                        remote_consumer: None,
                     };
                     instance.panes.insert(pane_id, pane);
                     let physical_size = instance.window.inner_size();
