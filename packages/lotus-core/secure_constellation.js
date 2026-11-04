@@ -68,9 +68,38 @@ class SecureConstellationManager extends EventEmitter {
             this._engineInstanceId++;
             const instanceId = this._engineInstanceId;
 
+            const passFds = [];
+            const engineArgs = [];
+            if (surfaceInfo.shm) {
+                const pixelRwFd = surfaceInfo.shm.pixelRwFd ?? surfaceInfo.shm.rwFd;
+                const ackRoFd = surfaceInfo.shm.ackRoFd;
+                if (typeof pixelRwFd === 'number' && pixelRwFd >= 0) {
+                    passFds.push(pixelRwFd);
+                    engineArgs.push('--shm-fd', pixelRwFd.toString());
+                }
+                if (typeof ackRoFd === 'number' && ackRoFd >= 0) {
+                    passFds.push(ackRoFd);
+                    engineArgs.push('--ack-fd', ackRoFd.toString());
+                }
+                if (surfaceInfo.shm.width) {
+                    engineArgs.push('--width', surfaceInfo.shm.width.toString());
+                }
+                if (surfaceInfo.shm.height) {
+                    engineArgs.push('--height', surfaceInfo.shm.height.toString());
+                }
+            }
+            if (surfaceId) {
+                engineArgs.push('--surface-id', surfaceId);
+            }
+            if (surfaceInfo.url) {
+                engineArgs.push('--url', surfaceInfo.url);
+            }
+
             const instance = await spawnSandboxedEngine({
                 supervisorBin: this.supervisorBin,
                 engineBin: this.engineBin,
+                passFds,
+                engineArgs,
             });
 
             this._activeInstance = instance;

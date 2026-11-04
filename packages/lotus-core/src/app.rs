@@ -1025,6 +1025,7 @@ pub enum EngineCommand {
         pane_id: String,
         ro_fd: std::os::unix::io::RawFd,
         shm_size: usize,
+        ack_rw_fd: std::os::unix::io::RawFd,
         rect: euclid::Rect<f32, servo::DeviceIndependentPixel>,
         z_index: i32,
         anchor: PaneAnchor,
@@ -2072,6 +2073,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 pane_id,
                 ro_fd,
                 shm_size,
+                ack_rw_fd,
                 rect,
                 z_index,
                 anchor,
@@ -2090,7 +2092,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     let servo_size = ServoPhysicalSize::new(width.max(1), height.max(1));
                     let offscreen_ctx = Rc::new(instance.rendering_context.offscreen_context(servo_size));
 
-                    let consumer = match RemotePaneConsumer::new(ro_fd, shm_size, width.max(1), height.max(1)) {
+                    let consumer = match RemotePaneConsumer::new(ro_fd, shm_size, ack_rw_fd, width.max(1), height.max(1)) {
                         Ok(c) => Some(c),
                         Err(e) => {
                             error!("Rust: Failed to create RemotePaneConsumer for pane '{}': {:?}", pane_id, e);

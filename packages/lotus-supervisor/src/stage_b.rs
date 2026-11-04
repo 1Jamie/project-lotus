@@ -336,6 +336,10 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             libc::SYS_pread64 as u32,
             libc::SYS_pwrite64 as u32,
             libc::SYS_statx as u32,
+            libc::SYS_statfs as u32,
+            libc::SYS_fstatfs as u32,
+            libc::SYS_getdents as u32,
+            libc::SYS_umask as u32,
             // Memory management
             libc::SYS_mmap as u32,
             libc::SYS_mprotect as u32,
@@ -381,15 +385,55 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             libc::SYS_arch_prctl as u32,
             libc::SYS_exit as u32,
             libc::SYS_exit_group as u32,
+            // System info & entropy
+            libc::SYS_uname as u32,
+            libc::SYS_getrandom as u32,
+            libc::SYS_sysinfo as u32,
+            libc::SYS_pipe as u32,
+            libc::SYS_ftruncate as u32,
+            libc::SYS_unlink as u32,
+            libc::SYS_unlinkat as u32,
+            libc::SYS_mkdir as u32,
+            libc::SYS_mkdirat as u32,
+            libc::SYS_rmdir as u32,
+            libc::SYS_rename as u32,
+            libc::SYS_renameat as u32,
+            libc::SYS_renameat2 as u32,
+            libc::SYS_fchmod as u32,
+            libc::SYS_fchmodat as u32,
+            libc::SYS_prlimit64 as u32,
+            libc::SYS_getrlimit as u32,
+            libc::SYS_setrlimit as u32,
+            libc::SYS_getrusage as u32,
+            libc::SYS_sched_getscheduler as u32,
+            libc::SYS_sched_getparam as u32,
+            libc::SYS_sched_setparam as u32,
+            libc::SYS_sched_setscheduler as u32,
+            libc::SYS_getresuid as u32,
+            libc::SYS_getresgid as u32,
+            libc::SYS_socketpair as u32,
+            libc::SYS_memfd_create as u32,
+            libc::SYS_fallocate as u32,
+            libc::SYS_mincore as u32,
             // Network Client (TCP communication with supervisor / broker)
             libc::SYS_connect as u32,
+            libc::SYS_bind as u32,
+            libc::SYS_listen as u32,
+            libc::SYS_accept as u32,
+            libc::SYS_accept4 as u32,
+            libc::SYS_getsockname as u32,
+            libc::SYS_getpeername as u32,
             libc::SYS_recvfrom as u32,
             libc::SYS_sendto as u32,
             libc::SYS_recvmsg as u32,
             libc::SYS_sendmsg as u32,
+            libc::SYS_recvmmsg as u32,
+            libc::SYS_sendmmsg as u32,
             libc::SYS_getsockopt as u32,
             libc::SYS_setsockopt as u32,
             libc::SYS_shutdown as u32,
+            libc::SYS_sched_get_priority_min as u32,
+            libc::SYS_sched_get_priority_max as u32,
         ];
 
         for &nr in &allowed_syscalls {
@@ -422,14 +466,27 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             filter: filter.as_ptr(),
         };
 
+        // Install filter across ALL threads in thread-group using SECCOMP_FILTER_FLAG_TSYNC
         let ret = unsafe {
-            libc::prctl(
-                PR_SET_SECCOMP,
-                SECCOMP_MODE_FILTER,
-                &prog as *const SockFprog as libc::c_ulong,
-                0,
-                0,
+            libc::syscall(
+                libc::SYS_seccomp,
+                1u32, // SECCOMP_SET_MODE_FILTER
+                1u32, // SECCOMP_FILTER_FLAG_TSYNC
+                &prog as *const SockFprog as *const libc::c_void,
             )
+        };
+        let ret = if ret == -1 && unsafe { *libc::__errno_location() } == libc::ENOSYS {
+            unsafe {
+                libc::prctl(
+                    PR_SET_SECCOMP,
+                    SECCOMP_MODE_FILTER,
+                    &prog as *const SockFprog as libc::c_ulong,
+                    0,
+                    0,
+                )
+            }
+        } else {
+            ret as i32
         };
 
         if ret != 0 {
@@ -533,12 +590,12 @@ mod tests {
 
     #[test]
     fn test_stage_b_seccomp_kills_unlisted_syscalls() {
-        // Verify userfaultfd (SYS 323), io_uring_setup (SYS 425), and fchmod (SYS 91)
+        // Verify userfaultfd (SYS 323), io_uring_setup (SYS 425), and bpf
         // are strictly blocked by SECCOMP_RET_KILL_PROCESS
         let unlisted_syscalls = [
             (323, "userfaultfd"),
             (425, "io_uring_setup"),
-            (libc::SYS_fchmod as libc::c_long, "fchmod"),
+            (libc::SYS_keyctl as libc::c_long, "keyctl"),
             (libc::SYS_bpf as libc::c_long, "bpf"),
         ];
 

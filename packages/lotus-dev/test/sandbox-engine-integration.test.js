@@ -25,6 +25,8 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
 
     assert(shm.rwFd > 0, 'Producer rwFd must be valid');
     assert(shm.roFd > 0, 'Consumer roFd must be valid');
+    assert(shm.ackRwFd > 0, 'Consumer ackRwFd must be valid');
+    assert(shm.ackRoFd > 0, 'Producer ackRoFd must be valid');
     assert(shm.totalSize > 0, 'SHM totalSize must be positive');
 
     // 2. Spawn sandboxed engine with real lotus-engine binary
@@ -32,8 +34,10 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
         supervisorBin,
         engineBin,
         timeoutMs: 15000,
+        passFds: [shm.rwFd, shm.ackRoFd],
         engineArgs: [
             '--shm-fd', shm.rwFd.toString(),
+            '--ack-fd', shm.ackRoFd.toString(),
             '--surface-id', surfaceId,
             '--width', width.toString(),
             '--height', height.toString(),
@@ -44,13 +48,27 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
     assert(engineInstance, 'Engine instance must be returned');
     assert(engineInstance.enginePid > 0, `Engine PID must be valid: ${engineInstance.enginePid}`);
 
-    // 3. Verify Engine Process Status Invariants (/proc/<pid>/status)
+    // 3. Verify Engine Process Status Invariants (/proc/<pid>/status & /proc/<pid>/task/*/status)
     const engStatus = launcher.parseProcStatus(engineInstance.enginePid);
     assert(engStatus, 'Engine /proc status must be accessible');
     assert.strictEqual(engStatus.NoNewPrivs, '1', 'Engine must have NoNewPrivs active');
     assert.strictEqual(engStatus.Seccomp, '2', 'Engine must have Seccomp mode 2 (filter) active');
     assert.strictEqual(engStatus.CapEff, '0000000000000000', 'Engine must have 0 effective capabilities');
     assert.strictEqual(engStatus.CapPrm, '0000000000000000', 'Engine must have 0 permitted capabilities');
+
+    // Audit all threads: every single thread in /proc/<pid>/task must have Seccomp == 2
+    const tasksDir = `/proc/${engineInstance.enginePid}/task`;
+    const tasks = fs.readdirSync(tasksDir);
+    assert(tasks.length > 1, `Engine must have spawned worker threads (found ${tasks.length} threads)`);
+    for (const tid of tasks) {
+        const taskStatus = launcher.parseProcStatus(tid, tasksDir);
+        assert(taskStatus, `Thread ${tid} status must be readable`);
+        assert.strictEqual(
+            taskStatus.Seccomp,
+            '2',
+            `Engine thread ${tid} (${taskStatus.Name}) must have Seccomp mode 2 (filter) active`
+        );
+    }
 
     // 4. Verify Supervisor Restricted Phase Invariants
     const supPid = engineInstance.supervisor.pid;

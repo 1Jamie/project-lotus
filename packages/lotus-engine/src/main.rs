@@ -12,7 +12,7 @@ use std::fs;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -20,16 +20,17 @@ use dpi::PhysicalSize;
 use euclid::Point2D;
 use servo::resources::{self, Resource};
 use servo::{
-    DeviceIntPoint, DeviceIntRect, DeviceIntSize, EventLoopWaker, InputEvent as ServoInputEvent,
-    LoadStatus, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
-    RenderingContext, ServoBuilder, SoftwareRenderingContext, WebViewBuilder, WebViewDelegate,
-    WheelDelta, WheelEvent, WheelMode,
+    Code, DeviceIntPoint, DeviceIntRect, DeviceIntSize, EventLoopWaker, InputEvent as ServoInputEvent,
+    Key, KeyboardEvent as ServoKeyboardEvent, KeyState, LoadStatus, Location, Modifiers,
+    MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
+    NamedKey, RenderingContext, ServoBuilder, SoftwareRenderingContext, WebViewBuilder,
+    WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 
 use lotus_supervisor::shm::{
     calculate_shm_geometry, publish_slot, reserve_slot_for_writing, ConsumerAckHeader,
-    ProducerControlHeader, SealedMemfdPlane, CLAIM_UNCLAIMED,
+    ProducerControlHeader, SealedMemfdPlane,
 };
 use lotus_supervisor::stage_b::apply_stage_b_seccomp;
 
@@ -44,6 +45,13 @@ struct EngineResourceReader;
 
 impl resources::ResourceReaderMethods for EngineResourceReader {
     fn read(&self, file: Resource) -> Vec<u8> {
+        if let Ok(res_path) = env::var("LOTUS_RESOURCES_PATH") {
+            let path = PathBuf::from(&res_path).join(file.filename());
+            if let Ok(data) = fs::read(&path) {
+                return data;
+            }
+        }
+
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let res_dir = manifest_dir.join("../lotus-core/resources");
         let path = res_dir.join(file.filename());
@@ -71,8 +79,13 @@ impl resources::ResourceReaderMethods for EngineResourceReader {
     }
 
     fn sandbox_access_files_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(res_path) = env::var("LOTUS_RESOURCES_PATH") {
+            dirs.push(PathBuf::from(res_path));
+        }
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        vec![manifest_dir.join("../lotus-core/resources")]
+        dirs.push(manifest_dir.join("../lotus-core/resources"));
+        dirs
     }
 
     fn sandbox_access_files(&self) -> Vec<PathBuf> {
@@ -135,6 +148,7 @@ struct EngineConfig {
     control_fd: Option<RawFd>,
     liveness_fd: Option<RawFd>,
     shm_fd: Option<RawFd>,
+    ack_fd: Option<RawFd>,
     width: u32,
     height: u32,
     surface_id: String,
@@ -145,6 +159,7 @@ fn parse_config() -> EngineConfig {
     let mut control_fd: Option<RawFd> = env::var("LOTUS_CONTROL_FD").ok().and_then(|v| v.parse().ok());
     let mut liveness_fd: Option<RawFd> = env::var("LOTUS_LIVENESS_FD").ok().and_then(|v| v.parse().ok());
     let mut shm_fd: Option<RawFd> = env::var("LOTUS_SHM_FD").ok().and_then(|v| v.parse().ok());
+    let mut ack_fd: Option<RawFd> = env::var("LOTUS_ACK_FD").ok().and_then(|v| v.parse().ok());
     let mut width = 800u32;
     let mut height = 600u32;
     let mut surface_id = "default".to_string();
@@ -170,6 +185,12 @@ fn parse_config() -> EngineConfig {
                 i += 1;
                 if i < args.len() {
                     shm_fd = args[i].parse().ok();
+                }
+            }
+            "--ack-fd" => {
+                i += 1;
+                if i < args.len() {
+                    ack_fd = args[i].parse().ok();
                 }
             }
             "--width" => {
@@ -205,6 +226,7 @@ fn parse_config() -> EngineConfig {
         control_fd,
         liveness_fd,
         shm_fd,
+        ack_fd,
         width,
         height,
         surface_id,
@@ -221,7 +243,61 @@ fn main() {
     let width = config.width;
     let height = config.height;
 
-    // 1. Initialize Servo Singleton & Waker FIRST (Opts must be initialized before anything calls opts::get())
+    // 1. Line 1: Apply Stage B Seccomp-BPF Lockdown before creating any threads
+    apply_stage_b_seccomp().expect("Failed to apply Stage B seccomp");
+
+    // 2. Verify Lockdown Invariants (/proc/self/status Seccomp == 2 && NoNewPrivs == 1)
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        let mut seccomp_ok = false;
+        let mut no_new_privs_ok = false;
+        for line in status.lines() {
+            if line.starts_with("Seccomp:") {
+                let v = line.split_whitespace().nth(1).unwrap_or("");
+                seccomp_ok = v == "2";
+            }
+            if line.starts_with("NoNewPrivs:") {
+                let v = line.split_whitespace().nth(1).unwrap_or("");
+                no_new_privs_ok = v == "1";
+            }
+        }
+        if !seccomp_ok || !no_new_privs_ok {
+            eprintln!("[lotus-engine] Fatal: Lockdown verification failed (seccomp: {}, no_new_privs: {})", seccomp_ok, no_new_privs_ok);
+            std::process::abort();
+        }
+    }
+
+    // 3. Attestation Gate Handshake over LOTUS_CONTROL_FD (Stage B locked, single-threaded)
+    if let Some(ctrl_fd) = config.control_fd {
+        // Send STAGE_B_LOCKED
+        let locked_msg = b"STAGE_B_LOCKED\n";
+        let n = unsafe { libc::write(ctrl_fd, locked_msg.as_ptr() as *const _, locked_msg.len()) };
+        if n < 0 {
+            eprintln!("[lotus-engine] Failed to write STAGE_B_LOCKED");
+            std::process::exit(1);
+        }
+
+        // Wait for PROCEED_TO_INIT
+        let mut line_buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let r = unsafe { libc::read(ctrl_fd, byte.as_mut_ptr() as *mut _, 1) };
+            if r <= 0 {
+                eprintln!("[lotus-engine] Failed to read PROCEED_TO_INIT");
+                std::process::exit(2);
+            }
+            if byte[0] == b'\n' {
+                let s = String::from_utf8_lossy(&line_buf);
+                if s.contains("PROCEED_TO_INIT") {
+                    break;
+                }
+                line_buf.clear();
+            } else {
+                line_buf.push(byte[0]);
+            }
+        }
+    }
+
+    // 4. Initialize Servo Singleton & Waker (Opts registered; any worker threads inherit Stage B seccomp)
     let (wake_tx, wake_rx) = mpsc::channel();
     let waker = EngineWaker(wake_tx);
     let mut prefs = servo::prefs::Preferences::default();
@@ -232,13 +308,13 @@ fn main() {
         .preferences(prefs)
         .build();
 
-    // 2. Initialize Headless Software / Offscreen Rendering Context
+    // 5. Initialize Headless Software / Offscreen Rendering Context
     let rendering_ctx = Rc::new(
         SoftwareRenderingContext::new(PhysicalSize::new(width, height))
             .expect("Failed to initialize SoftwareRenderingContext"),
     );
 
-    // 3. Map Shared Memory Region (RemotePaneShm)
+    // 6. Map Shared Memory Region (RemotePaneShm: Pixel Plane RW, Consumer Ack Plane RO)
     let geom = calculate_shm_geometry(width, height).expect("calculate_shm_geometry");
     let total_shm_size = 256 + geom.total_pixel_bytes;
 
@@ -274,21 +350,40 @@ fn main() {
     prod_hdr.prod_resize_gen.store(1, Ordering::Relaxed);
     prod_hdr.active_slots = 3;
 
-    // Local consumer ack simulation for standalone tracking
-    let consumer_ack = ConsumerAckHeader {
-        consumer_gen_id: AtomicU64::new(1),
-        claimed_generation: AtomicU64::new(0),
-        claimed_seq: AtomicU64::new(0),
-        free_seq: AtomicU64::new(0),
-        claimed_slot: AtomicU32::new(CLAIM_UNCLAIMED),
-        _pad: [0; 28],
+    // Map ConsumerAckHeader from ack_fd (RO) or fallback to local plane
+    let (_owned_ack_plane, consumer_ack_ptr) = if let Some(fd) = config.ack_fd {
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                std::mem::size_of::<ConsumerAckHeader>(),
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            ) as *const ConsumerAckHeader
+        };
+        if ptr != libc::MAP_FAILED as *const ConsumerAckHeader {
+            (None, ptr)
+        } else {
+            let plane = SealedMemfdPlane::new("lotus_engine_ack", std::mem::size_of::<ConsumerAckHeader>())
+                .expect("Failed to create SealedMemfdPlane for ack");
+            let ptr = plane.rw_ptr as *const ConsumerAckHeader;
+            (Some(plane), ptr)
+        }
+    } else {
+        let plane = SealedMemfdPlane::new("lotus_engine_ack", std::mem::size_of::<ConsumerAckHeader>())
+            .expect("Failed to create SealedMemfdPlane for ack");
+        let ptr = plane.rw_ptr as *const ConsumerAckHeader;
+        (Some(plane), ptr)
     };
+
+    let consumer_ack = unsafe { &*consumer_ack_ptr };
 
     let mut last_pub_gen = [0u64; 3];
     let mut last_pub_seq = [0u64; 3];
     let mut current_slot = 0usize;
 
-    // 4. Create WebView with initial URL
+    // 7. Create WebView with initial URL
     let load_complete = Arc::new(AtomicBool::new(false));
     let frame_ready = Arc::new(AtomicBool::new(false));
     let last_url = Arc::new(Mutex::new(None));
@@ -309,66 +404,12 @@ fn main() {
         webview.load(u);
     }
 
-    // 5. Apply Stage B Seccomp-BPF Lockdown
-    apply_stage_b_seccomp().expect("Failed to apply Stage B seccomp");
-
-    // 6. Verify Lockdown Invariants (/proc/self/status Seccomp == 2 && NoNewPrivs == 1)
-    if let Ok(status) = fs::read_to_string("/proc/self/status") {
-        let mut seccomp_ok = false;
-        let mut no_new_privs_ok = false;
-        for line in status.lines() {
-            if line.starts_with("Seccomp:") {
-                let v = line.split_whitespace().nth(1).unwrap_or("");
-                seccomp_ok = v == "2";
-            }
-            if line.starts_with("NoNewPrivs:") {
-                let v = line.split_whitespace().nth(1).unwrap_or("");
-                no_new_privs_ok = v == "1";
-            }
-        }
-        if !seccomp_ok || !no_new_privs_ok {
-            eprintln!("[lotus-engine] Fatal: Lockdown verification failed (seccomp: {}, no_new_privs: {})", seccomp_ok, no_new_privs_ok);
-            std::process::abort();
-        }
-    }
-
-    // 7. Attestation Gate Handshake over LOTUS_CONTROL_FD
+    // 8. Attestation Gate Ready Handshake over LOTUS_CONTROL_FD
     if let Some(ctrl_fd) = config.control_fd {
-        // Send STAGE_B_LOCKED
-        let locked_msg = b"STAGE_B_LOCKED\n";
-        let n = unsafe { libc::write(ctrl_fd, locked_msg.as_ptr() as *const _, locked_msg.len()) };
-        if n < 0 {
-            eprintln!("[lotus-engine] Failed to write STAGE_B_LOCKED");
-            std::process::exit(1);
-        }
-
-        // Wait for PROCEED_TO_INIT
-        let mut line_buf = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            let r = unsafe { libc::read(ctrl_fd, byte.as_mut_ptr() as *mut _, 1) };
-            if r <= 0 {
-                eprintln!("[lotus-engine] Failed to read PROCEED_TO_INIT");
-                std::process::exit(2);
-            }
-            if byte[0] == b'\n' {
-                let s = String::from_utf8_lossy(&line_buf);
-                if s.contains("PROCEED_TO_INIT") {
-                    break;
-                }
-                line_buf.clear();
-            } else {
-                line_buf.push(byte[0]);
-            }
-        }
-
-        // Send ENGINE_READY
         let ready_msg = b"ENGINE_READY\n";
         let _ = unsafe { libc::write(ctrl_fd, ready_msg.as_ptr() as *const _, ready_msg.len()) };
-    }
 
-    // Set control_fd non-blocking for event loop
-    if let Some(ctrl_fd) = config.control_fd {
+        // Set control_fd non-blocking for event loop
         unsafe {
             let flags = libc::fcntl(ctrl_fd, libc::F_GETFL);
             if flags >= 0 {
@@ -557,18 +598,154 @@ fn handle_input_event(webview: &servo::WebView, event: InputEvent) {
                 servo::WebViewPoint::Device(pt),
             )));
         }
-        InputEvent::MouseWheel { dx, dy, .. } => {
+        InputEvent::MouseWheel { x, y, dx, dy, .. } => {
             let delta = WheelDelta {
                 x: dx,
                 y: dy,
                 z: 0.0,
                 mode: WheelMode::DeltaPixel,
             };
+            let pt = Point2D::new(x as f32, y as f32);
             webview.notify_input_event(ServoInputEvent::Wheel(WheelEvent::new(
                 delta,
-                servo::WebViewPoint::Device(Point2D::new(0.0, 0.0)),
+                servo::WebViewPoint::Device(pt),
             )));
         }
+        InputEvent::KeyDown { key, code, keycode, modifiers, repeat, .. } => {
+            let s_key = if let Some(ref k) = key {
+                map_str_to_key(k)
+            } else if keycode > 0 {
+                if let Some(ch) = char::from_u32(keycode) {
+                    Key::Character(ch.to_string())
+                } else {
+                    Key::Named(NamedKey::Unidentified)
+                }
+            } else {
+                Key::Named(NamedKey::Unidentified)
+            };
+            let s_code = if let Some(ref c) = code {
+                map_str_to_code(c)
+            } else {
+                Code::Unidentified
+            };
+            let s_mods = Modifiers::from_bits_truncate(modifiers);
+            let kb_event = ServoKeyboardEvent::new_without_event(
+                KeyState::Down,
+                s_key,
+                s_code,
+                Location::Standard,
+                s_mods,
+                repeat,
+                false,
+            );
+            webview.notify_input_event(ServoInputEvent::Keyboard(kb_event));
+        }
+        InputEvent::KeyUp { key, code, keycode, modifiers, .. } => {
+            let s_key = if let Some(ref k) = key {
+                map_str_to_key(k)
+            } else if keycode > 0 {
+                if let Some(ch) = char::from_u32(keycode) {
+                    Key::Character(ch.to_string())
+                } else {
+                    Key::Named(NamedKey::Unidentified)
+                }
+            } else {
+                Key::Named(NamedKey::Unidentified)
+            };
+            let s_code = if let Some(ref c) = code {
+                map_str_to_code(c)
+            } else {
+                Code::Unidentified
+            };
+            let s_mods = Modifiers::from_bits_truncate(modifiers);
+            let kb_event = ServoKeyboardEvent::new_without_event(
+                KeyState::Up,
+                s_key,
+                s_code,
+                Location::Standard,
+                s_mods,
+                false,
+                false,
+            );
+            webview.notify_input_event(ServoInputEvent::Keyboard(kb_event));
+        }
         _ => {}
+    }
+}
+
+fn map_str_to_key(s: &str) -> Key {
+    match s {
+        "Backspace" => Key::Named(NamedKey::Backspace),
+        "Tab" => Key::Named(NamedKey::Tab),
+        "Enter" => Key::Named(NamedKey::Enter),
+        "Escape" => Key::Named(NamedKey::Escape),
+        "ArrowLeft" => Key::Named(NamedKey::ArrowLeft),
+        "ArrowRight" => Key::Named(NamedKey::ArrowRight),
+        "ArrowUp" => Key::Named(NamedKey::ArrowUp),
+        "ArrowDown" => Key::Named(NamedKey::ArrowDown),
+        "PageUp" => Key::Named(NamedKey::PageUp),
+        "PageDown" => Key::Named(NamedKey::PageDown),
+        "Home" => Key::Named(NamedKey::Home),
+        "End" => Key::Named(NamedKey::End),
+        "Insert" => Key::Named(NamedKey::Insert),
+        "Delete" => Key::Named(NamedKey::Delete),
+        "Shift" => Key::Named(NamedKey::Shift),
+        "Control" => Key::Named(NamedKey::Control),
+        "Alt" => Key::Named(NamedKey::Alt),
+        "Meta" | "Super" => Key::Named(NamedKey::Meta),
+        other => {
+            if other.chars().count() == 1 {
+                Key::Character(other.to_string())
+            } else {
+                Key::Named(NamedKey::Unidentified)
+            }
+        }
+    }
+}
+
+fn map_str_to_code(s: &str) -> Code {
+    match s {
+        "KeyA" => Code::KeyA,
+        "KeyB" => Code::KeyB,
+        "KeyC" => Code::KeyC,
+        "KeyD" => Code::KeyD,
+        "KeyE" => Code::KeyE,
+        "KeyF" => Code::KeyF,
+        "KeyG" => Code::KeyG,
+        "KeyH" => Code::KeyH,
+        "KeyI" => Code::KeyI,
+        "KeyJ" => Code::KeyJ,
+        "KeyK" => Code::KeyK,
+        "KeyL" => Code::KeyL,
+        "KeyM" => Code::KeyM,
+        "KeyN" => Code::KeyN,
+        "KeyO" => Code::KeyO,
+        "KeyP" => Code::KeyP,
+        "KeyQ" => Code::KeyQ,
+        "KeyR" => Code::KeyR,
+        "KeyS" => Code::KeyS,
+        "KeyT" => Code::KeyT,
+        "KeyU" => Code::KeyU,
+        "KeyV" => Code::KeyV,
+        "KeyW" => Code::KeyW,
+        "KeyX" => Code::KeyX,
+        "KeyY" => Code::KeyY,
+        "KeyZ" => Code::KeyZ,
+        "Digit0" => Code::Digit0,
+        "Digit1" => Code::Digit1,
+        "Digit2" => Code::Digit2,
+        "Digit3" => Code::Digit3,
+        "Digit4" => Code::Digit4,
+        "Digit5" => Code::Digit5,
+        "Digit6" => Code::Digit6,
+        "Digit7" => Code::Digit7,
+        "Digit8" => Code::Digit8,
+        "Digit9" => Code::Digit9,
+        "Enter" => Code::Enter,
+        "Escape" => Code::Escape,
+        "Backspace" => Code::Backspace,
+        "Tab" => Code::Tab,
+        "Space" => Code::Space,
+        _ => Code::Unidentified,
     }
 }

@@ -57,6 +57,10 @@ pub enum InputEvent {
     MouseWheel {
         surface_id: String,
         generation: u64,
+        #[serde(default)]
+        x: f64,
+        #[serde(default)]
+        y: f64,
         dx: f64,
         dy: f64,
         modifiers: u32,
@@ -64,14 +68,27 @@ pub enum InputEvent {
     KeyDown {
         surface_id: String,
         generation: u64,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
         keycode: u32,
+        #[serde(default)]
         modifiers: u32,
+        #[serde(default)]
         repeat: bool,
     },
     KeyUp {
         surface_id: String,
         generation: u64,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
         keycode: u32,
+        #[serde(default)]
         modifiers: u32,
     },
     Focus {

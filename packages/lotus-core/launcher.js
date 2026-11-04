@@ -8,9 +8,9 @@ const fs = require('fs');
 /**
  * Parses /proc/<pid>/status into a key-value dictionary.
  */
-function parseProcStatus(pid) {
+function parseProcStatus(pid, baseDir = '/proc') {
     try {
-        const text = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+        const text = fs.readFileSync(path.join(baseDir, String(pid), 'status'), 'utf8');
         const map = {};
         for (const line of text.split('\n')) {
             const idx = line.indexOf(':');
@@ -115,11 +115,15 @@ async function spawnSandboxedEngine(options = {}) {
         throw new Error(`engine binary not found at ${engineBin}`);
     }
 
+    const passFds = options.passFds || [];
     const supArgs = [
         '--supervisor-fd', '3',
         '--control-fd', '4',
         '--engine-bin', engineBin,
     ];
+    if (passFds.length > 0) {
+        supArgs.push('--pass-fds', passFds.join(','));
+    }
     if (cacheDir) {
         supArgs.push('--cache-dir', cacheDir);
     }
@@ -130,8 +134,22 @@ async function spawnSandboxedEngine(options = {}) {
         supArgs.push('--', ...engineArgs);
     }
 
+    const stdio = ['inherit', 'inherit', 'inherit', 'pipe', 'pipe'];
+    if (passFds.length > 0) {
+        for (const fd of passFds) {
+            if (typeof fd === 'number' && fd >= 0) {
+                stdio[fd] = fd;
+            }
+        }
+        for (let i = 0; i < stdio.length; i++) {
+            if (stdio[i] === undefined) {
+                stdio[i] = 'ignore';
+            }
+        }
+    }
+
     const supervisorProc = spawn(supervisorBin, supArgs, {
-        stdio: ['inherit', 'inherit', 'inherit', 'pipe', 'pipe']
+        stdio
     });
 
     const supervisorStream = supervisorProc.stdio[3];
@@ -144,8 +162,13 @@ async function spawnSandboxedEngine(options = {}) {
         let startupTimeout = null;
         let verificationReport = null;
 
+        let onDataHandler = null;
         const cleanupAndReject = (err) => {
             if (startupTimeout) clearTimeout(startupTimeout);
+            if (onDataHandler && controlStream) {
+                controlStream.off('data', onDataHandler);
+                onDataHandler = null;
+            }
             try {
                 supervisorProc.kill('SIGKILL');
             } catch {}
@@ -181,8 +204,8 @@ async function spawnSandboxedEngine(options = {}) {
             if (!engStatus) {
                 return cleanupAndReject(new Error(`Failed to read /proc/${enginePid}/status`));
             }
-            const requireSingleThreaded = options.requireSingleThreaded ?? (options.engineBin && options.engineBin.includes('probe'));
-            if (requireSingleThreaded && engStatus.Threads !== '1') {
+            // Strict Invariant: Threads must be exactly 1 at STAGE_B_LOCKED for all engines
+            if (engStatus.Threads !== '1') {
                 return cleanupAndReject(new Error(`Engine thread invariant failed: expected 1 thread, found ${engStatus.Threads}`));
             }
             if (engStatus.NoNewPrivs !== '1') {
@@ -193,6 +216,20 @@ async function spawnSandboxedEngine(options = {}) {
             }
             if (engStatus.CapEff !== '0000000000000000' || engStatus.CapPrm !== '0000000000000000') {
                 return cleanupAndReject(new Error(`Engine capabilities violation: CapEff=${engStatus.CapEff}, CapPrm=${engStatus.CapPrm}`));
+            }
+
+            // Verify all tasks in /proc/<pid>/task have Seccomp == 2
+            const tasksDir = `/proc/${enginePid}/task`;
+            try {
+                const tasks = fs.readdirSync(tasksDir);
+                for (const tid of tasks) {
+                    const taskStatus = parseProcStatus(tid, tasksDir);
+                    if (taskStatus && taskStatus.Seccomp !== '2') {
+                        return cleanupAndReject(new Error(`Engine thread ${tid} Seccomp violation: mode ${taskStatus.Seccomp}`));
+                    }
+                }
+            } catch (err) {
+                return cleanupAndReject(new Error(`Failed to read engine task status: ${err.message}`));
             }
 
             // 2. Audit Supervisor Process Status (Restricted Supervision Phase)
@@ -234,7 +271,10 @@ async function spawnSandboxedEngine(options = {}) {
         };
 
         let controlBuffer = '';
-        controlStream.on('data', (chunk) => {
+        onDataHandler = (chunk) => {
+            if (controlBuffer.length + chunk.length > 65536) {
+                return cleanupAndReject(new Error('controlBuffer exceeded maximum allowed size (64 KiB)'));
+            }
             controlBuffer += chunk.toString('utf8');
             const lines = controlBuffer.split('\n');
             controlBuffer = lines.pop(); // Keep trailing incomplete line
@@ -256,7 +296,27 @@ async function spawnSandboxedEngine(options = {}) {
                     if (!stageBLOCKEDPassed(stageBLockedReceived)) {
                         return cleanupAndReject(new Error('ENGINE_READY received before STAGE_B_LOCKED verification passed'));
                     }
+
+                    // Audit engine tasks post-startup: every thread spawned by Servo must have Seccomp == 2
+                    const tasksDir = `/proc/${enginePid}/task`;
+                    try {
+                        const tasks = fs.readdirSync(tasksDir);
+                        for (const tid of tasks) {
+                            const taskStatus = parseProcStatus(tid, tasksDir);
+                            if (taskStatus && taskStatus.Seccomp !== '2') {
+                                return cleanupAndReject(new Error(`Engine thread ${tid} post-startup Seccomp violation: mode ${taskStatus.Seccomp}`));
+                            }
+                        }
+                    } catch (err) {
+                        return cleanupAndReject(new Error(`Failed to audit engine tasks post-startup: ${err.message}`));
+                    }
+
                     clearTimeout(startupTimeout);
+                    if (onDataHandler && controlStream) {
+                        controlStream.off('data', onDataHandler);
+                        onDataHandler = null;
+                    }
+
                     const instance = new SandboxedEngineProcess(
                         supervisorProc,
                         enginePid,
@@ -268,7 +328,9 @@ async function spawnSandboxedEngine(options = {}) {
                     resolve(instance);
                 }
             }
-        });
+        };
+
+        controlStream.on('data', onDataHandler);
 
         supervisorProc.on('error', cleanupAndReject);
         supervisorProc.on('exit', (code, sig) => {

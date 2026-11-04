@@ -12,19 +12,27 @@ pub struct RemotePaneConsumer {
     pub ro_fd: RawFd,
     pub ro_ptr: *const u8,
     pub mapped_size: usize,
-    pub consumer_ack: ConsumerAckHeader,
+    pub ack_rw_fd: RawFd,
+    pub ack_ptr: *mut ConsumerAckHeader,
     pub active_resize_gen: u64,
     pub last_rendered_seq: u64,
     pub texture: Option<glow::Texture>,
     pub tex_width: u32,
     pub tex_height: u32,
+    local_ack_fallback: Option<Box<ConsumerAckHeader>>,
 }
 
 // Raw pointers across threads need unsafe impl Send
 unsafe impl Send for RemotePaneConsumer {}
 
 impl RemotePaneConsumer {
-    pub fn new(ro_fd: RawFd, mapped_size: usize, initial_width: u32, initial_height: u32) -> Result<Self, &'static str> {
+    pub fn new(
+        ro_fd: RawFd,
+        mapped_size: usize,
+        ack_rw_fd: RawFd,
+        initial_width: u32,
+        initial_height: u32,
+    ) -> Result<Self, &'static str> {
         if ro_fd < 0 {
             return Err("E_SHM_INVALID_FD");
         }
@@ -47,26 +55,59 @@ impl RemotePaneConsumer {
             return Err("E_SHM_MMAP_FAILED");
         }
 
-        let consumer_ack = ConsumerAckHeader {
-            consumer_gen_id: AtomicU64::new(1),
-            claimed_generation: AtomicU64::new(0),
-            claimed_seq: AtomicU64::new(0),
-            free_seq: AtomicU64::new(0),
-            claimed_slot: AtomicU32::new(CLAIM_UNCLAIMED),
-            _pad: [0; 28],
+        let (ack_ptr, local_ack_fallback) = if ack_rw_fd >= 0 {
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    std::mem::size_of::<ConsumerAckHeader>(),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    ack_rw_fd,
+                    0,
+                ) as *mut ConsumerAckHeader
+            };
+            if ptr == libc::MAP_FAILED as *mut ConsumerAckHeader {
+                unsafe { libc::munmap(ro_ptr as *mut libc::c_void, mapped_size); }
+                return Err("E_SHM_ACK_MMAP_FAILED");
+            }
+            unsafe {
+                (*ptr).consumer_gen_id.store(1, Ordering::Relaxed);
+                (*ptr).claimed_generation.store(0, Ordering::Relaxed);
+                (*ptr).claimed_seq.store(0, Ordering::Relaxed);
+                (*ptr).free_seq.store(0, Ordering::Relaxed);
+                (*ptr).claimed_slot.store(CLAIM_UNCLAIMED, Ordering::Relaxed);
+            }
+            (ptr, None)
+        } else {
+            let mut boxed = Box::new(ConsumerAckHeader {
+                consumer_gen_id: AtomicU64::new(1),
+                claimed_generation: AtomicU64::new(0),
+                claimed_seq: AtomicU64::new(0),
+                free_seq: AtomicU64::new(0),
+                claimed_slot: AtomicU32::new(CLAIM_UNCLAIMED),
+                _pad: [0; 28],
+            });
+            let ptr = boxed.as_mut() as *mut ConsumerAckHeader;
+            (ptr, Some(boxed))
         };
 
         Ok(Self {
             ro_fd,
             ro_ptr,
             mapped_size,
-            consumer_ack,
+            ack_rw_fd,
+            ack_ptr,
             active_resize_gen: 1,
             last_rendered_seq: 0,
             texture: None,
             tex_width: initial_width,
             tex_height: initial_height,
+            local_ack_fallback,
         })
+    }
+
+    pub fn ack_header(&self) -> &ConsumerAckHeader {
+        unsafe { &*self.ack_ptr }
     }
 
     /// Checks the producer control header, claims the latest published frame,
@@ -81,6 +122,8 @@ impl RemotePaneConsumer {
         if latest_pub_seq <= self.last_rendered_seq {
             return Ok(false);
         }
+
+        let consumer_ack = unsafe { &*self.ack_ptr };
 
         // Find the slot with the highest published sequence that is in STATE_READY
         let mut target_slot: Option<usize> = None;
@@ -106,7 +149,7 @@ impl RemotePaneConsumer {
         let (_claimed_gen, claimed_seq) = claim_and_verify_slot(
             slot_idx,
             prod_hdr,
-            &self.consumer_ack,
+            consumer_ack,
             self.active_resize_gen,
         )?;
 
@@ -114,7 +157,7 @@ impl RemotePaneConsumer {
         let geom = match calculate_shm_geometry(self.tex_width.max(1), self.tex_height.max(1)) {
             Ok(g) => g,
             Err(e) => {
-                release_slot_claim(&self.consumer_ack, claimed_seq);
+                release_slot_claim(consumer_ack, claimed_seq);
                 return Err(e);
             }
         };
@@ -123,7 +166,7 @@ impl RemotePaneConsumer {
             slot_idx,
             &prod_hdr.slots[slot_idx],
             prod_hdr,
-            &self.consumer_ack,
+            consumer_ack,
             self.active_resize_gen,
             self.tex_width.max(1),
             self.tex_height.max(1),
@@ -133,7 +176,7 @@ impl RemotePaneConsumer {
             Ok(v) => v,
             Err(err) => {
                 warn!("SHM Consumer: 15-point frame validation failed: {}", err);
-                release_slot_claim(&self.consumer_ack, claimed_seq);
+                release_slot_claim(consumer_ack, claimed_seq);
                 return Err(err);
             }
         };
@@ -156,7 +199,7 @@ impl RemotePaneConsumer {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
 
             let pixel_ptr = self.ro_ptr.add(256 + validated.slot_offset);
-            let frame_len = validated.slot_row_bytes;
+            let frame_len = validated.stride * (validated.height as usize);
             let slice = std::slice::from_raw_parts(pixel_ptr, frame_len);
 
             // Reallocate texture surface if dimensions changed
@@ -192,7 +235,7 @@ impl RemotePaneConsumer {
         }
 
         // 4. Release claim and advance last_rendered_seq
-        release_slot_claim(&self.consumer_ack, validated.pub_seq);
+        release_slot_claim(consumer_ack, validated.pub_seq);
         self.last_rendered_seq = validated.pub_seq;
 
         trace!(
@@ -220,6 +263,16 @@ impl Drop for RemotePaneConsumer {
                 libc::close(self.ro_fd);
             }
         }
+        if self.local_ack_fallback.is_none() && !self.ack_ptr.is_null() && self.ack_ptr != libc::MAP_FAILED as *mut ConsumerAckHeader {
+            unsafe {
+                libc::munmap(self.ack_ptr as *mut libc::c_void, std::mem::size_of::<ConsumerAckHeader>());
+            }
+        }
+        if self.ack_rw_fd >= 0 {
+            unsafe {
+                libc::close(self.ack_rw_fd);
+            }
+        }
     }
 }
 
@@ -243,18 +296,18 @@ mod tests {
         prod_hdr.prod_resize_gen.store(1, Ordering::Relaxed);
         prod_hdr.active_slots = 3;
 
-        let consumer = RemotePaneConsumer::new(plane.ro_fd, total_size, width, height)
+        let consumer = RemotePaneConsumer::new(plane.ro_fd, total_size, -1, width, height)
             .expect("RemotePaneConsumer::new");
 
         assert_eq!(consumer.last_rendered_seq, 0);
-        assert_eq!(consumer.consumer_ack.claimed_slot.load(Ordering::Relaxed), CLAIM_UNCLAIMED);
+        assert_eq!(consumer.ack_header().claimed_slot.load(Ordering::Relaxed), CLAIM_UNCLAIMED);
 
         // Produce a frame
         let mut last_pub_gen = [0u64; 3];
         let mut last_pub_seq = [0u64; 3];
         let slot_idx = 0usize;
 
-        reserve_slot_for_writing(slot_idx, prod_hdr, &consumer.consumer_ack, &last_pub_gen, &last_pub_seq)
+        reserve_slot_for_writing(slot_idx, prod_hdr, consumer.ack_header(), &last_pub_gen, &last_pub_seq)
             .expect("reserve slot");
 
         let pub_seq = publish_slot(
@@ -272,7 +325,7 @@ mod tests {
         let (_claimed_gen, claimed_seq) = claim_and_verify_slot(
             slot_idx,
             prod_hdr,
-            &consumer.consumer_ack,
+            consumer.ack_header(),
             consumer.active_resize_gen,
         )
         .expect("claim and verify");
@@ -283,7 +336,7 @@ mod tests {
             slot_idx,
             &prod_hdr.slots[slot_idx],
             prod_hdr,
-            &consumer.consumer_ack,
+            consumer.ack_header(),
             consumer.active_resize_gen,
             width,
             height,
@@ -297,8 +350,8 @@ mod tests {
         assert_eq!(validated.stride, geom.stride);
         assert_eq!(validated.pub_seq, pub_seq);
 
-        release_slot_claim(&consumer.consumer_ack, pub_seq);
-        assert_eq!(consumer.consumer_ack.claimed_slot.load(Ordering::Acquire), CLAIM_UNCLAIMED);
+        release_slot_claim(consumer.ack_header(), pub_seq);
+        assert_eq!(consumer.ack_header().claimed_slot.load(Ordering::Acquire), CLAIM_UNCLAIMED);
     }
 
     #[test]
@@ -314,12 +367,12 @@ mod tests {
         prod_hdr.prod_resize_gen.store(1, Ordering::Relaxed);
         prod_hdr.active_slots = 3;
 
-        let consumer = RemotePaneConsumer::new(plane.ro_fd, total_size, width, height)
+        let consumer = RemotePaneConsumer::new(plane.ro_fd, total_size, -1, width, height)
             .expect("RemotePaneConsumer::new");
 
         // Attempting to validate a slot that is not in STATE_READY must fail
         assert_eq!(
-            claim_and_verify_slot(0, prod_hdr, &consumer.consumer_ack, 1),
+            claim_and_verify_slot(0, prod_hdr, consumer.ack_header(), 1),
             Err("E_SHM_SLOT_NOT_READY")
         );
     }

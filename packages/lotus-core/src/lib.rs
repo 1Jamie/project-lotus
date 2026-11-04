@@ -227,6 +227,7 @@ impl WindowHandle {
         pane_id: String,
         ro_fd: i32,
         shm_size: i64,
+        ack_rw_fd: Option<i32>,
         x: f64,
         y: f64,
         width: f64,
@@ -246,6 +247,7 @@ impl WindowHandle {
                 pane_id,
                 ro_fd,
                 shm_size: shm_size as usize,
+                ack_rw_fd: ack_rw_fd.unwrap_or(-1),
                 rect,
                 z_index,
                 anchor: PaneAnchor::from(anchor.unwrap_or(0)),
@@ -606,6 +608,10 @@ pub fn create_window(options: WindowOptions) -> WindowHandle {
 
 #[napi(object)]
 pub struct ShmPlaneAllocation {
+    pub pixel_rw_fd: i32,
+    pub pixel_ro_fd: i32,
+    pub ack_rw_fd: i32,
+    pub ack_ro_fd: i32,
     pub rw_fd: i32,
     pub ro_fd: i32,
     pub total_size: i64,
@@ -618,19 +624,27 @@ pub fn allocate_remote_pane_shm(name: String, width: u32, height: u32) -> napi::
     let geom = lotus_supervisor::shm::calculate_shm_geometry(width, height)
         .map_err(|e| napi::Error::from_reason(format!("Invalid SHM geometry: {}", e)))?;
     let total_size = 256 + geom.total_pixel_bytes;
-    let plane = lotus_supervisor::shm::SealedMemfdPlane::new(&name, total_size)
-        .map_err(|e| napi::Error::from_reason(format!("Failed to create SealedMemfdPlane: {}", e)))?;
+    let pixel_plane = lotus_supervisor::shm::SealedMemfdPlane::new(&format!("{}_pixel", name), total_size)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to create SealedMemfdPlane for pixels: {}", e)))?;
+    let ack_plane = lotus_supervisor::shm::SealedMemfdPlane::new(&format!("{}_ack", name), 64)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to create SealedMemfdPlane for ack: {}", e)))?;
 
     // Duplicate descriptors so dropping plane doesn't close them prematurely
-    let rw_fd = unsafe { libc::dup(plane.rw_fd) };
-    let ro_fd = unsafe { libc::dup(plane.ro_fd) };
-    if rw_fd < 0 || ro_fd < 0 {
+    let pixel_rw_fd = unsafe { libc::dup(pixel_plane.rw_fd) };
+    let pixel_ro_fd = unsafe { libc::dup(pixel_plane.ro_fd) };
+    let ack_rw_fd = unsafe { libc::dup(ack_plane.rw_fd) };
+    let ack_ro_fd = unsafe { libc::dup(ack_plane.ro_fd) };
+    if pixel_rw_fd < 0 || pixel_ro_fd < 0 || ack_rw_fd < 0 || ack_ro_fd < 0 {
         return Err(napi::Error::from_reason("dup failed"));
     }
 
     Ok(ShmPlaneAllocation {
-        rw_fd,
-        ro_fd,
+        pixel_rw_fd,
+        pixel_ro_fd,
+        ack_rw_fd,
+        ack_ro_fd,
+        rw_fd: pixel_rw_fd,
+        ro_fd: pixel_ro_fd,
         total_size: total_size as i64,
         width,
         height,

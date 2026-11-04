@@ -49,6 +49,7 @@ struct SupervisorConfig {
     engine_args: Vec<String>,
     cache_dir: Option<String>,
     temp_dir: Option<String>,
+    pass_fds: Vec<i32>,
 }
 
 fn parse_args() -> Result<SupervisorConfig, String> {
@@ -62,6 +63,7 @@ fn parse_args() -> Result<SupervisorConfig, String> {
     let mut engine_bin: Option<String> = env::var("LOTUS_ENGINE_BIN").ok();
     let mut cache_dir: Option<String> = env::var("LOTUS_CACHE_DIR").ok();
     let mut temp_dir: Option<String> = env::var("LOTUS_TEMP_DIR").ok();
+    let mut pass_fds: Vec<i32> = Vec::new();
     let mut engine_args = Vec::new();
 
     let mut i = 1;
@@ -97,6 +99,16 @@ fn parse_args() -> Result<SupervisorConfig, String> {
                     temp_dir = Some(args[i].clone());
                 }
             }
+            "--pass-fds" => {
+                i += 1;
+                if i < args.len() {
+                    for part in args[i].split(',') {
+                        if let Ok(fd) = part.trim().parse::<i32>() {
+                            pass_fds.push(fd);
+                        }
+                    }
+                }
+            }
             "--" => {
                 i += 1;
                 while i < args.len() {
@@ -127,6 +139,7 @@ fn parse_args() -> Result<SupervisorConfig, String> {
         engine_args,
         cache_dir,
         temp_dir,
+        pass_fds,
     })
 }
 
@@ -173,6 +186,12 @@ fn main() {
             if let Ok(d) = landlock::open_landlock_dir(cwd_str, false) {
                 landlock_fds.push(d);
             }
+        }
+    }
+    // Allow explicit resources path
+    if let Ok(res_path) = env::var("LOTUS_RESOURCES_PATH") {
+        if let Ok(d) = landlock::open_landlock_dir(&res_path, false) {
+            landlock_fds.push(d);
         }
     }
     if let Some(ref cache) = config.cache_dir {
@@ -356,6 +375,9 @@ fn main() {
             libc::fcntl(config.control_fd, libc::F_SETFD, 0);
             libc::fcntl(liveness_read_fd, libc::F_SETFD, 0);
             libc::fcntl(listener_fd, libc::F_SETFD, 0);
+            for &pfd in &config.pass_fds {
+                libc::fcntl(pfd, libc::F_SETFD, 0);
+            }
         }
 
         // Drop all capabilities
@@ -373,6 +395,9 @@ fn main() {
             liveness_read_fd,
             listener_fd,
         ];
+        for &pfd in &config.pass_fds {
+            child_bootstrap_allowlist.push(pfd);
+        }
         for d in &landlock_fds {
             child_bootstrap_allowlist.push(d.fd);
         }
@@ -386,7 +411,7 @@ fn main() {
         landlock::apply_landlock_and_close_descriptors(&landlock_fds, Some(bound_port));
 
         // Verify remaining descriptor table strictly matches final allowlist
-        let mut child_final_allowlist = [
+        let mut child_final_allowlist = vec![
             0,
             1,
             2,
@@ -394,8 +419,12 @@ fn main() {
             liveness_read_fd,
             listener_fd,
         ];
+        for &pfd in &config.pass_fds {
+            child_final_allowlist.push(pfd);
+        }
         child_final_allowlist.sort_unstable();
-        fd::verify_exact_descriptor_table(&child_final_allowlist);
+        child_final_allowlist.dedup();
+        fd::sanitize_descriptors_fail_closed(&child_final_allowlist);
 
         // Execute engine binary
         unsafe {
@@ -421,6 +450,9 @@ fn main() {
         libc::close(port_write_fd);
         libc::close(config.control_fd);
         libc::close(liveness_read_fd);
+        for &pfd in &config.pass_fds {
+            libc::close(pfd);
+        }
         for d in landlock_fds {
             libc::close(d.fd);
         }
