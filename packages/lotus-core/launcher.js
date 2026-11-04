@@ -142,6 +142,7 @@ async function spawnSandboxedEngine(options = {}) {
         let enginePort = null;
         let stageBLockedReceived = false;
         let startupTimeout = null;
+        let verificationReport = null;
 
         const cleanupAndReject = (err) => {
             if (startupTimeout) clearTimeout(startupTimeout);
@@ -164,10 +165,72 @@ async function spawnSandboxedEngine(options = {}) {
                     if (msg.type === 'SPAWNED') {
                         enginePid = msg.engine_pid;
                         enginePort = msg.engine_port;
+                        tryAudit();
                     }
                 } catch {}
             }
         });
+
+        let auditCompleted = false;
+        const tryAudit = () => {
+            if (!stageBLockedReceived || !enginePid || auditCompleted) return;
+            auditCompleted = true;
+
+            // 1. Audit Engine Process Status
+            const engStatus = parseProcStatus(enginePid);
+            if (!engStatus) {
+                return cleanupAndReject(new Error(`Failed to read /proc/${enginePid}/status`));
+            }
+            if (engStatus.Threads !== '1') {
+                return cleanupAndReject(new Error(`Engine thread invariant failed: expected 1 thread, found ${engStatus.Threads}`));
+            }
+            if (engStatus.NoNewPrivs !== '1') {
+                return cleanupAndReject(new Error(`Engine NoNewPrivs violation: ${engStatus.NoNewPrivs}`));
+            }
+            if (engStatus.Seccomp !== '2') {
+                return cleanupAndReject(new Error(`Engine Seccomp violation: mode ${engStatus.Seccomp} (expected 2 - filter)`));
+            }
+            if (engStatus.CapEff !== '0000000000000000' || engStatus.CapPrm !== '0000000000000000') {
+                return cleanupAndReject(new Error(`Engine capabilities violation: CapEff=${engStatus.CapEff}, CapPrm=${engStatus.CapPrm}`));
+            }
+
+            // 2. Audit Supervisor Process Status (Restricted Supervision Phase)
+            const supStatus = parseProcStatus(supervisorProc.pid);
+            if (!supStatus) {
+                return cleanupAndReject(new Error(`Failed to read /proc/${supervisorProc.pid}/status`));
+            }
+            if (supStatus.Threads !== '1') {
+                return cleanupAndReject(new Error(`Supervisor thread invariant failed: expected 1 thread, found ${supStatus.Threads}`));
+            }
+            if (supStatus.NoNewPrivs !== '1') {
+                return cleanupAndReject(new Error(`Supervisor NoNewPrivs violation: ${supStatus.NoNewPrivs}`));
+            }
+            if (supStatus.Seccomp !== '2') {
+                return cleanupAndReject(new Error(`Supervisor Seccomp violation: mode ${supStatus.Seccomp} (expected 2 - filter)`));
+            }
+            if (supStatus.CapEff !== '0000000000000000' || supStatus.CapPrm !== '0000000000000000') {
+                return cleanupAndReject(new Error(`Supervisor capabilities violation: CapEff=${supStatus.CapEff}, CapPrm=${supStatus.CapPrm}`));
+            }
+
+            // 3. Audit Supervisor Allowed File Descriptors [0, 1, 2, 3, liveness_write_fd, engine_pidfd]
+            const supFds = readProcessFds(supervisorProc.pid);
+            if (supFds.length !== 6) {
+                return cleanupAndReject(new Error(`Supervisor descriptor leak: expected 6 open descriptors, found ${supFds.length}: [${supFds.join(', ')}]`));
+            }
+
+            // 4. Audit Isolated Namespaces (Engine PID and netns must differ from Supervisor)
+            const engNs = readNamespaceInodes(enginePid);
+            const supNs = readNamespaceInodes(supervisorProc.pid);
+            if (engNs.pid && supNs.pid && engNs.pid === supNs.pid) {
+                return cleanupAndReject(new Error(`Engine PID namespace not isolated: ${engNs.pid}`));
+            }
+            if (engNs.net && supNs.net && engNs.net === supNs.net) {
+                return cleanupAndReject(new Error(`Engine Network namespace not isolated: ${engNs.net}`));
+            }
+
+            // All /proc sandbox verification passed! Send PROCEED_TO_INIT
+            controlStream.write('PROCEED_TO_INIT\n');
+        };
 
         let controlBuffer = '';
         controlStream.on('data', (chunk) => {
@@ -179,67 +242,15 @@ async function spawnSandboxedEngine(options = {}) {
                 const trimmed = line.trim();
                 if (trimmed === 'STAGE_B_LOCKED') {
                     stageBLockedReceived = true;
-                    // =========================================================
-                    // AUDIT BOTH SUPERVISOR & ENGINE PROCESSES VIA /proc
-                    // =========================================================
-                    if (!enginePid) {
-                        return cleanupAndReject(new Error('Received STAGE_B_LOCKED before SPAWNED message with engine PID'));
+                    tryAudit();
+                } else if (trimmed.startsWith('VERIFICATION_REPORT:')) {
+                    const rawReport = trimmed.slice('VERIFICATION_REPORT:'.length);
+                    const reportMap = {};
+                    for (const pair of rawReport.split(',')) {
+                        const [k, v] = pair.split(':');
+                        if (k) reportMap[k] = v === 'true';
                     }
-
-                    // 1. Audit Engine Process Status
-                    const engStatus = parseProcStatus(enginePid);
-                    if (!engStatus) {
-                        return cleanupAndReject(new Error(`Failed to read /proc/${enginePid}/status`));
-                    }
-                    if (engStatus.Threads !== '1') {
-                        return cleanupAndReject(new Error(`Engine thread invariant failed: expected 1 thread, found ${engStatus.Threads}`));
-                    }
-                    if (engStatus.NoNewPrivs !== '1') {
-                        return cleanupAndReject(new Error(`Engine NoNewPrivs violation: ${engStatus.NoNewPrivs}`));
-                    }
-                    if (engStatus.Seccomp !== '2') {
-                        return cleanupAndReject(new Error(`Engine Seccomp violation: mode ${engStatus.Seccomp} (expected 2 - filter)`));
-                    }
-                    if (engStatus.CapEff !== '0000000000000000' || engStatus.CapPrm !== '0000000000000000') {
-                        return cleanupAndReject(new Error(`Engine capabilities violation: CapEff=${engStatus.CapEff}, CapPrm=${engStatus.CapPrm}`));
-                    }
-
-                    // 2. Audit Supervisor Process Status (Restricted Supervision Phase)
-                    const supStatus = parseProcStatus(supervisorProc.pid);
-                    if (!supStatus) {
-                        return cleanupAndReject(new Error(`Failed to read /proc/${supervisorProc.pid}/status`));
-                    }
-                    if (supStatus.Threads !== '1') {
-                        return cleanupAndReject(new Error(`Supervisor thread invariant failed: expected 1 thread, found ${supStatus.Threads}`));
-                    }
-                    if (supStatus.NoNewPrivs !== '1') {
-                        return cleanupAndReject(new Error(`Supervisor NoNewPrivs violation: ${supStatus.NoNewPrivs}`));
-                    }
-                    if (supStatus.Seccomp !== '2') {
-                        return cleanupAndReject(new Error(`Supervisor Seccomp violation: mode ${supStatus.Seccomp} (expected 2 - filter)`));
-                    }
-                    if (supStatus.CapEff !== '0000000000000000' || supStatus.CapPrm !== '0000000000000000') {
-                        return cleanupAndReject(new Error(`Supervisor capabilities violation: CapEff=${supStatus.CapEff}, CapPrm=${supStatus.CapPrm}`));
-                    }
-
-                    // 3. Audit Supervisor Allowed File Descriptors [0, 1, 2, 3, liveness_write_fd, engine_pidfd]
-                    const supFds = readProcessFds(supervisorProc.pid);
-                    if (supFds.length !== 6) {
-                        return cleanupAndReject(new Error(`Supervisor descriptor leak: expected 6 open descriptors, found ${supFds.length}: [${supFds.join(', ')}]`));
-                    }
-
-                    // 4. Audit Isolated Namespaces (Engine PID and netns must differ from Supervisor)
-                    const engNs = readNamespaceInodes(enginePid);
-                    const supNs = readNamespaceInodes(supervisorProc.pid);
-                    if (engNs.pid && supNs.pid && engNs.pid === supNs.pid) {
-                        return cleanupAndReject(new Error(`Engine PID namespace not isolated: ${engNs.pid}`));
-                    }
-                    if (engNs.net && supNs.net && engNs.net === supNs.net) {
-                        return cleanupAndReject(new Error(`Engine Network namespace not isolated: ${engNs.net}`));
-                    }
-
-                    // All /proc sandbox verification passed! Send PROCEED_TO_INIT
-                    controlStream.write('PROCEED_TO_INIT\n');
+                    verificationReport = reportMap;
                 } else if (trimmed === 'ENGINE_READY') {
                     if (!stageBLOCKEDPassed(stageBLockedReceived)) {
                         return cleanupAndReject(new Error('ENGINE_READY received before STAGE_B_LOCKED verification passed'));
@@ -252,6 +263,7 @@ async function spawnSandboxedEngine(options = {}) {
                         supervisorStream,
                         controlStream
                     );
+                    instance.verificationReport = verificationReport;
                     resolve(instance);
                 }
             }

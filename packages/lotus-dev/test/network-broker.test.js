@@ -419,3 +419,75 @@ test('Network Broker - redirect loop with anti-SSRF validation at every hop', as
         server.close();
     }
 });
+
+test('Network Broker - N1: cross-origin redirect drops Authorization and credential headers', async () => {
+    let capturedHeadersB = null;
+    let capturedHeadersSameOrigin = null;
+
+    // Server B (Target cross-origin)
+    const serverB = http.createServer((req, res) => {
+        capturedHeadersB = req.headers;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+    });
+    await new Promise(r => serverB.listen(0, '127.0.0.1', r));
+    const portB = serverB.address().port;
+
+    // Server A (Originating server)
+    const serverA = http.createServer((req, res) => {
+        if (req.url === '/cross-redirect') {
+            res.writeHead(302, { 'Location': `http://127.0.0.1:${portB}/target` });
+            res.end();
+        } else if (req.url === '/same-redirect') {
+            res.writeHead(302, { 'Location': '/same-target' });
+            res.end();
+        } else if (req.url === '/same-target') {
+            capturedHeadersSameOrigin = req.headers;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+        }
+    });
+    await new Promise(r => serverA.listen(0, '127.0.0.1', r));
+    const portA = serverA.address().port;
+
+    try {
+        const broker = new NetworkBroker({ allowLocalhost: true });
+        const surface = {
+            id: 'surf-n1',
+            navigationState: 'committed',
+            activeDocumentId: 'doc-n1',
+            currentOrigin: `http://127.0.0.1:${portA}`
+        };
+
+        // 1. Cross-origin redirect: Must strip authorization and x-api-key
+        await broker.handleBrokerFetchRequest(surface, 'doc-n1', {
+            url: `http://127.0.0.1:${portA}/cross-redirect`,
+            headers: {
+                'authorization': 'Bearer SECRET_TOKEN',
+                'x-api-key': 'API_KEY_123',
+                'x-custom-trace': 'trace-999'
+            },
+            requiredCookieSequence: 0
+        });
+
+        assert(capturedHeadersB, 'Server B must have received redirected request');
+        assert.strictEqual(capturedHeadersB['authorization'], undefined, 'Authorization must be stripped on cross-origin redirect');
+        assert.strictEqual(capturedHeadersB['x-api-key'], undefined, 'x-api-key must be stripped on cross-origin redirect');
+        assert.strictEqual(capturedHeadersB['x-custom-trace'], 'trace-999', 'Non-sensitive custom headers should be preserved');
+
+        // 2. Same-origin redirect: Authorization must be preserved
+        await broker.handleBrokerFetchRequest(surface, 'doc-n1', {
+            url: `http://127.0.0.1:${portA}/same-redirect`,
+            headers: {
+                'authorization': 'Bearer SECRET_TOKEN'
+            },
+            requiredCookieSequence: 0
+        });
+
+        assert(capturedHeadersSameOrigin, 'Same-origin server must receive redirected request');
+        assert.strictEqual(capturedHeadersSameOrigin['authorization'], 'Bearer SECRET_TOKEN', 'Authorization should be preserved on same-origin redirect');
+    } finally {
+        serverA.close();
+        serverB.close();
+    }
+});

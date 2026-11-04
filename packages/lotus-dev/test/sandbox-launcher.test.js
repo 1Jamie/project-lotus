@@ -47,6 +47,20 @@ test('Sandboxed Launcher - boots supervisor and engine under Stage-A and Stage-B
     assert.notStrictEqual(engNs.pid, supNs.pid, 'Engine PID namespace must differ from supervisor');
     assert.notStrictEqual(engNs.net, supNs.net, 'Engine Net namespace must differ from supervisor');
 
+    // Verify end-to-end sandbox probe behavioral assertions (real Stage-A -> execve -> Stage-B)
+    assert(engineInstance.verificationReport, 'Probe verification report must be captured');
+    assert.strictEqual(engineInstance.verificationReport.PID_IS_1, true, 'Engine must be PID 1 in child PID namespace');
+    assert.strictEqual(engineInstance.verificationReport.PROC_ONLY_PID_1, true, 'Engine /proc must hide host processes');
+    assert.strictEqual(engineInstance.verificationReport.CAP_EFF_ZERO, true, 'Engine effective capabilities must be 0');
+    assert.strictEqual(engineInstance.verificationReport.NO_NEW_PRIVS, true, 'Engine NoNewPrivs must be set');
+    assert.strictEqual(engineInstance.verificationReport.SECCOMP_MODE_2, true, 'Engine Seccomp must be active in mode 2');
+    assert.strictEqual(engineInstance.verificationReport.FORK_BLOCKED, true, 'Raw fork must be blocked with EPERM');
+    assert.strictEqual(engineInstance.verificationReport.MOUNT_BLOCKED, true, 'SYS_mount must be blocked with EPERM');
+    assert.strictEqual(engineInstance.verificationReport.BIND_BLOCKED, true, 'SYS_bind must be blocked with EPERM');
+    assert.strictEqual(engineInstance.verificationReport.EXTERNAL_NET_BLOCKED, true, 'External network connect must be blocked');
+    assert.strictEqual(engineInstance.verificationReport.CANARY_READ_BLOCKED, true, 'Canary file read outside sandbox must fail with EACCES under Landlock');
+    assert.strictEqual(engineInstance.verificationReport.UNAUTHORIZED_PORT_CONNECT_BLOCKED, true, 'Connect to unauthorized port must fail with EACCES under Landlock');
+
     // Clean graceful shutdown
     await engineInstance.terminate();
     assert.strictEqual(engineInstance.supervisor.killed || engineInstance.supervisor.exitCode !== null, true);

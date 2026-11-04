@@ -160,6 +160,41 @@ fn main() {
     }
     results.push(format!("EXTERNAL_NET_BLOCKED:{}", connect_blocked));
 
+    // Check 10: Verify canary file read outside Landlock allowed paths fails with EACCES
+    let canary_path = std::ffi::CString::new("/etc/shadow").unwrap();
+    let fd = unsafe { libc::open(canary_path.as_ptr(), libc::O_RDONLY) };
+    let canary_read_blocked = if fd >= 0 {
+        unsafe { libc::close(fd) };
+        false
+    } else {
+        let err = unsafe { *libc::__errno_location() };
+        err == libc::EACCES
+    };
+    results.push(format!("CANARY_READ_BLOCKED:{}", canary_read_blocked));
+
+    // Check 11: Verify TCP connect to unauthorized loopback port fails under Landlock
+    let lb_sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    let mut unauthorized_port_blocked = false;
+    if lb_sock >= 0 {
+        let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        sa.sin_family = libc::AF_INET as libc::sa_family_t;
+        sa.sin_port = 8080u16.to_be(); // Port 8080 is NOT allowed by Landlock
+        sa.sin_addr.s_addr = 0x0100007f; // 127.0.0.1
+        let cret = unsafe {
+            libc::connect(
+                lb_sock,
+                &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        let err = unsafe { *libc::__errno_location() };
+        if cret != 0 && (err == libc::EACCES || err == libc::EPERM) {
+            unauthorized_port_blocked = true;
+        }
+        unsafe { libc::close(lb_sock) };
+    }
+    results.push(format!("UNAUTHORIZED_PORT_CONNECT_BLOCKED:{}", unauthorized_port_blocked));
+
     // Send results report to Node Host
     let report = format!("VERIFICATION_REPORT:{}\n", results.join(","));
     let _ = control_stream.write_all(report.as_bytes());

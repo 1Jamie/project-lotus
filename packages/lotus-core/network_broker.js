@@ -624,10 +624,40 @@ class NetworkBroker {
                         nextBody = undefined;
                     }
 
+                    // N1 Fix: Cross-origin redirect credential and token hygiene
+                    const currentOrigin = normalizeOrigin(currentEnvelope.url);
+                    const nextOrigin = normalizeOrigin(nextUrl);
+                    let nextHeaders = { ...(currentEnvelope.headers || {}) };
+
+                    if (currentOrigin !== nextOrigin) {
+                        const SENSITIVE_CROSS_ORIGIN_HEADERS = new Set([
+                            'authorization',
+                            'proxy-authorization',
+                            'cookie',
+                            'cookie2',
+                            'origin'
+                        ]);
+
+                        for (const headerName of Object.keys(nextHeaders)) {
+                            const lowerName = headerName.toLowerCase();
+                            if (
+                                SENSITIVE_CROSS_ORIGIN_HEADERS.has(lowerName) ||
+                                lowerName.startsWith('x-auth') ||
+                                lowerName.startsWith('x-api-key') ||
+                                lowerName.startsWith('x-token') ||
+                                lowerName === 'x-csrf-token' ||
+                                lowerName === 'x-xsrf-token'
+                            ) {
+                                delete nextHeaders[headerName];
+                            }
+                        }
+                    }
+
                     currentEnvelope = {
                         ...currentEnvelope,
                         url: nextUrl,
                         method: nextMethod,
+                        headers: nextHeaders,
                         body: nextBody
                     };
                     continue;
