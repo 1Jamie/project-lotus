@@ -594,3 +594,66 @@ test('Audit 4 S2 - Unregistered surfaces fail closed with E_SURFACE_NOT_FOUND', 
     assert.strictEqual(replyResult.replyId, 'reply-s2');
     assert.match(replyResult.data._error, /E_SURFACE_NOT_FOUND/);
 });
+
+test('Audit 4 Q1 & Q2 - Per-pane surface isolation and fail-closed commit handling', () => {
+    const tracker = new HostSurfaceTracker();
+    const surfaceA = tracker.createSurface('win-q2:paneA', {
+        secure: true,
+        allowedChannels: ['vault', 'telemetry'],
+        origin: 'https://good.example.com'
+    });
+    const surfaceB = tracker.createSurface('win-q2:paneB', {
+        secure: true,
+        allowedChannels: ['vault'],
+        origin: 'https://pane-b.example.com'
+    });
+
+    // 1. Independent navigations do not clobber each other (Q2)
+    tracker.startNavigation('win-q2:paneA', 'nav-a-1', 'https://good.example.com/redir');
+    tracker.startNavigation('win-q2:paneB', 'nav-b-1', 'https://pane-b.example.com/page2');
+
+    assert.strictEqual(surfaceA.pendingNavigationId, 'nav-a-1');
+    assert.strictEqual(surfaceB.pendingNavigationId, 'nav-b-1');
+
+    // 2. Commit failure on pane A (missing URL or mismatch) fails closed (Q1 & Q2)
+    assert.throws(() => {
+        tracker.commitNavigation('win-q2:paneA', 'nav-a-1', null);
+    }, { code: 'E_NAVIGATION_MISMATCH' });
+
+    assert.strictEqual(surfaceA.ipcEligible, false);
+    assert.strictEqual(surfaceA.allowedChannels.size, 0);
+    assert.strictEqual(surfaceA.trustedOrigins.size, 0);
+    assert.match(surfaceA.activeDocumentId, /^doc-failed-/);
+
+    // 3. Pane B remains unaffected and commits cleanly with its own authority
+    tracker.commitNavigation('win-q2:paneB', 'nav-b-1', 'https://pane-b.example.com/page2');
+    assert.strictEqual(surfaceB.ipcEligible, true);
+    assert.strictEqual(surfaceB.currentOrigin, 'https://pane-b.example.com');
+    assert.strictEqual(surfaceB.allowedChannels.has('vault'), true);
+});
+
+test('Audit 4 Q4 - Initial navigation preserves grants while cross-origin subsequently drops them', () => {
+    const tracker = new HostSurfaceTracker();
+    // Surface created without an established origin (typical at window creation)
+    const surface = tracker.createSurface('win-q4:main', {
+        secure: true,
+        allowedChannels: ['vault', 'telemetry'],
+        trustedOrigins: ['https://app.example.com']
+    });
+
+    // Initial navigation establishes the surface origin without wiping initial grants
+    tracker.startNavigation('win-q4:main', 'nav-init', 'https://app.example.com');
+    tracker.commitNavigation('win-q4:main', 'nav-init', 'https://app.example.com');
+
+    assert.strictEqual(surface.currentOrigin, 'https://app.example.com');
+    assert.strictEqual(surface.allowedChannels.has('vault'), true);
+    assert.strictEqual(surface.allowedChannels.has('telemetry'), true);
+
+    // Subsequent cross-origin navigation to untrusted domain revokes all grants
+    tracker.startNavigation('win-q4:main', 'nav-subsequent', 'https://evil.example.com');
+    tracker.commitNavigation('win-q4:main', 'nav-subsequent', 'https://evil.example.com');
+
+    assert.strictEqual(surface.currentOrigin, 'https://evil.example.com');
+    assert.strictEqual(surface.allowedChannels.size, 0);
+    assert.strictEqual(surface.trustedOrigins.size, 0);
+});

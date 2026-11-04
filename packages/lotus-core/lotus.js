@@ -142,10 +142,13 @@ class IpcMain extends EventEmitter {
             delete payload._replyId;
 
             try {
-                const surfaceId = fromClientId ? fromClientId.split(':')[0] : 'main-window';
-                const surface = hostIpcRouter.surfaceTracker.getSurface(surfaceId);
+                const targetClientId = fromClientId || 'main-window:main';
+                let surface = hostIpcRouter.surfaceTracker.getSurface(targetClientId);
+                if (!surface && !targetClientId.includes(':')) {
+                    surface = hostIpcRouter.surfaceTracker.getSurface(`${targetClientId}:main`);
+                }
                 if (!surface) {
-                    const err = new Error(`E_SURFACE_NOT_FOUND: Surface "${surfaceId}" is not registered`);
+                    const err = new Error(`E_SURFACE_NOT_FOUND: Surface "${targetClientId}" is not registered`);
                     err.code = 'E_SURFACE_NOT_FOUND';
                     throw err;
                 }
@@ -661,32 +664,50 @@ function processEvent(win, msg) {
 
     if (msg.event === 'load-status') {
         const pane = win ? win.panes.get(paneId) : null;
+        const surfaceId = `${msg.window_id}:${paneId}`;
+
         if (win && pane) {
             if (msg.status === 'started') {
-                if (!pane._pendingNavId) {
+                const targetUrl = msg.url || pane._pendingUrl || 'about:blank';
+                // Q3: Page-initiated navigation carries target URL from engine.
+                // If no navigation was pending or a new target URL arrived, start new provisional navigation.
+                if (!pane._pendingNavId || (msg.url && msg.url !== pane._pendingUrl)) {
                     const navId = `nav-${crypto.randomBytes(8).toString('hex')}`;
                     pane._pendingNavId = navId;
-                    pane._pendingUrl = pane._pendingUrl || 'about:blank';
-                    hostIpcRouter.surfaceTracker.startNavigation(win.id, navId, pane._pendingUrl);
+                    pane._pendingUrl = targetUrl;
+                    hostIpcRouter.surfaceTracker.startNavigation(surfaceId, navId, targetUrl);
                 }
             } else if (msg.status === 'complete') {
-                if (pane._pendingNavId) {
-                    const navId = pane._pendingNavId;
-                    const finalUrl = pane._pendingUrl || 'about:blank';
-                    pane._pendingNavId = null;
-                    pane._pendingUrl = null;
-                    try {
-                        hostIpcRouter.surfaceTracker.commitNavigation(win.id, navId, finalUrl);
-                    } catch (e) {
-                        // Tolerate navigation state mismatch
+                const finalUrl = msg.url;
+                const navId = pane._pendingNavId;
+                pane._pendingNavId = null;
+                pane._pendingUrl = null;
+
+                try {
+                    // Q1: Commit only from the engine's reported finalUrl; fail closed if missing.
+                    if (!finalUrl) {
+                        const err = new Error('E_NAVIGATION_NO_URL: Engine reported no committed URL on complete');
+                        err.code = 'E_NAVIGATION_NO_URL';
+                        throw err;
+                    }
+                    hostIpcRouter.surfaceTracker.commitNavigation(surfaceId, navId, finalUrl);
+                } catch (e) {
+                    // Q2 (Attack 2): On any commit failure, fail closed!
+                    // Revoke channels, revoke trusted origins, drop eligibility, rotate documentId
+                    const surface = hostIpcRouter.surfaceTracker.getSurface(surfaceId);
+                    if (surface) {
+                        surface.navigationState = 'failed';
+                        surface.ipcEligible = false;
+                        surface.allowedChannels = new Set();
+                        surface.trustedOrigins = new Set();
+                        surface.activeDocumentId = `doc-failed-${crypto.randomBytes(8).toString('hex')}`;
+                        surface.bootstrapSecret = crypto.randomBytes(32).toString('hex');
                     }
                 }
             } else if (msg.status === 'failed') {
-                if (pane._pendingNavId) {
-                    pane._pendingNavId = null;
-                    pane._pendingUrl = null;
-                    hostIpcRouter.surfaceTracker.failNavigation(win.id);
-                }
+                pane._pendingNavId = null;
+                pane._pendingUrl = null;
+                hostIpcRouter.surfaceTracker.failNavigation(surfaceId);
             }
         }
 
@@ -723,6 +744,9 @@ function processEvent(win, msg) {
         if (win) {
             win.emit('close');
             win.emit('closed');
+            for (const p of win.panes.keys()) {
+                hostIpcRouter.surfaceTracker.removeSurface(`${windowId}:${p}`);
+            }
             windows.delete(windowId);
         }
         if (windows.size === 0) {
@@ -926,6 +950,7 @@ class Pane extends EventEmitter {
         super();
         this.window = window;
         this.id = id;
+        this.surfaceId = `${window.id}:${id}`;
         this.visible = Boolean(visible);
         this._pendingNavId = null;
         this._pendingUrl = null;
@@ -935,7 +960,7 @@ class Pane extends EventEmitter {
         const navId = `nav-${crypto.randomBytes(8).toString('hex')}`;
         this._pendingNavId = navId;
         this._pendingUrl = url;
-        hostIpcRouter.surfaceTracker.startNavigation(this.window.id, navId, url);
+        hostIpcRouter.surfaceTracker.startNavigation(this.surfaceId, navId, url);
         this.window.handle.loadUrlInPane(this.id, url);
     }
 
@@ -1149,20 +1174,30 @@ class ServoWindow extends EventEmitter {
         }
 
         this._allowedChannels = finalOptions.allowedChannels || ['vault', 'telemetry'];
-        hostIpcRouter.surfaceTracker.createSurface(this.id, {
-            secure: finalOptions.secure === true,
-            allowedChannels: this._allowedChannels,
-            trustedOrigins: finalOptions.trustedOrigins || []
-        });
+        this._trustedOrigins = finalOptions.trustedOrigins || [];
+        this._finalOptions = finalOptions;
 
-        const initialUrl = finalOptions.initialUrl || (finalOptions.panes && finalOptions.panes[0]?.url) || 'about:blank';
-        const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
-        const mainPane = this.panes.get('main');
-        if (mainPane) {
-            mainPane._pendingNavId = initNavId;
-            mainPane._pendingUrl = initialUrl;
+        // Register each pane as a distinct surface in HostSurfaceTracker
+        if (finalOptions.panes) {
+            finalOptions.panes.forEach(p => {
+                const surfaceId = `${this.id}:${p.id}`;
+                const paneObj = this.panes.get(p.id);
+                if (paneObj) paneObj.surfaceId = surfaceId;
+
+                hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
+                    secure: finalOptions.secure === true,
+                    allowedChannels: this._allowedChannels,
+                    trustedOrigins: this._trustedOrigins
+                });
+
+                const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
+                if (paneObj) {
+                    paneObj._pendingNavId = initNavId;
+                    paneObj._pendingUrl = p.url || 'about:blank';
+                }
+                hostIpcRouter.surfaceTracker.startNavigation(surfaceId, initNavId, p.url || 'about:blank');
+            });
         }
-        hostIpcRouter.surfaceTracker.startNavigation(this.id, initNavId, initialUrl);
 
         windows.set(this.id, this);
 
@@ -1196,7 +1231,21 @@ class ServoWindow extends EventEmitter {
         const { url = 'about:blank', x = 0, y = 0, width = 0, height = 0, zIndex = 0, anchor = 0, dockOrder = 0, visible = true } = options;
         this.handle.createPane(id, url, x, y, width, height, zIndex, anchor, dockOrder, visible);
         const pane = new Pane(this, id, visible);
+        const surfaceId = `${this.id}:${id}`;
+        pane.surfaceId = surfaceId;
         this.panes.set(id, pane);
+
+        hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
+            secure: options.secure === true || (this._finalOptions && this._finalOptions.secure === true),
+            allowedChannels: options.allowedChannels || this._allowedChannels || ['vault', 'telemetry'],
+            trustedOrigins: options.trustedOrigins || this._trustedOrigins || []
+        });
+
+        const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
+        pane._pendingNavId = initNavId;
+        pane._pendingUrl = url;
+        hostIpcRouter.surfaceTracker.startNavigation(surfaceId, initNavId, url);
+
         return pane;
     }
 
@@ -1209,6 +1258,8 @@ class ServoWindow extends EventEmitter {
             throw new Error("Cannot remove the 'main' pane");
         }
         if (this.panes.has(id)) {
+            const surfaceId = `${this.id}:${id}`;
+            hostIpcRouter.surfaceTracker.removeSurface(surfaceId);
             this.handle.removePane(id);
             this.panes.delete(id);
         }

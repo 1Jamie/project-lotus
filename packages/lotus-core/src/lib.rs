@@ -2535,7 +2535,7 @@ impl WebViewDelegate for LotusPaneDelegate {
         });
     }
 
-    fn notify_load_status_changed(&self, _webview: servo::WebView, status: LoadStatus) {
+    fn notify_load_status_changed(&self, webview: servo::WebView, status: LoadStatus) {
         let (profiling, window_start) = if let Some(state) = APP_STATE.get() {
             if let Ok(s) = state.lock() {
                 (s.profiling, s.window_start_times.get(&self.window_id).cloned())
@@ -2571,12 +2571,14 @@ impl WebViewDelegate for LotusPaneDelegate {
             }
         }
 
+        let current_url = webview.url().map(|u| u.to_string());
         let client_id = format!("{}:{}", self.window_id, self.pane_id);
         if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
             "event": "load-status",
             "window_id": self.window_id,
             "pane_id": self.pane_id,
-            "status": status_str
+            "status": status_str,
+            "url": current_url
         })) {
             if let Some(proxy) = EVENT_LOOP_PROXY.get() {
                 let _ = proxy.send_event(EngineCommand::IpcMessage(client_id, msg));

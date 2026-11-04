@@ -239,7 +239,8 @@ class HostSurfaceTracker {
             maxPayloadBytes: options.maxPayloadBytes || 4 * 1024 * 1024,
             trustedOrigins: new Set((options.trustedOrigins || []).map(normalizeOrigin)),
             allowedChannels: new Set(options.allowedChannels || []),
-            bootstrapSecret: options.bootstrapSecret || crypto.randomBytes(32).toString('hex')
+            bootstrapSecret: options.bootstrapSecret || crypto.randomBytes(32).toString('hex'),
+            _initialCommitPending: options.initialCommitPending !== false && !options.origin
         };
         this.surfaces.set(surfaceId, surface);
         return surface;
@@ -282,7 +283,18 @@ class HostSurfaceTracker {
             throw err;
         }
 
-        if (!surface.pendingNavigationId || surface.pendingNavigationId !== navigationId) {
+        if (!surface.pendingNavigationId || surface.pendingNavigationId !== navigationId || !finalUrl) {
+            // Fail closed on commit failure: drop eligibility, clear channels, rotate doc id
+            surface.navigationState = 'failed';
+            surface.pendingNavigationId = null;
+            surface.pendingTargetUrl = null;
+            surface.pendingOrigin = null;
+            surface.ipcEligible = false;
+            surface.allowedChannels = new Set();
+            surface.trustedOrigins = new Set();
+            surface.activeDocumentId = `doc-failed-${crypto.randomBytes(8).toString('hex')}`;
+            surface.bootstrapSecret = crypto.randomBytes(32).toString('hex');
+
             const err = new Error(`E_NAVIGATION_MISMATCH: Expected pending navigation ${surface.pendingNavigationId}, got ${navigationId}`);
             err.code = 'E_NAVIGATION_MISMATCH';
             throw err;
@@ -301,8 +313,11 @@ class HostSurfaceTracker {
         surface.navigationState = 'committed';
         surface.bootstrapSecret = crypto.randomBytes(32).toString('hex');
 
-        // On cross-origin navigation, revoke all granted channels and trusted origins
-        if (previousOrigin !== surface.currentOrigin) {
+        // Q4: On initial commit that establishes surface origin, preserve initial grants.
+        // On subsequent cross-origin navigation, revoke all granted channels and trusted origins.
+        if (surface._initialCommitPending) {
+            surface._initialCommitPending = false;
+        } else if (previousOrigin !== surface.currentOrigin) {
             surface.allowedChannels = new Set();
             surface.trustedOrigins = new Set();
         }
@@ -317,6 +332,10 @@ class HostSurfaceTracker {
         surface.pendingNavigationId = null;
         surface.pendingTargetUrl = null;
         surface.pendingOrigin = null;
+        surface.ipcEligible = false;
+        surface.allowedChannels = new Set();
+        surface.trustedOrigins = new Set();
+        surface.activeDocumentId = `doc-failed-${crypto.randomBytes(8).toString('hex')}`;
     }
 
     grantChannel(surfaceId, channel) {
