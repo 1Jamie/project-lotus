@@ -19,8 +19,10 @@ mod window_state;
 mod platform;
 pub mod ipc_security;
 pub mod vfs;
+pub mod layout;
 
 use vfs::{ByteLimitedLruCache, EncryptedVfs};
+pub use layout::{PaneAnchor, StagedPaneLayout, StagedLayout};
 
 use window_state::WindowStateManager;
 
@@ -1205,29 +1207,6 @@ fn map_winit_code(winit_code: winit::keyboard::PhysicalKey) -> Code {
 
 use glow::HasContext;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaneAnchor {
-    None = 0,
-    Fill = 1,
-    Left = 2,
-    Right = 3,
-    Top = 4,
-    Bottom = 5,
-}
-
-impl From<u32> for PaneAnchor {
-    fn from(v: u32) -> Self {
-        match v {
-            1 => PaneAnchor::Fill,
-            2 => PaneAnchor::Left,
-            3 => PaneAnchor::Right,
-            4 => PaneAnchor::Top,
-            5 => PaneAnchor::Bottom,
-            _ => PaneAnchor::None,
-        }
-    }
-}
-
 struct PaneInstance {
     id: String,
     webview: servo::WebView,
@@ -1267,20 +1246,6 @@ struct PaneInstance {
     pub pending_visible: bool,
     pub ghost_tex: Option<glow::NativeTexture>,
     pub ghost_tex_size: Option<winit::dpi::PhysicalSize<u32>>,
-}
-
-#[derive(Debug, Clone)]
-struct StagedPaneLayout {
-    rect: euclid::default::Rect<i32>,
-    visible: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-struct StagedLayout {
-    panes: HashMap<String, StagedPaneLayout>,
-    width: u32,
-    height: u32,
-    scale_factor: f32,
 }
 
 pub struct ActiveSelectPrompt {
