@@ -208,6 +208,18 @@ fn main() {
     if let Ok(d) = landlock::open_landlock_dir(temp_path, true) {
         landlock_fds.push(d);
     }
+    // Allow broker socket directory if specified
+    for (i, arg) in config.engine_args.iter().enumerate() {
+        if arg == "--broker-socket" && i + 1 < config.engine_args.len() {
+            if let Some(parent) = std::path::Path::new(&config.engine_args[i + 1]).parent() {
+                if let Some(parent_str) = parent.to_str() {
+                    if let Ok(d) = landlock::open_landlock_dir(parent_str, true) {
+                        landlock_fds.push(d);
+                    }
+                }
+            }
+        }
+    }
 
     // 2. Create coordination pipes
     let mut map_pipe = [0i32; 2];
@@ -247,9 +259,14 @@ fn main() {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
+    let target_listener_fd = 60i32;
+    assert!(!landlock_fds.iter().any(|d| d.fd == target_listener_fd), "target_listener_fd conflicts with landlock_fds");
+    assert!(!config.pass_fds.contains(&target_listener_fd), "target_listener_fd conflicts with pass_fds");
+    assert!(target_listener_fd != config.control_fd && target_listener_fd != liveness_read_fd, "target_listener_fd conflicts with control or liveness fd");
     let mut envs_c = Vec::new();
     envs_c.push(CString::new(format!("LOTUS_CONTROL_FD={}", config.control_fd)).unwrap());
     envs_c.push(CString::new(format!("LOTUS_LIVENESS_FD={}", liveness_read_fd)).unwrap());
+    envs_c.push(CString::new(format!("LOTUS_IPC_LISTENER_FD={}", target_listener_fd)).unwrap());
     for (k, v) in env::vars() {
         if k != "LOTUS_CONTROL_FD"
             && k != "LOTUS_LIVENESS_FD"
@@ -275,6 +292,7 @@ fn main() {
     child_bootstrap_allowlist.push(2);
     child_bootstrap_allowlist.push(config.control_fd);
     child_bootstrap_allowlist.push(liveness_read_fd);
+    child_bootstrap_allowlist.push(target_listener_fd);
     for &pfd in &config.pass_fds {
         child_bootstrap_allowlist.push(pfd);
     }
@@ -288,6 +306,7 @@ fn main() {
     child_final_allowlist.push(2);
     child_final_allowlist.push(config.control_fd);
     child_final_allowlist.push(liveness_read_fd);
+    child_final_allowlist.push(target_listener_fd);
     for &pfd in &config.pass_fds {
         child_final_allowlist.push(pfd);
     }
@@ -347,9 +366,19 @@ fn main() {
         }
 
         // Bind internal IPC listener
-        let (listener_fd, bound_port) = match ns::bind_netns_listener() {
+        let (raw_listener_fd, bound_port) = match ns::bind_netns_listener() {
             Ok(res) => res,
             Err(_) => unsafe { libc::_exit(104) },
+        };
+
+        let listener_fd = if raw_listener_fd != target_listener_fd {
+            if unsafe { libc::dup2(raw_listener_fd, target_listener_fd) } < 0 {
+                unsafe { libc::_exit(104) };
+            }
+            unsafe { libc::close(raw_listener_fd) };
+            target_listener_fd
+        } else {
+            raw_listener_fd
         };
 
         // Send bound port to supervisor via port pipe
@@ -415,7 +444,6 @@ fn main() {
         caps::set_no_new_privs();
 
         // Finalize bootstrap allowlist (pre-allocated in parent, zero heap allocations)
-        child_bootstrap_allowlist.push(listener_fd);
         child_bootstrap_allowlist.sort_unstable();
         child_bootstrap_allowlist.dedup();
 
@@ -426,7 +454,6 @@ fn main() {
         landlock::apply_landlock_and_close_descriptors(&landlock_fds, Some(bound_port));
 
         // Finalize final allowlist and verify descriptor table matches strictly before execve
-        child_final_allowlist.push(listener_fd);
         child_final_allowlist.sort_unstable();
         child_final_allowlist.dedup();
         fd::sanitize_descriptors_fail_closed(&child_final_allowlist);

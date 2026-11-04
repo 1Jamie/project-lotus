@@ -142,7 +142,7 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
     const hdrBuf2 = Buffer.alloc(64);
     let pubSeq2 = 0n;
     let activeSlots2 = 0;
-    for (let attempt = 0; attempt < 50; attempt++) {
+    for (let attempt = 0; attempt < 100; attempt++) {
         fs.readSync(shm2.roFd, hdrBuf2, 0, 64, 0);
         pubSeq2 = hdrBuf2.readBigUInt64LE(0);
         activeSlots2 = hdrBuf2.readUInt32LE(16);

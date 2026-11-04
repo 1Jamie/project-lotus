@@ -14,6 +14,8 @@ class SecureConstellationManager extends EventEmitter {
         this.supervisorBin = options.supervisorBin;
         this.engineBin = options.engineBin;
         this.idleTimeoutMs = options.idleTimeoutMs ?? 30000; // default 30s
+        this.networkBroker = options.networkBroker || null;
+        this.allowLocalhost = options.allowLocalhost ?? false;
 
         this._activeInstance = null; // SandboxedEngineProcess
         this._engineInstanceId = 0;
@@ -121,6 +123,8 @@ class SecureConstellationManager extends EventEmitter {
                 engineBin: this.engineBin,
                 passFds,
                 engineArgs,
+                networkBroker: this.networkBroker,
+                allowLocalhost: this.allowLocalhost,
             });
 
             this._activeInstance = instance;

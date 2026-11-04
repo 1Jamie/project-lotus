@@ -4,6 +4,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 /**
  * Parses /proc/<pid>/status into a key-value dictionary.
@@ -56,13 +57,14 @@ function readProcessFds(pid) {
 }
 
 class SandboxedEngineProcess {
-    constructor(supervisorProcess, enginePid, enginePort, supervisorStream, controlStream, controlFd) {
+    constructor(supervisorProcess, enginePid, enginePort, supervisorStream, controlStream, controlFd, brokerServer) {
         this.supervisor = supervisorProcess;
         this.enginePid = enginePid;
         this.enginePort = enginePort;
         this.supervisorStream = supervisorStream;
         this.controlStream = controlStream;
         this.controlFd = controlFd || null;
+        this.brokerServer = brokerServer || null;
         this._isTerminated = false;
     }
 
@@ -72,6 +74,20 @@ class SandboxedEngineProcess {
     async terminate() {
         if (this._isTerminated) return;
         this._isTerminated = true;
+
+        try {
+            if (this.supervisorStream && !this.supervisorStream.destroyed) {
+                this.supervisorStream.write('SHUTDOWN\n');
+            } else {
+                this.supervisor.kill('SIGTERM');
+            }
+        } catch {}
+
+        if (this.brokerServer) {
+            try {
+                await this.brokerServer.close();
+            } catch {}
+        }
 
         return new Promise((resolve) => {
             const timeout = setTimeout(() => {
@@ -85,16 +101,6 @@ class SandboxedEngineProcess {
                 clearTimeout(timeout);
                 resolve();
             });
-
-            try {
-                if (this.supervisorStream && !this.supervisorStream.destroyed) {
-                    this.supervisorStream.write('SHUTDOWN\n');
-                } else {
-                    this.supervisor.kill('SIGTERM');
-                }
-            } catch {
-                resolve();
-            }
         });
     }
 }
@@ -105,7 +111,7 @@ class SandboxedEngineProcess {
 async function spawnSandboxedEngine(options = {}) {
     const supervisorBin = options.supervisorBin || path.resolve(__dirname, '../lotus-supervisor/target/debug/lotus-supervisor');
     const engineBin = options.engineBin || path.resolve(__dirname, '../lotus-supervisor/target/debug/lotus-sandbox-probe');
-    const engineArgs = options.engineArgs || [];
+    const engineArgs = [...(options.engineArgs || [])];
     const cacheDir = options.cacheDir;
     const tempDir = options.tempDir;
 
@@ -114,6 +120,20 @@ async function spawnSandboxedEngine(options = {}) {
     }
     if (!fs.existsSync(engineBin)) {
         throw new Error(`engine binary not found at ${engineBin}`);
+    }
+
+    let brokerServer = null;
+    const shouldEnableNetwork = options.enableNetwork !== false && (options.networkBroker || !engineBin.includes('probe'));
+    if (shouldEnableNetwork) {
+        try {
+            const { NetworkBroker } = require('./network_broker.js');
+            const broker = options.networkBroker || new NetworkBroker({ allowLocalhost: options.allowLocalhost ?? false });
+            const socketPath = options.brokerSocketPath || path.join(tempDir || os.tmpdir(), `lotus-broker-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.sock`);
+            brokerServer = await broker.startProxyServer({ socketPath });
+            engineArgs.push('--broker-socket', socketPath);
+        } catch (err) {
+            console.warn('[launcher] Failed to start NetworkBroker proxy server:', err);
+        }
     }
 
     const passFds = options.passFds || [];
@@ -192,11 +212,20 @@ async function spawnSandboxedEngine(options = {}) {
                 controlStream.off('data', onDataHandler);
                 onDataHandler = null;
             }
+            if (brokerServer) {
+                brokerServer.close().catch(() => {});
+            }
             try {
                 supervisorProc.kill('SIGKILL');
             } catch {}
             reject(err);
         };
+
+        supervisorProc.once('exit', () => {
+            if (brokerServer) {
+                brokerServer.close().catch(() => {});
+            }
+        });
 
         startupTimeout = setTimeout(() => {
             cleanupAndReject(new Error('Sandboxed engine startup timed out waiting for STAGE_B_LOCKED/ENGINE_READY'));
@@ -334,10 +363,22 @@ async function spawnSandboxedEngine(options = {}) {
                         return cleanupAndReject(new Error(`Failed to audit engine tasks post-startup: ${err.message}`));
                     }
 
+                    const readyIdx = lines.indexOf(line);
+                    const remainingLines = readyIdx >= 0 ? lines.slice(readyIdx + 1) : [];
+                    let unconsumed = remainingLines.length > 0 ? remainingLines.join('\n') + '\n' : '';
+                    if (controlBuffer) {
+                        unconsumed += controlBuffer;
+                        controlBuffer = '';
+                    }
+
                     clearTimeout(startupTimeout);
                     if (onDataHandler && controlStream) {
                         controlStream.off('data', onDataHandler);
                         onDataHandler = null;
+                    }
+
+                    if (unconsumed && controlStream && typeof controlStream.unshift === 'function') {
+                        controlStream.unshift(Buffer.from(unconsumed, 'utf8'));
                     }
 
                     const instance = new SandboxedEngineProcess(
@@ -346,7 +387,8 @@ async function spawnSandboxedEngine(options = {}) {
                         enginePort,
                         supervisorStream,
                         controlStream,
-                        controlSocketPair ? (controlSocketPair.hostFd ?? controlSocketPair.host_fd) : null
+                        controlSocketPair ? (controlSocketPair.hostFd ?? controlSocketPair.host_fd) : null,
+                        brokerServer
                     );
                     instance.verificationReport = verificationReport;
                     resolve(instance);

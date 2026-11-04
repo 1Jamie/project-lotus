@@ -236,8 +236,8 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             k: SECCOMP_DATA_NR_OFFSET,
         });
 
-        // 7. Inspect SYS_socket: domain must be AF_INET (2), type must be SOCK_STREAM (1)
-        let sock_check_len = 8;
+        // 7. Inspect SYS_socket: domain must be AF_UNIX (1) or AF_INET (2), type must be SOCK_STREAM (1)
+        let sock_check_len = 9;
         filter.push(SockFilter {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 0,
@@ -245,12 +245,18 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             k: libc::SYS_socket as u32,
         });
 
-        // Check domain == AF_INET (2)
+        // Check domain == AF_UNIX (1) or AF_INET (2)
         filter.push(SockFilter {
             code: BPF_LD | BPF_W | BPF_ABS,
             jt: 0,
             jf: 0,
             k: SECCOMP_DATA_ARG0_LO_OFFSET,
+        });
+        filter.push(SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2,
+            jf: 0,
+            k: libc::AF_UNIX as u32,
         });
         filter.push(SockFilter {
             code: BPF_JMP | BPF_JEQ | BPF_K,

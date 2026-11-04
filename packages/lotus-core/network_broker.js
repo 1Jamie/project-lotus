@@ -839,6 +839,162 @@ class NetworkBroker {
             req.end();
         });
     }
+
+    /**
+     * Starts an HTTP / HTTPS CONNECT proxy server for sandboxed engine networking.
+     * Enforces anti-SSRF validation on every request / CONNECT tunnel.
+     */
+    startProxyServer(options = {}) {
+        const net = require('node:net');
+        const fs = require('node:fs');
+        const socketPath = options.socketPath;
+        const port = options.port !== undefined ? options.port : (socketPath ? null : 0);
+        const host = options.host || '127.0.0.1';
+
+        if (socketPath) {
+            try {
+                if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+            } catch {}
+        }
+
+        const server = http.createServer(async (req, res) => {
+            try {
+                const targetUrl = req.url.startsWith('http://') ? req.url : `http://${req.headers.host}${req.url}`;
+                const parsed = new URL(targetUrl);
+
+                // Anti-SSRF check on hostname
+                let targetIp = parsed.hostname;
+                if (!net.isIP(targetIp)) {
+                    const resolved = await dns.promises.resolve(parsed.hostname);
+                    if (!resolved || resolved.length === 0) {
+                        res.writeHead(502, { 'Content-Type': 'text/plain' });
+                        return res.end('DNS resolution failed');
+                    }
+                    targetIp = resolved[0];
+                }
+
+                if (!isAllowedPublicIp(targetIp, this.allowLocalhost)) {
+                    res.writeHead(403, { 'Content-Type': 'text/plain' });
+                    return res.end('Blocked by anti-SSRF policy');
+                }
+
+                // Ingest and attach cookies
+                const surfaceId = req.headers['x-lotus-surface-id'];
+                const topOrigin = normalizeOrigin(targetUrl);
+                const reqHeaders = { ...req.headers };
+                delete reqHeaders['proxy-connection'];
+
+                if (surfaceId && topOrigin) {
+                    const cookieHdr = this.cookieStore.getCookieHeader(surfaceId, topOrigin, targetUrl);
+                    if (cookieHdr) {
+                        reqHeaders['cookie'] = cookieHdr;
+                    }
+                }
+
+                const proxyReq = http.request(targetUrl, {
+                    method: req.method,
+                    headers: reqHeaders,
+                    agent: this._httpAgent,
+                }, (proxyRes) => {
+                    // Record response Set-Cookie headers into cookie store
+                    if (surfaceId && topOrigin && proxyRes.headers['set-cookie']) {
+                        const setCookies = Array.isArray(proxyRes.headers['set-cookie'])
+                            ? proxyRes.headers['set-cookie']
+                            : [proxyRes.headers['set-cookie']];
+                        for (const sc of setCookies) {
+                            this.cookieStore.setCookie(surfaceId, topOrigin, targetUrl, sc);
+                        }
+                    }
+
+                    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                    proxyRes.pipe(res);
+                });
+
+                proxyReq.on('error', (err) => {
+                    res.writeHead(502, { 'Content-Type': 'text/plain' });
+                    res.end(`Bad Gateway: ${err.message}`);
+                });
+
+                req.pipe(proxyReq);
+            } catch (err) {
+                res.writeHead(400, { 'Content-Type': 'text/plain' });
+                res.end(`Bad Request: ${err.message}`);
+            }
+        });
+
+        server.on('connect', async (req, clientSocket, head) => {
+            try {
+                const [targetHost, targetPortStr] = req.url.split(':');
+                const targetPort = parseInt(targetPortStr, 10) || 443;
+
+                let targetIp = targetHost;
+                if (!net.isIP(targetIp)) {
+                    const resolved = await dns.promises.resolve(targetHost);
+                    if (!resolved || resolved.length === 0) {
+                        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+                        return clientSocket.destroy();
+                    }
+                    targetIp = resolved[0];
+                }
+
+                if (!isAllowedPublicIp(targetIp, this.allowLocalhost)) {
+                    clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+                    return clientSocket.destroy();
+                }
+
+                const serverSocket = net.connect(targetPort, targetIp, () => {
+                    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+                    if (head && head.length > 0) {
+                        serverSocket.write(head);
+                    }
+                    serverSocket.pipe(clientSocket);
+                    clientSocket.pipe(serverSocket);
+                });
+
+                serverSocket.on('error', () => {
+                    clientSocket.destroy();
+                });
+                clientSocket.on('error', () => {
+                    serverSocket.destroy();
+                });
+            } catch {
+                clientSocket.destroy();
+            }
+        });
+
+        return new Promise((resolve, reject) => {
+            const listenCallback = () => {
+                const addr = server.address();
+                const result = {
+                    server,
+                    socketPath: socketPath || null,
+                    port: typeof addr === 'object' && addr ? addr.port : null,
+                    proxyUri: socketPath ? `unix:${socketPath}` : `http://${host}:${addr.port}`,
+                    close: () => new Promise((res) => {
+                        try {
+                            if (typeof server.closeAllConnections === 'function') {
+                                server.closeAllConnections();
+                            }
+                        } catch {}
+                        server.close(() => {
+                            if (socketPath) {
+                                try { fs.unlinkSync(socketPath); } catch {}
+                            }
+                            res();
+                        });
+                    }),
+                };
+                resolve(result);
+            };
+
+            if (socketPath) {
+                server.listen(socketPath, listenCallback);
+            } else {
+                server.listen(port, host, listenCallback);
+            }
+            server.on('error', reject);
+        });
+    }
 }
 
 module.exports = {

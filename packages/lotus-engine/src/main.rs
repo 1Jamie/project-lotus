@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,6 +124,7 @@ struct EngineDelegate {
 
 impl WebViewDelegate for EngineDelegate {
     fn notify_load_status_changed(&self, webview: servo::WebView, status: LoadStatus) {
+        eprintln!("[lotus-engine] notify_load_status_changed: status={:?}, url={:?}", status, webview.url());
         if status == LoadStatus::Complete {
             if let Some(u) = webview.url() {
                 *self.last_url.lock().unwrap() = Some(u.to_string());
@@ -247,15 +248,22 @@ fn create_surface(
         last_title: last_title.clone(),
     };
 
-    let webview = WebViewBuilder::new(servo, rendering_ctx.clone())
-        .delegate(Rc::new(delegate))
-        .build();
+    let mut builder = WebViewBuilder::new(servo, rendering_ctx.clone())
+        .delegate(Rc::new(delegate));
 
     if let Some(ref u_str) = initial_url {
-        if let Ok(u) = Url::parse(u_str) {
-            webview.load(u);
+        match Url::parse(u_str) {
+            Ok(u) => {
+                eprintln!("[lotus-engine] Initializing WebView with URL {}", u);
+                builder = builder.url(u);
+            }
+            Err(e) => {
+                eprintln!("[lotus-engine] Url::parse failed for {:?}: {}", u_str, e);
+            }
         }
     }
+
+    let webview = builder.build();
 
     Ok(SurfaceState {
         surface_id,
@@ -346,6 +354,8 @@ fn recv_control_msg_with_fds(
 struct EngineConfig {
     control_fd: Option<RawFd>,
     liveness_fd: Option<RawFd>,
+    listener_fd: Option<RawFd>,
+    broker_socket: Option<String>,
     shm_fd: Option<RawFd>,
     ack_fd: Option<RawFd>,
     width: u32,
@@ -357,6 +367,8 @@ struct EngineConfig {
 fn parse_config() -> EngineConfig {
     let mut control_fd: Option<RawFd> = env::var("LOTUS_CONTROL_FD").ok().and_then(|v| v.parse().ok());
     let mut liveness_fd: Option<RawFd> = env::var("LOTUS_LIVENESS_FD").ok().and_then(|v| v.parse().ok());
+    let mut listener_fd: Option<RawFd> = env::var("LOTUS_IPC_LISTENER_FD").ok().and_then(|v| v.parse().ok());
+    let mut broker_socket: Option<String> = env::var("LOTUS_BROKER_SOCKET").ok();
     let mut shm_fd: Option<RawFd> = env::var("LOTUS_SHM_FD").ok().and_then(|v| v.parse().ok());
     let mut ack_fd: Option<RawFd> = env::var("LOTUS_ACK_FD").ok().and_then(|v| v.parse().ok());
     let mut width = 800u32;
@@ -378,6 +390,18 @@ fn parse_config() -> EngineConfig {
                 i += 1;
                 if i < args.len() {
                     liveness_fd = args[i].parse().ok();
+                }
+            }
+            "--listener-fd" => {
+                i += 1;
+                if i < args.len() {
+                    listener_fd = args[i].parse().ok();
+                }
+            }
+            "--broker-socket" => {
+                i += 1;
+                if i < args.len() {
+                    broker_socket = Some(args[i].clone());
                 }
             }
             "--shm-fd" => {
@@ -424,6 +448,8 @@ fn parse_config() -> EngineConfig {
     EngineConfig {
         control_fd,
         liveness_fd,
+        listener_fd,
+        broker_socket,
         shm_fd,
         ack_fd,
         width,
@@ -501,6 +527,60 @@ fn main() {
     let waker = EngineWaker(wake_tx);
     let mut prefs = servo::prefs::Preferences::default();
     prefs.shell_background_color_rgba = [0.0, 0.0, 0.0, 1.0];
+
+    // Initialize local proxy forwarder to host network broker if listener_fd and broker_socket are present
+    eprintln!("[lotus-engine] Broker config: listener_fd={:?}, broker_socket={:?}", config.listener_fd, config.broker_socket);
+    if let (Some(l_fd), Some(broker_path)) = (config.listener_fd, config.broker_socket.clone()) {
+        let listener = unsafe { std::net::TcpListener::from_raw_fd(l_fd) };
+        eprintln!("[lotus-engine] listener.local_addr() = {:?}", listener.local_addr());
+        if let Ok(addr) = listener.local_addr() {
+            let bound_port = addr.port();
+            let proxy_uri = format!("http://127.0.0.1:{}", bound_port);
+            prefs.network_http_proxy_uri = proxy_uri.clone();
+            prefs.network_https_proxy_uri = proxy_uri;
+
+            let path = broker_path.clone();
+            std::thread::Builder::new()
+                .name("lotus-net-proxy".into())
+                .spawn(move || {
+                    eprintln!("[lotus-engine] lotus-net-proxy thread started, listening on {:?}", listener.local_addr());
+                    for incoming in listener.incoming() {
+                        eprintln!("[lotus-engine] lotus-net-proxy incoming connection: {:?}", incoming);
+                        match incoming {
+                            Ok(mut client_stream) => {
+                                let p = path.clone();
+                                std::thread::spawn(move || {
+                                    match std::os::unix::net::UnixStream::connect(&p) {
+                                        Ok(mut broker_stream) => {
+                                            if let (Ok(mut client_reader), Ok(mut broker_reader)) = (client_stream.try_clone(), broker_stream.try_clone()) {
+                                                let mut client_writer = client_stream;
+                                                let mut broker_writer = broker_stream;
+
+                                                let t1 = std::thread::spawn(move || {
+                                                    let _ = std::io::copy(&mut client_reader, &mut broker_writer);
+                                                    let _ = broker_writer.shutdown(std::net::Shutdown::Write);
+                                                });
+                                                let _ = std::io::copy(&mut broker_reader, &mut client_writer);
+                                                let _ = client_writer.shutdown(std::net::Shutdown::Write);
+                                                let _ = t1.join();
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[lotus-engine] Failed to connect to broker socket {}: {}", p, e);
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("[lotus-engine] Proxy listener accept error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                })
+                .expect("Failed to spawn proxy forwarder thread");
+        }
+    }
 
     let servo = ServoBuilder::default()
         .event_loop_waker(Box::new(waker))
