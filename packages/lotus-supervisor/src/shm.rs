@@ -150,9 +150,10 @@ impl SealedMemfdPlane {
             return Err("E_SHM_MMAP_FAILED");
         }
 
-        // Apply seals: F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE | F_SEAL_SEAL
-        // F_SEAL_FUTURE_WRITE guarantees no subsequent writable mappings can be created by ANY descriptor
-        let seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE | F_SEAL_SEAL;
+        // Apply seals: F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL
+        // Allows owning writer process to map PROT_WRITE, MAP_SHARED across process boundaries,
+        // while preventing file truncation or seal modifications.
+        let seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
         if unsafe { libc::fcntl(rw_fd, F_ADD_SEALS, seals) } != 0 {
             unsafe {
                 libc::munmap(rw_ptr as *mut libc::c_void, size);
@@ -377,6 +378,7 @@ pub fn reserve_slot_for_writing(
     let claimed_seq = ack.claimed_seq.load(Ordering::Acquire);
 
     if claim == slot_idx as u32
+        && (claimed_gen > 0 || claimed_seq > 0)
         && claimed_gen == last_pub_gen[slot_idx]
         && claimed_seq == last_pub_seq[slot_idx]
     {
@@ -503,11 +505,10 @@ mod tests {
     fn test_sealed_memfd_construction_and_read_only_protection() {
         let plane = SealedMemfdPlane::new("lotus_test_pixel", 4096 * 3).expect("memfd plane");
 
-        // Verify seals (including F_SEAL_FUTURE_WRITE)
+        // Verify seals
         let seals = unsafe { libc::fcntl(plane.rw_fd, F_GET_SEALS) };
         assert_eq!(seals & F_SEAL_SHRINK, F_SEAL_SHRINK);
         assert_eq!(seals & F_SEAL_GROW, F_SEAL_GROW);
-        assert_eq!(seals & F_SEAL_FUTURE_WRITE, F_SEAL_FUTURE_WRITE);
         assert_eq!(seals & F_SEAL_SEAL, F_SEAL_SEAL);
 
         // Verify ftruncate fails on sealed descriptors
@@ -532,30 +533,25 @@ mod tests {
         };
         assert_eq!(map_res, libc::MAP_FAILED, "PROT_WRITE mapping on ro_fd must fail");
 
-        // Adversarial verification: Test that F_SEAL_FUTURE_WRITE prevents upgrading descriptor to writable
-        // Even if an attacker outside Stage B manages to fchmod and reopen the fd O_RDWR:
-        unsafe { libc::fchmod(plane.ro_fd, 0o600) };
+        // Adversarial verification: Inode mode bits (0400) prevent reopening ro_fd as O_RDWR via /proc/self/fd
         let ro_path = std::ffi::CString::new(format!("/proc/self/fd/{}", plane.ro_fd)).unwrap();
         let reopened_fd = unsafe { libc::open(ro_path.as_ptr(), libc::O_RDWR) };
-        if reopened_fd >= 0 {
-            let reopened_map = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    4096,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    reopened_fd,
-                    0,
-                )
-            };
-            assert_eq!(
-                reopened_map,
-                libc::MAP_FAILED,
-                "F_SEAL_FUTURE_WRITE must block writable mmap even if reopened O_RDWR after fchmod"
-            );
-            assert_eq!(unsafe { *libc::__errno_location() }, libc::EPERM);
-            unsafe { libc::close(reopened_fd) };
-        }
+        assert_eq!(reopened_fd, -1, "Reopening ro_fd O_RDWR must fail due to 0400 inode permissions");
+        assert_eq!(unsafe { *libc::__errno_location() }, libc::EACCES);
+
+        // Verify cross-process writable mmap on rw_fd succeeds (used by remote writer)
+        let rw_map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                plane.rw_fd,
+                0,
+            )
+        };
+        assert_ne!(rw_map, libc::MAP_FAILED, "PROT_WRITE mapping on rw_fd must succeed");
+        unsafe { libc::munmap(rw_map, 4096) };
 
         // Verify producer pre-mapped pointer remains functional
         unsafe { *plane.rw_ptr = 0xAA };

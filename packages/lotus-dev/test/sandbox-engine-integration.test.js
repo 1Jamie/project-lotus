@@ -109,7 +109,21 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
 
     assert.strictEqual(pongReceived, true, 'Engine must reply with Pong over control stream');
 
-    // 7. Clean Graceful Termination
+    // 7. Verify Shared Memory Publication Invariants on Consumer roFd
+    const hdrBuf = Buffer.alloc(64);
+    let pubSeq = 0n;
+    let activeSlots = 0;
+    for (let attempt = 0; attempt < 50; attempt++) {
+        fs.readSync(shm.roFd, hdrBuf, 0, 64, 0);
+        pubSeq = hdrBuf.readBigUInt64LE(0);
+        activeSlots = hdrBuf.readUInt32LE(16);
+        if (pubSeq >= 1n && activeSlots === 3) break;
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.strictEqual(activeSlots, 3, 'Active slots in SHM header must be 3');
+    assert(pubSeq >= 1n, `pub_seq must be at least 1, got ${pubSeq}`);
+
+    // 8. Clean Graceful Termination
     await engineInstance.terminate();
     assert.strictEqual(engineInstance.supervisor.killed || engineInstance.supervisor.exitCode !== null, true);
 });

@@ -629,6 +629,16 @@ pub fn allocate_remote_pane_shm(name: String, width: u32, height: u32) -> napi::
     let ack_plane = lotus_supervisor::shm::SealedMemfdPlane::new(&format!("{}_ack", name), 64)
         .map_err(|e| napi::Error::from_reason(format!("Failed to create SealedMemfdPlane for ack: {}", e)))?;
 
+    // Initialize ConsumerAckHeader before dropping SealedMemfdPlane
+    unsafe {
+        let ack_hdr = &mut *(ack_plane.rw_ptr as *mut lotus_supervisor::shm::ConsumerAckHeader);
+        ack_hdr.consumer_gen_id.store(1, std::sync::atomic::Ordering::Relaxed);
+        ack_hdr.claimed_generation.store(0, std::sync::atomic::Ordering::Relaxed);
+        ack_hdr.claimed_seq.store(0, std::sync::atomic::Ordering::Relaxed);
+        ack_hdr.free_seq.store(0, std::sync::atomic::Ordering::Relaxed);
+        ack_hdr.claimed_slot.store(lotus_supervisor::shm::CLAIM_UNCLAIMED, std::sync::atomic::Ordering::Relaxed);
+    }
+
     // Duplicate descriptors so dropping plane doesn't close them prematurely
     let pixel_rw_fd = unsafe { libc::dup(pixel_plane.rw_fd) };
     let pixel_ro_fd = unsafe { libc::dup(pixel_plane.ro_fd) };

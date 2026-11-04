@@ -265,6 +265,31 @@ fn main() {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
+    // Pre-allocate descriptor allowlists before clone (zero allocations after clone)
+    landlock_fds.reserve(8);
+    let mut child_bootstrap_allowlist: Vec<i32> = Vec::with_capacity(64);
+    child_bootstrap_allowlist.push(0);
+    child_bootstrap_allowlist.push(1);
+    child_bootstrap_allowlist.push(2);
+    child_bootstrap_allowlist.push(config.control_fd);
+    child_bootstrap_allowlist.push(liveness_read_fd);
+    for &pfd in &config.pass_fds {
+        child_bootstrap_allowlist.push(pfd);
+    }
+    for d in &landlock_fds {
+        child_bootstrap_allowlist.push(d.fd);
+    }
+
+    let mut child_final_allowlist: Vec<i32> = Vec::with_capacity(64);
+    child_final_allowlist.push(0);
+    child_final_allowlist.push(1);
+    child_final_allowlist.push(2);
+    child_final_allowlist.push(config.control_fd);
+    child_final_allowlist.push(liveness_read_fd);
+    for &pfd in &config.pass_fds {
+        child_final_allowlist.push(pfd);
+    }
+
     // 4. Verify single-threaded immediately before clone
     assert_single_threaded();
 
@@ -367,6 +392,7 @@ fn main() {
 
         // Open newly mounted /proc for Landlock
         if let Ok(d) = landlock::open_landlock_dir("/proc", false) {
+            child_bootstrap_allowlist.push(d.fd);
             landlock_fds.push(d);
         }
 
@@ -386,21 +412,8 @@ fn main() {
         // Lock down privileges
         caps::set_no_new_privs();
 
-        // Construct bootstrap allowlist
-        let mut child_bootstrap_allowlist = vec![
-            0,
-            1,
-            2,
-            config.control_fd,
-            liveness_read_fd,
-            listener_fd,
-        ];
-        for &pfd in &config.pass_fds {
-            child_bootstrap_allowlist.push(pfd);
-        }
-        for d in &landlock_fds {
-            child_bootstrap_allowlist.push(d.fd);
-        }
+        // Finalize bootstrap allowlist (pre-allocated in parent, zero heap allocations)
+        child_bootstrap_allowlist.push(listener_fd);
         child_bootstrap_allowlist.sort_unstable();
         child_bootstrap_allowlist.dedup();
 
@@ -410,21 +423,12 @@ fn main() {
         // Apply Landlock ruleset and close Landlock descriptors (ABI >= 4 with network port containment)
         landlock::apply_landlock_and_close_descriptors(&landlock_fds, Some(bound_port));
 
-        // Verify remaining descriptor table strictly matches final allowlist
-        let mut child_final_allowlist = vec![
-            0,
-            1,
-            2,
-            config.control_fd,
-            liveness_read_fd,
-            listener_fd,
-        ];
-        for &pfd in &config.pass_fds {
-            child_final_allowlist.push(pfd);
-        }
+        // Finalize final allowlist and verify descriptor table matches strictly before execve
+        child_final_allowlist.push(listener_fd);
         child_final_allowlist.sort_unstable();
         child_final_allowlist.dedup();
         fd::sanitize_descriptors_fail_closed(&child_final_allowlist);
+        fd::verify_exact_descriptor_table(&child_final_allowlist);
 
         // Execute engine binary
         unsafe {

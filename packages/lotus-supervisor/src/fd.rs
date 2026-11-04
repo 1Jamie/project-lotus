@@ -138,7 +138,8 @@ pub fn sanitize_descriptors_fail_closed(allowlist: &[RawFd]) {
 /// - Zero required allowlisted descriptors are missing.
 ///
 /// Guaranteed allocation-free. Aborts startup immediately on any discrepancy.
-pub fn verify_exact_descriptor_table<const N: usize>(allowlist: &[RawFd; N]) {
+pub fn verify_exact_descriptor_table(allowlist: &[RawFd]) {
+    assert!(allowlist.len() <= 64, "allowlist exceeds stack capacity of 64 fds");
     let dir_fd = unsafe {
         libc::open(
             b"/proc/self/fd\0".as_ptr() as *const libc::c_char,
@@ -150,7 +151,7 @@ pub fn verify_exact_descriptor_table<const N: usize>(allowlist: &[RawFd; N]) {
         std::process::abort();
     }
 
-    let mut seen = [false; N];
+    let mut seen = [false; 64];
     let mut buf = [0u8; 1024];
 
     loop {
@@ -201,9 +202,9 @@ pub fn verify_exact_descriptor_table<const N: usize>(allowlist: &[RawFd; N]) {
 
     unsafe { libc::close(dir_fd) };
 
-    for (idx, &present) in seen.iter().enumerate() {
-        if !present {
-            eprintln!("[lotus-supervisor] Fatal: Required allowlisted descriptor {} missing", allowlist[idx]);
+    for (idx, &allowed_fd) in allowlist.iter().enumerate() {
+        if !seen[idx] {
+            eprintln!("[lotus-supervisor] Fatal: Required allowlisted descriptor {} missing", allowed_fd);
             std::process::abort();
         }
     }

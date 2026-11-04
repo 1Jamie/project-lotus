@@ -399,8 +399,6 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             libc::SYS_rename as u32,
             libc::SYS_renameat as u32,
             libc::SYS_renameat2 as u32,
-            libc::SYS_fchmod as u32,
-            libc::SYS_fchmodat as u32,
             libc::SYS_prlimit64 as u32,
             libc::SYS_getrlimit as u32,
             libc::SYS_setrlimit as u32,
@@ -417,8 +415,6 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             libc::SYS_mincore as u32,
             // Network Client (TCP communication with supervisor / broker)
             libc::SYS_connect as u32,
-            libc::SYS_bind as u32,
-            libc::SYS_listen as u32,
             libc::SYS_accept as u32,
             libc::SYS_accept4 as u32,
             libc::SYS_getsockname as u32,
@@ -597,6 +593,7 @@ mod tests {
             (425, "io_uring_setup"),
             (libc::SYS_keyctl as libc::c_long, "keyctl"),
             (libc::SYS_bpf as libc::c_long, "bpf"),
+            (libc::SYS_fchmod as libc::c_long, "fchmod"),
         ];
 
         for (nr, name) in unlisted_syscalls {

@@ -30,7 +30,7 @@ use url::Url;
 
 use lotus_supervisor::shm::{
     calculate_shm_geometry, publish_slot, reserve_slot_for_writing, ConsumerAckHeader,
-    ProducerControlHeader, SealedMemfdPlane,
+    ProducerControlHeader,
 };
 use lotus_supervisor::stage_b::apply_stage_b_seccomp;
 
@@ -318,30 +318,29 @@ fn main() {
     let geom = calculate_shm_geometry(width, height).expect("calculate_shm_geometry");
     let total_shm_size = 256 + geom.total_pixel_bytes;
 
-    let (_owned_plane, rw_ptr) = if let Some(fd) = config.shm_fd {
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total_shm_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            ) as *mut u8
-        };
-        if ptr != libc::MAP_FAILED as *mut u8 {
-            (None, ptr)
-        } else {
-            let plane = SealedMemfdPlane::new("lotus_engine_shm", total_shm_size)
-                .expect("Failed to create SealedMemfdPlane");
-            let ptr = plane.rw_ptr;
-            (Some(plane), ptr)
+    let rw_ptr = match config.shm_fd {
+        Some(fd) => {
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    total_shm_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                ) as *mut u8
+            };
+            if ptr == libc::MAP_FAILED as *mut u8 {
+                let err = unsafe { *libc::__errno_location() };
+                eprintln!("[lotus-engine] Fatal: Failed to mmap shm_fd {}: errno {}", fd, err);
+                std::process::abort();
+            }
+            ptr
         }
-    } else {
-        let plane = SealedMemfdPlane::new("lotus_engine_shm", total_shm_size)
-            .expect("Failed to create SealedMemfdPlane");
-        let ptr = plane.rw_ptr;
-        (Some(plane), ptr)
+        None => {
+            eprintln!("[lotus-engine] Fatal: shm_fd is required");
+            std::process::abort();
+        }
     };
 
     // Initialize producer control header
@@ -350,31 +349,30 @@ fn main() {
     prod_hdr.prod_resize_gen.store(1, Ordering::Relaxed);
     prod_hdr.active_slots = 3;
 
-    // Map ConsumerAckHeader from ack_fd (RO) or fallback to local plane
-    let (_owned_ack_plane, consumer_ack_ptr) = if let Some(fd) = config.ack_fd {
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                std::mem::size_of::<ConsumerAckHeader>(),
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            ) as *const ConsumerAckHeader
-        };
-        if ptr != libc::MAP_FAILED as *const ConsumerAckHeader {
-            (None, ptr)
-        } else {
-            let plane = SealedMemfdPlane::new("lotus_engine_ack", std::mem::size_of::<ConsumerAckHeader>())
-                .expect("Failed to create SealedMemfdPlane for ack");
-            let ptr = plane.rw_ptr as *const ConsumerAckHeader;
-            (Some(plane), ptr)
+    // Map ConsumerAckHeader from ack_fd (RO)
+    let consumer_ack_ptr = match config.ack_fd {
+        Some(fd) => {
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    std::mem::size_of::<ConsumerAckHeader>(),
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                ) as *const ConsumerAckHeader
+            };
+            if ptr == libc::MAP_FAILED as *const ConsumerAckHeader {
+                let err = unsafe { *libc::__errno_location() };
+                eprintln!("[lotus-engine] Fatal: Failed to mmap ack_fd {}: errno {}", fd, err);
+                std::process::abort();
+            }
+            ptr
         }
-    } else {
-        let plane = SealedMemfdPlane::new("lotus_engine_ack", std::mem::size_of::<ConsumerAckHeader>())
-            .expect("Failed to create SealedMemfdPlane for ack");
-        let ptr = plane.rw_ptr as *const ConsumerAckHeader;
-        (Some(plane), ptr)
+        None => {
+            eprintln!("[lotus-engine] Fatal: ack_fd is required");
+            std::process::abort();
+        }
     };
 
     let consumer_ack = unsafe { &*consumer_ack_ptr };
