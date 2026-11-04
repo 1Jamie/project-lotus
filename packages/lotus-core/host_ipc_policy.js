@@ -695,7 +695,7 @@ class HostIpcPolicyRouter {
 /**
  * Generates client-side bridge script for Track 2 secure surfaces.
  */
-function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, enginePort, endpoints = {} }) {
+function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, enginePort, wsPort, endpoints = {} }) {
     const handshakePath = endpoints.handshake || '/ipc/handshake';
     const wsPath = endpoints.secure_ws || '/ipc/secure-ws';
 
@@ -721,6 +721,12 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
         }
         if (window.frames && window.frames.length > 0) {
             const stack = (new TopError()).stack || '';
+            if (stack.includes('about:srcdoc') || stack.includes('srcdoc')) {
+                throwSecurityError();
+            }
+            if (stack.includes('about:blank') && window.location && window.location.href !== 'about:blank') {
+                throwSecurityError();
+            }
             for (let i = 0; i < window.frames.length; i++) {
                 try {
                     const subWin = window.frames[i];
@@ -760,8 +766,9 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
     const documentId = ${JSON.stringify(documentId)};
     const bootstrapSecret = ${JSON.stringify(bootstrapSecret)};
     const port = ${Number(enginePort)};
+    const wsPort = ${Number(wsPort || enginePort)};
     const handshakeUrl = 'http://127.0.0.1:' + port + ${JSON.stringify(handshakePath)};
-    const wsBaseUrl = 'ws://127.0.0.1:' + port + ${JSON.stringify(wsPath)};
+    const wsBaseUrl = 'ws://127.0.0.1:' + wsPort + ${JSON.stringify(wsPath)};
 
     let ws = null;
     let pendingInvocations = new Map();
@@ -810,18 +817,25 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
             verifyTopRealm();
             verifyTopRealm(payload);
             return new Promise((resolve, reject) => {
-                if (!ws || ws.readyState !== WebSocket.OPEN) {
-                    return reject(new Error('Lotus IPC is not connected'));
+                const startTime = Date.now();
+                function poll() {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        const id = ++invocationCounter;
+                        pendingInvocations.set(id, { resolve, reject });
+                        ws.send(JSON.stringify({
+                            type: 'invoke',
+                            id,
+                            method,
+                            payload,
+                            documentId
+                        }));
+                    } else if (Date.now() - startTime < 3000) {
+                        setTimeout(poll, 25);
+                    } else {
+                        reject(new Error('Lotus IPC is not connected'));
+                    }
                 }
-                const id = ++invocationCounter;
-                pendingInvocations.set(id, { resolve, reject });
-                ws.send(JSON.stringify({
-                    type: 'invoke',
-                    id,
-                    method,
-                    payload,
-                    documentId
-                }));
+                poll();
             });
         },
         on: function(eventName, callback) {

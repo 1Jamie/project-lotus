@@ -446,7 +446,22 @@ impl EngineSecurityState {
     pub fn register_surface(&self, policy: SurfacePolicy) {
         let mut map = self.surfaces.lock().unwrap();
         let id = policy.surface_id.clone();
-        map.insert(id, Arc::new(Mutex::new(policy)));
+        if let Some(existing) = map.get(&id) {
+            let mut curr = existing.lock().unwrap();
+            curr.is_secure = policy.is_secure;
+            curr.active_bootstrap_secret = policy.active_bootstrap_secret;
+            if curr.active_document_id != policy.active_document_id {
+                curr.active_document_id = policy.active_document_id;
+                curr.active_ticket = None;
+                curr.active_ws_session_id = None;
+            }
+            curr.allowed_channels = policy.allowed_channels;
+            curr.allowed_methods = policy.allowed_methods;
+            curr.current_origin = policy.current_origin;
+            curr.ipc_eligible = policy.ipc_eligible;
+        } else {
+            map.insert(id, Arc::new(Mutex::new(policy)));
+        }
     }
 }
 

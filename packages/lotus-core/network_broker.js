@@ -1000,12 +1000,16 @@ class NetworkBroker {
                 }
 
                 let targetIp = targetHost;
-                if (net.isIP(targetIp)) {
+                const isHostIpcConnect = options.ipcPort &&
+                    (targetHost === '127.0.0.1' || targetHost === 'localhost') &&
+                    targetPort === options.ipcPort;
+
+                if (!isHostIpcConnect && net.isIP(targetIp)) {
                     if (!isAllowedPublicIp(targetIp, this.allowLocalhost)) {
                         clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
                         return clientSocket.destroy();
                     }
-                } else {
+                } else if (!isHostIpcConnect) {
                     let resolved;
                     try {
                         resolved = await dns.promises.lookup(targetHost, { all: true });
@@ -1058,7 +1062,6 @@ class NetworkBroker {
                 const targetPort = parseInt(parsed.port, 10) || 80;
                 const isHostIpcWs = options.ipcPort &&
                     (cleanHostname === '127.0.0.1' || cleanHostname === 'localhost') &&
-                    targetPort === options.ipcPort &&
                     parsed.pathname === '/ipc/secure-ws';
 
                 if (!isHostIpcWs) {
@@ -1069,7 +1072,11 @@ class NetworkBroker {
                 const wsTarget = net.connect(options.ipcPort, '127.0.0.1', () => {
                     wsTarget.write(`${req.method} ${parsed.pathname}${parsed.search} HTTP/1.1\r\n`);
                     for (const [k, v] of Object.entries(req.headers)) {
-                        wsTarget.write(`${k}: ${v}\r\n`);
+                        if (k.toLowerCase() === 'host') {
+                            wsTarget.write(`host: 127.0.0.1:${options.ipcPort}\r\n`);
+                        } else {
+                            wsTarget.write(`${k}: ${v}\r\n`);
+                        }
                     }
                     wsTarget.write('\r\n');
                     if (head && head.length > 0) {
