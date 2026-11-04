@@ -258,6 +258,21 @@ impl WindowHandle {
     }
 
     #[napi]
+    pub fn attach_remote_pane_input(&self, pane_id: String, input_fd: i32) -> napi::Result<()> {
+        let dup_fd = unsafe { libc::dup(input_fd) };
+        if dup_fd < 0 {
+            let err = unsafe { *libc::__errno_location() };
+            return Err(napi::Error::from_reason(format!("dup failed for input_fd: errno {}", err)));
+        }
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::AttachRemotePaneInput(self.id.clone(), pane_id, dup_fd));
+        } else {
+            unsafe { libc::close(dup_fd); };
+        }
+        Ok(())
+    }
+
+    #[napi]
     pub fn update_select_control(&self, control_id: String, selected_indices: Vec<u32>) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::UpdateSelectControl {

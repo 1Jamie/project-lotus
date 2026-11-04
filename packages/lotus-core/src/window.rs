@@ -236,6 +236,17 @@ pub struct PaneInstance {
     pub ghost_tex_size: Option<winit::dpi::PhysicalSize<u32>>,
     pub is_remote: bool,
     pub remote_consumer: Option<crate::gl::RemotePaneConsumer>,
+    pub remote_input_fd: Option<std::os::unix::io::RawFd>,
+}
+
+impl Drop for PaneInstance {
+    fn drop(&mut self) {
+        if let Some(fd) = self.remote_input_fd.take() {
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
 }
 
 pub struct ActiveSelectPrompt {

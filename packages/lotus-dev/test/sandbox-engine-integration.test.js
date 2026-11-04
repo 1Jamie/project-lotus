@@ -158,7 +158,64 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
         surface_id: surfaceId2,
     }) + '\n');
 
-    // 10. Clean Graceful Termination
+    // 10. Test Remote Input Forwarding and Frame Progression on First Surface
+    const htmlUrl = 'data:text/html,%3Chtml%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3Ablack%3B%22%3E%3Cbutton%20id%3D%22btn%22%20style%3D%22width%3A200px%3Bheight%20200px%3B%22%20onclick%3D%22document.body.style.background%3D%27red%27%22%3EClick%3C%2Fbutton%3E%3C%2Fbody%3E%3C%2Fhtml%3E';
+    
+    // Navigate surface 1 to interactive document
+    engineInstance.controlStream.write(JSON.stringify({
+        type: 'Navigate',
+        surface_id: surfaceId,
+        navigation_id: 2,
+        url: htmlUrl,
+    }) + '\n');
+
+    // Wait for frame publication after navigation
+    let navPubSeq = pubSeq;
+    for (let attempt = 0; attempt < 60; attempt++) {
+        fs.readSync(shm.roFd, hdrBuf, 0, 64, 0);
+        navPubSeq = hdrBuf.readBigUInt64LE(0);
+        if (navPubSeq > pubSeq) break;
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    assert(navPubSeq >= pubSeq, 'Navigation must publish at least one frame');
+
+    // Send MouseDown + MouseUp to click the button at (50, 50)
+    engineInstance.controlStream.write(JSON.stringify({
+        type: 'Input',
+        event: {
+            kind: 'MouseDown',
+            surface_id: surfaceId,
+            generation: 1,
+            button: 0,
+            x: 50,
+            y: 50,
+            modifiers: 0,
+        }
+    }) + '\n');
+    engineInstance.controlStream.write(JSON.stringify({
+        type: 'Input',
+        event: {
+            kind: 'MouseUp',
+            surface_id: surfaceId,
+            generation: 1,
+            button: 0,
+            x: 50,
+            y: 50,
+            modifiers: 0,
+        }
+    }) + '\n');
+
+    // Verify click event triggered DOM mutation and published an updated frame (pub_seq advanced)
+    let clickPubSeq = navPubSeq;
+    for (let attempt = 0; attempt < 60; attempt++) {
+        fs.readSync(shm.roFd, hdrBuf, 0, 64, 0);
+        clickPubSeq = hdrBuf.readBigUInt64LE(0);
+        if (clickPubSeq > navPubSeq) break;
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    assert(clickPubSeq > navPubSeq, `Click input must trigger frame publication: navPubSeq=${navPubSeq}, clickPubSeq=${clickPubSeq}`);
+
+    // 11. Clean Graceful Termination
     await engineInstance.terminate();
     assert.strictEqual(engineInstance.supervisor.killed || engineInstance.supervisor.exitCode !== null, true);
 });

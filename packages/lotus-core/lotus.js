@@ -1283,6 +1283,13 @@ class ServoWindow extends EventEmitter {
                 shm,
             }).then(engineRes => {
                 pane._engineInstance = engineRes.instance;
+                if (engineRes.instance.controlFd && this.handle && typeof this.handle.attachRemotePaneInput === 'function') {
+                    try {
+                        this.handle.attachRemotePaneInput(id, engineRes.instance.controlFd);
+                    } catch (e) {
+                        console.error('[createPane] attachRemotePaneInput error:', e);
+                    }
+                }
                 if (url && url !== 'about:blank') {
                     try {
                         engineRes.instance.controlStream.write(JSON.stringify({

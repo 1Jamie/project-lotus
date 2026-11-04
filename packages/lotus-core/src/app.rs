@@ -1036,6 +1036,7 @@ pub enum EngineCommand {
     SetPaneRect(String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>), // window_id, pane_id, rect
     SetPaneVisible(String, String, bool), // window_id, pane_id, visible
     FocusPane(String, String), // window_id, pane_id
+    AttachRemotePaneInput(String, String, std::os::unix::io::RawFd), // window_id, pane_id, fd
 
     // Embedder control commands
     ShowSelectControl {
@@ -1200,6 +1201,14 @@ impl LotusApp {
             self.servo = Some(servo);
         }
         self.servo.as_ref().unwrap()
+    }
+}
+
+fn forward_remote_input(fd: std::os::unix::io::RawFd, json: &str) {
+    let mut bytes = json.as_bytes().to_vec();
+    bytes.push(b'\n');
+    unsafe {
+        let _ = libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
     }
 }
 
@@ -1558,6 +1567,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         ghost_tex_size: None,
                         is_remote: false,
                         remote_consumer: None,
+                        remote_input_fd: None,
                     };
                     panes.insert(pane_opt.id.clone(), pane);
                 }
@@ -2060,6 +2070,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         ghost_tex_size: None,
                         is_remote: false,
                         remote_consumer: None,
+                        remote_input_fd: None,
                     };
                     instance.panes.insert(pane_id, pane);
                     let physical_size = instance.window.inner_size();
@@ -2136,6 +2147,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         ghost_tex_size: None,
                         is_remote: true,
                         remote_consumer: consumer,
+                        remote_input_fd: None,
                     };
                     instance.panes.insert(pane_id, pane);
                     let physical_size = instance.window.inner_size();
@@ -2218,6 +2230,21 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             EngineCommand::FocusPane(window_id, pane_id) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     instance.active_pane_id = pane_id;
+                }
+            },
+            EngineCommand::AttachRemotePaneInput(window_id, pane_id, fd) => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if let Some(pane) = instance.panes.get_mut(&pane_id) {
+                        if let Some(old_fd) = pane.remote_input_fd.replace(fd) {
+                            if old_fd >= 0 {
+                                unsafe { libc::close(old_fd) };
+                            }
+                        }
+                    } else {
+                        unsafe { libc::close(fd); }
+                    }
+                } else {
+                    unsafe { libc::close(fd); }
                 }
             },
             EngineCommand::ShowSelectControl { window_id, pane_id, prompt } => {
@@ -2757,9 +2784,20 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         (physical_rect.origin.x.round(), physical_rect.origin.y.round())
                                     };
                                     let translated_point = Point2D::new(point.x - px, point.y - py);
-                                    pane.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
-                                        servo::WebViewPoint::Device(translated_point)
-                                    )));
+                                    if pane.is_remote {
+                                        if let Some(fd) = pane.remote_input_fd {
+                                            let surface_id = format!("{}:{}", uuid, pane.id);
+                                            let msg = format!(
+                                                "{{\"type\":\"Input\",\"event\":{{\"kind\":\"MouseMove\",\"surface_id\":\"{}\",\"generation\":1,\"x\":{},\"y\":{},\"modifiers\":0}}}}",
+                                                surface_id, translated_point.x, translated_point.y
+                                            );
+                                            forward_remote_input(fd, &msg);
+                                        }
+                                    } else {
+                                        pane.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
+                                            servo::WebViewPoint::Device(translated_point)
+                                        )));
+                                    }
                                     return;
                                 }
                             }
@@ -2880,9 +2918,20 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 };
                                 let translated_point = Point2D::new(point.x - px, point.y - py);
 
-                                pane.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
-                                    servo::WebViewPoint::Device(translated_point)
-                                )));
+                                if pane.is_remote {
+                                    if let Some(fd) = pane.remote_input_fd {
+                                        let surface_id = format!("{}:{}", uuid, pane.id);
+                                        let msg = format!(
+                                            "{{\"type\":\"Input\",\"event\":{{\"kind\":\"MouseMove\",\"surface_id\":\"{}\",\"generation\":1,\"x\":{},\"y\":{},\"modifiers\":0}}}}",
+                                            surface_id, translated_point.x, translated_point.y
+                                        );
+                                        forward_remote_input(fd, &msg);
+                                    }
+                                } else {
+                                    pane.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
+                                        servo::WebViewPoint::Device(translated_point)
+                                    )));
+                                }
                             }
                         } else {
                             // Standard window: just find hovered pane and route
@@ -2910,9 +2959,20 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                                 if rect.contains(point) {
                                     let translated_point = Point2D::new(point.x - px, point.y - py);
-                                    pane.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
-                                        servo::WebViewPoint::Device(translated_point)
-                                    )));
+                                    if pane.is_remote {
+                                        if let Some(fd) = pane.remote_input_fd {
+                                            let surface_id = format!("{}:{}", uuid, pane.id);
+                                            let msg = format!(
+                                                "{{\"type\":\"Input\",\"event\":{{\"kind\":\"MouseMove\",\"surface_id\":\"{}\",\"generation\":1,\"x\":{},\"y\":{},\"modifiers\":0}}}}",
+                                                surface_id, translated_point.x, translated_point.y
+                                            );
+                                            forward_remote_input(fd, &msg);
+                                        }
+                                    } else {
+                                        pane.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
+                                            servo::WebViewPoint::Device(translated_point)
+                                        )));
+                                    }
                                     break;
                                 }
                             }
@@ -3121,11 +3181,32 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
 
                                 let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
-                                pane.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-                                    action,
-                                    servo_button,
-                                    servo::WebViewPoint::Device(translated_point)
-                                )));
+                                if pane.is_remote {
+                                    if let Some(fd) = pane.remote_input_fd {
+                                        let surface_id = format!("{}:{}", uuid, pane.id);
+                                        let kind = match action {
+                                            MouseButtonAction::Down => "MouseDown",
+                                            MouseButtonAction::Up => "MouseUp",
+                                        };
+                                        let btn_num = match servo_button {
+                                            ServoMouseButton::Primary => 0,
+                                            ServoMouseButton::Auxiliary => 1,
+                                            ServoMouseButton::Secondary => 2,
+                                            _ => 0,
+                                        };
+                                        let msg = format!(
+                                            "{{\"type\":\"Input\",\"event\":{{\"kind\":\"{}\",\"surface_id\":\"{}\",\"generation\":1,\"button\":{},\"x\":{},\"y\":{},\"modifiers\":0}}}}",
+                                            kind, surface_id, btn_num, translated_point.x, translated_point.y
+                                        );
+                                        forward_remote_input(fd, &msg);
+                                    }
+                                } else {
+                                    pane.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+                                        action,
+                                        servo_button,
+                                        servo::WebViewPoint::Device(translated_point)
+                                    )));
+                                }
                             }
                         }
                     },
@@ -3207,10 +3288,21 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         (physical_rect.origin.x.round(), physical_rect.origin.y.round())
                                     };
                                     let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
-                                    pane.webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                                        wheel_delta,
-                                        servo::WebViewPoint::Device(translated_point)
-                                    )));
+                                    if pane.is_remote {
+                                        if let Some(fd) = pane.remote_input_fd {
+                                            let surface_id = format!("{}:{}", uuid, pane.id);
+                                            let msg = format!(
+                                                "{{\"type\":\"Input\",\"event\":{{\"kind\":\"MouseWheel\",\"surface_id\":\"{}\",\"generation\":1,\"x\":{},\"y\":{},\"dx\":{},\"dy\":{},\"modifiers\":0}}}}",
+                                                surface_id, translated_point.x, translated_point.y, x, y
+                                            );
+                                            forward_remote_input(fd, &msg);
+                                        }
+                                    } else {
+                                        pane.webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
+                                            wheel_delta,
+                                            servo::WebViewPoint::Device(translated_point)
+                                        )));
+                                    }
                                     return;
                                 }
                             }
@@ -3240,10 +3332,21 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                             if rect.contains(instance.last_mouse_pos) {
                                 let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
-                                pane.webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                                    wheel_delta,
-                                    servo::WebViewPoint::Device(translated_point)
-                                )));
+                                if pane.is_remote {
+                                    if let Some(fd) = pane.remote_input_fd {
+                                        let surface_id = format!("{}:{}", uuid, pane.id);
+                                        let msg = format!(
+                                            "{{\"type\":\"Input\",\"event\":{{\"kind\":\"MouseWheel\",\"surface_id\":\"{}\",\"generation\":1,\"x\":{},\"y\":{},\"dx\":{},\"dy\":{},\"modifiers\":0}}}}",
+                                            surface_id, translated_point.x, translated_point.y, x, y
+                                        );
+                                        forward_remote_input(fd, &msg);
+                                    }
+                                } else {
+                                    pane.webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
+                                        wheel_delta,
+                                        servo::WebViewPoint::Device(translated_point)
+                                    )));
+                                }
                                 break;
                             }
                         }
@@ -3376,7 +3479,25 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         );
                         
                         if let Some(pane) = instance.panes.get(&instance.active_pane_id) {
-                            pane.webview.notify_input_event(InputEvent::Keyboard(keyboard_event));
+                            if pane.is_remote {
+                                if let Some(fd) = pane.remote_input_fd {
+                                    let surface_id = format!("{}:{}", uuid, pane.id);
+                                    let kind = match event.state {
+                                        winit::event::ElementState::Pressed => "KeyDown",
+                                        winit::event::ElementState::Released => "KeyUp",
+                                    };
+                                    let key_str = format!("{:?}", event.logical_key);
+                                    let code_str = format!("{:?}", event.physical_key);
+                                    let repeat = event.repeat;
+                                    let msg = format!(
+                                        "{{\"type\":\"Input\",\"event\":{{\"kind\":\"{}\",\"surface_id\":\"{}\",\"generation\":1,\"key\":\"{}\",\"code\":\"{}\",\"keycode\":0,\"modifiers\":0,\"repeat\":{}}}}}",
+                                        kind, surface_id, key_str, code_str, repeat
+                                    );
+                                    forward_remote_input(fd, &msg);
+                                }
+                            } else {
+                                pane.webview.notify_input_event(InputEvent::Keyboard(keyboard_event));
+                            }
                         }
                     },
                     _ => {}
