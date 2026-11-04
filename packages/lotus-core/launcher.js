@@ -57,7 +57,7 @@ function readProcessFds(pid) {
 }
 
 class SandboxedEngineProcess {
-    constructor(supervisorProcess, enginePid, enginePort, supervisorStream, controlStream, controlFd, brokerServer) {
+    constructor(supervisorProcess, enginePid, enginePort, supervisorStream, controlStream, controlFd, brokerServer, allocatedTempDir) {
         this.supervisor = supervisorProcess;
         this.enginePid = enginePid;
         this.enginePort = enginePort;
@@ -65,6 +65,7 @@ class SandboxedEngineProcess {
         this.controlStream = controlStream;
         this.controlFd = controlFd || null;
         this.brokerServer = brokerServer || null;
+        this.allocatedTempDir = allocatedTempDir || null;
         this._isTerminated = false;
         if (this.supervisorStream && typeof this.supervisorStream.on === 'function') {
             this.supervisorStream.on('error', () => {});
@@ -95,6 +96,13 @@ class SandboxedEngineProcess {
             } catch {}
         }
 
+        if (this.allocatedTempDir) {
+            try {
+                fs.rmSync(this.allocatedTempDir, { recursive: true, force: true });
+                this.allocatedTempDir = null;
+            } catch {}
+        }
+
         return new Promise((resolve) => {
             const timeout = setTimeout(() => {
                 try {
@@ -105,6 +113,12 @@ class SandboxedEngineProcess {
 
             this.supervisor.once('exit', () => {
                 clearTimeout(timeout);
+                if (this.allocatedTempDir) {
+                    try {
+                        fs.rmSync(this.allocatedTempDir, { recursive: true, force: true });
+                        this.allocatedTempDir = null;
+                    } catch {}
+                }
                 resolve();
             });
         });
@@ -119,7 +133,14 @@ async function spawnSandboxedEngine(options = {}) {
     const engineBin = options.engineBin || path.resolve(__dirname, '../lotus-supervisor/target/debug/lotus-sandbox-probe');
     const engineArgs = [...(options.engineArgs || [])];
     const cacheDir = options.cacheDir;
-    const tempDir = options.tempDir;
+    
+    // Allocate a dedicated mode-0o700 temporary directory when options.tempDir is not supplied (I1 fix)
+    let allocatedTempDir = null;
+    let tempDir = options.tempDir;
+    if (!tempDir) {
+        allocatedTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lotus-sandbox-'));
+        tempDir = allocatedTempDir;
+    }
 
     if (!fs.existsSync(supervisorBin)) {
         throw new Error(`lotus-supervisor binary not found at ${supervisorBin}`);
@@ -133,9 +154,12 @@ async function spawnSandboxedEngine(options = {}) {
     if (shouldEnableNetwork) {
         try {
             const { NetworkBroker } = require('./network_broker.js');
-            const broker = options.networkBroker || new NetworkBroker({ allowLocalhost: options.allowLocalhost ?? false });
-            const socketPath = options.brokerSocketPath || path.join(tempDir || os.tmpdir(), `lotus-broker-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.sock`);
-            brokerServer = await broker.startProxyServer({ socketPath });
+            const broker = options.networkBroker || new NetworkBroker({
+                allowLocalhost: options.allowLocalhost ?? false,
+                ipcPort: options.ipcPort
+            });
+            const socketPath = options.brokerSocketPath || path.join(tempDir, `lotus-broker-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.sock`);
+            brokerServer = await broker.startProxyServer({ socketPath, ipcPort: options.ipcPort });
             engineArgs.push('--broker-socket', socketPath);
         } catch (err) {
             console.warn('[launcher] Failed to start NetworkBroker proxy server:', err);
@@ -221,6 +245,9 @@ async function spawnSandboxedEngine(options = {}) {
             if (brokerServer) {
                 brokerServer.close().catch(() => {});
             }
+            if (allocatedTempDir) {
+                try { fs.rmSync(allocatedTempDir, { recursive: true, force: true }); } catch {}
+            }
             try {
                 supervisorProc.kill('SIGKILL');
             } catch {}
@@ -230,6 +257,9 @@ async function spawnSandboxedEngine(options = {}) {
         supervisorProc.once('exit', () => {
             if (brokerServer) {
                 brokerServer.close().catch(() => {});
+            }
+            if (allocatedTempDir) {
+                try { fs.rmSync(allocatedTempDir, { recursive: true, force: true }); } catch {}
             }
         });
 
@@ -394,7 +424,8 @@ async function spawnSandboxedEngine(options = {}) {
                         supervisorStream,
                         controlStream,
                         controlSocketPair ? (controlSocketPair.hostFd ?? controlSocketPair.host_fd) : null,
-                        brokerServer
+                        brokerServer,
+                        allocatedTempDir
                     );
                     instance.verificationReport = verificationReport;
                     resolve(instance);

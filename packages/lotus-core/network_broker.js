@@ -858,24 +858,67 @@ class NetworkBroker {
         }
 
         const server = http.createServer(async (req, res) => {
+            let slotReleased = false;
+            const releaseSlot = () => {
+                if (!slotReleased) {
+                    slotReleased = true;
+                    this._releaseConcurrencySlot();
+                }
+            };
+
             try {
+                await this._acquireConcurrencySlot();
+                res.on('finish', releaseSlot);
+                res.on('close', releaseSlot);
+
                 const targetUrl = req.url.startsWith('http://') ? req.url : `http://${req.headers.host}${req.url}`;
                 const parsed = new URL(targetUrl);
 
-                // Anti-SSRF check on hostname
-                let targetIp = parsed.hostname;
-                if (!net.isIP(targetIp)) {
-                    const resolved = await dns.promises.resolve(parsed.hostname);
-                    if (!resolved || resolved.length === 0) {
-                        res.writeHead(502, { 'Content-Type': 'text/plain' });
-                        return res.end('DNS resolution failed');
-                    }
-                    targetIp = resolved[0];
+                let cleanHostname = parsed.hostname;
+                if (cleanHostname.startsWith('[') && cleanHostname.endsWith(']')) {
+                    cleanHostname = cleanHostname.slice(1, -1);
                 }
 
-                if (!isAllowedPublicIp(targetIp, this.allowLocalhost)) {
-                    res.writeHead(403, { 'Content-Type': 'text/plain' });
-                    return res.end('Blocked by anti-SSRF policy');
+                // Check for Track 2 host IPC handshake routing
+                const targetPort = parseInt(parsed.port, 10) || 80;
+                const isHostIpcHandshake = options.ipcPort &&
+                    (cleanHostname === '127.0.0.1' || cleanHostname === 'localhost') &&
+                    targetPort === options.ipcPort &&
+                    parsed.pathname === '/ipc/handshake';
+
+                let pinnedIp = null;
+                let pinnedFamily = 4;
+
+                if (isHostIpcHandshake) {
+                    pinnedIp = '127.0.0.1';
+                    pinnedFamily = 4;
+                } else if (net.isIP(cleanHostname)) {
+                    if (!isAllowedPublicIp(cleanHostname, this.allowLocalhost)) {
+                        res.writeHead(403, { 'Content-Type': 'text/plain' });
+                        return res.end('Blocked by anti-SSRF policy');
+                    }
+                    pinnedIp = cleanHostname;
+                    pinnedFamily = net.isIPv6(cleanHostname) ? 6 : 4;
+                } else {
+                    let resolvedIps;
+                    try {
+                        resolvedIps = await dns.promises.lookup(cleanHostname, { all: true });
+                    } catch (err) {
+                        res.writeHead(502, { 'Content-Type': 'text/plain' });
+                        return res.end(`DNS resolution failed for ${cleanHostname}: ${err.message}`);
+                    }
+                    if (!resolvedIps || resolvedIps.length === 0) {
+                        res.writeHead(502, { 'Content-Type': 'text/plain' });
+                        return res.end('DNS resolution failed: no records found');
+                    }
+                    for (const item of resolvedIps) {
+                        if (!isAllowedPublicIp(item.address, this.allowLocalhost)) {
+                            res.writeHead(403, { 'Content-Type': 'text/plain' });
+                            return res.end('Blocked by anti-SSRF policy');
+                        }
+                    }
+                    pinnedIp = resolvedIps[0].address;
+                    pinnedFamily = resolvedIps[0].family;
                 }
 
                 // Ingest and attach cookies
@@ -895,6 +938,7 @@ class NetworkBroker {
                     method: req.method,
                     headers: reqHeaders,
                     agent: this._httpAgent,
+                    lookup: (_h, _opts, cb) => cb(null, pinnedIp, pinnedFamily),
                 }, (proxyRes) => {
                     // Record response Set-Cookie headers into cookie store
                     if (surfaceId && topOrigin && proxyRes.headers['set-cookie']) {
@@ -902,12 +946,29 @@ class NetworkBroker {
                             ? proxyRes.headers['set-cookie']
                             : [proxyRes.headers['set-cookie']];
                         for (const sc of setCookies) {
-                            this.cookieStore.setCookie(surfaceId, topOrigin, targetUrl, sc);
+                            const parsedCookie = parseCookieString(sc);
+                            if (parsedCookie) {
+                                this.cookieStore.setCookie(surfaceId, topOrigin, parsedCookie);
+                            }
                         }
                     }
 
+                    // Enforce response body quota
+                    let bodyBytes = 0;
+                    proxyRes.on('data', (chunk) => {
+                        bodyBytes += chunk.length;
+                        if (bodyBytes > this.maxResponseBodyBytes) {
+                            proxyRes.destroy(new Error('Response body exceeded quota'));
+                            res.destroy();
+                        }
+                    });
+
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
                     proxyRes.pipe(res);
+                });
+
+                proxyReq.setTimeout(this.requestTimeoutMs || 30000, () => {
+                    proxyReq.destroy(new Error('Gateway Timeout'));
                 });
 
                 proxyReq.on('error', (err) => {
@@ -917,6 +978,7 @@ class NetworkBroker {
 
                 req.pipe(proxyReq);
             } catch (err) {
+                releaseSlot();
                 res.writeHead(400, { 'Content-Type': 'text/plain' });
                 res.end(`Bad Request: ${err.message}`);
             }
@@ -924,22 +986,44 @@ class NetworkBroker {
 
         server.on('connect', async (req, clientSocket, head) => {
             try {
-                const [targetHost, targetPortStr] = req.url.split(':');
-                const targetPort = parseInt(targetPortStr, 10) || 443;
+                let targetHost;
+                let targetPort;
+                if (req.url.startsWith('[')) {
+                    const closeBracket = req.url.indexOf(']');
+                    targetHost = req.url.slice(1, closeBracket);
+                    const portPart = req.url.slice(closeBracket + 1);
+                    targetPort = parseInt(portPart.replace(/^:/, ''), 10) || 443;
+                } else {
+                    const parts = req.url.split(':');
+                    targetHost = parts[0];
+                    targetPort = parseInt(parts[1], 10) || 443;
+                }
 
                 let targetIp = targetHost;
-                if (!net.isIP(targetIp)) {
-                    const resolved = await dns.promises.resolve(targetHost);
+                if (net.isIP(targetIp)) {
+                    if (!isAllowedPublicIp(targetIp, this.allowLocalhost)) {
+                        clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+                        return clientSocket.destroy();
+                    }
+                } else {
+                    let resolved;
+                    try {
+                        resolved = await dns.promises.lookup(targetHost, { all: true });
+                    } catch {
+                        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+                        return clientSocket.destroy();
+                    }
                     if (!resolved || resolved.length === 0) {
                         clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
                         return clientSocket.destroy();
                     }
-                    targetIp = resolved[0];
-                }
-
-                if (!isAllowedPublicIp(targetIp, this.allowLocalhost)) {
-                    clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-                    return clientSocket.destroy();
+                    for (const item of resolved) {
+                        if (!isAllowedPublicIp(item.address, this.allowLocalhost)) {
+                            clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+                            return clientSocket.destroy();
+                        }
+                    }
+                    targetIp = resolved[0].address;
                 }
 
                 const serverSocket = net.connect(targetPort, targetIp, () => {
@@ -957,6 +1041,46 @@ class NetworkBroker {
                 clientSocket.on('error', () => {
                     serverSocket.destroy();
                 });
+            } catch {
+                clientSocket.destroy();
+            }
+        });
+
+        server.on('upgrade', (req, clientSocket, head) => {
+            try {
+                const targetUrl = req.url.startsWith('http://') || req.url.startsWith('ws://') ? req.url : `http://${req.headers.host}${req.url}`;
+                const parsed = new URL(targetUrl);
+                let cleanHostname = parsed.hostname;
+                if (cleanHostname.startsWith('[') && cleanHostname.endsWith(']')) {
+                    cleanHostname = cleanHostname.slice(1, -1);
+                }
+
+                const targetPort = parseInt(parsed.port, 10) || 80;
+                const isHostIpcWs = options.ipcPort &&
+                    (cleanHostname === '127.0.0.1' || cleanHostname === 'localhost') &&
+                    targetPort === options.ipcPort &&
+                    parsed.pathname === '/ipc/secure-ws';
+
+                if (!isHostIpcWs) {
+                    clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+                    return clientSocket.destroy();
+                }
+
+                const wsTarget = net.connect(options.ipcPort, '127.0.0.1', () => {
+                    wsTarget.write(`${req.method} ${parsed.pathname}${parsed.search} HTTP/1.1\r\n`);
+                    for (const [k, v] of Object.entries(req.headers)) {
+                        wsTarget.write(`${k}: ${v}\r\n`);
+                    }
+                    wsTarget.write('\r\n');
+                    if (head && head.length > 0) {
+                        wsTarget.write(head);
+                    }
+                    clientSocket.pipe(wsTarget);
+                    wsTarget.pipe(clientSocket);
+                });
+
+                wsTarget.on('error', () => clientSocket.destroy());
+                clientSocket.on('error', () => wsTarget.destroy());
             } catch {
                 clientSocket.destroy();
             }

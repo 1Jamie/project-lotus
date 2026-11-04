@@ -37,6 +37,42 @@ class SecureConstellationManager extends EventEmitter {
         return this._activeInstance !== null && !this._activeInstance._isTerminated;
     }
 
+    _sendCreateSurface(instance, surfaceId, surfaceInfo) {
+        if (!surfaceInfo?.shm || !instance?.controlFd) return;
+        const pixelRwFd = surfaceInfo.shm.pixelRwFd ?? surfaceInfo.shm.rwFd;
+        const ackRoFd = surfaceInfo.shm.ackRoFd;
+        const lotusCore = require('./lotus.js');
+        if (typeof lotusCore.sendFdsOverSocket === 'function' && typeof pixelRwFd === 'number' && typeof ackRoFd === 'number') {
+            const surface = lotusCore.hostIpcRouter?.surfaceTracker?.getSurface(surfaceId);
+            let bridgeScript = surfaceInfo.bridgeScript || null;
+            if (!bridgeScript && surface && surface.secure) {
+                const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
+                if (ipcPort > 0) {
+                    bridgeScript = lotusCore.hostIpcPolicy.generateSecureBridgeScript({
+                        surfaceId,
+                        documentId: surface.activeDocumentId,
+                        bootstrapSecret: surface.bootstrapSecret,
+                        enginePort: ipcPort,
+                    });
+                }
+            }
+
+            const msg = JSON.stringify({
+                type: 'CreateSurface',
+                surface_id: surfaceId,
+                width: surfaceInfo.shm.width || 800,
+                height: surfaceInfo.shm.height || 600,
+                url: surfaceInfo.url || 'about:blank',
+                bridge_script: bridgeScript,
+            }) + '\n';
+            try {
+                lotusCore.sendFdsOverSocket(instance.controlFd, [pixelRwFd, ackRoFd], msg);
+            } catch (e) {
+                console.error('[SecureConstellationManager] sendFdsOverSocket error:', e);
+            }
+        }
+    }
+
     /**
      * Lazily acquires or spawns the shared PID_secure_engine instance.
      * Increments reference count and returns the active instance tagged with monotonic engineInstanceId.
@@ -50,26 +86,7 @@ class SecureConstellationManager extends EventEmitter {
         if (this._activeInstance && !this._activeInstance._isTerminated) {
             this._refCount++;
             this._surfaces.set(surfaceId, surfaceInfo);
-
-            if (surfaceInfo?.shm && this._activeInstance.controlFd) {
-                const pixelRwFd = surfaceInfo.shm.pixelRwFd ?? surfaceInfo.shm.rwFd;
-                const ackRoFd = surfaceInfo.shm.ackRoFd;
-                const lotusCore = require('./lotus.js');
-                if (typeof lotusCore.sendFdsOverSocket === 'function' && typeof pixelRwFd === 'number' && typeof ackRoFd === 'number') {
-                    const msg = JSON.stringify({
-                        type: 'CreateSurface',
-                        surface_id: surfaceId,
-                        width: surfaceInfo.shm.width || 800,
-                        height: surfaceInfo.shm.height || 600,
-                        url: surfaceInfo.url || 'about:blank',
-                    }) + '\n';
-                    try {
-                        lotusCore.sendFdsOverSocket(this._activeInstance.controlFd, [pixelRwFd, ackRoFd], msg);
-                    } catch (e) {
-                        console.error('[SecureConstellationManager] sendFdsOverSocket error:', e);
-                    }
-                }
-            }
+            this._sendCreateSurface(this._activeInstance, surfaceId, surfaceInfo);
 
             return {
                 instance: this._activeInstance,
@@ -83,6 +100,7 @@ class SecureConstellationManager extends EventEmitter {
             const res = await this._spawnPromise;
             this._refCount++;
             this._surfaces.set(surfaceId, surfaceInfo);
+            this._sendCreateSurface(this._activeInstance, surfaceId, surfaceInfo);
             return res;
         }
 
@@ -118,6 +136,9 @@ class SecureConstellationManager extends EventEmitter {
                 engineArgs.push('--url', surfaceInfo.url);
             }
 
+            const lotusCore = require('./lotus.js');
+            const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
+
             const instance = await spawnSandboxedEngine({
                 supervisorBin: this.supervisorBin,
                 engineBin: this.engineBin,
@@ -125,6 +146,7 @@ class SecureConstellationManager extends EventEmitter {
                 engineArgs,
                 networkBroker: this.networkBroker,
                 allowLocalhost: this.allowLocalhost,
+                ipcPort,
             });
 
             this._activeInstance = instance;
@@ -132,6 +154,11 @@ class SecureConstellationManager extends EventEmitter {
             let engineDataBuffer = '';
             instance.controlStream.on('data', (chunk) => {
                 engineDataBuffer += chunk.toString('utf8');
+                if (engineDataBuffer.length > 64 * 1024) {
+                    console.error('[SecureConstellationManager] engineDataBuffer exceeded 64 KiB, terminating');
+                    instance.terminate().catch(() => {});
+                    return;
+                }
                 const lines = engineDataBuffer.split('\n');
                 engineDataBuffer = lines.pop();
                 for (const line of lines) {

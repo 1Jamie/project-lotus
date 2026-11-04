@@ -1204,6 +1204,21 @@ impl LotusApp {
     }
 }
 
+fn map_winit_logical_key(k: &winit::keyboard::Key) -> String {
+    match k {
+        winit::keyboard::Key::Named(named) => format!("{:?}", named),
+        winit::keyboard::Key::Character(s) => s.as_str().to_string(),
+        _ => "Unidentified".to_string(),
+    }
+}
+
+fn map_winit_physical_key(k: winit::keyboard::PhysicalKey) -> String {
+    match k {
+        winit::keyboard::PhysicalKey::Code(code) => format!("{:?}", code),
+        _ => "Unidentified".to_string(),
+    }
+}
+
 fn forward_remote_input(fd: std::os::unix::io::RawFd, json: &str) {
     let mut bytes = json.as_bytes().to_vec();
     bytes.push(b'\n');
@@ -2787,10 +2802,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     if pane.is_remote {
                                         if let Some(fd) = pane.remote_input_fd {
                                             let surface_id = format!("{}:{}", uuid, pane.id);
-                                            let msg = format!(
-                                                "{{\"type\":\"Input\",\"event\":{{\"kind\":\"MouseMove\",\"surface_id\":\"{}\",\"generation\":1,\"x\":{},\"y\":{},\"modifiers\":0}}}}",
-                                                surface_id, translated_point.x, translated_point.y
-                                            );
+                                            let msg = serde_json::json!({
+                                                "type": "Input",
+                                                "event": {
+                                                    "kind": "MouseMove",
+                                                    "surface_id": surface_id,
+                                                    "generation": 1,
+                                                    "x": translated_point.x,
+                                                    "y": translated_point.y,
+                                                    "modifiers": instance.modifiers.bits(),
+                                                }
+                                            }).to_string();
                                             forward_remote_input(fd, &msg);
                                         }
                                     } else {
@@ -2962,10 +2984,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     if pane.is_remote {
                                         if let Some(fd) = pane.remote_input_fd {
                                             let surface_id = format!("{}:{}", uuid, pane.id);
-                                            let msg = format!(
-                                                "{{\"type\":\"Input\",\"event\":{{\"kind\":\"MouseMove\",\"surface_id\":\"{}\",\"generation\":1,\"x\":{},\"y\":{},\"modifiers\":0}}}}",
-                                                surface_id, translated_point.x, translated_point.y
-                                            );
+                                            let msg = serde_json::json!({
+                                                "type": "Input",
+                                                "event": {
+                                                    "kind": "MouseMove",
+                                                    "surface_id": surface_id,
+                                                    "generation": 1,
+                                                    "x": translated_point.x,
+                                                    "y": translated_point.y,
+                                                    "modifiers": instance.modifiers.bits(),
+                                                }
+                                            }).to_string();
                                             forward_remote_input(fd, &msg);
                                         }
                                     } else {
@@ -3194,10 +3223,18 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                             ServoMouseButton::Secondary => 2,
                                             _ => 0,
                                         };
-                                        let msg = format!(
-                                            "{{\"type\":\"Input\",\"event\":{{\"kind\":\"{}\",\"surface_id\":\"{}\",\"generation\":1,\"button\":{},\"x\":{},\"y\":{},\"modifiers\":0}}}}",
-                                            kind, surface_id, btn_num, translated_point.x, translated_point.y
-                                        );
+                                        let msg = serde_json::json!({
+                                            "type": "Input",
+                                            "event": {
+                                                "kind": kind,
+                                                "surface_id": surface_id,
+                                                "generation": 1,
+                                                "button": btn_num,
+                                                "x": translated_point.x,
+                                                "y": translated_point.y,
+                                                "modifiers": instance.modifiers.bits(),
+                                            }
+                                        }).to_string();
                                         forward_remote_input(fd, &msg);
                                     }
                                 } else {
@@ -3291,10 +3328,19 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     if pane.is_remote {
                                         if let Some(fd) = pane.remote_input_fd {
                                             let surface_id = format!("{}:{}", uuid, pane.id);
-                                            let msg = format!(
-                                                "{{\"type\":\"Input\",\"event\":{{\"kind\":\"MouseWheel\",\"surface_id\":\"{}\",\"generation\":1,\"x\":{},\"y\":{},\"dx\":{},\"dy\":{},\"modifiers\":0}}}}",
-                                                surface_id, translated_point.x, translated_point.y, x, y
-                                            );
+                                            let msg = serde_json::json!({
+                                                "type": "Input",
+                                                "event": {
+                                                    "kind": "MouseWheel",
+                                                    "surface_id": surface_id,
+                                                    "generation": 1,
+                                                    "x": translated_point.x,
+                                                    "y": translated_point.y,
+                                                    "dx": x,
+                                                    "dy": y,
+                                                    "modifiers": instance.modifiers.bits(),
+                                                }
+                                            }).to_string();
                                             forward_remote_input(fd, &msg);
                                         }
                                     } else {
@@ -3335,10 +3381,19 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 if pane.is_remote {
                                     if let Some(fd) = pane.remote_input_fd {
                                         let surface_id = format!("{}:{}", uuid, pane.id);
-                                        let msg = format!(
-                                            "{{\"type\":\"Input\",\"event\":{{\"kind\":\"MouseWheel\",\"surface_id\":\"{}\",\"generation\":1,\"x\":{},\"y\":{},\"dx\":{},\"dy\":{},\"modifiers\":0}}}}",
-                                            surface_id, translated_point.x, translated_point.y, x, y
-                                        );
+                                        let msg = serde_json::json!({
+                                            "type": "Input",
+                                            "event": {
+                                                "kind": "MouseWheel",
+                                                "surface_id": surface_id,
+                                                "generation": 1,
+                                                "x": translated_point.x,
+                                                "y": translated_point.y,
+                                                "dx": x,
+                                                "dy": y,
+                                                "modifiers": instance.modifiers.bits(),
+                                            }
+                                        }).to_string();
                                         forward_remote_input(fd, &msg);
                                     }
                                 } else {
@@ -3486,13 +3541,22 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         winit::event::ElementState::Pressed => "KeyDown",
                                         winit::event::ElementState::Released => "KeyUp",
                                     };
-                                    let key_str = format!("{:?}", event.logical_key);
-                                    let code_str = format!("{:?}", event.physical_key);
+                                    let key_str = map_winit_logical_key(&event.logical_key);
+                                    let code_str = map_winit_physical_key(event.physical_key);
                                     let repeat = event.repeat;
-                                    let msg = format!(
-                                        "{{\"type\":\"Input\",\"event\":{{\"kind\":\"{}\",\"surface_id\":\"{}\",\"generation\":1,\"key\":\"{}\",\"code\":\"{}\",\"keycode\":0,\"modifiers\":0,\"repeat\":{}}}}}",
-                                        kind, surface_id, key_str, code_str, repeat
-                                    );
+                                    let msg = serde_json::json!({
+                                        "type": "Input",
+                                        "event": {
+                                            "kind": kind,
+                                            "surface_id": surface_id,
+                                            "generation": 1,
+                                            "key": key_str,
+                                            "code": code_str,
+                                            "keycode": 0,
+                                            "modifiers": instance.modifiers.bits(),
+                                            "repeat": repeat,
+                                        }
+                                    }).to_string();
                                     forward_remote_input(fd, &msg);
                                 }
                             } else {

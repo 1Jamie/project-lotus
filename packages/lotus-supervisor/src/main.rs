@@ -202,20 +202,41 @@ fn main() {
             landlock_fds.push(d);
         }
     }
-    // Allow /tmp for temporary files (or explicit temp_dir)
-    let temp_path = config.temp_dir.as_deref().unwrap_or("/tmp");
-    let _ = fs::create_dir_all(temp_path);
-    if let Ok(d) = landlock::open_landlock_dir(temp_path, true) {
-        landlock_fds.push(d);
+fn is_forbidden_landlock_write_dir(path: &std::path::Path) -> bool {
+    let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let forbidden = ["/", "/tmp", "/var", "/var/tmp", "/home", "/run", "/etc", "/usr", "/root"];
+    for f in &forbidden {
+        if p == std::path::Path::new(f) {
+            return true;
+        }
     }
-    // Allow broker socket directory if specified
+    false
+}
+
+    // Allow explicit temp_dir for temporary files (only if provided and not a system directory)
+    if let Some(ref temp_path) = config.temp_dir {
+        let p = std::path::Path::new(temp_path);
+        if !is_forbidden_landlock_write_dir(p) {
+            let _ = fs::create_dir_all(temp_path);
+            if let Ok(d) = landlock::open_landlock_dir(temp_path, true) {
+                landlock_fds.push(d);
+            }
+        } else {
+            eprintln!("[lotus-supervisor] Refusing Landlock write access to system directory: {:?}", p);
+        }
+    }
+    // Allow broker socket directory if specified and not a forbidden system directory
     for (i, arg) in config.engine_args.iter().enumerate() {
         if arg == "--broker-socket" && i + 1 < config.engine_args.len() {
             if let Some(parent) = std::path::Path::new(&config.engine_args[i + 1]).parent() {
-                if let Some(parent_str) = parent.to_str() {
-                    if let Ok(d) = landlock::open_landlock_dir(parent_str, true) {
-                        landlock_fds.push(d);
+                if !is_forbidden_landlock_write_dir(parent) {
+                    if let Some(parent_str) = parent.to_str() {
+                        if let Ok(d) = landlock::open_landlock_dir(parent_str, true) {
+                            landlock_fds.push(d);
+                        }
                     }
+                } else {
+                    eprintln!("[lotus-supervisor] Refusing Landlock write access to broker socket parent dir: {:?}", parent);
                 }
             }
         }
@@ -267,11 +288,19 @@ fn main() {
     envs_c.push(CString::new(format!("LOTUS_CONTROL_FD={}", config.control_fd)).unwrap());
     envs_c.push(CString::new(format!("LOTUS_LIVENESS_FD={}", liveness_read_fd)).unwrap());
     envs_c.push(CString::new(format!("LOTUS_IPC_LISTENER_FD={}", target_listener_fd)).unwrap());
+    if let Some(ref temp_path) = config.temp_dir {
+        envs_c.push(CString::new(format!("TMPDIR={}", temp_path)).unwrap());
+        envs_c.push(CString::new(format!("TEMP={}", temp_path)).unwrap());
+        envs_c.push(CString::new(format!("TMP={}", temp_path)).unwrap());
+    }
     for (k, v) in env::vars() {
         if k != "LOTUS_CONTROL_FD"
             && k != "LOTUS_LIVENESS_FD"
             && k != "LOTUS_IPC_LISTENER_FD"
             && k != "LOTUS_SUPERVISOR_FD"
+            && k != "TMPDIR"
+            && k != "TEMP"
+            && k != "TMP"
         {
             if let Ok(c) = CString::new(format!("{}={}", k, v)) {
                 envs_c.push(c);

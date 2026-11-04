@@ -221,6 +221,16 @@ function validateAndProjectOutput(schema, value) {
  * Surface state tracking manager.
  */
 function syncSurfacePolicyToNative(surface) {
+    let allowedMethods = Array.from(surface.allowedMethods || []);
+    if (allowedMethods.length === 0) {
+        try {
+            const lotusCore = require('./lotus.js');
+            if (lotusCore.hostIpcRouter && lotusCore.hostIpcRouter.track2Methods) {
+                allowedMethods = Array.from(lotusCore.hostIpcRouter.track2Methods.keys());
+            }
+        } catch (_) {}
+    }
+
     if (typeof globalThis.__lotusCoreRegisterSurfacePolicy === 'function') {
         globalThis.__lotusCoreRegisterSurfacePolicy(
             surface.surfaceId,
@@ -228,7 +238,7 @@ function syncSurfacePolicyToNative(surface) {
             surface.bootstrapSecret,
             surface.activeDocumentId,
             Array.from(surface.allowedChannels || []),
-            [],
+            allowedMethods,
             surface.currentOrigin
         );
     } else {
@@ -242,7 +252,7 @@ function syncSurfacePolicyToNative(surface) {
                     surface.bootstrapSecret,
                     surface.activeDocumentId,
                     Array.from(surface.allowedChannels || []),
-                    [],
+                    allowedMethods,
                     surface.currentOrigin
                 );
             }
@@ -687,12 +697,32 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
     'use strict';
     if (window.parent !== window || window.top !== window) return; // subframes denied bridge
 
-    function verifyTopRealm() {
+    const TopObject = window.Object;
+    const TopFunction = window.Function;
+    const TopArray = window.Array;
+    const TopError = window.Error;
+
+    function throwSecurityError() {
+        const err = new TopError('SecurityError: Lotus IPC is restricted exclusively to top-level browsing contexts');
+        err.name = 'DOMException';
+        err.code = 18;
+        throw err;
+    }
+
+    function verifyTopRealm(payload, callback) {
         if (window.parent !== window || window.top !== window) {
-            const err = new Error('SecurityError: Lotus IPC is restricted exclusively to top-level browsing contexts');
-            err.name = 'DOMException';
-            err.code = 18;
-            throw err;
+            throwSecurityError();
+        }
+        if (callback !== undefined && callback !== null) {
+            if (typeof callback !== 'function' || !(callback instanceof TopFunction) || Object.getPrototypeOf(callback) !== TopFunction.prototype) {
+                throwSecurityError();
+            }
+        }
+        if (payload !== undefined && payload !== null && typeof payload === 'object') {
+            const proto = Object.getPrototypeOf(payload);
+            if (proto !== TopObject.prototype && proto !== null && proto !== TopArray.prototype) {
+                throwSecurityError();
+            }
         }
     }
 
@@ -745,8 +775,10 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
     }
 
     window.lotus = Object.freeze({
-        invoke: (method, payload) => {
+        invoke: function(method, payload) {
+            if (this !== window.lotus) throwSecurityError();
             verifyTopRealm();
+            verifyTopRealm(payload);
             return new Promise((resolve, reject) => {
                 if (!ws || ws.readyState !== WebSocket.OPEN) {
                     return reject(new Error('Lotus IPC is not connected'));
@@ -762,15 +794,19 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
                 }));
             });
         },
-        on: (eventName, callback) => {
+        on: function(eventName, callback) {
+            if (this !== window.lotus) throwSecurityError();
             verifyTopRealm();
+            verifyTopRealm(undefined, callback);
             if (!eventListeners.has(eventName)) {
                 eventListeners.set(eventName, new Set());
             }
             eventListeners.get(eventName).add(callback);
         },
-        off: (eventName, callback) => {
+        off: function(eventName, callback) {
+            if (this !== window.lotus) throwSecurityError();
             verifyTopRealm();
+            verifyTopRealm(undefined, callback);
             if (eventListeners.has(eventName)) {
                 eventListeners.get(eventName).delete(callback);
             }

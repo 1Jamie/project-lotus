@@ -12,6 +12,8 @@ pub enum ControlMessage {
         width: u32,
         height: u32,
         url: Option<String>,
+        #[serde(default)]
+        bridge_script: Option<String>,
     },
     DestroySurface {
         surface_id: String,

@@ -25,8 +25,8 @@ use servo::{
     Code, DeviceIntPoint, DeviceIntRect, DeviceIntSize, EventLoopWaker, InputEvent as ServoInputEvent,
     Key, KeyboardEvent as ServoKeyboardEvent, KeyState, LoadStatus, Location, Modifiers,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
-    NamedKey, RenderingContext, ServoBuilder, SoftwareRenderingContext, WebViewBuilder,
-    WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
+    NamedKey, RenderingContext, ServoBuilder, SoftwareRenderingContext, UserContentManager,
+    UserScript, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 
@@ -199,6 +199,7 @@ fn create_surface(
     shm_fd: RawFd,
     ack_fd: RawFd,
     initial_url: Option<String>,
+    bridge_script: Option<String>,
     rendering_ctx: Rc<SoftwareRenderingContext>,
     servo: &servo::Servo,
 ) -> Result<SurfaceState, String> {
@@ -218,6 +219,10 @@ fn create_surface(
     };
     if rw_ptr == libc::MAP_FAILED as *mut u8 {
         let err = unsafe { *libc::__errno_location() };
+        unsafe {
+            libc::close(shm_fd);
+            libc::close(ack_fd);
+        };
         log_engine!("[lotus-engine] mmap shm_fd failed for {}: errno {}", surface_id, err);
         return Err(format!("mmap shm_fd failed: errno {}", err));
     }
@@ -239,9 +244,19 @@ fn create_surface(
     };
     if consumer_ack_ptr == libc::MAP_FAILED as *const ConsumerAckHeader {
         let err = unsafe { *libc::__errno_location() };
-        unsafe { libc::munmap(rw_ptr as *mut libc::c_void, total_shm_size) };
+        unsafe {
+            libc::munmap(rw_ptr as *mut libc::c_void, total_shm_size);
+            libc::close(shm_fd);
+            libc::close(ack_fd);
+        };
         log_engine!("[lotus-engine] mmap ack_fd failed for {}: errno {}", surface_id, err);
         return Err(format!("mmap ack_fd failed: errno {}", err));
+    }
+
+    // Close descriptor numbers after mmap succeeds; kernel retains mapping references (I7 fix)
+    unsafe {
+        libc::close(shm_fd);
+        libc::close(ack_fd);
     }
 
     let load_complete = Arc::new(AtomicBool::new(false));
@@ -259,6 +274,12 @@ fn create_surface(
 
     let mut builder = WebViewBuilder::new(servo, rendering_ctx.clone())
         .delegate(Rc::new(delegate));
+
+    if let Some(ref script) = bridge_script {
+        let mut ucm = UserContentManager::new(servo);
+        ucm.add_script(Rc::new(UserScript::from(script.as_str())));
+        builder = builder.user_content_manager(Rc::new(ucm));
+    }
 
     if let Some(ref u_str) = initial_url {
         match Url::parse(u_str) {
@@ -551,6 +572,7 @@ fn main() {
             prefs.network_https_proxy_uri = proxy_uri;
 
             let path = broker_path.clone();
+            let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             std::thread::Builder::new()
                 .name("lotus-net-proxy".into())
                 .spawn(move || {
@@ -558,11 +580,26 @@ fn main() {
                     for incoming in listener.incoming() {
                         eprintln!("[lotus-engine] lotus-net-proxy incoming connection: {:?}", incoming);
                         match incoming {
-                            Ok(mut client_stream) => {
+                            Ok(client_stream) => {
+                                if active_conns.load(Ordering::Relaxed) >= 32 {
+                                    eprintln!("[lotus-engine] Proxy connection limit reached (32), rejecting connection");
+                                    drop(client_stream);
+                                    continue;
+                                }
+                                active_conns.fetch_add(1, Ordering::SeqCst);
+                                let conns_clone = active_conns.clone();
                                 let p = path.clone();
                                 std::thread::spawn(move || {
+                                    struct ConnGuard(Arc<std::sync::atomic::AtomicUsize>);
+                                    impl Drop for ConnGuard {
+                                        fn drop(&mut self) {
+                                            self.0.fetch_sub(1, Ordering::SeqCst);
+                                        }
+                                    }
+                                    let _guard = ConnGuard(conns_clone);
+
                                     match std::os::unix::net::UnixStream::connect(&p) {
-                                        Ok(mut broker_stream) => {
+                                        Ok(broker_stream) => {
                                             if let (Ok(mut client_reader), Ok(mut broker_reader)) = (client_stream.try_clone(), broker_stream.try_clone()) {
                                                 let mut client_writer = client_stream;
                                                 let mut broker_writer = broker_stream;
@@ -613,6 +650,7 @@ fn main() {
             sfd,
             afd,
             Some(config.initial_url.clone()),
+            None,
             primary_rendering_ctx.clone(),
             &servo,
         ) {
@@ -667,7 +705,14 @@ fn main() {
                     if !lines.is_empty() || !fds.is_empty() {
                         eprintln!("[lotus-engine] recv_control: lines={:?}, fds={:?}", lines, fds);
                     }
+                    if control_read_buf.len() > 64 * 1024 {
+                        control_read_buf.clear();
+                    }
                     pending_fds.extend(fds);
+                    while pending_fds.len() > 16 {
+                        let excess = pending_fds.pop().unwrap();
+                        unsafe { libc::close(excess); }
+                    }
                     for trimmed in lines {
                         if trimmed == "SHUTDOWN" {
                             running = false;
@@ -677,11 +722,11 @@ fn main() {
                         match serde_json::from_str::<ControlMessage>(&trimmed) {
                             Ok(msg) => {
                                 match msg {
-                                    ControlMessage::CreateSurface { surface_id, width: s_w, height: s_h, url } => {
+                                    ControlMessage::CreateSurface { surface_id, width: s_w, height: s_h, url, bridge_script } => {
                                         if pending_fds.len() >= 2 {
                                             let sfd = pending_fds.remove(0);
                                             let afd = pending_fds.remove(0);
-                                            match create_surface(surface_id.clone(), s_w, s_h, sfd, afd, url, primary_rendering_ctx.clone(), &servo) {
+                                            match create_surface(surface_id.clone(), s_w, s_h, sfd, afd, url, bridge_script, primary_rendering_ctx.clone(), &servo) {
                                                 Ok(surf) => {
                                                     surfaces.insert(surface_id, surf);
                                                 }
@@ -717,13 +762,21 @@ fn main() {
                                             eprintln!("[lotus-engine] Navigate surface not found: {}", surface_id);
                                         }
                                     }
-                                    ControlMessage::Resize { surface_id, width: new_w, height: new_h, .. } => {
+                                    ControlMessage::Resize { surface_id, generation, width: new_w, height: new_h, .. } => {
                                         if let Some(surf) = surfaces.get_mut(&surface_id) {
                                             if new_w > 0 && new_h > 0 {
-                                                surf.width = new_w;
-                                                surf.height = new_h;
-                                                surf.webview.resize(PhysicalSize::new(new_w, new_h));
-                                                surf.paint_needed = true;
+                                                if (new_w as usize) * 4 <= surf.geom.stride && (new_h as usize) * surf.geom.stride <= surf.geom.slot_stride_bytes {
+                                                    surf.width = new_w;
+                                                    surf.height = new_h;
+                                                    surf.rendering_ctx.resize(PhysicalSize::new(new_w, new_h));
+                                                    surf.webview.resize(PhysicalSize::new(new_w, new_h));
+                                                    let prod_hdr = unsafe { &mut *(surf.rw_ptr as *mut ProducerControlHeader) };
+                                                    prod_hdr.prod_resize_gen.store(generation, Ordering::Release);
+                                                    surf.paint_needed = true;
+                                                } else {
+                                                    eprintln!("[lotus-engine] Resize rejected: {}x{} exceeds SHM bounds (stride={}, slot_stride={})",
+                                                        new_w, new_h, surf.geom.stride, surf.geom.slot_stride_bytes);
+                                                }
                                             }
                                         }
                                     }
@@ -791,6 +844,7 @@ fn main() {
             // 3. Paint and Publish Frame if ready
             if surf.frame_ready.swap(false, Ordering::SeqCst) || surf.paint_needed {
                 surf.paint_needed = false;
+                surf.rendering_ctx.resize(PhysicalSize::new(surf.width, surf.height));
                 if let Err(e) = surf.rendering_ctx.make_current() {
                     log_engine!("[lotus-engine] make_current error for {}: {:?}", surface_id, e);
                 }
@@ -821,12 +875,17 @@ fn main() {
                                 let slot_ptr = unsafe { surf.rw_ptr.add(slot_offset) };
                                 let row_bytes = (surf.width as usize) * 4;
 
-                                for y in 0..(surf.height as usize) {
-                                    let src_row = &raw_pixels[y * row_bytes..(y + 1) * row_bytes];
-                                    let dst_row = unsafe { slot_ptr.add(y * surf.geom.stride) };
-                                    unsafe {
-                                        std::ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, row_bytes);
+                                if row_bytes <= surf.geom.stride && (surf.height as usize) * surf.geom.stride <= surf.geom.slot_stride_bytes {
+                                    for y in 0..(surf.height as usize) {
+                                        let src_row = &raw_pixels[y * row_bytes..(y + 1) * row_bytes];
+                                        let dst_row = unsafe { slot_ptr.add(y * surf.geom.stride) };
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, row_bytes);
+                                        }
                                     }
+                                } else {
+                                    log_engine!("[lotus-engine] Skip write: dimensions {}x{} exceed SHM plane geometry", surf.width, surf.height);
+                                    continue;
                                 }
 
                                 match publish_slot(
