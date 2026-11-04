@@ -23,7 +23,7 @@ pub mod app;
 
 use crate::window_state::WindowStateManager;
 pub use app::*;
-use vfs::{ByteLimitedLruCache, EncryptedVfs};
+pub(crate) use vfs::*;
 pub use layout::{PaneAnchor, StagedPaneLayout, StagedLayout};
 pub use server::{dispatch_to_renderer, start_ipc_server, WS_SENDERS, WS_PENDING};
 pub use delegate::LotusPaneDelegate;
