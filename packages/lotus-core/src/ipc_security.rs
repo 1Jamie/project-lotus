@@ -280,6 +280,7 @@ pub struct SurfacePolicy {
     pub ipc_eligible: bool,
     pub max_payload_bytes: usize,
     pub rate_limiter: TokenBucket,
+    pub auth_failure_limiter: TokenBucket,
     pub active_ticket: Option<SecureTicket>,
     pub active_ws_session_id: Option<String>,
     pub outbound_queue: OutboundEventQueue,
@@ -304,6 +305,7 @@ impl SurfacePolicy {
             ipc_eligible: true,
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             rate_limiter: TokenBucket::new(100.0, 50.0), // 100 burst, 50/sec
+            auth_failure_limiter: TokenBucket::new(20.0, 5.0), // 20 burst, 5/sec for unauthenticated attempts
             active_ticket: None,
             active_ws_session_id: None,
             outbound_queue: OutboundEventQueue::new(
@@ -353,6 +355,7 @@ impl SurfacePolicy {
 
     /// Atomically consumes the active ticket for the given document and ticket string.
     /// Replay attempts fail immediately because the ticket is cleared on consumption.
+    /// Failed ticket attempts (mismatches) do NOT clear the active ticket, preventing denial of service (N2).
     pub fn consume_ticket(&mut self, document_id: &str, ticket_str: &str) -> Result<(), &'static str> {
         if !self.ipc_eligible {
             return Err("E_IPC_INELIGIBLE");
@@ -361,14 +364,17 @@ impl SurfacePolicy {
             return Err("E_DOCUMENT_MISMATCH");
         }
 
-        let ticket = self.active_ticket.take().ok_or("E_TICKET_NOT_FOUND_OR_ALREADY_USED")?;
+        let ticket = self.active_ticket.as_ref().ok_or("E_TICKET_NOT_FOUND_OR_ALREADY_USED")?;
         if ticket.is_expired() {
+            self.active_ticket.take();
             return Err("E_TICKET_EXPIRED");
         }
         if !constant_time_eq_str(&ticket.ticket, ticket_str) {
+            // N2 Fix: Keep active ticket intact on mismatch so legitimate client is not locked out
             return Err("E_TICKET_MISMATCH");
         }
 
+        self.active_ticket.take();
         Ok(())
     }
 
@@ -442,6 +448,18 @@ pub fn validate_strict_host(headers: &HeaderMap, expected_port: u16) -> bool {
     let expected_lh = format!("localhost:{}", expected_port);
 
     host == expected_127 || host == expected_lh
+}
+
+/// Validates that request `Origin` header matches the surface's expected origin if present.
+pub fn validate_strict_origin(headers: &HeaderMap, allowed_origin: Option<&str>) -> bool {
+    if let Some(origin_header) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if let Some(expected) = allowed_origin {
+            if !expected.is_empty() && origin_header != expected {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Handshake request payload.
@@ -549,14 +567,23 @@ pub async fn handle_secure_ws_upgrade(
 
     let mut surface = surface_arc.lock().unwrap();
 
-    // 3. Rate limiting check
-    if !surface.rate_limiter.try_consume(1.0) {
-        return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
+    // Strict Origin check against expected surface origin (if present)
+    if !validate_strict_origin(&headers, surface.current_origin.as_deref()) {
+        return (StatusCode::FORBIDDEN, "Forbidden Origin").into_response();
     }
 
-    // 4. Atomic ticket consumption under lock (replay fails immediately)
+    // 3. Atomic ticket consumption under lock (N2: invalid attempts do not burn ticket)
     if let Err(err_code) = surface.consume_ticket(&query.document_id, &query.ticket) {
+        // Failed attempt: throttle against auth_failure_limiter without depleting legitimate rate_limiter
+        if !surface.auth_failure_limiter.try_consume(1.0) {
+            return (StatusCode::TOO_MANY_REQUESTS, "Auth failure rate limit exceeded").into_response();
+        }
         return (StatusCode::UNAUTHORIZED, err_code).into_response();
+    }
+
+    // 4. Rate limiting check for authenticated connection
+    if !surface.rate_limiter.try_consume(1.0) {
+        return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response();
     }
 
     // 5. Generate new session ID and atomically replace active session
@@ -695,6 +722,10 @@ mod tests {
 
         // Document mismatch -> rejected
         assert_eq!(policy.consume_ticket("doc-2", &ticket), Err("E_DOCUMENT_MISMATCH"));
+
+        // N2: Attacker with wrong ticket string -> rejected with E_TICKET_MISMATCH, ticket preserved!
+        assert_eq!(policy.consume_ticket("doc-1", "attacker-forged-ticket-1234"), Err("E_TICKET_MISMATCH"));
+        assert!(policy.active_ticket.is_some(), "Active ticket must NOT be burned by failed attempt");
 
         // Valid consumption -> succeeds
         assert!(policy.consume_ticket("doc-1", &ticket).is_ok());
