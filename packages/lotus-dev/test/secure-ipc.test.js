@@ -435,3 +435,162 @@ test('IpcMain.register - dispatches invoke requests and replies with projection 
     assert.strictEqual(errorReply.replyId, 'reply-2');
     assert.match(errorReply.data._error, /E_CHANNEL_FORBIDDEN/);
 });
+
+test('Audit 4 P1 - Array accessors and sparse arrays are strictly forbidden', () => {
+    // 1. Array with getter index
+    const evilArr = ['ok'];
+    Object.defineProperty(evilArr, 1, {
+        get() { return 'evil'; },
+        enumerable: true,
+        configurable: true
+    });
+
+    assert.throws(() => {
+        validateAndProjectOutput(null, evilArr);
+    }, {
+        name: 'TypeError',
+        message: /E_ACCESSOR_FORBIDDEN/
+    });
+
+    // 2. Sparse array (hole)
+    const sparseArr = ['a', , 'c']; // eslint-disable-line no-sparse-arrays
+    assert.throws(() => {
+        validateAndProjectOutput(null, sparseArr);
+    }, {
+        name: 'TypeError',
+        message: /E_SPARSE_ARRAY_FORBIDDEN/
+    });
+});
+
+test('Audit 4 P2 - Array length caps, total element budgets, and complex types rejected', () => {
+    // 1. Array length cap
+    const largeArr = new Array(10001).fill('x');
+    assert.throws(() => {
+        validateAndProjectOutput(null, largeArr);
+    }, {
+        name: 'RangeError',
+        message: /E_ARRAY_TOO_LARGE/
+    });
+
+    // 2. Total element budget across nested structure
+    const nested = [];
+    for (let i = 0; i < 200; i++) {
+        nested.push(new Array(60).fill(1)); // 200 * 60 = 12000 elements
+    }
+    assert.throws(() => {
+        validateAndProjectOutput(null, nested);
+    }, {
+        name: 'RangeError',
+        message: /E_MAX_ELEMENTS_EXCEEDED/
+    });
+
+    // 3. TypedArrays, Maps, Sets, Dates, RegExps rejected
+    assert.throws(() => {
+        validateAndProjectOutput(null, new Uint8Array([1, 2, 3]));
+    }, { name: 'TypeError', message: /E_UNSUPPORTED_TYPE/ });
+
+    assert.throws(() => {
+        validateAndProjectOutput(null, new Map([['a', 1]]));
+    }, { name: 'TypeError', message: /E_UNSUPPORTED_TYPE/ });
+
+    assert.throws(() => {
+        validateAndProjectOutput(null, new Set([1, 2]));
+    }, { name: 'TypeError', message: /E_UNSUPPORTED_TYPE/ });
+
+    assert.throws(() => {
+        validateAndProjectOutput(null, new Date());
+    }, { name: 'TypeError', message: /E_UNSUPPORTED_TYPE/ });
+
+    assert.throws(() => {
+        validateAndProjectOutput(null, /abc/);
+    }, { name: 'TypeError', message: /E_UNSUPPORTED_TYPE/ });
+});
+
+test('Audit 4 P3 & P4 - Navigation commit derives authoritative final URL origin and eligibility', () => {
+    const tracker = new HostSurfaceTracker();
+    const surface = tracker.createSurface('win-nav', {
+        secure: true,
+        origin: 'https://good.example.com',
+        allowedChannels: ['vault', 'telemetry'],
+        trustedOrigins: ['https://good.example.com']
+    });
+
+    // 1. Cross-origin redirect landing on different origin (P3)
+    tracker.startNavigation('win-nav', 'nav-redir-1', 'https://good.example.com/redirect');
+    tracker.commitNavigation('win-nav', 'nav-redir-1', 'https://evil.example.com/landed');
+
+    assert.strictEqual(surface.currentOrigin, 'https://evil.example.com');
+    // Granted channels and trusted origins MUST be revoked on cross-origin commit
+    assert.strictEqual(surface.allowedChannels.size, 0);
+    assert.strictEqual(surface.trustedOrigins.size, 0);
+
+    // 2. Navigation committing to data: URL loses IPC eligibility (P4)
+    tracker.startNavigation('win-nav', 'nav-data-1', 'data:text/html,<h1>Hello</h1>');
+    tracker.commitNavigation('win-nav', 'nav-data-1', 'data:text/html,<h1>Hello</h1>');
+
+    assert.strictEqual(surface.currentOrigin, 'null');
+    assert.strictEqual(surface.ipcEligible, false);
+});
+
+test('Audit 4 P5 - commitNavigation rejects null or unstarted navigations', () => {
+    const tracker = new HostSurfaceTracker();
+    tracker.createSurface('win-idle', { secure: true });
+
+    // 1. Commit with no pending navigation throws E_NAVIGATION_MISMATCH
+    assert.throws(() => {
+        tracker.commitNavigation('win-idle', 'nav-fake', 'https://example.com');
+    }, { code: 'E_NAVIGATION_MISMATCH' });
+
+    // 2. Commit with null navigationId throws E_NAVIGATION_MISMATCH
+    assert.throws(() => {
+        tracker.commitNavigation('win-idle', null, 'https://example.com');
+    }, { code: 'E_NAVIGATION_MISMATCH' });
+});
+
+test('Audit 4 P6 - Shared references (DAGs) succeed while circular references fail', () => {
+    // 1. Shared non-cyclical references succeed
+    const shared = { hello: 'world', count: 42 };
+    const dag = {
+        left: shared,
+        right: shared,
+        items: [shared, shared]
+    };
+
+    const cloned = validateAndProjectOutput(null, dag);
+    assert.strictEqual(Object.getPrototypeOf(cloned.left), null);
+    assert.strictEqual(Object.getPrototypeOf(cloned.right), null);
+    assert.strictEqual(cloned.left.hello, 'world');
+    assert.strictEqual(cloned.left.count, 42);
+    assert.strictEqual(cloned.right.hello, 'world');
+    assert.strictEqual(cloned.right.count, 42);
+    assert.strictEqual(cloned.items.length, 2);
+    assert.strictEqual(cloned.items[0].hello, 'world');
+    assert.strictEqual(cloned.items[1].hello, 'world');
+
+    // 2. True circular reference fails
+    const cyclic = { a: 1 };
+    cyclic.loop = cyclic;
+
+    assert.throws(() => {
+        validateAndProjectOutput(null, cyclic);
+    }, {
+        name: 'TypeError',
+        message: /E_CIRCULAR_REFERENCE/
+    });
+});
+
+test('Audit 4 S2 - Unregistered surfaces fail closed with E_SURFACE_NOT_FOUND', async () => {
+    const { ipcMain } = require('@lotus-gui/core');
+
+    let replyResult = null;
+    ipcMain.sendTo = (clientId, replyId, data) => {
+        replyResult = { clientId, replyId, data };
+    };
+
+    ipcMain.emit('vault.testSecret', { _replyId: 'reply-s2' }, 'unknown-unregistered-surface:main');
+    await new Promise(r => setTimeout(r, 20));
+
+    assert.ok(replyResult, 'Should receive reply for unregistered surface');
+    assert.strictEqual(replyResult.replyId, 'reply-s2');
+    assert.match(replyResult.data._error, /E_SURFACE_NOT_FOUND/);
+});

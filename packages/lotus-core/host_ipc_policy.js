@@ -15,10 +15,15 @@
 const util = require('node:util');
 const crypto = require('node:crypto');
 const { normalizeOrigin } = require('./network_broker.js');
+const { deriveOriginForUrl } = require('./origin_derivation.js');
 
 let track1GenerationCounter = 0;
 let track2GenerationCounter = 0;
 let track2EventCounter = 0;
+
+const MAX_STRUCTURAL_DEPTH = 32;
+const MAX_TOTAL_ELEMENTS = 10000;
+const MAX_ARRAY_LENGTH = 10000;
 
 /**
  * Reads an own data property safely from an object, explicitly forbidding Proxies and accessors (getters/setters).
@@ -38,61 +43,29 @@ function readSafeDataProperty(obj, key) {
 }
 
 /**
- * Validates structural bounds, depth, and circular references.
- * Checks util.types.isProxy FIRST at every recursion level.
+ * Unified single-pass validation and sanitization cloning.
+ * - Checks util.types.isProxy FIRST at every step.
+ * - Reads property/index descriptors ONCE and checks for accessors (preventing TOCTOU).
+ * - Forbids sparse arrays (holes).
+ * - Enforces structural depth and total element budget.
+ * - Tracks active traversal ancestors in a Set (cleared on return), allowing shared DAG references
+ *   while rejecting actual circular references.
+ * - Rejects TypedArrays, ArrayBuffers, Maps, Sets, and complex object instances.
  */
-function validateStructuralBounds(value, depth = 0, maxDepth = 32, seen = new WeakSet()) {
-    if (value === null || value === undefined) return;
-
-    if (util.types.isProxy(value)) {
-        throw new TypeError('E_PROXY_FORBIDDEN: Proxy instances are forbidden in Lotus IPC');
-    }
-
-    if (depth > maxDepth) {
-        throw new RangeError(`E_MAX_DEPTH_EXCEEDED: Exceeded max structural depth of ${maxDepth}`);
-    }
-
-    const type = typeof value;
-    if (type === 'boolean' || type === 'string') return;
-    if (type === 'number') {
-        if (!Number.isFinite(value)) {
-            throw new TypeError(`E_NON_FINITE_NUMBER: Found non-finite number ${value}`);
-        }
-        return;
-    }
-    if (type === 'function' || type === 'symbol' || type === 'bigint') {
-        throw new TypeError(`E_UNSUPPORTED_TYPE: Type "${type}" is forbidden in Lotus IPC`);
-    }
-
-    if (type === 'object') {
-        if (seen.has(value)) {
-            throw new TypeError('E_CIRCULAR_REFERENCE: Circular reference detected');
-        }
-        seen.add(value);
-
-        if (Array.isArray(value)) {
-            for (let i = 0; i < value.length; i++) {
-                validateStructuralBounds(value[i], depth + 1, maxDepth, seen);
-            }
-        } else {
-            const keys = Object.keys(value);
-            for (const key of keys) {
-                const propVal = readSafeDataProperty(value, key);
-                validateStructuralBounds(propVal, depth + 1, maxDepth, seen);
-            }
-        }
-    }
-}
-
-/**
- * Deep-clones and sanitizes an object into clean primitives and Object.create(null).
- * Checks util.types.isProxy FIRST at every recursion step.
- */
-function sanitizeClone(value, depth = 0, seen = new WeakSet()) {
+function sanitizeCloneAndValidate(value, depth = 0, ancestors = new Set(), budget = { count: 0 }) {
     if (value === null || value === undefined) return value;
 
     if (util.types.isProxy(value)) {
         throw new TypeError('E_PROXY_FORBIDDEN: Proxy instances are forbidden in Lotus IPC');
+    }
+
+    if (depth > MAX_STRUCTURAL_DEPTH) {
+        throw new RangeError(`E_MAX_DEPTH_EXCEEDED: Exceeded max structural depth of ${MAX_STRUCTURAL_DEPTH}`);
+    }
+
+    budget.count++;
+    if (budget.count > MAX_TOTAL_ELEMENTS) {
+        throw new RangeError(`E_MAX_ELEMENTS_EXCEEDED: Exceeded maximum element count of ${MAX_TOTAL_ELEMENTS}`);
     }
 
     const type = typeof value;
@@ -107,35 +80,87 @@ function sanitizeClone(value, depth = 0, seen = new WeakSet()) {
         throw new TypeError(`E_UNSUPPORTED_TYPE: Type "${type}" is forbidden in Lotus IPC`);
     }
 
+    // Explicitly reject TypedArrays, ArrayBuffers, Maps, Sets, and non-plain complex types
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)) {
+        throw new TypeError('E_UNSUPPORTED_TYPE: TypedArray and ArrayBuffer instances are forbidden in Lotus IPC');
+    }
+    if (value instanceof Map || value instanceof Set) {
+        throw new TypeError('E_UNSUPPORTED_TYPE: Map and Set collections are forbidden in Lotus IPC');
+    }
+    if (value instanceof Date || value instanceof RegExp || value instanceof Promise) {
+        throw new TypeError('E_UNSUPPORTED_TYPE: Complex object types (Date, RegExp, Promise) are forbidden in Lotus IPC');
+    }
+
     if (type === 'object') {
-        if (seen.has(value)) {
+        if (ancestors.has(value)) {
             throw new TypeError('E_CIRCULAR_REFERENCE: Circular reference detected');
         }
-        seen.add(value);
 
-        if (Array.isArray(value)) {
-            const out = new Array(value.length);
-            for (let i = 0; i < value.length; i++) {
-                out[i] = sanitizeClone(value[i], depth + 1, seen);
+        ancestors.add(value);
+        try {
+            if (Array.isArray(value)) {
+                if (value.length > MAX_ARRAY_LENGTH) {
+                    throw new RangeError(`E_ARRAY_TOO_LARGE: Array length ${value.length} exceeds maximum allowed (${MAX_ARRAY_LENGTH})`);
+                }
+                const out = new Array(value.length);
+                for (let i = 0; i < value.length; i++) {
+                    const key = String(i);
+                    const desc = Object.getOwnPropertyDescriptor(value, key);
+                    if (!desc) {
+                        throw new TypeError(`E_SPARSE_ARRAY_FORBIDDEN: Sparse arrays are forbidden in Lotus IPC (missing index ${i})`);
+                    }
+                    if (desc.get || desc.set) {
+                        throw new TypeError(`E_ACCESSOR_FORBIDDEN: Array index "${i}" has getter/setter accessors which are forbidden in Lotus IPC`);
+                    }
+                    out[i] = sanitizeCloneAndValidate(desc.value, depth + 1, ancestors, budget);
+                }
+                return out;
+            }
+
+            // Plain object validation
+            const proto = Object.getPrototypeOf(value);
+            if (proto !== Object.prototype && proto !== null) {
+                throw new TypeError('E_UNSUPPORTED_TYPE: Only plain objects and null-prototype objects are permitted in Lotus IPC');
+            }
+
+            const out = Object.create(null);
+            const keys = Object.getOwnPropertyNames(value);
+            for (const key of keys) {
+                const desc = Object.getOwnPropertyDescriptor(value, key);
+                if (!desc) continue;
+                if (desc.get || desc.set) {
+                    throw new TypeError(`E_ACCESSOR_FORBIDDEN: Property "${key}" has getter/setter accessors which are forbidden in Lotus IPC`);
+                }
+                out[key] = sanitizeCloneAndValidate(desc.value, depth + 1, ancestors, budget);
             }
             return out;
+        } finally {
+            ancestors.delete(value);
         }
-
-        const out = Object.create(null);
-        const keys = Object.keys(value);
-        for (const key of keys) {
-            const propVal = readSafeDataProperty(value, key);
-            out[key] = sanitizeClone(propVal, depth + 1, seen);
-        }
-        return out;
     }
 
     return value;
 }
 
 /**
+ * Validates structural bounds, depth, and circular references.
+ * Delegates to sanitizeCloneAndValidate.
+ */
+function validateStructuralBounds(value, depth = 0, maxDepth = 32, seen = new WeakSet()) {
+    sanitizeCloneAndValidate(value, depth);
+}
+
+/**
+ * Deep-clones and sanitizes an object into clean primitives and Object.create(null).
+ * Delegates to sanitizeCloneAndValidate.
+ */
+function sanitizeClone(value, depth = 0, seen = new WeakSet()) {
+    return sanitizeCloneAndValidate(value, depth);
+}
+
+/**
  * Projects a value against an optional declarative schema onto Object.create(null).
- * Checks util.types.isProxy FIRST.
+ * Reads each property descriptor exactly once to eliminate TOCTOU race conditions.
  */
 function validateAndProjectOutput(schema, value) {
     if (value === null || value === undefined) return value;
@@ -143,32 +168,50 @@ function validateAndProjectOutput(schema, value) {
         throw new TypeError('E_PROXY_FORBIDDEN: Proxy instances are forbidden in Lotus IPC');
     }
 
-    validateStructuralBounds(value);
-
     if (!schema || typeof schema !== 'object') {
-        return sanitizeClone(value);
+        return sanitizeCloneAndValidate(value);
     }
 
-    // Schema projection
+    if (typeof value !== 'object' || Array.isArray(value)) {
+        throw new TypeError('E_SCHEMA_TYPE_MISMATCH: Expected plain object for schema projection');
+    }
+
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+        throw new TypeError('E_UNSUPPORTED_TYPE: Schema projection requires plain object or null prototype');
+    }
+
     const out = Object.create(null);
     const schemaKeys = Object.keys(schema);
-    for (const key of schemaKeys) {
-        const expectedType = schema[key];
-        const val = readSafeDataProperty(value, key);
-        if (val === undefined) continue;
+    const ancestors = new Set([value]);
+    const budget = { count: 1 };
 
-        if (typeof expectedType === 'string') {
-            if (expectedType === 'string' && typeof val !== 'string') {
-                throw new TypeError(`E_SCHEMA_TYPE_MISMATCH: Property "${key}" expected string, got ${typeof val}`);
+    try {
+        for (const key of schemaKeys) {
+            const expectedType = schema[key];
+            const desc = Object.getOwnPropertyDescriptor(value, key);
+            if (!desc) continue;
+            if (desc.get || desc.set) {
+                throw new TypeError(`E_ACCESSOR_FORBIDDEN: Property "${key}" has getter/setter accessors which are forbidden in Lotus IPC`);
             }
-            if (expectedType === 'number' && (typeof val !== 'number' || !Number.isFinite(val))) {
-                throw new TypeError(`E_SCHEMA_TYPE_MISMATCH: Property "${key}" expected finite number, got ${typeof val}`);
+            const val = desc.value;
+            if (val === undefined) continue;
+
+            if (typeof expectedType === 'string') {
+                if (expectedType === 'string' && typeof val !== 'string') {
+                    throw new TypeError(`E_SCHEMA_TYPE_MISMATCH: Property "${key}" expected string, got ${typeof val}`);
+                }
+                if (expectedType === 'number' && (typeof val !== 'number' || !Number.isFinite(val))) {
+                    throw new TypeError(`E_SCHEMA_TYPE_MISMATCH: Property "${key}" expected finite number, got ${typeof val}`);
+                }
+                if (expectedType === 'boolean' && typeof val !== 'boolean') {
+                    throw new TypeError(`E_SCHEMA_TYPE_MISMATCH: Property "${key}" expected boolean, got ${typeof val}`);
+                }
             }
-            if (expectedType === 'boolean' && typeof val !== 'boolean') {
-                throw new TypeError(`E_SCHEMA_TYPE_MISMATCH: Property "${key}" expected boolean, got ${typeof val}`);
-            }
+            out[key] = sanitizeCloneAndValidate(val, 1, ancestors, budget);
         }
-        out[key] = sanitizeClone(val);
+    } finally {
+        ancestors.delete(value);
     }
 
     return out;
@@ -191,6 +234,7 @@ class HostSurfaceTracker {
             currentOrigin: options.origin ? normalizeOrigin(options.origin) : 'null',
             pendingNavigationId: null,
             pendingOrigin: null,
+            pendingTargetUrl: null,
             ipcEligible: options.ipcEligible !== false,
             maxPayloadBytes: options.maxPayloadBytes || 4 * 1024 * 1024,
             trustedOrigins: new Set((options.trustedOrigins || []).map(normalizeOrigin)),
@@ -210,31 +254,58 @@ class HostSurfaceTracker {
     }
 
     startNavigation(surfaceId, navigationId, targetUrl) {
+        if (!navigationId || typeof navigationId !== 'string') {
+            const err = new Error(`E_NAVIGATION_INVALID: Invalid or empty navigationId "${navigationId}"`);
+            err.code = 'E_NAVIGATION_INVALID';
+            throw err;
+        }
         const surface = this.surfaces.get(surfaceId);
         if (!surface) return null;
         surface.navigationState = 'provisional';
         surface.pendingNavigationId = navigationId;
+        surface.pendingTargetUrl = targetUrl;
         surface.pendingOrigin = normalizeOrigin(targetUrl);
         return surface;
     }
 
     commitNavigation(surfaceId, navigationId, finalUrl) {
-        const surface = this.surfaces.get(surfaceId);
-        if (!surface) return null;
+        if (!navigationId || typeof navigationId !== 'string') {
+            const err = new Error(`E_NAVIGATION_MISMATCH: Expected non-empty navigationId, got "${navigationId}"`);
+            err.code = 'E_NAVIGATION_MISMATCH';
+            throw err;
+        }
 
-        if (surface.pendingNavigationId !== navigationId) {
+        const surface = this.surfaces.get(surfaceId);
+        if (!surface) {
+            const err = new Error(`E_SURFACE_NOT_FOUND: Surface "${surfaceId}" not found`);
+            err.code = 'E_SURFACE_NOT_FOUND';
+            throw err;
+        }
+
+        if (!surface.pendingNavigationId || surface.pendingNavigationId !== navigationId) {
             const err = new Error(`E_NAVIGATION_MISMATCH: Expected pending navigation ${surface.pendingNavigationId}, got ${navigationId}`);
             err.code = 'E_NAVIGATION_MISMATCH';
             throw err;
         }
 
-        const normalizedFinal = normalizeOrigin(finalUrl);
-        surface.currentOrigin = surface.pendingOrigin || normalizedFinal;
+        // Authoritatively derive origin and IPC eligibility from the final URL
+        const originInfo = deriveOriginForUrl(finalUrl);
+        const previousOrigin = surface.currentOrigin;
+
+        surface.currentOrigin = originInfo.origin;
+        surface.ipcEligible = originInfo.ipcEligible;
         surface.activeDocumentId = surface.pendingNavigationId;
         surface.pendingNavigationId = null;
+        surface.pendingTargetUrl = null;
         surface.pendingOrigin = null;
         surface.navigationState = 'committed';
         surface.bootstrapSecret = crypto.randomBytes(32).toString('hex');
+
+        // On cross-origin navigation, revoke all granted channels and trusted origins
+        if (previousOrigin !== surface.currentOrigin) {
+            surface.allowedChannels = new Set();
+            surface.trustedOrigins = new Set();
+        }
 
         return surface;
     }
@@ -244,6 +315,7 @@ class HostSurfaceTracker {
         if (!surface) return;
         surface.navigationState = 'failed';
         surface.pendingNavigationId = null;
+        surface.pendingTargetUrl = null;
         surface.pendingOrigin = null;
     }
 
@@ -646,6 +718,7 @@ module.exports = {
     readSafeDataProperty,
     validateStructuralBounds,
     sanitizeClone,
+    sanitizeCloneAndValidate,
     validateAndProjectOutput,
     HostSurfaceTracker,
     HostIpcPolicyRouter,

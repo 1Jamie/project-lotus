@@ -54,6 +54,7 @@ if (process.platform === 'win32') {
 
 const { App, createWindow } = require('./index.js');
 const EventEmitter = require('events');
+const crypto = require('node:crypto');
 let msgpackr;
 try {
     msgpackr = require('msgpackr');
@@ -142,13 +143,11 @@ class IpcMain extends EventEmitter {
 
             try {
                 const surfaceId = fromClientId ? fromClientId.split(':')[0] : 'main-window';
-                let surface = hostIpcRouter.surfaceTracker.getSurface(surfaceId);
+                const surface = hostIpcRouter.surfaceTracker.getSurface(surfaceId);
                 if (!surface) {
-                    const win = windows.get(surfaceId);
-                    surface = hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
-                        secure: true,
-                        allowedChannels: (win && win._allowedChannels) || ['vault', 'telemetry']
-                    });
+                    const err = new Error(`E_SURFACE_NOT_FOUND: Surface "${surfaceId}" is not registered`);
+                    err.code = 'E_SURFACE_NOT_FOUND';
+                    throw err;
                 }
 
                 // Execute Track 2 inbound validation
@@ -505,19 +504,23 @@ function ensureApp() {
         const assembler = new MessageAssembler((clientId, fullBuffer, unpacker) => {
             try {
                 const msg = unpacker.unpack(fullBuffer);
-                const [windowId, paneId] = clientId.split(':');
-                handleProcessedMsg(windowId, paneId || 'main', msg);
+                const [windowId, rawPaneId] = clientId.split(':');
+                const targetPaneId = rawPaneId || (msg && msg.pane_id) || 'main';
+                handleProcessedMsg(windowId, targetPaneId, msg);
             } catch (e) {
                 console.error(`[lotus] Failed to unpack reassembled message for ${clientId}:`, e);
             }
         });
 
         const handleProcessedMsg = (windowId, paneId, msg) => {
-            const clientId = paneId ? `${windowId}:${paneId}` : windowId;
+            const actualPaneId = (msg && msg.pane_id) || paneId || 'main';
+            const clientId = `${windowId}:${actualPaneId}`;
 
             // Re-attach window_id and pane_id for compatibility with existing emitters/handlers
-            msg.window_id = windowId;
-            if (paneId) msg.pane_id = paneId;
+            if (msg && typeof msg === 'object') {
+                msg.window_id = windowId;
+                msg.pane_id = actualPaneId;
+            }
 
             // Handle app-ready event
             if (msg.event === 'app-ready') {
@@ -569,14 +572,15 @@ function ensureApp() {
         globalApp = new App((clientId, messages) => {
             if (!msgpackr) return;
             const unpacker = getUnpacker(clientId);
-            const [windowId, paneId] = clientId.split(':');
+            const [windowId, rawPaneId] = clientId.split(':');
             
             for (const data of messages) {
                 try {
                     const type = data[0];
                     if (type === MSG_TYPE_DATA) {
                         const msg = unpacker.unpack(data.subarray(1));
-                        handleProcessedMsg(windowId, paneId || 'main', msg);
+                        const targetPaneId = rawPaneId || (msg && msg.pane_id) || 'main';
+                        handleProcessedMsg(windowId, targetPaneId, msg);
                     } else if (type === MSG_TYPE_CHUNK) {
                         assembler.handleChunk(clientId, data, unpacker);
                     }
@@ -656,12 +660,41 @@ function processEvent(win, msg) {
     }
 
     if (msg.event === 'load-status') {
+        const pane = win ? win.panes.get(paneId) : null;
+        if (win && pane) {
+            if (msg.status === 'started') {
+                if (!pane._pendingNavId) {
+                    const navId = `nav-${crypto.randomBytes(8).toString('hex')}`;
+                    pane._pendingNavId = navId;
+                    pane._pendingUrl = pane._pendingUrl || 'about:blank';
+                    hostIpcRouter.surfaceTracker.startNavigation(win.id, navId, pane._pendingUrl);
+                }
+            } else if (msg.status === 'complete') {
+                if (pane._pendingNavId) {
+                    const navId = pane._pendingNavId;
+                    const finalUrl = pane._pendingUrl || 'about:blank';
+                    pane._pendingNavId = null;
+                    pane._pendingUrl = null;
+                    try {
+                        hostIpcRouter.surfaceTracker.commitNavigation(win.id, navId, finalUrl);
+                    } catch (e) {
+                        // Tolerate navigation state mismatch
+                    }
+                }
+            } else if (msg.status === 'failed') {
+                if (pane._pendingNavId) {
+                    pane._pendingNavId = null;
+                    pane._pendingUrl = null;
+                    hostIpcRouter.surfaceTracker.failNavigation(win.id);
+                }
+            }
+        }
+
         if (win) {
             // Do not emit public window-level load-status for internal framework panes (__lotus_select_overlay, etc.)
             if (!paneId || !paneId.startsWith('__lotus_')) {
                 win.emit('load-status', msg.status, paneId);
             }
-            const pane = win.panes.get(paneId);
             if (pane) pane.emit('load-status', msg.status);
         }
         return;
@@ -894,9 +927,15 @@ class Pane extends EventEmitter {
         this.window = window;
         this.id = id;
         this.visible = Boolean(visible);
+        this._pendingNavId = null;
+        this._pendingUrl = null;
     }
 
     loadUrl(url) {
+        const navId = `nav-${crypto.randomBytes(8).toString('hex')}`;
+        this._pendingNavId = navId;
+        this._pendingUrl = url;
+        hostIpcRouter.surfaceTracker.startNavigation(this.window.id, navId, url);
         this.window.handle.loadUrlInPane(this.id, url);
     }
 
@@ -1115,6 +1154,15 @@ class ServoWindow extends EventEmitter {
             allowedChannels: this._allowedChannels,
             trustedOrigins: finalOptions.trustedOrigins || []
         });
+
+        const initialUrl = finalOptions.initialUrl || (finalOptions.panes && finalOptions.panes[0]?.url) || 'about:blank';
+        const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
+        const mainPane = this.panes.get('main');
+        if (mainPane) {
+            mainPane._pendingNavId = initNavId;
+            mainPane._pendingUrl = initialUrl;
+        }
+        hostIpcRouter.surfaceTracker.startNavigation(this.id, initNavId, initialUrl);
 
         windows.set(this.id, this);
 

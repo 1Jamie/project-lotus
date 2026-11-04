@@ -2571,6 +2571,7 @@ impl WebViewDelegate for LotusPaneDelegate {
             }
         }
 
+        let client_id = format!("{}:{}", self.window_id, self.pane_id);
         if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
             "event": "load-status",
             "window_id": self.window_id,
@@ -2578,7 +2579,7 @@ impl WebViewDelegate for LotusPaneDelegate {
             "status": status_str
         })) {
             if let Some(proxy) = EVENT_LOOP_PROXY.get() {
-                let _ = proxy.send_event(EngineCommand::IpcMessage(self.window_id.clone(), msg));
+                let _ = proxy.send_event(EngineCommand::IpcMessage(client_id, msg));
             }
         }
     }
@@ -2597,6 +2598,7 @@ impl WebViewDelegate for LotusPaneDelegate {
     
     fn notify_page_title_changed(&self, _webview: servo::WebView, title: Option<String>) {
          info!("Rust: Title changed for {} pane {} to {:?}", self.window_id, self.pane_id, title);
+         let client_id = format!("{}:{}", self.window_id, self.pane_id);
          if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
             "event": "title-changed",
             "window_id": self.window_id,
@@ -2604,7 +2606,7 @@ impl WebViewDelegate for LotusPaneDelegate {
             "title": title
         })) {
             if let Some(proxy) = EVENT_LOOP_PROXY.get() {
-                let _ = proxy.send_event(EngineCommand::IpcMessage(self.window_id.clone(), msg));
+                let _ = proxy.send_event(EngineCommand::IpcMessage(client_id, msg));
             }
         }
     }
