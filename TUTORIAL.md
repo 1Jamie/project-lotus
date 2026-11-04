@@ -13,7 +13,8 @@ In this tutorial, we will build a **"System Pulse" Desktop Monitor** from scratc
 3. Designing a frameless window with custom drag regions and window controls
 4. Using `invoke()` / `handle()` and `send()` / `on()` to stream OS stats from Node.js to the UI
 5. Splitting a window into multiple panes with `LayoutBuilder`
-6. Packaging your app into a native installer (and optionally encrypting your assets)
+6. Sandboxing external or untrusted content with `sandbox: true`
+7. Packaging your app into a native installer (and optionally encrypting your assets)
 
 ---
 
@@ -394,7 +395,79 @@ ipcMain.on('file-selected', (file) => {
 
 ---
 
-## Step 6: Packaging Your App for Distribution
+## Step 6: Sandboxing External or Untrusted Content (`sandbox: true`)
+
+What if part of your application needs to load an untrusted external website, an embedded documentation viewer, or user-provided web code?
+
+In a standard desktop runtime, loading an untrusted webpage in the same process as your Node.js application poses a severe security risk. Lotus solves this with **Process-Isolated Sandboxed Panes**.
+
+By setting `sandbox: true` on a pane, Lotus isolates the web view in a dedicated, unprivileged child engine process (`PID_secure_engine`) with strict OS-level sandboxing:
+* **Linux Namespaces (`CLONE_NEWUSER`, `CLONE_NEWNET`, `CLONE_NEWPID`):** The engine runs with zero capabilities (`no_new_privs`) and loopback-only network isolation.
+* **Landlock Filesystem Jailing:** Completely denies write access to host directories (including `/`, `/tmp`, `/home`, `/etc`).
+* **Seccomp Stage B BPF Lockdown:** Enforces a strict syscall filter across all 77 engine threads, denying dangerous syscalls with `SIGSYS`.
+* **Anti-SSRF Network Proxy:** External HTTP/HTTPS fetches are filtered through the host's `NetworkBroker` with synchronous DNS socket pinning, blocking loopback (`127.0.0.1`) and private IP ranges (RFC 1918).
+* **Dual-Plane Shared Memory (SHM):** Frame pixels stream back to the OpenGL compositor through read-only sealed `memfd` buffers (`0o400`), providing tear-free 60+ FPS rendering without network hops.
+
+### Adding a Sandboxed Web Pane
+
+In your `main.js`, add a sandboxed pane to your layout using `sandbox: true` and specify which capability channels (if any) it is authorized to access:
+
+```javascript
+const { ServoWindow, LayoutBuilder, ipcMain, app } = require('@lotus-gui/core');
+const path = require('path');
+
+app.warmup();
+
+// 1. Authorize specific capability methods for the sandboxed pane (Track 2 IPC)
+ipcMain.register('vault.getSecret', async () => {
+    return { token: 'secret-token-123' };
+}, {
+    channel: 'vault',
+    schema: { token: 'string' }
+});
+
+// 2. Combine trusted local UI with an untrusted sandboxed web pane
+const layout = new LayoutBuilder()
+    .left('sidebar', 260, { url: 'lotus-resource://localhost/sidebar.html' })
+    .fill('browser', {
+        url: 'https://example.com',
+        sandbox: true,                          // Spawns inside an isolated, sandboxed child engine
+        allowedChannels: ['vault'],             // Strictly grants access only to the 'vault' channel
+        trustedOrigins: ['https://example.com'] // Bounds Track 2 IPC credentials to this origin
+    });
+
+const win = new ServoWindow({
+    id: 'workspace-window',
+    root: path.join(__dirname, 'ui'),
+    width: 1200,
+    height: 800,
+    autoResizeMain: false,
+    ...layout.config()
+});
+
+win.once('ready-to-show', () => win.show());
+```
+
+### Calling Node from the Sandboxed Page
+
+Inside the sandboxed page, `window.lotus.invoke()` communicates over an authenticated, single-use ticket WebSocket bridge:
+
+```javascript
+// Inside the sandboxed page:
+try {
+    const res = await window.lotus.invoke('vault.getSecret', {});
+    console.log('Secret received from host:', res.token);
+} catch (err) {
+    // If the channel was not in allowedChannels, or origin doesn't match:
+    console.error('IPC blocked:', err.message);
+}
+```
+
+If the sandboxed engine crashes or panics (e.g., due to malicious content or a segmentation fault), the supervisor safely isolates the crash, and Lotus transparently recovers without crashing your main window.
+
+---
+
+## Step 7: Packaging Your App for Distribution
 
 When you are ready to distribute your app, `@lotus-gui/dev` compiles your JavaScript into a Node.js Single Executable Application (SEA), bundles the native `.node` addon and your `ui/` assets, and wraps everything into a native installer.
 

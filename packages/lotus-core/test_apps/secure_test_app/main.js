@@ -64,7 +64,7 @@ const win = new ServoWindow({
     width: 1040,
     height: 760,
     title: 'Lotus Process-Isolated Sandbox & Track 2 Showcase',
-    secure: true,
+    sandbox: true,
     allowedChannels: ['vault', 'telemetry'],
     visible: false
 });

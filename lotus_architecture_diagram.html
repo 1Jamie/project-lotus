@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Lotus GUI — Production Multi-Process Sandbox & Execution Topology</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body {
+    background-color: #070a10;
+    color: #e2e8f0;
+    padding: 28px 36px;
+    width: 2320px;
+    margin: 0 auto;
+  }
+
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    border-bottom: 1px solid #1e293b;
+    padding-bottom: 16px;
+    margin-bottom: 20px;
+  }
+  .title-block h1 { font-size: 26px; color: #f8fafc; font-weight: 800; letter-spacing: -0.3px; }
+  .title-block .subtitle { font-size: 13px; color: #94a3b8; margin-top: 4px; }
+
+  .legend-bar {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+  }
+  .legend-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 6px;
+    background: #0f172a;
+    border: 1px solid #1e293b;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+
+  .svg-wrapper {
+    background: #090d16;
+    border: 1px solid #1e293b;
+    border-radius: 12px;
+    padding: 12px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+    margin-bottom: 24px;
+  }
+
+  .ref-section { margin-top: 12px; }
+  .ref-title { font-size: 15px; font-weight: 800; color: #f8fafc; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.8px; }
+  table.ref-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    background: #0b111e;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  table.ref-table th {
+    background: #131c31;
+    color: #93c5fd;
+    text-align: left;
+    padding: 10px 14px;
+    font-weight: 700;
+    border-bottom: 1px solid #1e293b;
+  }
+  table.ref-table td {
+    padding: 10px 14px;
+    border-bottom: 1px solid #162032;
+    color: #cbd5e1;
+    line-height: 1.45;
+  }
+  table.ref-table code {
+    background: #1e293b;
+    color: #38bdf8;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+  }
+  .tag {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    margin-right: 4px;
+    text-transform: uppercase;
+  }
+  .t-purple { background: #3b0764; color: #e9d5ff; border: 1px solid #7e22ce; }
+  .t-green { background: #064e3b; color: #a7f3d0; border: 1px solid #059669; }
+  .t-amber { background: #451a03; color: #fde68a; border: 1px solid #d97706; }
+  .t-blue { background: #172554; color: #bfdbfe; border: 1px solid #2563eb; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title-block">
+    <h1>Lotus GUI — Multi-Process Sandbox, Split-Plane SHM &amp; Dual-Track IPC Topology</h1>
+    <div class="subtitle">@lotus-gui/core (modular Rust + Node.js) • lotus-supervisor (Stage A TCB) • lotus-engine (Stage B Seccomp + Headless Servo)</div>
+  </div>
+  <div class="legend-bar">
+    <div class="legend-pill"><span class="dot" style="background:#a855f7;"></span> <strong>[S] Stage A/B Sandbox &amp; Attest</strong> (SYS_clone &#8594; Landlock &#8594; Seccomp TSYNC)</div>
+    <div class="legend-pill"><span class="dot" style="background:#ef4444;"></span> <strong>[Loop A] Input &amp; Raster Pipeline</strong> (app.rs &#8594; LOTUS_CONTROL_FD &#8594; BGRA Slot)</div>
+    <div class="legend-pill"><span class="dot" style="background:#f59e0b;"></span> <strong>[Loop B] Split-Plane Seqlock Sync</strong> (pixel_ro_fd + ack_rw_fd)</div>
+    <div class="legend-pill"><span class="dot" style="background:#3b82f6;"></span> <strong>[Loop C] Brokered Net &amp; Track 2 IPC</strong> (broker_socket &#8594; DNS Pin / Axum WS)</div>
+  </div>
+</header>
+
+<div class="svg-wrapper">
+<svg viewBox="0 0 2220 1120" width="100%" height="auto" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#a855f7"/>
+    </marker>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#ef4444"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#f59e0b"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#3b82f6"/>
+    </marker>
+    <marker id="arr-cyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#06b6d4"/>
+    </marker>
+    <marker id="arr-slate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- ========================================================================= -->
+  <!-- 1. PROCESS CONTAINERS                                                     -->
+  <!-- ========================================================================= -->
+
+  <!-- PID 1: HOST PROCESS -->
+  <rect x="20" y="20" width="830" height="1080" rx="12" fill="#0c1322" stroke="#2563eb" stroke-width="2"/>
+  <rect x="20" y="20" width="830" height="42" rx="12" fill="#172554"/>
+  <text x="40" y="46" fill="#93c5fd" font-size="15" font-weight="800" letter-spacing="0.6">1. HOST PROCESS (packages/lotus-core — Unconfined Trusted Domain)</text>
+  <text x="645" y="46" fill="#60a5fa" font-size="12" font-weight="600">Threads === 1 Pre-Fork Invariant</text>
+
+  <!-- KERNEL IPC / SHM BOUNDARY -->
+  <rect x="870" y="20" width="480" height="1080" rx="12" fill="#0d1117" stroke="#334155" stroke-width="1.5" stroke-dasharray="6,6"/>
+  <text x="1110" y="46" fill="#94a3b8" font-size="14" font-weight="800" text-anchor="middle" letter-spacing="1">KERNEL FD / SCM_RIGHTS / SPLIT-MEMFD BOUNDARY</text>
+
+  <!-- PID 2: SUPERVISOR TCB -->
+  <rect x="1370" y="20" width="830" height="200" rx="12" fill="#160d24" stroke="#9333ea" stroke-width="2"/>
+  <rect x="1370" y="20" width="830" height="38" rx="12" fill="#3b0764"/>
+  <text x="1390" y="44" fill="#e9d5ff" font-size="14" font-weight="800" letter-spacing="0.6">2. SUPERVISOR TCB (packages/lotus-supervisor — Container PID 1 Ancestor)</text>
+
+  <!-- PID 3: SANDBOXED ENGINE -->
+  <rect x="1370" y="255" width="830" height="845" rx="12" fill="#091914" stroke="#10b981" stroke-width="2"/>
+  <rect x="1370" y="255" width="830" height="42" rx="12" fill="#064e3b"/>
+  <text x="1390" y="281" fill="#a7f3d0" font-size="15" font-weight="800" letter-spacing="0.6">3. SANDBOXED ENGINE (packages/lotus-engine — Untrusted Headless Servo)</text>
+  <text x="1930" y="281" fill="#34d399" font-size="12" font-weight="700">77/77 Threads (Seccomp: 2 / SIGSYS)</text>
+
+
+  <!-- ========================================================================= -->
+  <!-- 2. HOST PROCESS INTERNAL MODULES                                          -->
+  <!-- ========================================================================= -->
+
+  <!-- Node.js Policy & Lifecycle Layer -->
+  <rect x="45" y="80" width="355" height="125" rx="8" fill="#111c33" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="60" y="104" fill="#f8fafc" font-size="13.5" font-weight="700">Node.js Host &amp; Policy Engine</text>
+  <rect x="295" y="88" width="90" height="20" rx="4" fill="#1e3a8a"/><text x="340" y="102" fill="#93c5fd" font-size="10" font-weight="700" text-anchor="middle">host_ipc_policy.js</text>
+  <text x="60" y="126" fill="#cbd5e1" font-size="11.5">• HostSurfaceTracker: provisional vs. committed URLs</text>
+  <text x="60" y="145" fill="#cbd5e1" font-size="11.5">• Rotates doc credentials &amp; revokes grants on cross-origin</text>
+  <text x="60" y="164" fill="#cbd5e1" font-size="11.5">• Pre-await &amp; post-await TOCTOU generationId validation</text>
+  <text x="60" y="183" fill="#93c5fd" font-size="11.5" font-weight="600">• Two-phase deep-clone &amp; schema output projection</text>
+
+  <!-- Modular Rust Core Bridge -->
+  <rect x="45" y="245" width="355" height="110" rx="8" fill="#111c33" stroke="#06b6d4" stroke-width="1.5"/>
+  <text x="60" y="269" fill="#f8fafc" font-size="13.5" font-weight="700">Modular Rust Core (@lotus-gui/core)</text>
+  <rect x="295" y="253" width="90" height="20" rx="4" fill="#164e63"/><text x="340" y="267" fill="#67e8f9" font-size="10" font-weight="700" text-anchor="middle">window / vfs / layout</text>
+  <text x="60" y="291" fill="#cbd5e1" font-size="11.5">• window.rs &amp; layout.rs: Pane lifecycle &amp; dock math</text>
+  <text x="60" y="310" fill="#cbd5e1" font-size="11.5">• vfs.rs: AES-GCM encrypted SEA archive &amp; LRU cache</text>
+  <text x="60" y="329" fill="#cbd5e1" font-size="11.5">• origin_derivation.js: Authoritative origin &amp; top-realm</text>
+
+  <line x1="222" y1="205" x2="222" y2="245" stroke="#06b6d4" stroke-width="2.5" marker-start="url(#arr-cyan)" marker-end="url(#arr-cyan)"/>
+  <text x="232" y="229" fill="#67e8f9" font-size="11" font-weight="700">N-API FFI Bindings</text>
+
+  <!-- Trusted In-Process Servo Panes -->
+  <rect x="45" y="400" width="355" height="140" rx="8" fill="#0f243c" stroke="#0ea5e9" stroke-width="1.5"/>
+  <text x="60" y="424" fill="#f8fafc" font-size="13.5" font-weight="700">Local Trusted Servo Panes (delegate.rs)</text>
+  <rect x="300" y="408" width="85" height="20" rx="4" fill="#0c4a6e"/><text x="342" y="422" fill="#7dd3fc" font-size="10" font-weight="700" text-anchor="middle">TRACK 1 IPC</text>
+  <text x="60" y="446" fill="#cbd5e1" font-size="11.5">• WebViewDelegate &amp; WindowDelegate in-process</text>
+  <text x="60" y="465" fill="#cbd5e1" font-size="11.5">• Direct access to lotus-resource:// VFS assets</text>
+  <text x="60" y="484" fill="#cbd5e1" font-size="11.5">• Track 1 high-speed MsgPack IPC (&gt;9,000 msg/s)</text>
+  <text x="60" y="503" fill="#38bdf8" font-size="11.5" font-weight="600">• Composites directly alongside remote SHM panes</text>
+
+  <line x1="222" y1="355" x2="222" y2="400" stroke="#06b6d4" stroke-width="2" marker-end="url(#arr-cyan)"/>
+
+  <!-- Single OS Window Output -->
+  <rect x="45" y="605" width="355" height="110" rx="8" fill="#17152b" stroke="#818cf8" stroke-width="2"/>
+  <text x="60" y="631" fill="#f8fafc" font-size="14" font-weight="800">Single Window Unified GL Scene</text>
+  <rect x="295" y="615" width="90" height="20" rx="4" fill="#312e81"/><text x="340" y="629" fill="#c7d2fe" font-size="10" font-weight="700" text-anchor="middle">gl/compositor.rs</text>
+  <text x="60" y="655" fill="#cbd5e1" font-size="11.5">• Blits local WebRender + remote BGRA SHM textures</text>
+  <text x="60" y="674" fill="#cbd5e1" font-size="11.5">• Deterministic glScissor / glViewport dock isolation</text>
+  <text x="60" y="693" fill="#a5b4fc" font-size="11.5" font-weight="600">• Tear-free atomic VSync presentation</text>
+
+  <!-- Right Column inside Host -->
+
+  <!-- Row 0 Host: Launcher & SecureConstellationManager -->
+  <rect x="455" y="80" width="375" height="125" rx="8" fill="#161b2e" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="470" y="104" fill="#f8fafc" font-size="13.5" font-weight="700">Launcher &amp; SecureConstellation</text>
+  <rect x="695" y="88" width="120" height="20" rx="4" fill="#581c87"/><text x="755" y="102" fill="#e9d5ff" font-size="9.5" font-weight="700" text-anchor="middle">secure_constellation.js</text>
+  <text x="470" y="126" fill="#cbd5e1" font-size="11.5">• Creates mode-0o700 /tmp/lotus-sandbox-XXXXXX dir</text>
+  <text x="470" y="145" fill="#cbd5e1" font-size="11.5">• Audits /proc/&lt;pid&gt;/status &amp; mountinfo at STAGE_B_LOCKED</text>
+  <text x="470" y="164" fill="#cbd5e1" font-size="11.5">• Monotonic engineInstanceId restart on POLLHUP crash</text>
+  <text x="470" y="183" fill="#e9d5ff" font-size="11.5" font-weight="600">• Sends CreateSurface + SCM_RIGHTS (sendFdsOverSocket)</text>
+
+  <line x1="400" y1="140" x2="455" y2="140" stroke="#64748b" stroke-width="2" marker-end="url(#arr-slate)"/>
+
+  <!-- Row 1 Host: Winit Input Router (app.rs) -->
+  <rect x="455" y="310" width="375" height="125" rx="8" fill="#161b2e" stroke="#ef4444" stroke-width="1.5"/>
+  <text x="470" y="334" fill="#f8fafc" font-size="13.5" font-weight="700">Winit Event Loop &amp; Input Forwarder</text>
+  <rect x="735" y="318" width="80" height="20" rx="4" fill="#7f1d1d"/><text x="775" y="332" fill="#fca5a5" font-size="10" font-weight="700" text-anchor="middle">src/app.rs</text>
+  <text x="470" y="356" fill="#cbd5e1" font-size="11.5">• Reverse Z-order hit-testing across local &amp; remote panes</text>
+  <text x="470" y="375" fill="#cbd5e1" font-size="11.5">• Maps Winit logical/physical keys, modifiers, mouse, wheel</text>
+  <text x="470" y="394" fill="#cbd5e1" font-size="11.5">• Enforces strict stride &amp; buffer bounds on Create/Resize</text>
+  <text x="470" y="413" fill="#fca5a5" font-size="11.5" font-weight="600">• Serializes serde_json::json! over LOTUS_CONTROL_FD</text>
+
+  <line x1="400" y1="440" x2="455" y2="395" stroke="#0ea5e9" stroke-width="2" marker-end="url(#arr-cyan)"/>
+
+  <!-- Row 2 Host: Split-Plane SHM Consumer (gl/shm_consumer.rs) -->
+  <rect x="455" y="535" width="375" height="155" rx="8" fill="#1f1914" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="470" y="559" fill="#f8fafc" font-size="13.5" font-weight="700">Split-Plane SHM Consumer &amp; GL Uploader</text>
+  <rect x="705" y="543" width="110" height="20" rx="4" fill="#78350f"/><text x="760" y="557" fill="#fde68a" font-size="9.5" font-weight="700" text-anchor="middle">gl/shm_consumer.rs</text>
+  <text x="470" y="582" fill="#cbd5e1" font-size="11.5">• Hardens pixel_ro_fd via /proc/self/fd reopen (O_RDONLY)</text>
+  <text x="470" y="601" fill="#cbd5e1" font-size="11.5">• Sets fchmod(0o400) + F_SEAL_SHRINK | GROW | SEAL</text>
+  <text x="470" y="620" fill="#cbd5e1" font-size="11.5">• Lock-free Seqlock read of READY BGRA slot &#8594; OpenGL texture</text>
+  <text x="470" y="639" fill="#fde68a" font-size="11.5" font-weight="600">• Updates 64B ConsumerAckHeader via dedicated ack_rw_fd</text>
+
+  <path d="M 222 540 L 222 575 L 455 575" fill="none" stroke="#0ea5e9" stroke-width="2.5" marker-end="url(#arr-cyan)"/>
+  <line x1="455" y1="650" x2="400" y2="650" stroke="#818cf8" stroke-width="3" marker-end="url(#arr-blue)"/>
+
+  <!-- Row 3 Host: Anti-SSRF NetworkBroker (network_broker.js) -->
+  <rect x="455" y="750" width="375" height="140" rx="8" fill="#131c31" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="470" y="774" fill="#f8fafc" font-size="13.5" font-weight="700">Single-Hop Anti-SSRF NetworkBroker</text>
+  <rect x="705" y="758" width="110" height="20" rx="4" fill="#1e3a8a"/><text x="760" y="772" fill="#93c5fd" font-size="9.5" font-weight="700" text-anchor="middle">network_broker.js</text>
+  <text x="470" y="797" fill="#cbd5e1" font-size="11.5">• Blocks IPv4/IPv6 loopback, RFC1918, CGNAT, ULA, Teredo, NAT64</text>
+  <text x="470" y="816" fill="#cbd5e1" font-size="11.5">• Resolves all DNS (all:true) &amp; pins verified IP on socket lookup</text>
+  <text x="470" y="835" fill="#cbd5e1" font-size="11.5">• HostCookieStore keyed by (surfaceId, topLevelSite) + 64MiB cap</text>
+  <text x="470" y="854" fill="#93c5fd" font-size="11.5" font-weight="600">• Forwards Track 2 /ipc/handshake &amp; /ipc/secure-ws to Axum</text>
+
+  <!-- Row 4 Host: Axum Track 2 Server (server.rs & ipc_security.rs) -->
+  <rect x="455" y="935" width="375" height="135" rx="8" fill="#131c31" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="470" y="959" fill="#f8fafc" font-size="13.5" font-weight="700">Axum Track 2 Server &amp; Ticket Guard</text>
+  <rect x="695" y="943" width="120" height="20" rx="4" fill="#1e3a8a"/><text x="755" y="957" fill="#93c5fd" font-size="9.5" font-weight="700" text-anchor="middle">server / ipc_security.rs</text>
+  <text x="470" y="982" fill="#cbd5e1" font-size="11.5">• Constant-time 256-bit X-Lotus-Bootstrap verification</text>
+  <text x="470" y="1001" fill="#cbd5e1" font-size="11.5">• Single-use 256-bit tickets + separate auth_failure_limiter</text>
+  <text x="470" y="1020" fill="#cbd5e1" font-size="11.5">• Token-bucket rate limiter &amp; atomic WS session replacement</text>
+  <text x="470" y="1039" fill="#93c5fd" font-size="11.5" font-weight="600">• Routes validated RPC to HostIpcPolicyRouter</text>
+
+  <!-- Arrow: NetworkBroker -> Axum (Tunneled Track 2 Handshake & WS) -->
+  <line x1="642" y1="890" x2="642" y2="935" stroke="#3b82f6" stroke-width="2.5" marker-end="url(#arr-blue)"/>
+  <text x="652" y="917" fill="#60a5fa" font-size="11" font-weight="700">Tunnels /ipc/handshake &amp; /ipc/secure-ws</text>
+
+  <!-- Arrow: Axum -> Node.js HostIpcPolicyRouter -->
+  <path d="M 455 1000 L 140 1000 L 140 205" fill="none" stroke="#3b82f6" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#arr-blue)"/>
+  <text x="152" y="988" fill="#60a5fa" font-size="11" font-weight="600">validateTrack2Inbound &#8594; Handler &#8594; validateTrack2PostAwait</text>
+
+
+  <!-- ========================================================================= -->
+  <!-- 3. SUPERVISOR TCB (packages/lotus-supervisor)                             -->
+  <!-- ========================================================================= -->
+
+  <rect x="1395" y="70" width="380" height="130" rx="8" fill="#211236" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="1410" y="94" fill="#f8fafc" font-size="13.5" font-weight="700">Stage A Pre-Execve Container (procfs / caps)</text>
+  <text x="1410" y="116" fill="#e9d5ff" font-size="11.5">• Zero heap allocs between SYS_clone(NEWUSER|PID|NET|NS|IPC) &amp; exec</text>
+  <text x="1410" y="135" fill="#e9d5ff" font-size="11.5">• Fresh private /proc (MS_NOSUID|NODEV|NOEXEC, hidepid=2)</text>
+  <text x="1410" y="154" fill="#e9d5ff" font-size="11.5">• Drops CapEff/Prm/Inh/Bnd/Amb = 0 &amp; PR_SET_NO_NEW_PRIVS = 1</text>
+  <text x="1410" y="173" fill="#d8b4fe" font-size="11.5" font-weight="600">• PR_SET_PDEATHSIG(SIGKILL) + SYS_pidfd_send_signal</text>
+
+  <rect x="1800" y="70" width="375" height="130" rx="8" fill="#211236" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="1815" y="94" fill="#f8fafc" font-size="13.5" font-weight="700">Landlock &amp; Fail-Closed FD Audit (landlock / fd.rs)</text>
+  <text x="1815" y="116" fill="#e9d5ff" font-size="11.5">• Landlock RO system libs/fonts; RW only /tmp/lotus-sandbox-*</text>
+  <text x="1815" y="135" fill="#e9d5ff" font-size="11.5">• Zero TCP bind authority (AccessNet::BindTcp = 0)</text>
+  <text x="1815" y="154" fill="#e9d5ff" font-size="11.5">• close_range + stack [bool; 64] bitmap FD sanitization</text>
+  <text x="1815" y="173" fill="#d8b4fe" font-size="11.5" font-weight="700">• Execs lotus-engine &amp; holds LOTUS_LIVENESS_FD</text>
+
+  <line x1="1775" y1="135" x2="1800" y2="135" stroke="#a855f7" stroke-width="2" marker-end="url(#arr-purple)"/>
+
+  <!-- Vertical Execve from Supervisor -> Untrusted Engine -->
+  <line x1="1985" y1="200" x2="1985" y2="308" stroke="#a855f7" stroke-width="3" marker-end="url(#arr-purple)"/>
+  <rect x="1845" y="220" width="280" height="24" rx="4" fill="#3b0764" stroke="#a855f7"/>
+  <text x="1985" y="236" fill="#f3e8ff" font-size="11" font-weight="700" text-anchor="middle">[S2] execve(lotus-engine) inside Sealed Namespaces</text>
+
+
+  <!-- ========================================================================= -->
+  <!-- 4. SANDBOXED ENGINE PROCESS (packages/lotus-engine)                       -->
+  <!-- ========================================================================= -->
+
+  <!-- Statement 1: Stage B Seccomp Gate (stage_b.rs) -->
+  <rect x="1395" y="310" width="780" height="54" rx="6" fill="#06392a" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1415" y="331" fill="#a7f3d0" font-size="13" font-weight="800">STATEMENT 1 LOCKDOWN (stage_b.rs): apply_stage_b_seccomp() via SECCOMP_FILTER_FLAG_TSYNC</text>
+  <text x="1415" y="350" fill="#cbd5e1" font-size="11.5">Kills SYS_fchmod/fchmodat, ptrace, mount, execve, unshare, setns with SIGSYS &#8594; Emits STAGE_B_LOCKED &#8594; Waits for PROCEED_TO_INIT before ServoBuilder::build()</text>
+
+  <!-- Engine Control Loop & Protocol Demuxer -->
+  <rect x="1395" y="385" width="380" height="115" rx="8" fill="#0d261e" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1410" y="409" fill="#f8fafc" font-size="13.5" font-weight="700">Engine Protocol Demuxer (main / protocol.rs)</text>
+  <text x="1410" y="431" fill="#cbd5e1" font-size="11.5">• Multiplexes CreateSurface, Destroy, Navigate, Resize, Input, Ping</text>
+  <text x="1410" y="450" fill="#cbd5e1" font-size="11.5">• Receives pixel_rw_fd &amp; ack_ro_fd via SCM_RIGHTS</text>
+  <text x="1410" y="469" fill="#6ee7b7" font-size="11.5" font-weight="600">• Dispatches Winit key/mouse/wheel events into Servo</text>
+
+  <!-- Servo Multi-Surface Constellation -->
+  <rect x="1800" y="385" width="375" height="115" rx="8" fill="#0d261e" stroke="#10b981" stroke-width="1.5"/>
+  <text x="1815" y="409" fill="#f8fafc" font-size="13.5" font-weight="700">Headless Servo Constellation</text>
+  <text x="1815" y="431" fill="#cbd5e1" font-size="11.5">• Built after Stage B lockdown (all 77 worker threads filtered)</text>
+  <text x="1815" y="450" fill="#cbd5e1" font-size="11.5">• Manages independent Browsing Contexts per surfaceId</text>
+  <text x="1815" y="469" fill="#cbd5e1" font-size="11.5">• Reports startNavigation &amp; commitNavigation to Host</text>
+
+  <line x1="1775" y1="442" x2="1800" y2="442" stroke="#ef4444" stroke-width="2.5" marker-end="url(#arr-red)"/>
+
+  <!-- Servo Surface Pipelines & UserContentManager -->
+  <rect x="1800" y="535" width="375" height="165" rx="8" fill="#0f2e24" stroke="#34d399" stroke-width="1.5"/>
+  <text x="1815" y="559" fill="#f8fafc" font-size="13.5" font-weight="700">Sandboxed Surface Pipelines (DOM / SpiderMonkey)</text>
+  <text x="1815" y="582" fill="#cbd5e1" font-size="11.5">• Injects Track 2 Bridge via Servo UserContentManager (UserScript)</text>
+  <text x="1815" y="601" fill="#cbd5e1" font-size="11.5">• Calling-Realm Guard: blocks cross/same-origin &lt;iframe&gt; callers</text>
+  <text x="1815" y="620" fill="#cbd5e1" font-size="11.5">• Enforces TopObject / TopFunction / TopArray &amp; TopError stack</text>
+  <text x="1815" y="639" fill="#6ee7b7" font-size="11.5" font-weight="600">• Emits DisplayLists to SHM Producer &amp; Fetch/WS to Proxy</text>
+
+  <line x1="1985" y1="500" x2="1985" y2="535" stroke="#ef4444" stroke-width="2.5" marker-end="url(#arr-red)"/>
+
+  <!-- Split-Plane SHM Seqlock Producer (shm.rs) -->
+  <rect x="1395" y="535" width="380" height="155" rx="8" fill="#231c0d" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="1410" y="559" fill="#f8fafc" font-size="13.5" font-weight="700">Split-Plane Triple-Buffer Producer (shm.rs)</text>
+  <rect x="1675" y="543" width="85" height="20" rx="4" fill="#78350f"/><text x="1717" y="557" fill="#fde68a" font-size="9.5" font-weight="700" text-anchor="middle">LOCK-FREE SHM</text>
+  <text x="1410" y="582" fill="#cbd5e1" font-size="11.5">• Inspects ConsumerAckHeader via read-only ack_ro_fd</text>
+  <text x="1410" y="601" fill="#cbd5e1" font-size="11.5">• Lock-free Seqlock state: FREE &#8594; WRITING &#8594; READY</text>
+  <text x="1410" y="620" fill="#cbd5e1" font-size="11.5">• Odd/even generation counters + claimed_slot reservation</text>
+  <text x="1410" y="639" fill="#fde68a" font-size="11.5" font-weight="600">• Writes BGRA frame + 64B ProducerControlHeader to pixel_rw_fd</text>
+
+  <line x1="1800" y1="615" x2="1775" y2="615" stroke="#ef4444" stroke-width="2.5" marker-end="url(#arr-red)"/>
+
+  <!-- Row 3 & 4 Engine: Loopback Proxy Bridge (lotus-net-proxy) -->
+  <rect x="1395" y="750" width="380" height="140" rx="8" fill="#0d261e" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="1410" y="774" fill="#f8fafc" font-size="13.5" font-weight="700">In-Engine Loopback Bridge (lotus-net-proxy)</text>
+  <rect x="1670" y="758" width="90" height="20" rx="4" fill="#1e3a8a"/><text x="1715" y="772" fill="#93c5fd" font-size="9.5" font-weight="700" text-anchor="middle">CLONE_NEWNET</text>
+  <text x="1410" y="797" fill="#cbd5e1" font-size="11.5">• Runs inside isolated network namespace (loopback only)</text>
+  <text x="1410" y="816" fill="#cbd5e1" font-size="11.5">• Captures all Servo HTTP/HTTPS fetches on 127.0.0.1:port</text>
+  <text x="1410" y="835" fill="#cbd5e1" font-size="11.5">• Captures Track 2 /ipc/handshake &amp; /ipc/secure-ws upgrades</text>
+  <text x="1410" y="854" fill="#93c5fd" font-size="11.5" font-weight="600">• Bridges all TCP streams out over UNIX broker_socket</text>
+
+  <!-- Track 2 UserScript Client Box (Bottom Right of Engine) -->
+  <rect x="1395" y="935" width="380" height="135" rx="8" fill="#0d261e" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="1410" y="959" fill="#f8fafc" font-size="13.5" font-weight="700">Track 2 Client Bridge (generateSecureBridgeScript)</text>
+  <rect x="1670" y="943" width="90" height="20" rx="4" fill="#1e3a8a"/><text x="1715" y="957" fill="#93c5fd" font-size="9.5" font-weight="700" text-anchor="middle">USER SCRIPT</text>
+  <text x="1410" y="982" fill="#cbd5e1" font-size="11.5">• Injected via UserContentManager into top-level realm only</text>
+  <text x="1410" y="1001" fill="#cbd5e1" font-size="11.5">• Rejects iframe contexts with DOMException('SecurityError', 18)</text>
+  <text x="1410" y="1020" fill="#cbd5e1" font-size="11.5">• Requests single-use 256-bit ticket from /ipc/handshake</text>
+  <text x="1410" y="1039" fill="#93c5fd" font-size="11.5" font-weight="600">• Upgrades /ipc/secure-ws through lotus-net-proxy</text>
+
+  <!-- Connect Pipelines -> lotus-net-proxy & Track 2 Bridge -->
+  <path d="M 1930 700 L 1930 820 L 1775 820" fill="none" stroke="#3b82f6" stroke-width="2" marker-end="url(#arr-blue)"/>
+  <text x="1800" y="810" fill="#93c5fd" font-size="11" font-weight="600">HTTP/HTTPS Fetch</text>
+
+  <path d="M 2040 700 L 2040 1000 L 1775 1000" fill="none" stroke="#3b82f6" stroke-width="2" marker-end="url(#arr-blue)"/>
+  <text x="1835" y="990" fill="#93c5fd" font-size="11" font-weight="600">Top-Realm window.lotus Calls</text>
+
+  <!-- Arrow: Track 2 Client Bridge -> lotus-net-proxy (Tunneled WS) -->
+  <line x1="1585" y1="935" x2="1585" y2="890" stroke="#3b82f6" stroke-width="2.5" marker-end="url(#arr-blue)"/>
+  <text x="1595" y="918" fill="#60a5fa" font-size="11" font-weight="700">Tunnels Handshake &amp; WS via 127.0.0.1 Proxy</text>
+
+
+  <!-- ========================================================================= -->
+  <!-- 5. KERNEL CROSS-BOUNDARY CHANNELS                                         -->
+  <!-- ========================================================================= -->
+
+  <!-- BUS 0: Spawn, Liveness & Attestation -->
+  <rect x="895" y="80" width="430" height="125" rx="8" fill="#181124" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <text x="1110" y="103" fill="#d8b4fe" font-size="12" font-weight="800" text-anchor="middle">[S1] Spawn, /proc Audit &amp; Liveness Pipe</text>
+  <line x1="830" y1="122" x2="1395" y2="122" stroke="#a855f7" stroke-width="2.5" marker-end="url(#arr-purple)"/>
+  <text x="1110" y="139" fill="#cbd5e1" font-size="11" text-anchor="middle">SYS_clone • Audit /proc/&lt;pid&gt;/status &amp; mountinfo</text>
+  <line x1="1395" y1="162" x2="830" y2="162" stroke="#a855f7" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#arr-purple)"/>
+  <text x="1110" y="180" fill="#e9d5ff" font-size="11" font-weight="600" text-anchor="middle">Liveness Pipe POLLHUP + SYS_pidfd_send_signal</text>
+
+  <!-- Stage B Attestation Gate Line -->
+  <path d="M 1395 335 L 852 335 L 852 185 L 830 185" fill="none" stroke="#a855f7" stroke-width="2" stroke-dasharray="3,3" marker-end="url(#arr-purple)"/>
+  <text x="1110" y="326" fill="#d8b4fe" font-size="11" font-weight="700" text-anchor="middle">[S3] STAGE_B_LOCKED &#8596; PROCEED_TO_INIT (LOTUS_CONTROL_FD)</text>
+
+  <!-- BUS 1: Loop A1 — Control Socket & SCM_RIGHTS -->
+  <rect x="895" y="365" width="430" height="125" rx="8" fill="#231215" stroke="#ef4444" stroke-width="1.5"/>
+  <text x="1110" y="390" fill="#fca5a5" font-size="12" font-weight="800" text-anchor="middle">[Loop A1] Control Socket (LOTUS_CONTROL_FD)</text>
+  <line x1="830" y1="412" x2="1395" y2="412" stroke="#ef4444" stroke-width="3" marker-end="url(#arr-red)"/>
+  <text x="1110" y="432" fill="#f8fafc" font-size="11" font-weight="600" text-anchor="middle">SCM_RIGHTS: Passes pixel_rw_fd (RW) &amp; ack_ro_fd (RO)</text>
+  <text x="1110" y="450" fill="#cbd5e1" font-size="11" text-anchor="middle">CreateSurface • Navigate • Resize • Winit Key/Mouse/Wheel JSON</text>
+
+  <!-- BUS 2: Loop A2 & Loop B — Split-Plane Sealed memfd Seqlock -->
+  <rect x="895" y="535" width="430" height="155" rx="8" fill="#261c0a" stroke="#f59e0b" stroke-width="2"/>
+  <text x="1110" y="560" fill="#fde68a" font-size="12.5" font-weight="800" text-anchor="middle">[Loop A2 &amp; B] Split-Plane Sealed memfd Seqlock</text>
+  <text x="1110" y="578" fill="#fbbf24" font-size="10.5" font-weight="600" text-anchor="middle">O_RDONLY Reopen + fchmod(0o400) + F_SEAL_SHRINK|GROW|SEAL</text>
+  <!-- Plane 1: Pixel + ProducerControlHeader -->
+  <line x1="1395" y1="605" x2="830" y2="605" stroke="#ef4444" stroke-width="3.5" marker-end="url(#arr-red)"/>
+  <text x="1110" y="623" fill="#fca5a5" font-size="11" font-weight="700" text-anchor="middle">Plane 1 (pixel_rw_fd &#8594; pixel_ro_fd): 3 BGRA Slots + 64B ProducerHeader</text>
+  <!-- Plane 2: ConsumerAckHeader -->
+  <line x1="830" y1="652" x2="1395" y2="652" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="6,4" marker-end="url(#arr-amber)"/>
+  <text x="1110" y="672" fill="#fde68a" font-size="11" font-weight="700" text-anchor="middle">Plane 2 (ack_rw_fd &#8594; ack_ro_fd): 64B ConsumerAckHeader Plane</text>
+
+  <!-- BUS 3: Loop C — Broker Socket Tunnel (Both HTTP Fetch AND Track 2 WS) -->
+  <rect x="895" y="750" width="430" height="140" rx="8" fill="#111a2e" stroke="#3b82f6" stroke-width="2"/>
+  <text x="1110" y="777" fill="#93c5fd" font-size="12" font-weight="800" text-anchor="middle">[Loop C] Single-Hop UNIX Broker Socket (broker_socket)</text>
+  <line x1="1395" y1="805" x2="830" y2="805" stroke="#3b82f6" stroke-width="3" marker-start="url(#arr-blue)" marker-end="url(#arr-blue)"/>
+  <text x="1110" y="827" fill="#f8fafc" font-size="11" font-weight="600" text-anchor="middle">All Sandbox Egress Tunneled via lotus-net-proxy &#8594; broker_socket</text>
+  <text x="1110" y="846" fill="#cbd5e1" font-size="11" text-anchor="middle">1. External HTTP/S &#8594; DNS Pinning &amp; HostCookieStore</text>
+  <text x="1110" y="864" fill="#60a5fa" font-size="11" font-weight="600" text-anchor="middle">2. Track 2 /ipc/handshake &amp; /ipc/secure-ws &#8594; Axum Server</text>
+
+</svg>
+</div>
+
+<div class="ref-section">
+  <div class="ref-title">Hardened Architecture Contracts &amp; Verification Matrix (85/85 Suites Passing)</div>
+  <table class="ref-table">
+    <thead>
+      <tr>
+        <th style="width: 220px;">Subsystem &amp; Crate</th>
+        <th style="width: 290px;">Isolation &amp; Primitive Contract</th>
+        <th>Security Invariants &amp; Implementation Mechanics</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Stage A Supervisor</strong><br><code>packages/lotus-supervisor</code></td>
+        <td><span class="tag t-purple">Zero-Alloc Clone</span> <span class="tag t-purple">Landlock</span> <span class="tag t-purple">hidepid=2</span></td>
+        <td>Verifies <code>Threads === 1</code> pre-fork and executes zero heap allocations between <code>SYS_clone(CLONE_PIDFD | NEWUSER | NEWPID | NEWNET | NEWNS | NEWIPC)</code> and <code>execve</code>. Mounts private <code>/proc</code> (<code>MS_NOSUID|NODEV|NOEXEC, hidepid=2</code>), zeroes all capabilities, applies Landlock (RO libs/fonts, RW <code>0o700 /tmp/lotus-sandbox-*</code>, <code>BindTcp = 0</code>), and sanitizes FDs via <code>close_range</code> + <code>[bool; 64]</code> stack bitmap.</td>
+      </tr>
+      <tr>
+        <td><strong>Stage B Syscall Lockdown</strong><br><code>lotus-engine/src/stage_b.rs</code></td>
+        <td><span class="tag t-green">SECCOMP_FILTER_FLAG_TSYNC</span> <span class="tag t-green">SIGSYS</span></td>
+        <td>Applied at Statement 1 of <code>lotus-engine::main()</code> prior to <code>ServoBuilder::build()</code> (77/77 threads locked in <code>Seccomp: 2</code>). Kills <code>SYS_fchmod</code>, <code>SYS_fchmodat</code>, <code>SYS_ptrace</code>, <code>SYS_mount</code>, <code>SYS_execve</code>, <code>SYS_unshare</code>, and <code>SYS_setns</code> with <code>SIGSYS</code>. Host inspects <code>/proc/&lt;pid&gt;/status</code> and <code>mountinfo</code> at <code>STAGE_B_LOCKED</code> before unlocking via <code>PROCEED_TO_INIT</code>.</td>
+      </tr>
+      <tr>
+        <td><strong>Split-Plane SHM Seqlock</strong><br><code>shm.rs</code> &amp; <code>gl/shm_consumer.rs</code></td>
+        <td><span class="tag t-amber">pixel_rw / pixel_ro</span> <span class="tag t-amber">ack_rw / ack_ro</span></td>
+        <td>Allocates two independent sealed <code>memfd</code> planes per pane. Read-only FDs are hardened by reopening <code>/proc/self/fd/&lt;rw_fd&gt;</code> with <code>O_RDONLY</code>, setting <code>fchmod(0o400)</code>, and sealing (<code>F_SEAL_SHRINK|GROW|SEAL</code>) while Stage B blocks <code>SYS_fchmod</code>. Lock-free Seqlock (<code>FREE &#8594; WRITING &#8594; READY</code>) streams tear-free BGRA frames to OpenGL.</td>
+      </tr>
+      <tr>
+        <td><strong>Anti-SSRF Network Broker</strong><br><code>network_broker.js</code></td>
+        <td><span class="tag t-blue">DNS Socket Pinning</span> <span class="tag t-blue">HostCookieStore</span></td>
+        <td><code>lotus-net-proxy</code> inside <code>CLONE_NEWNET</code> forwards over <code>broker_socket</code>. Host blocks loopback, RFC 1918, link-local, CGNAT, ULA, 6to4, Teredo, and NAT64; resolves all DNS records (<code>all: true</code>) and pins verified IPs at the socket lookup callback to defeat DNS rebinding. Enforces double-keyed <code>(surfaceId, topLevelSite)</code> cookies and 64 MiB quotas.</td>
+      </tr>
+      <tr>
+        <td><strong>Track 2 IPC &amp; Realm Guard</strong><br><code>ipc_security.rs</code> &amp; <code>host_ipc_policy.js</code></td>
+        <td><span class="tag t-blue">Top-Realm Guard</span> <span class="tag t-blue">Pre/Post-Await</span></td>
+        <td>Injected via Servo <code>UserContentManager</code> and tunneled over <code>broker_socket</code>. Blocks cross/same-origin <code>&lt;iframe&gt;</code> callers via <code>verifyTopRealm</code> (<code>TopObject/Function/Array/Error</code> checks). Enforces 256-bit constant-time bootstrap auth, single-use tickets protected by <code>auth_failure_limiter</code>, pre/post-await <code>activeDocumentId</code> checks, and two-phase output projection.</td>
+      </tr>
+      <tr>
+        <td><strong>Sandboxed Panes API</strong><br><code>win.createPane()</code> &amp; <code>LayoutBuilder</code></td>
+        <td><span class="tag t-purple">sandbox: true</span> <span class="tag t-blue">allowedChannels</span></td>
+        <td>Spawn process-isolated untrusted or external web views with <code>win.createPane(id, { sandbox: true, allowedChannels: ['vault'] })</code> or <code>layout.fill('view', { sandbox: true })</code>. Automatically runs inside <code>PID_secure_engine</code>, enforces zero host filesystem access via Landlock, proxies egress via <code>NetworkBroker</code> anti-SSRF, and grants capability-scoped Track 2 IPC.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+</body>
+</html>

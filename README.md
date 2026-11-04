@@ -52,6 +52,7 @@ For a full walkthrough, follow [**TUTORIAL.md: Building Your First Lotus App**](
 
 ## What's New in v0.4.0
 
+* **Process-Isolated Sandboxed Panes (`sandbox: true`):** Run untrusted or third-party web content in an OS-level, multi-process sandbox (`PID_secure_engine`) managed by `lotus-supervisor`. Hardened with Landlock FS jailing, Seccomp Stage B BPF filters (`SECCOMP_FILTER_FLAG_TSYNC` on all 77 Servo threads), network namespaces (`CLONE_NEWNET`), anti-SSRF DNS-pinned proxy routing, zero-copy sealed shared memory (`memfd`), and capability-based Track 2 IPC.
 * **Multi-Pane OpenGL Compositor:** Split a single window into multiple docked or floating web views (`Pane`s) on one shared OpenGL surface using `LayoutBuilder` (`Left`, `Right`, `Top`, `Bottom`, `Fill`, `Absolute`). Hiding or showing a docked pane automatically reflows the rest of the layout in Rust on the next frame.
 * **Servo v0.7.0 Submodule:** Tracks upstream Servo v0.7.0 in-tree with a minimal 5-changed-line diff (33-line patch file: [`servo-compositor.patch`](./packages/lotus-core/servo-compositor.patch)) that passes a `target_fbo` parameter to `OffscreenRenderingContext` so multiple panes can blit into a single window's framebuffer.
 * **Native `<select>` Overlays:** HTML `<select>` dropdowns render in a pre-warmed, high-z-index overlay pane above split panes so they never clip. Supports single-select, multi-select, `<optgroup>`, and runtime theming (`'auto'`, `'dark'`, `'light'`, or custom CSS/tokens).
@@ -82,13 +83,31 @@ Window rendering is built on `winit` 0.30 and `window-vibrancy` 0.5. By clearing
 
 ---
 
-## IPC Security Model
+## IPC Security Model & Process Isolation
 
-Because Lotus runs your Node.js code directly on the host OS without a browser sandbox, the localhost WebSocket bridge (`127.0.0.1:<ephemeral-port>`) enforces several layers of access control in Rust (`handle_ws_upgrade` in [`src/lib.rs`](./packages/lotus-core/src/lib.rs)):
+Lotus distinguishes between trusted local application chrome and untrusted third-party content using two distinct execution tracks:
 
-1. **Per-Session Ephemeral UUID Token (Primary Defense):** On startup, Rust generates a random UUID v4 token in memory. Any local process or WebSocket upgrade request on `127.0.0.1` that does not provide the exact session token is rejected with `401 Unauthorized`.
-2. **Origin-Scoped Token Injection:** The `UserScript` that populates `window.lotus.token` and `window.lotus.port` is gated on `window.location` in the renderer: it only initializes credentials when the page protocol is `lotus-resource:` or the hostname is `localhost` / `127.0.0.1` (on any port, so local dev servers like Vite or Next.js work out of the box; this also means any page a pane loads from `http://localhost:<port>` receives IPC access). If a window or pane loads or navigates to a non-local URL (e.g., `https://example.com`), `window.lotus.token` and `window.lotus.port` remain `null` and IPC methods are unavailable on that page.
-3. **`Host` and `Origin` Header Validation:** The WebSocket upgrade handler validates that the `Host` header is `127.0.0.1` or `localhost` (blocking DNS-rebinding requests from external domains pointed at `127.0.0.1`). It also checks the `Origin` header, allowing only `http://127.0.0.1`, `http://localhost`, or `Origin: null` (which Servo sends for `lotus-resource://` custom-protocol pages). Because browser contexts like sandboxed iframes or `data:` URLs also send `Origin: null`, the `Origin` check is strictly secondary; the random session token and origin-gated script injection do the actual work.
+### Track 1: Trusted In-Process Windows & Panes
+For trusted local UI (`lotus-resource://` and `localhost`), Node.js runs alongside Servo in the main process with high-speed direct IPC:
+1. **Per-Session Ephemeral UUID Token:** On startup, Rust generates a random UUID v4 token. Any local process or WebSocket upgrade request on `127.0.0.1` without the exact token is rejected with `401 Unauthorized`.
+2. **Origin-Scoped Token Injection:** The `UserScript` populating `window.lotus.token` only runs on `lotus-resource:` and `localhost`/`127.0.0.1`. Remote origins (such as `https://example.com`) never receive credentials.
+3. **`Host` and `Origin` Header Validation:** The WebSocket upgrade handler validates that `Host` strictly targets `127.0.0.1` or `localhost` (preventing DNS rebinding).
+
+### Track 2: Process-Isolated Sandboxed Panes (`sandbox: true`)
+When embedding external websites, user-submitted HTML, or third-party web apps, set `sandbox: true` when creating the pane:
+```javascript
+const webPane = win.createPane('browser', {
+    url: 'https://untrusted-site.org',
+    sandbox: true,                       // Spawns in an unprivileged, sandboxed child engine
+    allowedChannels: ['vault'],          // Strictly whitelist authorized capability channels
+    trustedOrigins: ['https://untrusted-site.org']
+});
+```
+* **OS-Level Hardened Sandbox:** Runs inside `CLONE_NEWUSER`, `CLONE_NEWNET`, and `CLONE_NEWPID` namespaces with zero capabilities, Landlock filesystem jailing (zero write access, dedicated `0o700` sandbox dir, no host `/tmp` access), and Stage B Seccomp BPF filters across all 77 Servo threads.
+* **Double-Mapped Shared Memory (SHM):** Frame pixels stream to the OpenGL compositor through read-only sealed `memfd` buffers (`0o400` + `SYS_fchmod` lockout), providing tear-free 60+ FPS rendering without network hops.
+* **Anti-SSRF NetworkBroker:** Network egress is proxy-routed through `NetworkBroker` on the host, enforcing DNS socket pinning, blocking loopback and private IP ranges (RFC 1918), and enforcing a 64 MiB payload cap.
+* **Capability Gating & Single-Use Tickets:** Sandboxed pages authenticate via `/ipc/handshake` with a constant-time bootstrap secret, receiving a single-use 256-bit ticket to upgrade to `/ipc/secure-ws`. Calls are restricted strictly to declared `allowedChannels`, and the client-side bridge uses call-stack inspection (`verifyTopRealm`) to block same-origin or `about:srcdoc` `<iframe>` attacks.
+* **Automatic Crash Recovery:** If the sandboxed engine crashes or panics, the host supervisor detects the fault, cleans up descriptors, and transparently recovers on the next navigation without crashing your application.
 
 ---
 

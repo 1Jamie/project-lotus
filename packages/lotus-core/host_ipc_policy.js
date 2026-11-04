@@ -268,7 +268,7 @@ class HostSurfaceTracker {
     createSurface(surfaceId, options = {}) {
         const surface = {
             surfaceId,
-            secure: options.secure === true,
+            secure: options.sandbox === true || options.secure === true,
             navigationState: 'committed',
             activeDocumentId: options.documentId || `doc-${crypto.randomBytes(8).toString('hex')}`,
             currentOrigin: options.origin ? normalizeOrigin(options.origin) : 'null',

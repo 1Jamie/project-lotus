@@ -375,8 +375,8 @@ function detectLinuxThemeNode() {
  */
 function validatePlatformSecurityIsolation(options = {}) {
     if (!options || typeof options !== 'object') return;
-    const isSecure = options.secure === true;
-    const separateProcess = options.separateProcess !== false; // defaults to true when secure: true
+    const isSecure = options.secure === true || options.sandbox === true;
+    const separateProcess = options.separateProcess !== false; // defaults to true when sandbox/secure: true
     if (!isSecure || !separateProcess) {
         return;
     }
@@ -1285,9 +1285,9 @@ class ServoWindow extends EventEmitter {
                 if (paneObj) paneObj.surfaceId = surfaceId;
 
                 hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
-                    secure: finalOptions.secure === true,
-                    allowedChannels: this._allowedChannels,
-                    trustedOrigins: this._trustedOrigins
+                    secure: p.sandbox === true || p.secure === true || finalOptions.sandbox === true || finalOptions.secure === true,
+                    allowedChannels: p.allowedChannels || this._allowedChannels,
+                    trustedOrigins: p.trustedOrigins || this._trustedOrigins
                 });
 
                 const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
@@ -1329,7 +1329,7 @@ class ServoWindow extends EventEmitter {
             throw new Error(`Pane with id '${id}' already exists`);
         }
         const { url = 'about:blank', x = 0, y = 0, width = 0, height = 0, zIndex = 0, anchor = 0, dockOrder = 0, visible = true } = options;
-        const isSecure = options.secure === true || (this._finalOptions && this._finalOptions.secure === true);
+        const isSecure = options.sandbox === true || options.secure === true || (this._finalOptions && (this._finalOptions.sandbox === true || this._finalOptions.secure === true));
         const surfaceId = `${this.id}:${id}`;
 
         const pane = new Pane(this, id, visible);

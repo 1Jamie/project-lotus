@@ -21,6 +21,7 @@ class SecureConstellationManager extends EventEmitter {
         this._engineInstanceId = 0;
         this._refCount = 0;
         this._surfaces = new Map(); // surfaceId -> surfaceInfo
+        this._isolatedInstances = new Map(); // surfaceId -> { instance, instanceId, surfaceInfo }
         this._idleTimer = null;
         this._spawnPromise = null;
     }
@@ -77,11 +78,84 @@ class SecureConstellationManager extends EventEmitter {
         }
     }
 
+    _attachControlStream(instance) {
+        let engineDataBuffer = '';
+        instance.controlStream.on('data', (chunk) => {
+            engineDataBuffer += chunk.toString('utf8');
+            if (engineDataBuffer.length > 64 * 1024) {
+                console.error('[SecureConstellationManager] engineDataBuffer exceeded 64 KiB, terminating');
+                instance.terminate().catch(() => {});
+                return;
+            }
+            const lines = engineDataBuffer.split('\n');
+            engineDataBuffer = lines.pop();
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                    const evt = JSON.parse(line.trim());
+                    this._handleEngineEvent(evt);
+                } catch {}
+            }
+        });
+    }
+
     /**
-     * Lazily acquires or spawns the shared PID_secure_engine instance.
+     * Lazily acquires or spawns the shared PID_secure_engine instance, or spawns a dedicated
+     * isolated engine process when `surfaceInfo.isolated === true`.
      * Increments reference count and returns the active instance tagged with monotonic engineInstanceId.
      */
     async acquireSecureEngine(surfaceId, surfaceInfo = {}) {
+        // Dedicated isolated sandbox mode (`isolated: true`):
+        // Spawns an independent lotus-supervisor + lotus-engine process pair with its own
+        // user/PID/net/mount/IPC namespaces, private /tmp sandbox dir, and failure domain.
+        if (surfaceInfo && surfaceInfo.isolated === true) {
+            this._engineInstanceId++;
+            const instanceId = this._engineInstanceId;
+
+            const lotusCore = require('./lotus.js');
+            const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
+
+            const instance = await spawnSandboxedEngine({
+                supervisorBin: this.supervisorBin,
+                engineBin: this.engineBin,
+                passFds: [],
+                engineArgs: [],
+                networkBroker: this.networkBroker,
+                allowLocalhost: this.allowLocalhost,
+                ipcPort,
+            });
+
+            this._isolatedInstances.set(surfaceId, {
+                instance,
+                instanceId,
+                surfaceInfo,
+            });
+
+            this._attachControlStream(instance);
+
+            instance.supervisor.once('exit', (code, sig) => {
+                if (!this._isolatedInstances.has(surfaceId)) return;
+                this._isolatedInstances.delete(surfaceId);
+                this.emit('crashed', {
+                    instanceId,
+                    code,
+                    sig,
+                    surfaces: [surfaceId],
+                    isolated: true,
+                });
+            });
+
+            this._sendCreateSurface(instance, surfaceId, surfaceInfo);
+
+            return {
+                instance,
+                instanceId,
+                enginePid: instance.enginePid,
+                enginePort: instance.enginePort,
+                isolated: true,
+            };
+        }
+
         if (this._idleTimer) {
             clearTimeout(this._idleTimer);
             this._idleTimer = null;
@@ -97,6 +171,7 @@ class SecureConstellationManager extends EventEmitter {
                 instanceId: this._engineInstanceId,
                 enginePid: this._activeInstance.enginePid,
                 enginePort: this._activeInstance.enginePort,
+                isolated: false,
             };
         }
 
@@ -131,24 +206,7 @@ class SecureConstellationManager extends EventEmitter {
 
             this._activeInstance = instance;
 
-            let engineDataBuffer = '';
-            instance.controlStream.on('data', (chunk) => {
-                engineDataBuffer += chunk.toString('utf8');
-                if (engineDataBuffer.length > 64 * 1024) {
-                    console.error('[SecureConstellationManager] engineDataBuffer exceeded 64 KiB, terminating');
-                    instance.terminate().catch(() => {});
-                    return;
-                }
-                const lines = engineDataBuffer.split('\n');
-                engineDataBuffer = lines.pop();
-                for (const line of lines) {
-                    if (!line.trim()) continue;
-                    try {
-                        const evt = JSON.parse(line.trim());
-                        this._handleEngineEvent(evt);
-                    } catch {}
-                }
-            });
+            this._attachControlStream(instance);
 
             // Handle supervisor or engine crash
             instance.supervisor.once('exit', (code, sig) => {
@@ -160,6 +218,7 @@ class SecureConstellationManager extends EventEmitter {
                 instanceId,
                 enginePid: instance.enginePid,
                 enginePort: instance.enginePort,
+                isolated: false,
             };
         })();
 
@@ -175,10 +234,21 @@ class SecureConstellationManager extends EventEmitter {
     }
 
     /**
-     * Releases a reference to the shared secure engine.
-     * When refCount hits 0, starts the idle teardown cooldown timer.
+     * Releases a reference to the shared secure engine (or terminates a dedicated isolated engine).
+     * When shared refCount hits 0, starts the idle teardown cooldown timer.
      */
     async releaseSecureEngine(surfaceId) {
+        if (this._isolatedInstances.has(surfaceId)) {
+            const entry = this._isolatedInstances.get(surfaceId);
+            this._isolatedInstances.delete(surfaceId);
+            if (entry && entry.instance) {
+                try {
+                    await entry.instance.terminate();
+                } catch {}
+            }
+            return;
+        }
+
         this._surfaces.delete(surfaceId);
         if (this._refCount > 0) {
             this._refCount--;
@@ -240,7 +310,8 @@ class SecureConstellationManager extends EventEmitter {
 
     _handleEngineEvent(evt) {
         if (!evt || !evt.type) return;
-        const surfaceInfo = this._surfaces.get(evt.surface_id);
+        const surfaceInfo = this._surfaces.get(evt.surface_id)
+            || this._isolatedInstances.get(evt.surface_id)?.surfaceInfo;
         const pane = surfaceInfo?.pane;
 
         if (evt.type === 'LoadStatus') {

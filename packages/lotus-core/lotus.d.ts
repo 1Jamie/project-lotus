@@ -31,6 +31,20 @@ export interface PaneOptions {
   visible: boolean;
   anchor?: Anchor;
   dockOrder?: number;
+  /**
+   * Run the pane inside a process-isolated, OS-sandboxed engine
+   * (Landlock FS jailing, CLONE_NEWNET network namespace, Seccomp BPF syscall lockdown,
+   * zero host /tmp access, and anti-SSRF NetworkBroker HTTP proxy).
+   */
+  sandbox?: boolean;
+  /** Deprecated alias for `sandbox` */
+  secure?: boolean;
+  /** Track 2 authorized capability channels (e.g. ['vault', 'telemetry']) */
+  allowedChannels?: string[];
+  /** Allowed origins for Track 2 IPC */
+  trustedOrigins?: string[];
+  /** Run in a separate process (defaults to true when sandbox is enabled) */
+  separateProcess?: boolean;
 }
 
 export interface SelectMenuTheme {
@@ -117,6 +131,12 @@ export interface WindowOptions {
   frame?: boolean;
   selectMenu?: SelectMenuOptions;
   scrollbars?: boolean | ScrollbarOptions;
+  /** Run panes inside a process-isolated, OS-sandboxed engine */
+  sandbox?: boolean;
+  /** Deprecated alias for `sandbox` */
+  secure?: boolean;
+  /** Track 2 authorized capability channels */
+  allowedChannels?: string[];
   trustedOrigins?: string[];
 }
 
@@ -243,12 +263,12 @@ export const app: {
   getSystemTheme(): 'light' | 'dark';
   initVfs(options?: { required?: boolean }): boolean;
   isVfsInitialized(): boolean;
-  validatePlatformSecurityIsolation(options?: { secure?: boolean; separateProcess?: boolean }): void;
+  validatePlatformSecurityIsolation(options?: { sandbox?: boolean; secure?: boolean; separateProcess?: boolean }): void;
   detectLinuxThemeNode(): 'light' | 'dark' | null;
   spawnSandboxedEngine(options?: any): Promise<any>;
 };
 
-export function validatePlatformSecurityIsolation(options?: { secure?: boolean; separateProcess?: boolean }): void;
+export function validatePlatformSecurityIsolation(options?: { sandbox?: boolean; secure?: boolean; separateProcess?: boolean }): void;
 export function detectLinuxThemeNode(): 'light' | 'dark' | null;
 export function spawnSandboxedEngine(options?: any): Promise<any>;
 export const launcher: any;

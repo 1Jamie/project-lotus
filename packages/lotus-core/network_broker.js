@@ -883,7 +883,6 @@ class NetworkBroker {
                 const targetPort = parseInt(parsed.port, 10) || 80;
                 const isHostIpcHandshake = options.ipcPort &&
                     (cleanHostname === '127.0.0.1' || cleanHostname === 'localhost') &&
-                    targetPort === options.ipcPort &&
                     parsed.pathname === '/ipc/handshake';
 
                 let pinnedIp = null;
@@ -926,15 +925,22 @@ class NetworkBroker {
                 const topOrigin = normalizeOrigin(targetUrl);
                 const reqHeaders = { ...req.headers };
                 delete reqHeaders['proxy-connection'];
+                if (isHostIpcHandshake) {
+                    reqHeaders['host'] = `127.0.0.1:${options.ipcPort}`;
+                }
 
-                if (surfaceId && topOrigin) {
+                if (surfaceId && topOrigin && !isHostIpcHandshake) {
                     const cookieHdr = this.cookieStore.getCookieHeader(surfaceId, topOrigin, targetUrl);
                     if (cookieHdr) {
                         reqHeaders['cookie'] = cookieHdr;
                     }
                 }
 
-                const proxyReq = http.request(targetUrl, {
+                const requestTargetUrl = isHostIpcHandshake
+                    ? `http://127.0.0.1:${options.ipcPort}/ipc/handshake`
+                    : targetUrl;
+
+                const proxyReq = http.request(requestTargetUrl, {
                     method: req.method,
                     headers: reqHeaders,
                     agent: this._httpAgent,

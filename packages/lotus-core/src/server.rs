@@ -276,7 +276,24 @@ async fn handle_ipc(
 
 async fn handle_resource(
     Path(path): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    if let Some(origin_val) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        let trusted_set = get_trusted_origins();
+        let is_trusted = if origin_val == "null" {
+            trusted_set.contains("lotus-resource://localhost")
+        } else if let Some(norm) = normalize_origin(origin_val) {
+            trusted_set.contains(&norm)
+        } else {
+            false
+        };
+
+        if !is_trusted {
+            warn!("Rust: Rejected resource request from untrusted origin: {}", origin_val);
+            return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+        }
+    }
+
     let root = env::current_dir().unwrap_or_default();
     let mut full_path = root.clone();
     full_path.push(path.trim_start_matches('/'));
