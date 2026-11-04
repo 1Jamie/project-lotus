@@ -222,6 +222,40 @@ impl WindowHandle {
     }
 
     #[napi]
+    pub fn create_remote_pane(
+        &self,
+        pane_id: String,
+        ro_fd: i32,
+        shm_size: i64,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        z_index: i32,
+        anchor: Option<u32>,
+        dock_order: Option<u32>,
+        visible: Option<bool>,
+    ) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let rect: euclid::Rect<f32, servo::DeviceIndependentPixel> = euclid::Rect::new(
+                euclid::Point2D::new(x as f32, y as f32),
+                euclid::Size2D::new(width as f32, height as f32),
+            );
+            let _ = proxy.send_event(EngineCommand::CreateRemotePane {
+                window_id: self.id.clone(),
+                pane_id,
+                ro_fd,
+                shm_size: shm_size as usize,
+                rect,
+                z_index,
+                anchor: PaneAnchor::from(anchor.unwrap_or(0)),
+                dock_order: dock_order.unwrap_or(0),
+                visible: visible.unwrap_or(true),
+            });
+        }
+    }
+
+    #[napi]
     pub fn update_select_control(&self, control_id: String, selected_indices: Vec<u32>) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::UpdateSelectControl {
@@ -564,4 +598,41 @@ pub fn create_window(options: WindowOptions) -> WindowHandle {
     WindowHandle {
         id: window_id,
     }
+}
+
+// ------------------------------------------------------------------
+// REMOTE PANE SHARED MEMORY ALLOCATION
+// ------------------------------------------------------------------
+
+#[napi(object)]
+pub struct ShmPlaneAllocation {
+    pub rw_fd: i32,
+    pub ro_fd: i32,
+    pub total_size: i64,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[napi]
+pub fn allocate_remote_pane_shm(name: String, width: u32, height: u32) -> napi::Result<ShmPlaneAllocation> {
+    let geom = lotus_supervisor::shm::calculate_shm_geometry(width, height)
+        .map_err(|e| napi::Error::from_reason(format!("Invalid SHM geometry: {}", e)))?;
+    let total_size = 256 + geom.total_pixel_bytes;
+    let plane = lotus_supervisor::shm::SealedMemfdPlane::new(&name, total_size)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to create SealedMemfdPlane: {}", e)))?;
+
+    // Duplicate descriptors so dropping plane doesn't close them prematurely
+    let rw_fd = unsafe { libc::dup(plane.rw_fd) };
+    let ro_fd = unsafe { libc::dup(plane.ro_fd) };
+    if rw_fd < 0 || ro_fd < 0 {
+        return Err(napi::Error::from_reason("dup failed"));
+    }
+
+    Ok(ShmPlaneAllocation {
+        rw_fd,
+        ro_fd,
+        total_size: total_size as i64,
+        width,
+        height,
+    })
 }

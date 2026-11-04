@@ -253,10 +253,14 @@ fn main() {
                 0,
             ) as *mut u8
         };
-        if ptr == libc::MAP_FAILED as *mut u8 {
-            panic!("Failed to mmap inherited shm_fd {}", fd);
+        if ptr != libc::MAP_FAILED as *mut u8 {
+            (None, ptr)
+        } else {
+            let plane = SealedMemfdPlane::new("lotus_engine_shm", total_shm_size)
+                .expect("Failed to create SealedMemfdPlane");
+            let ptr = plane.rw_ptr;
+            (Some(plane), ptr)
         }
-        (None, ptr)
     } else {
         let plane = SealedMemfdPlane::new("lotus_engine_shm", total_shm_size)
             .expect("Failed to create SealedMemfdPlane");

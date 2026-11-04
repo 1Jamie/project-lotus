@@ -151,6 +151,8 @@ fn main() {
         "/etc/ld.so.cache",
         "/etc/ld.so.conf",
         "/etc/ld.so.conf.d",
+        "/etc/ssl",
+        "/etc/pki",
     ];
     for p in &ro_system_paths {
         if let Ok(d) = landlock::open_landlock_dir(p, false) {
@@ -165,17 +167,25 @@ fn main() {
             }
         }
     }
+    // Allow current working directory (for assets/resources)
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cwd_str) = cwd.to_str() {
+            if let Ok(d) = landlock::open_landlock_dir(cwd_str, false) {
+                landlock_fds.push(d);
+            }
+        }
+    }
     if let Some(ref cache) = config.cache_dir {
         let _ = fs::create_dir_all(cache);
         if let Ok(d) = landlock::open_landlock_dir(cache, true) {
             landlock_fds.push(d);
         }
     }
-    if let Some(ref temp) = config.temp_dir {
-        let _ = fs::create_dir_all(temp);
-        if let Ok(d) = landlock::open_landlock_dir(temp, true) {
-            landlock_fds.push(d);
-        }
+    // Allow /tmp for temporary files (or explicit temp_dir)
+    let temp_path = config.temp_dir.as_deref().unwrap_or("/tmp");
+    let _ = fs::create_dir_all(temp_path);
+    if let Ok(d) = landlock::open_landlock_dir(temp_path, true) {
+        landlock_fds.push(d);
     }
 
     // 2. Create coordination pipes

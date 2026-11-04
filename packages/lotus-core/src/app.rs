@@ -44,7 +44,7 @@ use crate::window::{
 use crate::layout::{PaneAnchor, StagedLayout};
 use crate::server::{WS_SENDERS, WS_PENDING};
 use crate::delegate::LotusPaneDelegate;
-use crate::gl;
+use crate::gl::{self, RemotePaneConsumer};
 use crate::vfs::{ByteLimitedLruCache, EncryptedVfs};
 use crate::window_state::{self, WindowStateManager};
 use crate::platform;
@@ -1020,6 +1020,17 @@ pub enum EngineCommand {
 
     // Pane-specific commands
     CreatePane(String, String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>, i32, PaneAnchor, u32, bool), // window_id, pane_id, url, rect, z_index, anchor, dock_order, visible
+    CreateRemotePane {
+        window_id: String,
+        pane_id: String,
+        ro_fd: std::os::unix::io::RawFd,
+        shm_size: usize,
+        rect: euclid::Rect<f32, servo::DeviceIndependentPixel>,
+        z_index: i32,
+        anchor: PaneAnchor,
+        dock_order: u32,
+        visible: bool,
+    },
     RemovePane(String, String), // window_id, pane_id
     SetPaneRect(String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>), // window_id, pane_id, rect
     SetPaneVisible(String, String, bool), // window_id, pane_id, visible
@@ -2048,6 +2059,81 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         ghost_tex_size: None,
                         is_remote: false,
                         remote_consumer: None,
+                    };
+                    instance.panes.insert(pane_id, pane);
+                    let physical_size = instance.window.inner_size();
+                    let scale_factor = instance.window.scale_factor() as f32;
+                    instance.recalculate_layout(physical_size, scale_factor);
+                    instance.window.request_redraw();
+                }
+            },
+            EngineCommand::CreateRemotePane {
+                window_id,
+                pane_id,
+                ro_fd,
+                shm_size,
+                rect,
+                z_index,
+                anchor,
+                dock_order,
+                visible,
+            } => {
+                let servo = self.ensure_servo().clone();
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if pane_id == "main" {
+                        instance.auto_resize_main = false;
+                    }
+
+                    let hidpi_scale_factor_val = instance.window.scale_factor() as f32;
+                    let width = (rect.size.width * hidpi_scale_factor_val).round() as u32;
+                    let height = (rect.size.height * hidpi_scale_factor_val).round() as u32;
+                    let servo_size = ServoPhysicalSize::new(width.max(1), height.max(1));
+                    let offscreen_ctx = Rc::new(instance.rendering_context.offscreen_context(servo_size));
+
+                    let consumer = match RemotePaneConsumer::new(ro_fd, shm_size, width.max(1), height.max(1)) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            error!("Rust: Failed to create RemotePaneConsumer for pane '{}': {:?}", pane_id, e);
+                            None
+                        }
+                    };
+
+                    let dummy_webview = WebViewBuilder::new(&servo, offscreen_ctx.clone()).build();
+
+                    let pane = PaneInstance {
+                        id: pane_id.clone(),
+                        webview: dummy_webview,
+                        rect,
+                        last_notified_rect: None,
+                        last_physical_rect: euclid::default::Rect::new(
+                            euclid::default::Point2D::new(0, 0),
+                            euclid::default::Size2D::new(servo_size.width as i32, servo_size.height as i32),
+                        ),
+                        z_index,
+                        anchor,
+                        dock_order,
+                        animating: false,
+                        is_dirty: true,
+                        needs_repaint: true,
+                        is_visible: visible,
+                        drag_regions: Vec::new(),
+                        no_drag_regions: Vec::new(),
+                        offscreen_ctx,
+                        servo_busy: false,
+                        pending_servo_size: None,
+                        requested_servo_size: servo_size,
+                        current_servo_size: servo_size,
+                        ready_to_repaint: Arc::new(AtomicBool::new(true)),
+                        ready_frame_size: None,
+                        first_frame_painted: true,
+                        first_frame_painted_time: None,
+                        pending_physical_rect: None,
+                        is_resizing: false,
+                        pending_visible: visible,
+                        ghost_tex: None,
+                        ghost_tex_size: None,
+                        is_remote: true,
+                        remote_consumer: consumer,
                     };
                     instance.panes.insert(pane_id, pane);
                     let physical_size = instance.window.inner_size();

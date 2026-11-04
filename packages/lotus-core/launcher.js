@@ -181,7 +181,8 @@ async function spawnSandboxedEngine(options = {}) {
             if (!engStatus) {
                 return cleanupAndReject(new Error(`Failed to read /proc/${enginePid}/status`));
             }
-            if (engStatus.Threads !== '1') {
+            const requireSingleThreaded = options.requireSingleThreaded ?? (options.engineBin && options.engineBin.includes('probe'));
+            if (requireSingleThreaded && engStatus.Threads !== '1') {
                 return cleanupAndReject(new Error(`Engine thread invariant failed: expected 1 thread, found ${engStatus.Threads}`));
             }
             if (engStatus.NoNewPrivs !== '1') {

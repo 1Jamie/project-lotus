@@ -52,9 +52,15 @@ if (process.platform === 'win32') {
 }
 
 
-const { App, createWindow } = require('./index.js');
+const { App, createWindow, allocateRemotePaneShm } = require('./index.js');
+const { SecureConstellationManager } = require('./secure_constellation.js');
 const EventEmitter = require('events');
 const crypto = require('node:crypto');
+
+const defaultSecureConstellation = new SecureConstellationManager({
+    engineBin: path.resolve(__dirname, '../lotus-engine/target/debug/lotus-engine'),
+    supervisorBin: path.resolve(__dirname, '../lotus-supervisor/target/debug/lotus-supervisor'),
+});
 let msgpackr;
 try {
     msgpackr = require('msgpackr');
@@ -954,6 +960,9 @@ class Pane extends EventEmitter {
         this.visible = Boolean(visible);
         this._pendingNavId = null;
         this._pendingUrl = null;
+        this.isRemote = false;
+        this._engineInstance = null;
+        this._shm = null;
     }
 
     loadUrl(url) {
@@ -961,7 +970,29 @@ class Pane extends EventEmitter {
         this._pendingNavId = navId;
         this._pendingUrl = url;
         hostIpcRouter.surfaceTracker.startNavigation(this.surfaceId, navId, url);
-        this.window.handle.loadUrlInPane(this.id, url);
+        if (this.isRemote && this._engineInstance) {
+            try {
+                this._engineInstance.controlStream.write(JSON.stringify({
+                    type: 'Navigate',
+                    surface_id: this.surfaceId,
+                    navigation_id: 1,
+                    url,
+                }) + '\n');
+            } catch {}
+        } else {
+            this.window.handle.loadUrlInPane(this.id, url);
+        }
+    }
+
+    sendInput(event) {
+        if (this.isRemote && this._engineInstance) {
+            try {
+                this._engineInstance.controlStream.write(JSON.stringify({
+                    type: 'Input',
+                    event,
+                }) + '\n');
+            } catch {}
+        }
     }
 
     executeScript(script) {
@@ -1229,14 +1260,48 @@ class ServoWindow extends EventEmitter {
             throw new Error(`Pane with id '${id}' already exists`);
         }
         const { url = 'about:blank', x = 0, y = 0, width = 0, height = 0, zIndex = 0, anchor = 0, dockOrder = 0, visible = true } = options;
-        this.handle.createPane(id, url, x, y, width, height, zIndex, anchor, dockOrder, visible);
-        const pane = new Pane(this, id, visible);
+        const isSecure = options.secure === true || (this._finalOptions && this._finalOptions.secure === true);
         const surfaceId = `${this.id}:${id}`;
+
+        const pane = new Pane(this, id, visible);
         pane.surfaceId = surfaceId;
+        pane.isRemote = isSecure;
+
+        if (isSecure && typeof allocateRemotePaneShm === 'function') {
+            const shmWidth = Math.max(1, width || this._logicalWidth || 800);
+            const shmHeight = Math.max(1, height || this._logicalHeight || 600);
+            const shm = allocateRemotePaneShm(surfaceId, shmWidth, shmHeight);
+            pane._shm = shm;
+
+            this.handle.createRemotePane(id, shm.roFd, shm.totalSize, x, y, width, height, zIndex, anchor, dockOrder, visible);
+
+            defaultSecureConstellation.acquireSecureEngine(surfaceId, {
+                pane,
+                url,
+                shm,
+            }).then(engineRes => {
+                pane._engineInstance = engineRes.instance;
+                if (url && url !== 'about:blank') {
+                    try {
+                        engineRes.instance.controlStream.write(JSON.stringify({
+                            type: 'Navigate',
+                            surface_id: surfaceId,
+                            navigation_id: 1,
+                            url,
+                        }) + '\n');
+                    } catch {}
+                }
+            }).catch(err => {
+                pane.emit('error', err);
+            });
+        } else {
+            this.handle.createPane(id, url, x, y, width, height, zIndex, anchor, dockOrder, visible);
+        }
+
         this.panes.set(id, pane);
 
         hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
-            secure: options.secure === true || (this._finalOptions && this._finalOptions.secure === true),
+            secure: isSecure,
             allowedChannels: options.allowedChannels || this._allowedChannels || ['vault', 'telemetry'],
             trustedOrigins: options.trustedOrigins || this._trustedOrigins || []
         });
@@ -1258,7 +1323,11 @@ class ServoWindow extends EventEmitter {
             throw new Error("Cannot remove the 'main' pane");
         }
         if (this.panes.has(id)) {
+            const pane = this.panes.get(id);
             const surfaceId = `${this.id}:${id}`;
+            if (pane && pane.isRemote) {
+                defaultSecureConstellation.releaseSecureEngine(surfaceId);
+            }
             hostIpcRouter.surfaceTracker.removeSurface(surfaceId);
             this.handle.removePane(id);
             this.panes.delete(id);
@@ -1620,6 +1689,11 @@ class ServoWindow extends EventEmitter {
     }
 
     close() {
+        for (const pane of this.panes.values()) {
+            if (pane && pane.isRemote) {
+                defaultSecureConstellation.releaseSecureEngine(pane.surfaceId);
+            }
+        }
         this.handle.close();
     }
 
@@ -1784,7 +1858,9 @@ module.exports = {
         secureConstellation: require('./secure_constellation.js'),
         originDerivation: require('./origin_derivation.js'),
         hostIpcPolicy,
-        hostIpcRouter
+        hostIpcRouter,
+        defaultSecureConstellation,
+        allocateRemotePaneShm,
     },
     validatePlatformSecurityIsolation,
     detectLinuxThemeNode,
@@ -1794,5 +1870,7 @@ module.exports = {
     secureConstellation: require('./secure_constellation.js'),
     originDerivation: require('./origin_derivation.js'),
     hostIpcPolicy,
-    hostIpcRouter
+    hostIpcRouter,
+    defaultSecureConstellation,
+    allocateRemotePaneShm,
 };
