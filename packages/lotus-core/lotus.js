@@ -52,7 +52,7 @@ if (process.platform === 'win32') {
 }
 
 
-const { App, createWindow, allocateRemotePaneShm } = require('./index.js');
+const { App, createWindow, allocateRemotePaneShm, createControlSocketPair, sendFdsOverSocket } = require('./index.js');
 const { SecureConstellationManager } = require('./secure_constellation.js');
 const EventEmitter = require('events');
 const crypto = require('node:crypto');
@@ -1863,6 +1863,8 @@ module.exports = {
         hostIpcRouter,
         defaultSecureConstellation,
         allocateRemotePaneShm,
+        createControlSocketPair,
+        sendFdsOverSocket,
     },
     validatePlatformSecurityIsolation,
     detectLinuxThemeNode,
@@ -1875,4 +1877,6 @@ module.exports = {
     hostIpcRouter,
     defaultSecureConstellation,
     allocateRemotePaneShm,
+    createControlSocketPair,
+    sendFdsOverSocket,
 };

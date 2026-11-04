@@ -48,6 +48,27 @@ class SecureConstellationManager extends EventEmitter {
         if (this._activeInstance && !this._activeInstance._isTerminated) {
             this._refCount++;
             this._surfaces.set(surfaceId, surfaceInfo);
+
+            if (surfaceInfo?.shm && this._activeInstance.controlFd) {
+                const pixelRwFd = surfaceInfo.shm.pixelRwFd ?? surfaceInfo.shm.rwFd;
+                const ackRoFd = surfaceInfo.shm.ackRoFd;
+                const lotusCore = require('./lotus.js');
+                if (typeof lotusCore.sendFdsOverSocket === 'function' && typeof pixelRwFd === 'number' && typeof ackRoFd === 'number') {
+                    const msg = JSON.stringify({
+                        type: 'CreateSurface',
+                        surface_id: surfaceId,
+                        width: surfaceInfo.shm.width || 800,
+                        height: surfaceInfo.shm.height || 600,
+                        url: surfaceInfo.url || 'about:blank',
+                    }) + '\n';
+                    try {
+                        lotusCore.sendFdsOverSocket(this._activeInstance.controlFd, [pixelRwFd, ackRoFd], msg);
+                    } catch (e) {
+                        console.error('[SecureConstellationManager] sendFdsOverSocket error:', e);
+                    }
+                }
+            }
+
             return {
                 instance: this._activeInstance,
                 instanceId: this._engineInstanceId,
@@ -104,6 +125,20 @@ class SecureConstellationManager extends EventEmitter {
 
             this._activeInstance = instance;
 
+            let engineDataBuffer = '';
+            instance.controlStream.on('data', (chunk) => {
+                engineDataBuffer += chunk.toString('utf8');
+                const lines = engineDataBuffer.split('\n');
+                engineDataBuffer = lines.pop();
+                for (const line of lines) {
+                    if (!line.trim()) continue;
+                    try {
+                        const evt = JSON.parse(line.trim());
+                        this._handleEngineEvent(evt);
+                    } catch {}
+                }
+            });
+
             // Handle supervisor or engine crash
             instance.supervisor.once('exit', (code, sig) => {
                 this._handleEngineCrash(instanceId, code, sig);
@@ -135,6 +170,15 @@ class SecureConstellationManager extends EventEmitter {
         this._surfaces.delete(surfaceId);
         if (this._refCount > 0) {
             this._refCount--;
+        }
+
+        if (this._activeInstance && this._activeInstance.controlStream && !this._activeInstance.controlStream.destroyed) {
+            try {
+                this._activeInstance.controlStream.write(JSON.stringify({
+                    type: 'DestroySurface',
+                    surface_id: surfaceId,
+                }) + '\n');
+            } catch {}
         }
 
         if (this._refCount === 0 && this.isRunning) {
@@ -180,6 +224,59 @@ class SecureConstellationManager extends EventEmitter {
             sig,
             surfaces: crashedSurfaces,
         });
+    }
+
+    _handleEngineEvent(evt) {
+        if (!evt || !evt.type) return;
+        const surfaceInfo = this._surfaces.get(evt.surface_id);
+        const pane = surfaceInfo?.pane;
+
+        if (evt.type === 'LoadStatus') {
+            const finalUrl = evt.url;
+            const surfaceId = evt.surface_id;
+            const lotusCore = require('./lotus.js');
+
+            if (evt.status === 'complete') {
+                if (pane) {
+                    const navId = pane._pendingNavId;
+                    pane._pendingNavId = null;
+                    pane._pendingUrl = null;
+                    try {
+                        if (lotusCore.hostIpcRouter && lotusCore.hostIpcRouter.surfaceTracker) {
+                            lotusCore.hostIpcRouter.surfaceTracker.commitNavigation(surfaceId, navId, finalUrl);
+                        }
+                    } catch (e) {
+                        const surface = lotusCore.hostIpcRouter?.surfaceTracker?.getSurface(surfaceId);
+                        if (surface) {
+                            surface.navigationState = 'failed';
+                            surface.ipcEligible = false;
+                        }
+                    }
+                    pane.emit('load-status', 'complete');
+                }
+            } else if (evt.status === 'started') {
+                if (pane) {
+                    pane.emit('load-status', 'started');
+                }
+            } else if (evt.status === 'failed') {
+                if (pane) {
+                    pane._pendingNavId = null;
+                    pane._pendingUrl = null;
+                    if (lotusCore.hostIpcRouter?.surfaceTracker) {
+                        lotusCore.hostIpcRouter.surfaceTracker.failNavigation(surfaceId);
+                    }
+                    pane.emit('load-status', 'failed');
+                }
+            }
+        } else if (evt.type === 'TitleChanged') {
+            if (pane) {
+                pane.emit('title-changed', evt.title);
+            }
+        } else if (evt.type === 'FramePublished') {
+            if (pane) {
+                pane.emit('frame-published', evt.slot_idx, evt.pub_seq);
+            }
+        }
     }
 
     async _teardownEngine() {

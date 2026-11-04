@@ -660,3 +660,71 @@ pub fn allocate_remote_pane_shm(name: String, width: u32, height: u32) -> napi::
         height,
     })
 }
+
+#[napi(object)]
+pub struct ControlSocketPair {
+    pub host_fd: i32,
+    pub child_fd: i32,
+}
+
+#[napi]
+pub fn create_control_socket_pair() -> napi::Result<ControlSocketPair> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) } != 0 {
+        let err = unsafe { *libc::__errno_location() };
+        return Err(napi::Error::from_reason(format!("socketpair failed: errno {}", err)));
+    }
+    Ok(ControlSocketPair {
+        host_fd: fds[0],
+        child_fd: fds[1],
+    })
+}
+
+#[napi]
+pub fn send_fds_over_socket(socket_fd: i32, fds_to_send: Vec<i32>, payload: String) -> napi::Result<()> {
+    if fds_to_send.is_empty() {
+        let bytes = payload.as_bytes();
+        let ret = unsafe { libc::send(socket_fd, bytes.as_ptr() as *const _, bytes.len(), 0) };
+        if ret < 0 {
+            let err = unsafe { *libc::__errno_location() };
+            return Err(napi::Error::from_reason(format!("send failed: errno {}", err)));
+        }
+        return Ok(());
+    }
+
+    let payload_bytes = payload.as_bytes();
+    let mut iov = libc::iovec {
+        iov_base: payload_bytes.as_ptr() as *mut libc::c_void,
+        iov_len: payload_bytes.len(),
+    };
+
+    let fds_bytes_len = std::mem::size_of::<i32>() * fds_to_send.len();
+    let cmsg_space = unsafe { libc::CMSG_SPACE(fds_bytes_len as u32) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space;
+
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err(napi::Error::from_reason("CMSG_FIRSTHDR returned null"));
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fds_bytes_len as u32) as usize;
+        let data_ptr = libc::CMSG_DATA(cmsg) as *mut i32;
+        std::ptr::copy_nonoverlapping(fds_to_send.as_ptr(), data_ptr, fds_to_send.len());
+    }
+
+    let ret = unsafe { libc::sendmsg(socket_fd, &msg, 0) };
+    if ret < 0 {
+        let err = unsafe { *libc::__errno_location() };
+        return Err(napi::Error::from_reason(format!("sendmsg with SCM_RIGHTS failed: errno {}", err)));
+    }
+
+    Ok(())
+}

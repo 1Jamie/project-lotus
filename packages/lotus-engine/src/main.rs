@@ -7,8 +7,10 @@
 //! - Liveness pipe (LOTUS_LIVENESS_FD): parent-death detection via POLLHUP.
 //! - Shared Memory (RemotePaneShm): zero-copy triple-buffered RGBA8 frame publication.
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io;
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -30,7 +32,7 @@ use url::Url;
 
 use lotus_supervisor::shm::{
     calculate_shm_geometry, publish_slot, reserve_slot_for_writing, ConsumerAckHeader,
-    ProducerControlHeader,
+    ProducerControlHeader, ShmGeometry,
 };
 use lotus_supervisor::stage_b::apply_stage_b_seccomp;
 
@@ -113,6 +115,7 @@ impl EventLoopWaker for EngineWaker {
 }
 
 struct EngineDelegate {
+    surface_id: String,
     load_complete: Arc<AtomicBool>,
     frame_ready: Arc<AtomicBool>,
     last_url: Arc<Mutex<Option<String>>>,
@@ -138,6 +141,202 @@ impl WebViewDelegate for EngineDelegate {
             *self.last_title.lock().unwrap() = Some(t);
         }
     }
+}
+
+struct SurfaceState {
+    surface_id: String,
+    width: u32,
+    height: u32,
+    geom: ShmGeometry,
+    rw_ptr: *mut u8,
+    shm_size: usize,
+    consumer_ack_ptr: *const ConsumerAckHeader,
+    rendering_ctx: Rc<SoftwareRenderingContext>,
+    webview: servo::WebView,
+    last_pub_gen: [u64; 3],
+    last_pub_seq: [u64; 3],
+    current_slot: usize,
+    frame_ready: Arc<AtomicBool>,
+    load_complete: Arc<AtomicBool>,
+    last_url: Arc<Mutex<Option<String>>>,
+    last_title: Arc<Mutex<Option<String>>>,
+    paint_needed: bool,
+}
+
+impl Drop for SurfaceState {
+    fn drop(&mut self) {
+        if !self.rw_ptr.is_null() && self.shm_size > 0 {
+            unsafe {
+                libc::munmap(self.rw_ptr as *mut libc::c_void, self.shm_size);
+            }
+        }
+        if !self.consumer_ack_ptr.is_null() {
+            unsafe {
+                libc::munmap(
+                    self.consumer_ack_ptr as *mut libc::c_void,
+                    std::mem::size_of::<ConsumerAckHeader>(),
+                );
+            }
+        }
+    }
+}
+
+fn create_surface(
+    surface_id: String,
+    width: u32,
+    height: u32,
+    shm_fd: RawFd,
+    ack_fd: RawFd,
+    initial_url: Option<String>,
+    servo: &servo::Servo,
+) -> Result<SurfaceState, String> {
+    let geom = calculate_shm_geometry(width, height).map_err(|e| format!("{:?}", e))?;
+    let total_shm_size = 256 + geom.total_pixel_bytes;
+
+    let rw_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total_shm_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            shm_fd,
+            0,
+        ) as *mut u8
+    };
+    if rw_ptr == libc::MAP_FAILED as *mut u8 {
+        let err = unsafe { *libc::__errno_location() };
+        return Err(format!("mmap shm_fd failed: errno {}", err));
+    }
+
+    let prod_hdr = unsafe { &mut *(rw_ptr as *mut ProducerControlHeader) };
+    prod_hdr.pub_seq.store(0, Ordering::Relaxed);
+    prod_hdr.prod_resize_gen.store(1, Ordering::Relaxed);
+    prod_hdr.active_slots = 3;
+
+    let consumer_ack_ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            std::mem::size_of::<ConsumerAckHeader>(),
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            ack_fd,
+            0,
+        ) as *const ConsumerAckHeader
+    };
+    if consumer_ack_ptr == libc::MAP_FAILED as *const ConsumerAckHeader {
+        let err = unsafe { *libc::__errno_location() };
+        unsafe { libc::munmap(rw_ptr as *mut libc::c_void, total_shm_size) };
+        return Err(format!("mmap ack_fd failed: errno {}", err));
+    }
+
+    let rendering_ctx = Rc::new(
+        SoftwareRenderingContext::new(PhysicalSize::new(width, height))
+            .expect("SoftwareRenderingContext::new"),
+    );
+
+    let load_complete = Arc::new(AtomicBool::new(false));
+    let frame_ready = Arc::new(AtomicBool::new(false));
+    let last_url = Arc::new(Mutex::new(None));
+    let last_title = Arc::new(Mutex::new(None));
+
+    let delegate = EngineDelegate {
+        surface_id: surface_id.clone(),
+        load_complete: load_complete.clone(),
+        frame_ready: frame_ready.clone(),
+        last_url: last_url.clone(),
+        last_title: last_title.clone(),
+    };
+
+    let webview = WebViewBuilder::new(servo, rendering_ctx.clone())
+        .delegate(Rc::new(delegate))
+        .build();
+
+    if let Some(ref u_str) = initial_url {
+        if let Ok(u) = Url::parse(u_str) {
+            webview.load(u);
+        }
+    }
+
+    Ok(SurfaceState {
+        surface_id,
+        width,
+        height,
+        geom,
+        rw_ptr,
+        shm_size: total_shm_size,
+        consumer_ack_ptr,
+        rendering_ctx,
+        webview,
+        last_pub_gen: [0u64; 3],
+        last_pub_seq: [0u64; 3],
+        current_slot: 0,
+        frame_ready,
+        load_complete,
+        last_url,
+        last_title,
+        paint_needed: true,
+    })
+}
+
+fn recv_control_msg_with_fds(
+    fd: RawFd,
+    buf: &mut Vec<u8>,
+) -> Result<(Vec<String>, Vec<RawFd>), io::Error> {
+    let mut chunk = [0u8; 1024];
+    let mut iov = libc::iovec {
+        iov_base: chunk.as_mut_ptr() as *mut libc::c_void,
+        iov_len: chunk.len(),
+    };
+
+    let cmsg_space = unsafe { libc::CMSG_SPACE((std::mem::size_of::<RawFd>() * 4) as u32) as usize };
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space;
+
+    let r = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+    if r < 0 {
+        let err = unsafe { *libc::__errno_location() };
+        if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+            return Ok((vec![], vec![]));
+        }
+        return Err(io::Error::from_raw_os_error(err));
+    }
+    if r == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "control_fd EOF"));
+    }
+
+    buf.extend_from_slice(&chunk[..r as usize]);
+
+    let mut received_fds = Vec::new();
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data_ptr = libc::CMSG_DATA(cmsg) as *const RawFd;
+                let data_len = (*cmsg).cmsg_len - libc::CMSG_LEN(0) as usize;
+                let fd_count = data_len / std::mem::size_of::<RawFd>();
+                for i in 0..fd_count {
+                    received_fds.push(*data_ptr.add(i));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+
+    let mut lines = Vec::new();
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+        let s = String::from_utf8_lossy(&line_bytes[..line_bytes.len().saturating_sub(1)]).to_string();
+        if !s.trim().is_empty() {
+            lines.push(s);
+        }
+    }
+
+    Ok((lines, received_fds))
 }
 
 // =========================================================================
@@ -308,101 +507,29 @@ fn main() {
         .preferences(prefs)
         .build();
 
-    // 5. Initialize Headless Software / Offscreen Rendering Context
-    let rendering_ctx = Rc::new(
-        SoftwareRenderingContext::new(PhysicalSize::new(width, height))
-            .expect("Failed to initialize SoftwareRenderingContext"),
-    );
-
-    // 6. Map Shared Memory Region (RemotePaneShm: Pixel Plane RW, Consumer Ack Plane RO)
-    let geom = calculate_shm_geometry(width, height).expect("calculate_shm_geometry");
-    let total_shm_size = 256 + geom.total_pixel_bytes;
-
-    let rw_ptr = match config.shm_fd {
-        Some(fd) => {
-            let ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    total_shm_size,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                ) as *mut u8
-            };
-            if ptr == libc::MAP_FAILED as *mut u8 {
-                let err = unsafe { *libc::__errno_location() };
-                eprintln!("[lotus-engine] Fatal: Failed to mmap shm_fd {}: errno {}", fd, err);
+    // 5. Initialize Surfaces Map & Optional Initial Surface from CLI
+    let mut surfaces: HashMap<String, SurfaceState> = HashMap::new();
+    if let (Some(sfd), Some(afd)) = (config.shm_fd, config.ack_fd) {
+        match create_surface(
+            config.surface_id.clone(),
+            width,
+            height,
+            sfd,
+            afd,
+            Some(config.initial_url.clone()),
+            &servo,
+        ) {
+            Ok(initial_surface) => {
+                surfaces.insert(config.surface_id.clone(), initial_surface);
+            }
+            Err(e) => {
+                eprintln!("[lotus-engine] Fatal: Failed to initialize initial surface: {}", e);
                 std::process::abort();
             }
-            ptr
         }
-        None => {
-            eprintln!("[lotus-engine] Fatal: shm_fd is required");
-            std::process::abort();
-        }
-    };
-
-    // Initialize producer control header
-    let prod_hdr = unsafe { &mut *(rw_ptr as *mut ProducerControlHeader) };
-    prod_hdr.pub_seq.store(0, Ordering::Relaxed);
-    prod_hdr.prod_resize_gen.store(1, Ordering::Relaxed);
-    prod_hdr.active_slots = 3;
-
-    // Map ConsumerAckHeader from ack_fd (RO)
-    let consumer_ack_ptr = match config.ack_fd {
-        Some(fd) => {
-            let ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    std::mem::size_of::<ConsumerAckHeader>(),
-                    libc::PROT_READ,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                ) as *const ConsumerAckHeader
-            };
-            if ptr == libc::MAP_FAILED as *const ConsumerAckHeader {
-                let err = unsafe { *libc::__errno_location() };
-                eprintln!("[lotus-engine] Fatal: Failed to mmap ack_fd {}: errno {}", fd, err);
-                std::process::abort();
-            }
-            ptr
-        }
-        None => {
-            eprintln!("[lotus-engine] Fatal: ack_fd is required");
-            std::process::abort();
-        }
-    };
-
-    let consumer_ack = unsafe { &*consumer_ack_ptr };
-
-    let mut last_pub_gen = [0u64; 3];
-    let mut last_pub_seq = [0u64; 3];
-    let mut current_slot = 0usize;
-
-    // 7. Create WebView with initial URL
-    let load_complete = Arc::new(AtomicBool::new(false));
-    let frame_ready = Arc::new(AtomicBool::new(false));
-    let last_url = Arc::new(Mutex::new(None));
-    let last_title = Arc::new(Mutex::new(None));
-
-    let delegate = EngineDelegate {
-        load_complete: load_complete.clone(),
-        frame_ready: frame_ready.clone(),
-        last_url: last_url.clone(),
-        last_title: last_title.clone(),
-    };
-
-    let webview = WebViewBuilder::new(&servo, rendering_ctx.clone())
-        .delegate(Rc::new(delegate))
-        .build();
-
-    if let Ok(u) = Url::parse(&config.initial_url) {
-        webview.load(u);
     }
 
-    // 8. Attestation Gate Ready Handshake over LOTUS_CONTROL_FD
+    // 6. Attestation Gate Ready Handshake over LOTUS_CONTROL_FD
     if let Some(ctrl_fd) = config.control_fd {
         let ready_msg = b"ENGINE_READY\n";
         let _ = unsafe { libc::write(ctrl_fd, ready_msg.as_ptr() as *const _, ready_msg.len()) };
@@ -416,10 +543,10 @@ fn main() {
         }
     }
 
-    // 8. Steady-State Event & Render Loop
+    // 7. Steady-State Event & Multi-Surface Render Loop
     let mut control_read_buf = Vec::new();
+    let mut pending_fds = Vec::new();
     let mut running = true;
-    let mut paint_needed = true;
 
     while running {
         // Check Liveness FD
@@ -436,59 +563,78 @@ fn main() {
             }
         }
 
-        // Read Control Messages from LOTUS_CONTROL_FD
+        // Read Control Messages & Passed Descriptors from LOTUS_CONTROL_FD
         if let Some(ctrl_fd) = config.control_fd {
-            let mut chunk = [0u8; 512];
-            loop {
-                let r = unsafe { libc::read(ctrl_fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
-                if r > 0 {
-                    control_read_buf.extend_from_slice(&chunk[..r as usize]);
-                } else {
-                    break;
-                }
-            }
-
-            // Process complete lines
-            while let Some(idx) = control_read_buf.iter().position(|&b| b == b'\n') {
-                let line_bytes: Vec<u8> = control_read_buf.drain(..=idx).collect();
-                let line_str = String::from_utf8_lossy(&line_bytes[..line_bytes.len().saturating_sub(1)]);
-                let trimmed = line_str.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                if trimmed == "SHUTDOWN" {
-                    running = false;
-                    break;
-                }
-
-                if let Ok(msg) = serde_json::from_str::<ControlMessage>(trimmed) {
-                    match msg {
-                        ControlMessage::Navigate { url, .. } => {
-                            if let Ok(u) = Url::parse(&url) {
-                                webview.load(u);
-                                paint_needed = true;
-                            }
-                        }
-                        ControlMessage::Resize { width: new_w, height: new_h, .. } => {
-                            if new_w > 0 && new_h > 0 {
-                                webview.resize(PhysicalSize::new(new_w, new_h));
-                                paint_needed = true;
-                            }
-                        }
-                        ControlMessage::Destroy { .. } => {
+            match recv_control_msg_with_fds(ctrl_fd, &mut control_read_buf) {
+                Ok((lines, fds)) => {
+                    pending_fds.extend(fds);
+                    for trimmed in lines {
+                        if trimmed == "SHUTDOWN" {
                             running = false;
                             break;
                         }
-                        ControlMessage::Input { event } => {
-                            handle_input_event(&webview, event);
-                            paint_needed = true;
-                        }
-                        ControlMessage::Ping => {
-                            send_engine_event(ctrl_fd, &EngineEvent::Pong);
+
+                        if let Ok(msg) = serde_json::from_str::<ControlMessage>(&trimmed) {
+                            match msg {
+                                ControlMessage::CreateSurface { surface_id, width: s_w, height: s_h, url } => {
+                                    if pending_fds.len() >= 2 {
+                                        let sfd = pending_fds.remove(0);
+                                        let afd = pending_fds.remove(0);
+                                        match create_surface(surface_id.clone(), s_w, s_h, sfd, afd, url, &servo) {
+                                            Ok(surf) => {
+                                                surfaces.insert(surface_id, surf);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("[lotus-engine] Failed to create surface {}: {}", surface_id, e);
+                                                unsafe {
+                                                    libc::close(sfd);
+                                                    libc::close(afd);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        eprintln!("[lotus-engine] CreateSurface missing passed FDs for {}", surface_id);
+                                    }
+                                }
+                                ControlMessage::DestroySurface { surface_id } | ControlMessage::Destroy { surface_id } => {
+                                    surfaces.remove(&surface_id);
+                                }
+                                ControlMessage::Navigate { surface_id, url, .. } => {
+                                    if let Some(surf) = surfaces.get_mut(&surface_id) {
+                                        if let Ok(u) = Url::parse(&url) {
+                                            surf.webview.load(u);
+                                            surf.paint_needed = true;
+                                        }
+                                    }
+                                }
+                                ControlMessage::Resize { surface_id, width: new_w, height: new_h, .. } => {
+                                    if let Some(surf) = surfaces.get_mut(&surface_id) {
+                                        if new_w > 0 && new_h > 0 {
+                                            surf.width = new_w;
+                                            surf.height = new_h;
+                                            surf.webview.resize(PhysicalSize::new(new_w, new_h));
+                                            surf.paint_needed = true;
+                                        }
+                                    }
+                                }
+                                ControlMessage::Input { event } => {
+                                    let sid = event.surface_id().to_string();
+                                    if let Some(surf) = surfaces.get_mut(&sid) {
+                                        handle_input_event(&surf.webview, event);
+                                        surf.paint_needed = true;
+                                    }
+                                }
+                                ControlMessage::Ping => {
+                                    send_engine_event(ctrl_fd, &EngineEvent::Pong);
+                                }
+                            }
                         }
                     }
                 }
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                Err(_) => {}
             }
         }
 
@@ -496,54 +642,94 @@ fn main() {
         servo.spin_event_loop();
         let _ = wake_rx.recv_timeout(Duration::from_millis(5));
 
-        // Paint and Publish Frame if ready
-        if frame_ready.swap(false, Ordering::SeqCst) || paint_needed {
-            paint_needed = false;
-            let _ = rendering_ctx.make_current();
-            webview.paint();
+        // Multi-Surface LoadStatus, Title, and Frame Publication
+        for (surface_id, surf) in surfaces.iter_mut() {
+            // 1. Emit LoadStatus if load completed
+            if surf.load_complete.swap(false, Ordering::SeqCst) {
+                if let Some(ctrl_fd) = config.control_fd {
+                    let u = surf.last_url.lock().unwrap().clone();
+                    send_engine_event(
+                        ctrl_fd,
+                        &EngineEvent::LoadStatus {
+                            surface_id: surface_id.clone(),
+                            status: "complete".to_string(),
+                            url: u,
+                        },
+                    );
+                }
+            }
 
-            let rect = DeviceIntRect::from_origin_and_size(
-                DeviceIntPoint::new(0, 0),
-                DeviceIntSize::new(width as i32, height as i32),
-            );
+            // 2. Emit TitleChanged if page title changed
+            if let Some(title) = surf.last_title.lock().unwrap().take() {
+                if let Some(ctrl_fd) = config.control_fd {
+                    send_engine_event(
+                        ctrl_fd,
+                        &EngineEvent::TitleChanged {
+                            surface_id: surface_id.clone(),
+                            title,
+                        },
+                    );
+                }
+            }
 
-            if let Some(image) = rendering_ctx.read_to_image(rect) {
-                let raw_pixels = image.into_raw();
-                if raw_pixels.len() == (width as usize) * (height as usize) * 4 {
-                    let slot_idx = current_slot;
-                    if reserve_slot_for_writing(slot_idx, prod_hdr, &consumer_ack, &last_pub_gen, &last_pub_seq).is_ok() {
-                        let slot_offset = 256 + slot_idx * geom.slot_stride_bytes;
-                        let slot_ptr = unsafe { rw_ptr.add(slot_offset) };
-                        let row_bytes = (width as usize) * 4;
+            // 3. Paint and Publish Frame if ready
+            if surf.frame_ready.swap(false, Ordering::SeqCst) || surf.paint_needed {
+                surf.paint_needed = false;
+                let _ = surf.rendering_ctx.make_current();
+                surf.webview.paint();
 
-                        for y in 0..(height as usize) {
-                            let src_row = &raw_pixels[y * row_bytes..(y + 1) * row_bytes];
-                            let dst_row = unsafe { slot_ptr.add(y * geom.stride) };
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, row_bytes);
-                            }
-                        }
+                let rect = DeviceIntRect::from_origin_and_size(
+                    DeviceIntPoint::new(0, 0),
+                    DeviceIntSize::new(surf.width as i32, surf.height as i32),
+                );
 
-                        if let Ok(pub_seq) = publish_slot(
+                if let Some(image) = surf.rendering_ctx.read_to_image(rect) {
+                    let raw_pixels = image.into_raw();
+                    if raw_pixels.len() == (surf.width as usize) * (surf.height as usize) * 4 {
+                        let slot_idx = surf.current_slot;
+                        let prod_hdr = unsafe { &mut *(surf.rw_ptr as *mut ProducerControlHeader) };
+                        let consumer_ack = unsafe { &*surf.consumer_ack_ptr };
+
+                        if reserve_slot_for_writing(
                             slot_idx,
                             prod_hdr,
-                            width,
-                            height,
-                            geom.stride as u32,
-                            &mut last_pub_gen,
-                            &mut last_pub_seq,
-                        ) {
-                            if let Some(ctrl_fd) = config.control_fd {
-                                send_engine_event(
-                                    ctrl_fd,
-                                    &EngineEvent::FramePublished {
-                                        surface_id: config.surface_id.clone(),
-                                        slot_idx,
-                                        pub_seq,
-                                    },
-                                );
+                            consumer_ack,
+                            &surf.last_pub_gen,
+                            &surf.last_pub_seq,
+                        ).is_ok() {
+                            let slot_offset = 256 + slot_idx * surf.geom.slot_stride_bytes;
+                            let slot_ptr = unsafe { surf.rw_ptr.add(slot_offset) };
+                            let row_bytes = (surf.width as usize) * 4;
+
+                            for y in 0..(surf.height as usize) {
+                                let src_row = &raw_pixels[y * row_bytes..(y + 1) * row_bytes];
+                                let dst_row = unsafe { slot_ptr.add(y * surf.geom.stride) };
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, row_bytes);
+                                }
                             }
-                            current_slot = (current_slot + 1) % 3;
+
+                            if let Ok(pub_seq) = publish_slot(
+                                slot_idx,
+                                prod_hdr,
+                                surf.width,
+                                surf.height,
+                                surf.geom.stride as u32,
+                                &mut surf.last_pub_gen,
+                                &mut surf.last_pub_seq,
+                            ) {
+                                if let Some(ctrl_fd) = config.control_fd {
+                                    send_engine_event(
+                                        ctrl_fd,
+                                        &EngineEvent::FramePublished {
+                                            surface_id: surface_id.clone(),
+                                            slot_idx,
+                                            pub_seq,
+                                        },
+                                    );
+                                }
+                                surf.current_slot = (surf.current_slot + 1) % 3;
+                            }
                         }
                     }
                 }

@@ -56,12 +56,13 @@ function readProcessFds(pid) {
 }
 
 class SandboxedEngineProcess {
-    constructor(supervisorProcess, enginePid, enginePort, supervisorStream, controlStream) {
+    constructor(supervisorProcess, enginePid, enginePort, supervisorStream, controlStream, controlFd) {
         this.supervisor = supervisorProcess;
         this.enginePid = enginePid;
         this.enginePort = enginePort;
         this.supervisorStream = supervisorStream;
         this.controlStream = controlStream;
+        this.controlFd = controlFd || null;
         this._isTerminated = false;
     }
 
@@ -134,7 +135,22 @@ async function spawnSandboxedEngine(options = {}) {
         supArgs.push('--', ...engineArgs);
     }
 
-    const stdio = ['inherit', 'inherit', 'inherit', 'pipe', 'pipe'];
+    let controlSocketPair = null;
+    let controlSocket = null;
+    let childControlFd = 'pipe';
+    try {
+        const lotusCore = require('./lotus.js');
+        if (typeof lotusCore.createControlSocketPair === 'function') {
+            controlSocketPair = lotusCore.createControlSocketPair();
+            const hostFd = controlSocketPair.hostFd ?? controlSocketPair.host_fd;
+            const childFd = controlSocketPair.childFd ?? controlSocketPair.child_fd;
+            childControlFd = childFd;
+            const net = require('net');
+            controlSocket = new net.Socket({ fd: hostFd, readable: true, writable: true });
+        }
+    } catch {}
+
+    const stdio = ['inherit', 'inherit', 'inherit', 'pipe', childControlFd];
     if (passFds.length > 0) {
         for (const fd of passFds) {
             if (typeof fd === 'number' && fd >= 0) {
@@ -152,8 +168,15 @@ async function spawnSandboxedEngine(options = {}) {
         stdio
     });
 
+    if (controlSocketPair) {
+        const childFd = controlSocketPair.childFd ?? controlSocketPair.child_fd;
+        if (typeof childFd === 'number' && childFd >= 0) {
+            try { fs.closeSync(childFd); } catch {}
+        }
+    }
+
     const supervisorStream = supervisorProc.stdio[3];
-    const controlStream = supervisorProc.stdio[4];
+    const controlStream = controlSocket || supervisorProc.stdio[4];
 
     return new Promise((resolve, reject) => {
         let enginePid = null;
@@ -322,7 +345,8 @@ async function spawnSandboxedEngine(options = {}) {
                         enginePid,
                         enginePort,
                         supervisorStream,
-                        controlStream
+                        controlStream,
+                        controlSocketPair ? (controlSocketPair.hostFd ?? controlSocketPair.host_fd) : null
                     );
                     instance.verificationReport = verificationReport;
                     resolve(instance);

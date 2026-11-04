@@ -123,7 +123,42 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
     assert.strictEqual(activeSlots, 3, 'Active slots in SHM header must be 3');
     assert(pubSeq >= 1n, `pub_seq must be at least 1, got ${pubSeq}`);
 
-    // 8. Clean Graceful Termination
+    // 8. Test Dynamic Second Surface Creation via SCM_RIGHTS FD Passing
+    const surfaceId2 = 'test-win:test-pane-2';
+    const shm2 = allocateRemotePaneShm(surfaceId2, 300, 200);
+    assert(engineInstance.controlFd, 'controlFd must be present on engineInstance for SCM_RIGHTS');
+
+    const createMsg = JSON.stringify({
+        type: 'CreateSurface',
+        surface_id: surfaceId2,
+        width: 300,
+        height: 200,
+        url: 'about:blank',
+    }) + '\n';
+
+    lotusCore.sendFdsOverSocket(engineInstance.controlFd, [shm2.rwFd, shm2.ackRoFd], createMsg);
+
+    // Verify Second Surface Shared Memory Publication
+    const hdrBuf2 = Buffer.alloc(64);
+    let pubSeq2 = 0n;
+    let activeSlots2 = 0;
+    for (let attempt = 0; attempt < 50; attempt++) {
+        fs.readSync(shm2.roFd, hdrBuf2, 0, 64, 0);
+        pubSeq2 = hdrBuf2.readBigUInt64LE(0);
+        activeSlots2 = hdrBuf2.readUInt32LE(16);
+        if (pubSeq2 >= 1n && activeSlots2 === 3) break;
+        await new Promise((r) => setTimeout(r, 50));
+    }
+    assert.strictEqual(activeSlots2, 3, 'Second surface active slots in SHM header must be 3');
+    assert(pubSeq2 >= 1n, `Second surface pub_seq must be at least 1, got ${pubSeq2}`);
+
+    // 9. Destroy Second Surface
+    engineInstance.controlStream.write(JSON.stringify({
+        type: 'DestroySurface',
+        surface_id: surfaceId2,
+    }) + '\n');
+
+    // 10. Clean Graceful Termination
     await engineInstance.terminate();
     assert.strictEqual(engineInstance.supervisor.killed || engineInstance.supervisor.exitCode !== null, true);
 });

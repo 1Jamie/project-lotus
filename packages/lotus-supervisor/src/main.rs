@@ -155,7 +155,7 @@ fn main() {
     };
 
     // 1. Prepare Landlock descriptors BEFORE unsharing/forking
-    let mut landlock_fds = Vec::new();
+    let mut landlock_fds = Vec::with_capacity(32);
     let ro_system_paths = [
         "/usr",
         "/lib",
@@ -164,6 +164,8 @@ fn main() {
         "/etc/ld.so.cache",
         "/etc/ld.so.conf",
         "/etc/ld.so.conf.d",
+        // System CA certificates: Required by Servo ResourceManager TLS connector initialization
+        // (Panics with "No CA certificates were loaded from the system" if omitted; recorded exception in plan §2.3)
         "/etc/ssl",
         "/etc/pki",
     ];

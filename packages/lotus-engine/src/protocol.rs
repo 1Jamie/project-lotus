@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ControlMessage {
+    CreateSurface {
+        surface_id: String,
+        width: u32,
+        height: u32,
+        url: Option<String>,
+    },
+    DestroySurface {
+        surface_id: String,
+    },
     Navigate {
         surface_id: String,
         navigation_id: u64,
@@ -104,6 +113,22 @@ pub enum InputEvent {
         surface_id: String,
         generation: u64,
     },
+}
+
+impl InputEvent {
+    pub fn surface_id(&self) -> &str {
+        match self {
+            InputEvent::MouseMove { surface_id, .. } => surface_id,
+            InputEvent::MouseDown { surface_id, .. } => surface_id,
+            InputEvent::MouseUp { surface_id, .. } => surface_id,
+            InputEvent::MouseWheel { surface_id, .. } => surface_id,
+            InputEvent::KeyDown { surface_id, .. } => surface_id,
+            InputEvent::KeyUp { surface_id, .. } => surface_id,
+            InputEvent::Focus { surface_id, .. } => surface_id,
+            InputEvent::CursorEnter { surface_id, .. } => surface_id,
+            InputEvent::CursorLeave { surface_id, .. } => surface_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
