@@ -4159,6 +4159,8 @@ dependencies = [
  "log",
  "lotus-supervisor",
  "nix",
+ "serde",
+ "serde_json",
  "servo",
  "url",
 ]
