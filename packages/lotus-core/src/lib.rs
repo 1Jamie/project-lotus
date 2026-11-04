@@ -743,3 +743,37 @@ pub fn send_fds_over_socket(socket_fd: i32, fds_to_send: Vec<i32>, payload: Stri
 
     Ok(())
 }
+
+#[napi]
+pub fn register_surface_policy(
+    surface_id: String,
+    is_secure: bool,
+    bootstrap_secret: String,
+    active_document_id: String,
+    allowed_channels: Vec<String>,
+    allowed_methods: Vec<String>,
+    origin: Option<String>,
+) -> napi::Result<()> {
+    let security_state = server::get_security_state();
+    let mut policy = ipc_security::SurfacePolicy::new(
+        surface_id.clone(),
+        is_secure,
+        active_document_id,
+        bootstrap_secret,
+        origin,
+    );
+    for ch in allowed_channels {
+        policy.allowed_channels.insert(ch);
+    }
+    for method in allowed_methods {
+        policy.allowed_methods.insert(method);
+    }
+    security_state.register_surface(policy);
+    Ok(())
+}
+
+#[napi]
+pub fn dispatch_to_surface(surface_id: String, data: napi::bindgen_prelude::Buffer) -> napi::Result<()> {
+    dispatch_to_renderer(surface_id, None, axum::body::Bytes::from(data.to_vec()));
+    Ok(())
+}

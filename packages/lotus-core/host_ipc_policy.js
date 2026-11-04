@@ -220,6 +220,36 @@ function validateAndProjectOutput(schema, value) {
 /**
  * Surface state tracking manager.
  */
+function syncSurfacePolicyToNative(surface) {
+    if (typeof globalThis.__lotusCoreRegisterSurfacePolicy === 'function') {
+        globalThis.__lotusCoreRegisterSurfacePolicy(
+            surface.surfaceId,
+            surface.secure,
+            surface.bootstrapSecret,
+            surface.activeDocumentId,
+            Array.from(surface.allowedChannels || []),
+            [],
+            surface.currentOrigin
+        );
+    } else {
+        try {
+            const lotusCore = require('./lotus.js');
+            const fn = lotusCore.registerSurfacePolicy || lotusCore.register_surface_policy;
+            if (typeof fn === 'function') {
+                fn(
+                    surface.surfaceId,
+                    surface.secure,
+                    surface.bootstrapSecret,
+                    surface.activeDocumentId,
+                    Array.from(surface.allowedChannels || []),
+                    [],
+                    surface.currentOrigin
+                );
+            }
+        } catch (_) {}
+    }
+}
+
 class HostSurfaceTracker {
     constructor() {
         this.surfaces = new Map();
@@ -243,6 +273,7 @@ class HostSurfaceTracker {
             _initialCommitPending: options.initialCommitPending !== false && !options.origin
         };
         this.surfaces.set(surfaceId, surface);
+        syncSurfacePolicyToNative(surface);
         return surface;
     }
 
@@ -294,6 +325,7 @@ class HostSurfaceTracker {
             surface.trustedOrigins = new Set();
             surface.activeDocumentId = `doc-failed-${crypto.randomBytes(8).toString('hex')}`;
             surface.bootstrapSecret = crypto.randomBytes(32).toString('hex');
+            syncSurfacePolicyToNative(surface);
 
             const err = new Error(`E_NAVIGATION_MISMATCH: Expected pending navigation ${surface.pendingNavigationId}, got ${navigationId}`);
             err.code = 'E_NAVIGATION_MISMATCH';
@@ -322,6 +354,7 @@ class HostSurfaceTracker {
             surface.trustedOrigins = new Set();
         }
 
+        syncSurfacePolicyToNative(surface);
         return surface;
     }
 
@@ -336,12 +369,14 @@ class HostSurfaceTracker {
         surface.allowedChannels = new Set();
         surface.trustedOrigins = new Set();
         surface.activeDocumentId = `doc-failed-${crypto.randomBytes(8).toString('hex')}`;
+        syncSurfacePolicyToNative(surface);
     }
 
     grantChannel(surfaceId, channel) {
         const surface = this.surfaces.get(surfaceId);
         if (surface) {
             surface.allowedChannels.add(channel);
+            syncSurfacePolicyToNative(surface);
         }
     }
 
@@ -349,6 +384,7 @@ class HostSurfaceTracker {
         const surface = this.surfaces.get(surfaceId);
         if (surface) {
             surface.allowedChannels.delete(channel);
+            syncSurfacePolicyToNative(surface);
         }
     }
 
@@ -649,7 +685,16 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
 
     return `(() => {
     'use strict';
-    if (window.parent !== window) return; // subframes denied bridge
+    if (window.parent !== window || window.top !== window) return; // subframes denied bridge
+
+    function verifyTopRealm() {
+        if (window.parent !== window || window.top !== window) {
+            const err = new Error('SecurityError: Lotus IPC is restricted exclusively to top-level browsing contexts');
+            err.name = 'DOMException';
+            err.code = 18;
+            throw err;
+        }
+    }
 
     const surfaceId = ${JSON.stringify(surfaceId)};
     const documentId = ${JSON.stringify(documentId)};
@@ -701,6 +746,7 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
 
     window.lotus = Object.freeze({
         invoke: (method, payload) => {
+            verifyTopRealm();
             return new Promise((resolve, reject) => {
                 if (!ws || ws.readyState !== WebSocket.OPEN) {
                     return reject(new Error('Lotus IPC is not connected'));
@@ -717,12 +763,14 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
             });
         },
         on: (eventName, callback) => {
+            verifyTopRealm();
             if (!eventListeners.has(eventName)) {
                 eventListeners.set(eventName, new Set());
             }
             eventListeners.get(eventName).add(callback);
         },
         off: (eventName, callback) => {
+            verifyTopRealm();
             if (eventListeners.has(eventName)) {
                 eventListeners.get(eventName).delete(callback);
             }

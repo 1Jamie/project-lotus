@@ -1703,7 +1703,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     intercept_drag_regions(payload, window_id.clone());
                 }
 
-                if !raw_bytes.is_empty() && (raw_bytes[0] == MSG_TYPE_CONTROL || raw_bytes[0] == MSG_TYPE_DATA || raw_bytes[0] == 0x03) {
+                if !raw_bytes.is_empty() && (raw_bytes[0] == MSG_TYPE_CONTROL || raw_bytes[0] == MSG_TYPE_DATA || raw_bytes[0] == 0x03 || raw_bytes[0] == b'{') {
                     self.callback.call((window_id, vec![raw_bytes.into()]), ThreadsafeFunctionCallMode::NonBlocking);
                 } else {
                     let mut wrapped = Vec::with_capacity(raw_bytes.len() + 1);

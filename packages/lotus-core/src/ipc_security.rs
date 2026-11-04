@@ -15,6 +15,11 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use dashmap::DashMap;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
+use winit::event_loop::EventLoopProxy;
+use crate::EngineCommand;
 
 /// Default maximum inbound wire-frame payload bytes (4 MiB).
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
@@ -413,16 +418,24 @@ impl TransportManifest {
 /// Engine security state containing policies for all registered surfaces.
 #[derive(Debug, Clone)]
 pub struct EngineSecurityState {
-    pub engine_port: u16,
+    pub engine_port: Arc<std::sync::atomic::AtomicU16>,
     pub surfaces: Arc<Mutex<HashMap<String, Arc<Mutex<SurfacePolicy>>>>>,
 }
 
 impl EngineSecurityState {
     pub fn new(engine_port: u16) -> Self {
         Self {
-            engine_port,
+            engine_port: Arc::new(std::sync::atomic::AtomicU16::new(engine_port)),
             surfaces: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn set_port(&self, port: u16) {
+        self.engine_port.store(port, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn port(&self) -> u16 {
+        self.engine_port.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn get_surface(&self, surface_id: &str) -> Option<Arc<Mutex<SurfacePolicy>>> {
@@ -490,7 +503,7 @@ pub async fn handle_handshake(
     Json(payload): Json<HandshakeRequest>,
 ) -> Response {
     // 1. Strict Host validation
-    if !validate_strict_host(&headers, state.engine_port) {
+    if !validate_strict_host(&headers, state.port()) {
         return (StatusCode::FORBIDDEN, "Invalid Host").into_response();
     }
 
@@ -551,16 +564,16 @@ pub struct SecureWsQuery {
 pub async fn handle_secure_ws_upgrade(
     ws: WebSocketUpgrade,
     Query(query): Query<SecureWsQuery>,
-    State(state): State<EngineSecurityState>,
+    State(state): State<crate::server::ServerState>,
     headers: HeaderMap,
 ) -> Response {
     // 1. Strict Host check
-    if !validate_strict_host(&headers, state.engine_port) {
+    if !validate_strict_host(&headers, state.security_state.port()) {
         return (StatusCode::FORBIDDEN, "Invalid Host").into_response();
     }
 
     // 2. Surface lookup
-    let surface_arc = match state.get_surface(&query.surface_id) {
+    let surface_arc = match state.security_state.get_surface(&query.surface_id) {
         Some(s) => s,
         None => return (StatusCode::NOT_FOUND, "Surface Not Found").into_response(),
     };
@@ -592,52 +605,96 @@ pub async fn handle_secure_ws_upgrade(
 
     let surface_id = query.surface_id.clone();
     let surface_for_client = surface_arc.clone();
+    let ws_senders = state.ws_senders.clone();
+    let proxy = state.proxy.clone();
 
     // 6. Complete WebSocket upgrade
-    ws.on_upgrade(move |socket| handle_secure_ws_client(socket, surface_id, session_id, surface_for_client))
+    ws.on_upgrade(move |socket| handle_secure_ws_client(socket, surface_id, session_id, surface_for_client, ws_senders, proxy))
 }
 
 /// Handles the active secure WebSocket connection.
 async fn handle_secure_ws_client(
-    mut socket: WebSocket,
-    _surface_id: String,
+    socket: WebSocket,
+    surface_id: String,
     session_id: String,
     surface_arc: Arc<Mutex<SurfacePolicy>>,
+    ws_senders: Arc<DashMap<String, mpsc::UnboundedSender<WsMessage>>>,
+    proxy: EventLoopProxy<EngineCommand>,
 ) {
-    while let Some(msg_result) = socket.recv().await {
-        let msg = match msg_result {
-            Ok(m) => m,
-            Err(_) => break,
-        };
+    let (mut sender, mut receiver) = socket.split();
 
-        // Check if session has been superseded by atomic replacement
-        {
-            let surface = surface_arc.lock().unwrap();
-            if surface.active_ws_session_id.as_deref() != Some(&session_id) {
-                // Session superseded: close cleanly
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    ws_senders.insert(surface_id.clone(), tx.clone());
+
+    if let Some(pending) = crate::server::WS_PENDING.get() {
+        if let Some(mut entry) = pending.get_mut(&surface_id) {
+            while let Some(frame) = entry.pop_front() {
+                let _ = tx.send(WsMessage::Binary(frame.into()));
+            }
+        }
+    }
+
+    let send_task = async move {
+        while let Some(msg) = rx.recv().await {
+            if sender.send(msg).await.is_err() {
                 break;
             }
         }
+    };
 
-        match msg {
-            WsMessage::Binary(bin) => {
-                let surface = surface_arc.lock().unwrap();
-                if bin.len() > surface.max_payload_bytes {
-                    // Frame exceeds maximum payload bytes: reject / drop
-                    continue;
+    let recv_surface_id = surface_id.clone();
+    let recv_session_id = session_id.clone();
+    let recv_surface_arc = surface_arc.clone();
+    let recv_task = async move {
+        while let Some(msg_result) = receiver.next().await {
+            let msg = match msg_result {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+
+            // Check if session has been superseded by atomic replacement
+            {
+                let surface = recv_surface_arc.lock().unwrap();
+                if surface.active_ws_session_id.as_deref() != Some(&recv_session_id) {
+                    // Session superseded: close cleanly
+                    break;
                 }
-                // Processing will be handled via dispatch channel
             }
-            WsMessage::Text(txt) => {
-                let surface = surface_arc.lock().unwrap();
-                if txt.len() > surface.max_payload_bytes {
-                    continue;
+
+            match msg {
+                WsMessage::Binary(bin) => {
+                    let max_bytes = {
+                        let surface = recv_surface_arc.lock().unwrap();
+                        surface.max_payload_bytes
+                    };
+                    if bin.len() > max_bytes {
+                        // Frame exceeds maximum payload bytes: reject / drop
+                        continue;
+                    }
+                    let _ = proxy.send_event(EngineCommand::IpcMessage(recv_surface_id.clone(), bin));
                 }
+                WsMessage::Text(txt) => {
+                    let max_bytes = {
+                        let surface = recv_surface_arc.lock().unwrap();
+                        surface.max_payload_bytes
+                    };
+                    if txt.len() > max_bytes {
+                        continue;
+                    }
+                    let _ = proxy.send_event(EngineCommand::IpcMessage(recv_surface_id.clone(), txt.into_bytes()));
+                }
+                WsMessage::Close(_) => break,
+                _ => {}
             }
-            WsMessage::Close(_) => break,
-            _ => {}
         }
+    };
+
+    tokio::select! {
+        _ = send_task => {},
+        _ = recv_task => {},
     }
+
+    ws_senders.remove(&surface_id);
 
     // Clean up session if this was the active one
     let mut surface = surface_arc.lock().unwrap();

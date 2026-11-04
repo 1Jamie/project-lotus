@@ -52,7 +52,15 @@ if (process.platform === 'win32') {
 }
 
 
-const { App, createWindow, allocateRemotePaneShm, createControlSocketPair, sendFdsOverSocket } = require('./index.js');
+const {
+    App,
+    createWindow,
+    allocateRemotePaneShm,
+    createControlSocketPair,
+    sendFdsOverSocket,
+    registerSurfacePolicy,
+    dispatchToSurface
+} = require('./index.js');
 const { SecureConstellationManager } = require('./secure_constellation.js');
 const EventEmitter = require('events');
 const crypto = require('node:crypto');
@@ -182,13 +190,46 @@ class IpcMain extends EventEmitter {
                 const safeResult = hostIpcPolicy.validateAndProjectOutput(options ? options.schema : undefined, rawResult);
 
                 // Reply to originating client
-                if (fromClientId) {
+                if (surface && surface.secure) {
+                    const replyEnvelope = {
+                        type: 'reply',
+                        id: replyId,
+                        result: safeResult
+                    };
+                    const jsonBuf = Buffer.from(JSON.stringify(replyEnvelope));
+                    if (typeof dispatchToSurface === 'function') {
+                        try {
+                            dispatchToSurface(surface.surfaceId, jsonBuf);
+                        } catch (_) {}
+                    }
+                    if (fromClientId) {
+                        this.sendTo(fromClientId, replyId, safeResult);
+                    }
+                } else if (fromClientId) {
                     this.sendTo(fromClientId, replyId, safeResult);
                 } else {
                     this.send(replyId, safeResult);
                 }
             } catch (err) {
                 const errPayload = { _error: err?.message ?? String(err) };
+                const targetClientId = fromClientId || 'main-window:main';
+                let surface = hostIpcRouter.surfaceTracker.getSurface(targetClientId);
+                if (!surface && !targetClientId.includes(':')) {
+                    surface = hostIpcRouter.surfaceTracker.getSurface(`${targetClientId}:main`);
+                }
+                if (surface && surface.secure) {
+                    const replyEnvelope = {
+                        type: 'reply',
+                        id: replyId,
+                        error: err?.message ?? String(err)
+                    };
+                    const jsonBuf = Buffer.from(JSON.stringify(replyEnvelope));
+                    if (typeof dispatchToSurface === 'function') {
+                        try {
+                            dispatchToSurface(surface.surfaceId, jsonBuf);
+                        } catch (_) {}
+                    }
+                }
                 if (fromClientId) {
                     this.sendTo(fromClientId, replyId, errPayload);
                 } else {
@@ -290,6 +331,7 @@ if (isProfiling) {
 
 const ipcMain = new IpcMain();
 let globalApp = null;
+let ipcServerPort = 0;
 let systemTheme = 'light';
 let vfsInitialized = false;
 const windows = new Map();
@@ -534,6 +576,7 @@ function ensureApp() {
             // Handle app-ready event
             if (msg.event === 'app-ready') {
                 if (isProfiling) console.log(`[PROFILE] App/IPC Ready event received.`);
+                ipcServerPort = msg.ipc_port || ipcServerPort;
                 ipcMain.emit('ready', msg);
                 return;
             }
@@ -587,11 +630,37 @@ function ensureApp() {
                 try {
                     const type = data[0];
                     if (type === MSG_TYPE_DATA) {
-                        const msg = unpacker.unpack(data.subarray(1));
-                        const targetPaneId = rawPaneId || (msg && msg.pane_id) || 'main';
-                        handleProcessedMsg(windowId, targetPaneId, msg);
+                        try {
+                            const msg = unpacker.unpack(data.subarray(1));
+                            const targetPaneId = rawPaneId || (msg && msg.pane_id) || 'main';
+                            handleProcessedMsg(windowId, targetPaneId, msg);
+                        } catch (unpackErr) {
+                            if (data[1] === 0x7B) {
+                                const json = JSON.parse(data.subarray(1).toString('utf8'));
+                                if (json && json.type === 'invoke') {
+                                    const payload = Object.assign({}, json.payload || {});
+                                    payload._replyId = json.id;
+                                    payload._documentId = json.documentId;
+                                    ipcMain.emit(json.method, payload, clientId);
+                                }
+                            } else {
+                                throw unpackErr;
+                            }
+                        }
                     } else if (type === MSG_TYPE_CHUNK) {
                         assembler.handleChunk(clientId, data, unpacker);
+                    } else if (type === 0x7B) { // '{' character - Track 2 JSON frame
+                        try {
+                            const json = JSON.parse(data.toString('utf8'));
+                            if (json && json.type === 'invoke') {
+                                const payload = Object.assign({}, json.payload || {});
+                                payload._replyId = json.id;
+                                payload._documentId = json.documentId;
+                                ipcMain.emit(json.method, payload, clientId);
+                            }
+                        } catch (e) {
+                            console.error(`[lotus] Failed to process Track 2 JSON frame for ${clientId}:`, e);
+                        }
                     }
                 } catch (e) {
                     console.error(`[lotus] Failed to process event for ${clientId}:`, e);
@@ -1874,6 +1943,11 @@ module.exports = {
         allocateRemotePaneShm,
         createControlSocketPair,
         sendFdsOverSocket,
+        registerSurfacePolicy,
+        register_surface_policy: registerSurfacePolicy,
+        dispatchToSurface,
+        dispatch_to_surface: dispatchToSurface,
+        getIpcPort: () => ipcServerPort,
     },
     validatePlatformSecurityIsolation,
     detectLinuxThemeNode,
@@ -1890,4 +1964,17 @@ module.exports = {
     allocateRemotePaneShm,
     createControlSocketPair,
     sendFdsOverSocket,
+    registerSurfacePolicy,
+    register_surface_policy: registerSurfacePolicy,
+    dispatchToSurface,
+    dispatch_to_surface: dispatchToSurface,
+    getIpcPort: () => ipcServerPort,
+    warmup: ensureApp,
+    exit: (code = 0) => {
+        if (globalApp && typeof globalApp.exit === 'function') {
+            globalApp.exit(code);
+        } else {
+            process.exit(code);
+        }
+    },
 };

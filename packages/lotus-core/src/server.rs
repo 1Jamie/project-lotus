@@ -29,7 +29,15 @@ pub static WS_PENDING: OnceCell<Arc<DashMap<String, std::collections::VecDeque<V
 pub const WS_PENDING_MAX_FRAMES: usize = 1024;
 
 pub fn dispatch_to_renderer(window_id: String, pane_id: Option<String>, data: axum::body::Bytes) {
-    let msg = axum::extract::ws::Message::Binary(data.to_vec());
+    let msg = if data.first() == Some(&b'{') || data.first() == Some(&b'[') {
+        if let Ok(text) = String::from_utf8(data.to_vec()) {
+            WsMessage::Text(text)
+        } else {
+            WsMessage::Binary(data.to_vec())
+        }
+    } else {
+        WsMessage::Binary(data.to_vec())
+    };
     if let Some(senders) = WS_SENDERS.get() {
         match pane_id {
             Some(p) => {
@@ -91,10 +99,23 @@ struct WsQuery {
 }
 
 #[derive(Clone)]
-struct ServerState {
-    proxy: EventLoopProxy<EngineCommand>,
-    token: String,
-    ws_senders: Arc<DashMap<String, mpsc::UnboundedSender<WsMessage>>>,
+pub struct ServerState {
+    pub proxy: EventLoopProxy<EngineCommand>,
+    pub token: String,
+    pub ws_senders: Arc<DashMap<String, mpsc::UnboundedSender<WsMessage>>>,
+    pub security_state: crate::ipc_security::EngineSecurityState,
+}
+
+impl axum::extract::FromRef<ServerState> for crate::ipc_security::EngineSecurityState {
+    fn from_ref(state: &ServerState) -> Self {
+        state.security_state.clone()
+    }
+}
+
+pub static SECURITY_STATE: OnceCell<crate::ipc_security::EngineSecurityState> = OnceCell::new();
+
+pub fn get_security_state() -> &'static crate::ipc_security::EngineSecurityState {
+    SECURITY_STATE.get_or_init(|| crate::ipc_security::EngineSecurityState::new(0))
 }
 
 pub fn start_ipc_server(
@@ -140,10 +161,14 @@ pub fn start_ipc_server(
             let ws_pending_map: Arc<DashMap<String, std::collections::VecDeque<Vec<u8>>>> = Arc::new(DashMap::new());
             WS_PENDING.set(ws_pending_map.clone()).ok();
 
+            let security_state = get_security_state().clone();
+            security_state.set_port(actual_port);
+
             let state = ServerState {
                 proxy: server_proxy,
                 token: server_token,
                 ws_senders: ws_senders_map,
+                security_state,
             };
 
             let cors = CorsLayer::new()
@@ -159,11 +184,14 @@ pub fn start_ipc_server(
                     header::ACCEPT_LANGUAGE,
                     header::HeaderName::from_static("x-lotus-auth"),
                     header::HeaderName::from_static("x-lotus-window-id"),
+                    header::HeaderName::from_static("x-lotus-bootstrap"),
                 ]);
 
             let app = Router::new()
                 .route("/batch", post(handle_batch))
                 .route("/ipc/:channel", post(handle_ipc))
+                .route("/ipc/handshake", post(crate::ipc_security::handle_handshake))
+                .route("/ipc/secure-ws", get(crate::ipc_security::handle_secure_ws_upgrade))
                 .route("/resource/*path", get(handle_resource))
                 .route("/ws", get(handle_ws_upgrade))
                 .layer(cors)
