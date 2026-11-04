@@ -395,45 +395,58 @@ ipcMain.on('file-selected', (file) => {
 
 ---
 
-## Step 6: Sandboxing External or Untrusted Content (`sandbox: true`)
+## Step 6: Sandboxing External or Untrusted Content (`sandbox: true`) *(Experimental — Linux Only)*
 
-What if part of your application needs to load an untrusted external website, an embedded documentation viewer, or user-provided web code?
+> **Status & Platform Requirements:** Process-isolated sandboxing (`sandbox: true`) is **experimental** in `v0.4.0` and currently supported on **Linux (`x86_64`) only**. It requires a Landlock-capable Linux kernel (5.13+) with unprivileged user namespaces enabled, and **will not work inside Flatpak** (which blocks nested user and network namespaces).
+>
+> **Fail-Closed Guarantee:** If `sandbox: true` is requested on an unsupported OS (Windows/macOS), inside Flatpak, or on a host where unprivileged user namespaces are disabled (`kernel.unprivileged_userns_clone=0` or `kernel.apparmor_restrict_unprivileged_userns=1`), Lotus **throws `E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM` immediately**—it never silently downgrades or loads the page unsandboxed.
 
-In a standard desktop runtime, loading an untrusted webpage in the same process as your Node.js application poses a severe security risk. Lotus solves this with **Process-Isolated Sandboxed Panes**.
+What if part of your application needs to load an external documentation site, a third-party widget, or user-provided web content?
 
-By setting `sandbox: true` on a pane, Lotus isolates the web view in a dedicated, unprivileged child engine process (`PID_secure_engine`) with strict OS-level sandboxing:
-* **Linux Namespaces (`CLONE_NEWUSER`, `CLONE_NEWNET`, `CLONE_NEWPID`):** The engine runs with zero capabilities (`no_new_privs`) and loopback-only network isolation.
-* **Landlock Filesystem Jailing:** Completely denies write access to host directories (including `/`, `/tmp`, `/home`, `/etc`).
-* **Seccomp Stage B BPF Lockdown:** Enforces a strict syscall filter across all 77 engine threads, denying dangerous syscalls with `SIGSYS`.
-* **Anti-SSRF Network Proxy:** External HTTP/HTTPS fetches are filtered through the host's `NetworkBroker` with synchronous DNS socket pinning, blocking loopback (`127.0.0.1`) and private IP ranges (RFC 1918).
-* **Dual-Plane Shared Memory (SHM):** Frame pixels stream back to the OpenGL compositor through read-only sealed `memfd` buffers (`0o400`), providing tear-free 60+ FPS rendering without network hops.
+Loading untrusted web content in the same process as your Node.js application exposes your host environment if the renderer is compromised. Lotus **mitigates** this risk with **Process-Isolated Sandboxed Panes** (see [Threat Model, Pooling & Crash Behavior](#threat-model-pooling--crash-behavior) below).
+
+By setting `sandbox: true` on a pane, Lotus runs that web view in an unprivileged child engine process (`PID_secure_engine`) with OS-level containment:
+* **Linux Namespaces (`CLONE_NEWUSER`, `CLONE_NEWNET`, `CLONE_NEWPID`):** The engine runs with zero capabilities (`no_new_privs`) and has no direct network access; all HTTP/HTTPS traffic goes through the host `NetworkBroker`.
+* **Landlock Filesystem Jailing:** Denies write access to host directories (`/`, `/home`, `/etc`, `/var`) and writes only to a private, mode-`0700` scratch directory (`/tmp/lotus-sandbox-XXXXXX`) that is recursively deleted when the engine exits.
+* **Seccomp Stage B BPF Lockdown:** Synchronizes a strict syscall filter (`SECCOMP_FILTER_FLAG_TSYNC`) across all engine threads before any untrusted content is parsed, denying dangerous syscalls with `SIGSYS`.
+* **Anti-SSRF Network Broker:** Outbound HTTP/HTTPS requests are proxied through the host's `NetworkBroker` with synchronous DNS socket pinning, blocking loopback (`127.0.0.1`, `::1`) and private IP ranges (RFC 1918) by default.
+* **CPU Rendering & Shared Memory (SHM):** Sandboxed panes use CPU software rasterization (`SoftwareRenderingContext`) with **no GPU device nodes (`/dev/dri`) and no WebGL**. Frame pixels stream to the host OpenGL compositor over read-only sealed `memfd` buffers (`0o400`) without network hops.
 
 ### Adding a Sandboxed Web Pane
 
-In your `main.js`, add a sandboxed pane to your layout using `sandbox: true` and specify which capability channels (if any) it is authorized to access:
+When exposing host capabilities to a sandboxed pane, grant only narrow, purpose-specific actions rather than raw credentials, and declare an explicit `returns` validation contract so extra or prototype-polluted properties are stripped before reaching the renderer:
 
 ```javascript
 const { ServoWindow, LayoutBuilder, ipcMain, app } = require('@lotus-gui/core');
 const path = require('path');
 
+app.initVfs(); // Always call before warmup() so --encrypt production builds unlock the VFS
 app.warmup();
 
-// 1. Authorize specific capability methods for the sandboxed pane (Track 2 IPC)
-ipcMain.register('vault.getSecret', async () => {
-    return { token: 'secret-token-123' };
+// 1. Register a narrow capability method with an explicit `returns` contract (Track 2 IPC)
+ipcMain.register('notes.save', async (payload) => {
+    const title = typeof payload?.title === 'string' ? payload.title.slice(0, 120) : 'Untitled';
+    return {
+        saved: true,
+        noteId: `note-${Date.now()}`,
+        internalPath: '/home/user/.local/share/notes.db' // Stripped automatically: not in `returns`
+    };
 }, {
-    channel: 'vault',
-    schema: { token: 'string' }
+    channel: 'notes',
+    returns: {
+        saved: 'boolean',
+        noteId: 'string'
+    }
 });
 
 // 2. Combine trusted local UI with an untrusted sandboxed web pane
 const layout = new LayoutBuilder()
     .left('sidebar', 260, { url: 'lotus-resource://localhost/sidebar.html' })
-    .fill('browser', {
-        url: 'https://example.com',
-        sandbox: true,                          // Spawns inside an isolated, sandboxed child engine
-        allowedChannels: ['vault'],             // Strictly grants access only to the 'vault' channel
-        trustedOrigins: ['https://example.com'] // Bounds Track 2 IPC credentials to this origin
+    .fill('docs-viewer', {
+        url: 'https://docs.example.com',
+        sandbox: true,                               // Spawns inside an unprivileged sandboxed child engine
+        allowedChannels: ['notes'],                  // Strictly grants access only to the 'notes' channel
+        trustedOrigins: ['https://docs.example.com'] // Bounds Track 2 IPC bridge to this origin
     });
 
 const win = new ServoWindow({
@@ -450,20 +463,56 @@ win.once('ready-to-show', () => win.show());
 
 ### Calling Node from the Sandboxed Page
 
-Inside the sandboxed page, `window.lotus.invoke()` communicates over an authenticated, single-use ticket WebSocket bridge:
+When the committed page origin is listed in `trustedOrigins`, Lotus injects `window.lotus` (`invoke`, `on`, `off`) into the top-level document and authenticates a single-use ticket WebSocket (`/ipc/handshake` → `/ipc/secure-ws`).
+
+* **If the page navigates to an origin NOT in `trustedOrigins` (or runs inside a subframe / `<iframe>`):** `window.lotus` is `undefined` (and any cross-frame attempt to call `window.parent.lotus.invoke` throws `DOMException: SecurityError`).
+* **If the origin is trusted, but calls a method outside `allowedChannels`:** `window.lotus.invoke()` rejects with `E_CHANNEL_FORBIDDEN`.
 
 ```javascript
-// Inside the sandboxed page:
-try {
-    const res = await window.lotus.invoke('vault.getSecret', {});
-    console.log('Secret received from host:', res.token);
-} catch (err) {
-    // If the channel was not in allowedChannels, or origin doesn't match:
-    console.error('IPC blocked:', err.message);
+// Inside https://docs.example.com:
+if (window.lotus) {
+    try {
+        const res = await window.lotus.invoke('notes.save', { title: 'Meeting Notes' });
+        console.log('Saved note ID:', res.noteId); // res.internalPath is undefined (stripped by `returns`)
+    } catch (err) {
+        console.error('IPC call rejected:', err.message);
+    }
+} else {
+    // Untrusted origin or subframe: window.lotus is undefined
 }
 ```
 
-If the sandboxed engine crashes or panics (e.g., due to malicious content or a segmentation fault), the supervisor safely isolates the crash, and Lotus transparently recovers without crashing your main window.
+### Localhost / Dev Servers & Broker Allowlisting
+
+Because `NetworkBroker` blocks loopback (`127.0.0.1`, `localhost`) and private network ranges (RFC 1918) to prevent SSRF attacks against local services, **a `sandbox: true` pane cannot load a local dev server (`http://localhost:3000`) or intranet URL by default**—the broker will reject the request with `403 Forbidden`.
+
+If you intentionally need a sandboxed pane to reach `localhost` during local development, opt in explicitly on the constellation manager before creating the pane:
+```javascript
+const { app } = require('@lotus-gui/core');
+app.defaultSecureConstellation.allowLocalhost = true;
+```
+
+### Threat Model, Pooling & Crash Behavior
+
+1. **What `sandbox: true` Mitigates vs. What Remains:**
+   Process isolation and OS sandboxing mitigate renderer memory-corruption or logic bugs by preventing direct filesystem writes, arbitrary syscall execution, GPU driver exploits (since rendering is CPU-only), and local network scanning. They **do not** protect against Linux kernel vulnerabilities (privilege escalation in user namespaces, Landlock, or netfilter), side-channel attacks, or logic bugs in `ipcMain.register()` handlers that you explicitly expose via `allowedChannels`.
+2. **Pooled Engine Default vs. `isolated: true`:**
+   By default, multiple `sandbox: true` panes share a single pooled `lotus-engine` process (`PID_secure_engine`) to keep memory overhead low. While cookies and Track 2 IPC policies are partitioned per surface on the host, **pooled panes share the same renderer process memory and failure domain**. If you are loading mutually untrusted pages that must be isolated from *each other* as well as from the host, pass `isolated: true` to spawn a dedicated `lotus-supervisor` + `lotus-engine` process pair for that pane:
+   ```javascript
+   win.createPane('third-party-plugin', {
+       url: 'https://untrusted-plugin.example.org',
+       sandbox: true,
+       isolated: true, // Dedicated OS process, namespaces, and private scratch directory
+   });
+   ```
+3. **What Happens on a Crash:**
+   If a sandboxed `lotus-engine` process crashes or is killed by Seccomp (`SIGSYS`), your main Node.js process and trusted local UI panes remain unaffected. Visually, the crashed pane stops updating (retaining its last composited frame or blanking if torn down), and `app.defaultSecureConstellation` emits a `'crashed'` event listing the affected surface IDs:
+   ```javascript
+   app.defaultSecureConstellation.on('crashed', ({ instanceId, code, sig, surfaces, isolated }) => {
+       console.warn(`Sandboxed engine #${instanceId} exited (code=${code}, sig=${sig}) for:`, surfaces);
+       // You can remove and recreate the pane, or display an error banner in your host UI
+   });
+   ```
 
 ---
 

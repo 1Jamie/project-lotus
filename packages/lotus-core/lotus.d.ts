@@ -39,6 +39,12 @@ export interface PaneOptions {
   sandbox?: boolean;
   /** Deprecated alias for `sandbox` */
   secure?: boolean;
+  /**
+   * When `sandbox: true` is set, setting `isolated: true` spawns a dedicated, independent
+   * `lotus-supervisor` + `lotus-engine` process pair and OS sandbox exclusively for this pane
+   * instead of sharing the default sandboxed engine pool.
+   */
+  isolated?: boolean;
   /** Track 2 authorized capability channels (e.g. ['vault', 'telemetry']) */
   allowedChannels?: string[];
   /** Allowed origins for Track 2 IPC */
@@ -135,6 +141,8 @@ export interface WindowOptions {
   sandbox?: boolean;
   /** Deprecated alias for `sandbox` */
   secure?: boolean;
+  /** Spawn a dedicated independent sandboxed engine process per pane instead of pooling */
+  isolated?: boolean;
   /** Track 2 authorized capability channels */
   allowedChannels?: string[];
   trustedOrigins?: string[];
@@ -236,11 +244,15 @@ export declare class ServoWindow extends EventEmitter {
 
 export interface SecureMethodOptions {
   channel: string;
+  /** Declarative output validation and projection contract (`schema` is also supported as an alias) */
+  returns?: Record<string, any>;
   schema?: Record<string, any>;
   [key: string]: any;
 }
 
 export interface SecureEventOptions {
+  /** Declarative output validation and projection contract (`schema` is also supported as an alias) */
+  returns?: Record<string, any>;
   schema?: Record<string, any>;
   [key: string]: any;
 }

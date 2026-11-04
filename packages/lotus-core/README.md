@@ -226,34 +226,45 @@ When you call `pane.setVisible(false)` or `pane.toggleVisible()` on a docked pan
 
 ---
 
-### 4. Process-Isolated Sandboxed Panes (`sandbox: true`)
+### 4. Process-Isolated Sandboxed Panes (`sandbox: true` — Experimental, Linux Only)
 
-Lotus features an OS-level multi-process security sandbox designed specifically for hosting untrusted content, external web pages, or third-party web views safely alongside your trusted host UI.
+> **Platform & Fail-Closed Requirements:** Process-isolated sandboxing (`sandbox: true`) is **experimental** in `v0.4.0` and supported on **Linux (`x86_64`) only**. It requires a Landlock-capable Linux kernel (5.13+) and unprivileged user namespaces, and will not work inside Flatpak. If `sandbox: true` is passed on an unsupported platform, inside Flatpak, or when unprivileged user namespaces are disabled, Lotus **throws `E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM`** immediately rather than silently loading content unsandboxed.
 
-By passing `sandbox: true` when creating a pane (or on the window), Lotus runs the pane inside a dedicated, unprivileged child engine process (`PID_secure_engine`) managed by the `lotus-supervisor` daemon. (`secure: true` is also supported as a backwards-compatible alias).
+Lotus mitigates the risk of hosting external documentation, third-party widgets, or untrusted web pages alongside your local UI by running `sandbox: true` panes inside an unprivileged child engine process (`PID_secure_engine`) managed by `lotus-supervisor`. (`secure: true` is also supported as a backwards-compatible alias).
 
-#### Quick Example: Embedding an Isolated Web Pane
+#### Quick Example: Embedding a Sandboxed Web Pane
 
 ```javascript
-const { ServoWindow, LayoutBuilder, ipcMain } = require('@lotus-gui/core');
+const { ServoWindow, LayoutBuilder, ipcMain, app } = require('@lotus-gui/core');
 const path = require('path');
 
-// 1. Authorize specific capability methods for the sandboxed pane (Track 2 IPC)
-ipcMain.register('vault.getSecret', async () => {
-    return { token: 'secret-token-123' };
+app.initVfs(); // Always call before warmup() so --encrypt production builds unlock the VFS
+app.warmup();
+
+// 1. Register a narrow capability method with an explicit `returns` validation contract (Track 2 IPC)
+ipcMain.register('notes.save', async (payload) => {
+    const title = typeof payload?.title === 'string' ? payload.title.slice(0, 120) : 'Untitled';
+    return {
+        saved: true,
+        noteId: `note-${Date.now()}`,
+        internalPath: '/home/user/.local/share/notes.db' // Stripped automatically: not in `returns`
+    };
 }, {
-    channel: 'vault',
-    schema: { token: 'string' }
+    channel: 'notes',
+    returns: {
+        saved: 'boolean',
+        noteId: 'string'
+    }
 });
 
 // 2. Build a layout combining trusted local UI with an untrusted sandboxed web pane
 const layout = new LayoutBuilder()
     .left('sidebar', 260, { url: 'lotus-resource://localhost/sidebar.html' })
-    .fill('browser', {
-        url: 'https://example.com',
-        sandbox: true,                          // Spawns inside an isolated, sandboxed child engine
-        allowedChannels: ['vault'],             // Strictly grants access only to the 'vault' channel
-        trustedOrigins: ['https://example.com'] // Bounds Track 2 IPC credentials to this origin
+    .fill('docs-viewer', {
+        url: 'https://docs.example.com',
+        sandbox: true,                               // Spawns inside an unprivileged sandboxed child engine
+        allowedChannels: ['notes'],                  // Strictly grants access only to the 'notes' channel
+        trustedOrigins: ['https://docs.example.com'] // Bounds Track 2 IPC bridge to this origin
     });
 
 const win = new ServoWindow({
@@ -265,36 +276,38 @@ const win = new ServoWindow({
     ...layout.config()
 });
 
-// You can also create sandboxed panes dynamically at runtime:
+// You can also create a dedicated per-pane isolated sandbox dynamically at runtime:
 const runtimePane = win.createPane('untrusted-tab', {
     url: 'https://untrusted-site.org',
     sandbox: true,
+    isolated: true,     // Spawns its own dedicated lotus-supervisor + lotus-engine process
     allowedChannels: [] // Zero IPC access by default
 });
 ```
 
 #### Calling from the Sandboxed Webpage (`window.lotus`)
 
-In a sandboxed pane, `window.lotus` uses the capability-gated **Track 2 IPC bridge**:
+When the committed origin is listed in `trustedOrigins`, Lotus injects `window.lotus` (`invoke`, `on`, `off`) into the top-level document. If the origin is **not** in `trustedOrigins` (or the code runs inside an `<iframe>`), `window.lotus` is `undefined`.
 
 ```javascript
-// Sandboxed pages use invoke() for authorized capability channels
-try {
-    const res = await window.lotus.invoke('vault.getSecret', {});
-    console.log('Received authorized secret:', res.token);
-} catch (err) {
-    console.error('Call rejected or channel unauthorized:', err.message);
-}
+if (window.lotus) {
+    try {
+        const res = await window.lotus.invoke('notes.save', { title: 'Meeting Notes' });
+        console.log('Saved note ID:', res.noteId);
+    } catch (err) {
+        console.error('Call rejected or channel unauthorized:', err.message);
+    }
 
-// Listening for host events on granted channels
-window.lotus.on('vault.alert', (data) => {
-    console.log('Host security alert:', data);
-});
+    // Listening for registered host events
+    window.lotus.on('notes.synced', (data) => {
+        console.log('Host event:', data);
+    });
+}
 ```
 
 #### Multi-Layer Sandboxing Architecture
 
-When `sandbox: true` is enabled, five coordinated defense layers protect your host system:
+When `sandbox: true` is enabled, five coordinated defense layers mitigate renderer compromise:
 
 ```text
 [ Node.js Host Process (PID_main) ]
@@ -310,37 +323,35 @@ When `sandbox: true` is enabled, five coordinated defense layers protect your ho
           │
           ▼ execve()
 [ lotus-engine (PID_secure_engine) ]
-  ├── Landlock ABI v1-v5 (Zero host write access; isolated 0o700 sandbox dir; no /tmp access)
-  ├── Stage B Seccomp BPF (SECCOMP_FILTER_FLAG_TSYNC on all 77 Servo threads; kills chmod/mount/ptrace)
-  ├── Dual-Plane Sealed SHM (pixel_rw / ack_ro; sealed memfd with fchmod(0o400) locked down)
-  ├── lotus-net-proxy (Loopback forwarder bridging egress across broker_socket)
-  └── UserContentManager (Injected client bridge with calling-realm stack inspection)
+  ├── Landlock ABI v1-v5 (Denies host writes; writes only to private 0o700 scratch dir)
+  ├── Stage B Seccomp BPF (SECCOMP_FILTER_FLAG_TSYNC across engine threads; kills chmod/mount/ptrace)
+  ├── Dual-Plane Sealed SHM (CPU SoftwareRenderingContext -> pixel_rw / ack_ro sealed memfd)
+  ├── lotus-net-proxy (Forwards all network traffic over broker_socket to host NetworkBroker)
+  └── UserContentManager (Injected client bridge with origin & calling-realm stack inspection)
 ```
 
 1. **Linux OS Namespaces (`CLONE_NEWUSER`, `CLONE_NEWNET`, `CLONE_NEWPID`, `CLONE_NEWNS`, `CLONE_NEWIPC`):**
-   The sandboxed engine runs in its own user namespace with zero Linux capabilities (`no_new_privs`), an isolated PID namespace (`PID 1`), and a dedicated network namespace with only a loopback interface.
-2. **Landlock Filesystem Jailing & Directory Jailing:**
-   The supervisor applies Landlock rules prohibiting write, create, or delete access to host directories (including `/`, `/tmp`, `/home`, `/etc`). The engine only receives read access to system fonts and shared libraries, plus isolated write access strictly to a private `0o700` temporary directory (`/tmp/lotus-sandbox-XXXXXX`) that is immediately purged upon process exit.
+   The sandboxed engine runs in its own user namespace with zero Linux capabilities (`no_new_privs`), an isolated PID namespace (`PID 1`), and no direct network access; all traffic goes through the host `NetworkBroker`.
+2. **Landlock Filesystem Jailing:**
+   The supervisor applies Landlock rules denying write, create, or delete access to host directories (`/`, `/home`, `/etc`, `/var`) and writes only to a private `0o700` scratch directory (`/tmp/lotus-sandbox-XXXXXX`) that is recursively deleted when the engine exits.
 3. **Stage B Seccomp BPF Syscall Lockdown:**
-   Before parsing untrusted HTML or executing JavaScript, `lotus-engine` synchronizes a strict seccomp BPF filter across all 77 internal Servo threads (`SECCOMP_FILTER_FLAG_TSYNC`). Dangerous syscalls—including `SYS_fchmod`, `SYS_fchmodat`, `SYS_ptrace`, `SYS_mount`, `SYS_execve`, `SYS_unshare`, and `SYS_setns`—are denied with immediate `SIGSYS` termination.
-4. **Zero-Copy Double-Mapped Shared Memory (SHM):**
-   Rendered pixels stream back to the host window compositor via double-mapped POSIX `memfd` buffers. The engine only receives write access to its pixel buffer, while the host retains read-only descriptors sealed with `0o400` permissions. Frame synchronization uses lock-free atomic Seqlocks (`pixel_rw` / `pixel_ro`, `ack_rw` / `ack_ro`), ensuring tear-free rendering at 60+ FPS with zero network overhead.
+   Before parsing untrusted HTML or executing JavaScript, `lotus-engine` synchronizes a strict seccomp BPF filter across all engine threads (`SECCOMP_FILTER_FLAG_TSYNC`). Dangerous syscalls—including `SYS_fchmod`, `SYS_fchmodat`, `SYS_ptrace`, `SYS_mount`, `SYS_execve`, `SYS_unshare`, and `SYS_setns`—are denied with immediate `SIGSYS` termination.
+4. **CPU Software Rendering & Double-Mapped Shared Memory (SHM):**
+   Sandboxed panes use CPU software rasterization (`SoftwareRenderingContext`) with **no GPU device nodes (`/dev/dri`) and no WebGL**. Rendered pixels stream back to the host window compositor via double-mapped POSIX `memfd` buffers (`0o400` read-only on the host, synchronized via lock-free atomic Seqlocks) without network hops.
 5. **Anti-SSRF NetworkBroker Egress Proxying:**
-   Because the sandboxed engine has no external network access inside `CLONE_NEWNET`, all HTTP/HTTPS traffic is tunneled through the host's `NetworkBroker`:
-   - **Loopback & Private Range Blocking:** Rejects private networks (RFC 1918), link-local, loopback (`127.0.0.1`), CGNAT, IPv6 ULA, and 6to4 addresses.
+   Because the sandboxed engine has no direct network access inside `CLONE_NEWNET`, all HTTP/HTTPS traffic goes through the host's `NetworkBroker`:
+   - **Loopback & Private Range Blocking:** Rejects private networks (RFC 1918), link-local, and loopback (`127.0.0.1` / `localhost`) by default. Consequently, **sandboxed panes cannot load a local dev server or intranet URL** unless you explicitly opt in via `app.defaultSecureConstellation.allowLocalhost = true`.
    - **Synchronous DNS Socket Pinning:** Resolves all `A` and `AAAA` records and pins the verified IP address directly at socket creation, defeating DNS rebinding and TOCTOU attacks.
-   - **RFC 6265 Host Cookie Store:** Stores cookies securely on the host partitioned by `(surfaceId, topLevelSite)` with strict `HttpOnly` isolation.
+   - **RFC 6265 Host Cookie Store:** Stores cookies on the host partitioned by `(surfaceId, topLevelSite)` with strict `HttpOnly` isolation.
    - **Quotas & Timeouts:** Imposes a strict 64 MiB response quota, 30s connection timeouts, and strips authorization headers across cross-origin redirects.
 
-#### Track 2 Authenticated IPC Protocol
+#### Track 2 Authenticated IPC, Pooling & Crash Behavior
 
-Sandboxed panes do not have access to arbitrary `ipcMain.handle()` or `ipcMain.send()` channels. Instead, they use capability-based **Track 2 IPC**:
-* **Capability Gating:** You explicitly declare which channels a surface may reach using `allowedChannels: ['channelName']`. Any call outside granted channels is rejected immediately.
-* **Schema Validation:** In `ipcMain.register(method, handler, { channel, schema })`, Lotus verifies parameter types and strips object prototypes, outputting strictly onto `Object.create(null)` objects to prevent prototype pollution.
-* **Single-Use 256-Bit Tickets:** During navigation, the bridge performs a constant-time handshake (`/ipc/handshake`) with a host bootstrap secret, acquiring a single-use 256-bit ticket that authenticates the WebSocket upgrade (`/ipc/secure-ws`). Replay attacks and brute-force attempts trigger automatic rate limiting.
-* **Calling-Realm Stack Guard:** The client-side bridge inspects invocation call-stacks and prototype lineages, immediately blocking malicious subframes (such as same-origin or `about:srcdoc` `<iframe>` elements) with `DOMException: SecurityError` (code 18).
-* **Automatic Crash & Restart Recovery:**
-   If a sandboxed engine experiences an unhandled panic or process failure, `SecureConstellationManager` detects the exit code, purges the dead process, logs the fault, and safely transparently restarts the secure constellation on subsequent requests without crashing your main Node.js process.
+* **Capability Gating & Output Projection (`returns`):** You explicitly declare which channels a surface may reach using `allowedChannels: ['notes']`. In `ipcMain.register(method, handler, { channel, returns })`, Lotus verifies output field types and projects the result onto `Object.create(null)`, stripping undeclared properties and prototypes (`schema` is also accepted as an alias for `returns`).
+* **Single-Use 256-Bit Tickets:** When the origin matches `trustedOrigins`, the bridge performs a constant-time handshake (`/ipc/handshake`) with a host bootstrap secret, acquiring a single-use 256-bit ticket that authenticates the WebSocket upgrade (`/ipc/secure-ws`).
+* **Calling-Realm Stack Guard:** The client-side bridge inspects invocation call-stacks and prototype lineages, immediately blocking subframes (such as same-origin or `about:srcdoc` `<iframe>` elements) with `DOMException: SecurityError` (code 18).
+* **Pooled Default vs. `isolated: true`:** By default, `sandbox: true` panes share a pooled `lotus-engine` process (`PID_secure_engine`). While cookies and IPC policies are partitioned per surface on the host, pooled panes share renderer memory and a failure domain. Pass `isolated: true` alongside `sandbox: true` to spawn a dedicated OS sandbox and engine process for a pane.
+* **Crash Behavior & Threat Model:** If a sandboxed engine crashes or is killed by Seccomp (`SIGSYS`), the host process and local UI stay up, the crashed pane stops updating, and `app.defaultSecureConstellation` emits `'crashed'` (`{ instanceId, code, sig, surfaces, isolated }`). Note that OS sandboxing mitigates renderer compromise but does not protect against Linux kernel bugs, side-channel attacks, or logic bugs in `ipcMain.register()` handlers you explicitly expose.
 
 ---
 

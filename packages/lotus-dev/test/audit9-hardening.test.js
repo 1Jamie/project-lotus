@@ -223,3 +223,55 @@ test('Audit 9 - I8: Concurrent acquireSecureEngine Race Successfully Registers S
 
     await manager._activeInstance.terminate();
 });
+
+test('Isolated Sandbox Mode (isolated: true): Spawns Dedicated Engine Process and Failure Domain', async () => {
+    const supervisorBin = path.resolve(__dirname, '../../lotus-supervisor/target/debug/lotus-supervisor');
+    const engineBin = path.resolve(__dirname, '../../lotus-supervisor/target/debug/lotus-sandbox-probe');
+
+    const manager = new SecureConstellationManager({
+        supervisorBin,
+        engineBin,
+        enableNetwork: false,
+    });
+
+    // 1. Acquire two pooled sandboxed panes and one dedicated isolated pane
+    const [shared1, shared2, isolated1] = await Promise.all([
+        manager.acquireSecureEngine('pane-shared-1', { url: 'about:blank' }),
+        manager.acquireSecureEngine('pane-shared-2', { url: 'about:blank' }),
+        manager.acquireSecureEngine('pane-isolated-1', { url: 'about:blank', isolated: true }),
+    ]);
+
+    assert.strictEqual(shared1.isolated, false);
+    assert.strictEqual(shared2.isolated, false);
+    assert.strictEqual(isolated1.isolated, true);
+
+    // Pooled panes share the same enginePid and instanceId
+    assert.strictEqual(shared1.instanceId, shared2.instanceId);
+    assert.strictEqual(shared1.enginePid, shared2.enginePid);
+
+    // Isolated pane has a distinct enginePid, instanceId, and private temp dir
+    assert.notStrictEqual(isolated1.instanceId, shared1.instanceId, 'Isolated pane must have a distinct instanceId');
+    assert.notStrictEqual(isolated1.enginePid, shared1.enginePid, 'Isolated pane must run in its own OS process');
+    assert.notStrictEqual(
+        isolated1.instance.allocatedTempDir,
+        shared1.instance.allocatedTempDir,
+        'Isolated pane must have its own private Landlock /tmp sandbox directory'
+    );
+
+    const isolatedTempDir = isolated1.instance.allocatedTempDir;
+    assert(fs.existsSync(isolatedTempDir), 'Isolated temp dir must exist while active');
+
+    // 2. Releasing the isolated pane immediately terminates its dedicated engine & purges its temp dir
+    // without disturbing the shared pool
+    await manager.releaseSecureEngine('pane-isolated-1');
+    assert(!manager._isolatedInstances.has('pane-isolated-1'));
+    assert(!fs.existsSync(isolatedTempDir), 'Isolated temp dir must be purged immediately upon release');
+    assert.strictEqual(manager._refCount, 2, 'Shared pool refCount must remain untouched');
+    assert(manager.isRunning, 'Shared pool engine must still be running');
+
+    // Cleanup shared pool
+    await manager.releaseSecureEngine('pane-shared-1');
+    await manager.releaseSecureEngine('pane-shared-2');
+    await manager._activeInstance.terminate();
+});
+

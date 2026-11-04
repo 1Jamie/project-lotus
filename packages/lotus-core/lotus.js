@@ -186,8 +186,9 @@ class IpcMain extends EventEmitter {
                     return; // Dropped post-await
                 }
 
-                // Two-phase output projection
-                const safeResult = hostIpcPolicy.validateAndProjectOutput(options ? options.schema : undefined, rawResult);
+                // Two-phase output projection (supports both `returns` and `schema`)
+                const outputSchema = options ? (options.returns || options.schema) : undefined;
+                const safeResult = hostIpcPolicy.validateAndProjectOutput(outputSchema, rawResult);
 
                 // Reply to originating client
                 if (surface && surface.secure) {
@@ -390,9 +391,16 @@ function validatePlatformSecurityIsolation(options = {}) {
         throw err;
     }
 
-    // On Linux, verify that unprivileged user namespaces are not disabled by the kernel or AppArmor
+    // Flatpak sandboxes block nested CLONE_NEWUSER / CLONE_NEWNET creation
     try {
         const fs = require('node:fs');
+        if (process.env.FLATPAK_ID || fs.existsSync('/.flatpak-info')) {
+            const err = new Error(
+                'Process-isolated secure engine cannot spawn nested user/network namespaces inside a Flatpak sandbox.'
+            );
+            err.code = 'E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM';
+            throw err;
+        }
         if (fs.existsSync('/proc/sys/kernel/unprivileged_userns_clone')) {
             const val = fs.readFileSync('/proc/sys/kernel/unprivileged_userns_clone', 'utf8').trim();
             if (val === '0') {
@@ -819,8 +827,12 @@ function processEvent(win, msg) {
         if (win) {
             win.emit('close');
             win.emit('closed');
-            for (const p of win.panes.keys()) {
-                hostIpcRouter.surfaceTracker.removeSurface(`${windowId}:${p}`);
+            for (const [p, paneObj] of win.panes.entries()) {
+                const surfaceId = `${windowId}:${p}`;
+                if (paneObj && paneObj.isRemote) {
+                    defaultSecureConstellation.releaseSecureEngine(surfaceId);
+                }
+                hostIpcRouter.surfaceTracker.removeSurface(surfaceId);
             }
             windows.delete(windowId);
         }
@@ -1030,6 +1042,7 @@ class Pane extends EventEmitter {
         this._pendingNavId = null;
         this._pendingUrl = null;
         this.isRemote = false;
+        this.isIsolated = false;
         this._engineInstance = null;
         this._shm = null;
     }
@@ -1154,6 +1167,7 @@ class ServoWindow extends EventEmitter {
         // If the user provided panes, ensure they are in the format Rust expects
         if (finalOptions.panes && Array.isArray(finalOptions.panes) && finalOptions.panes.length > 0) {
             finalOptions.panes = finalOptions.panes.map(p => ({
+                ...p,
                 id: p.id,
                 url: p.url || 'about:blank',
                 x: p.x || 0,
@@ -1177,7 +1191,12 @@ class ServoWindow extends EventEmitter {
                 zIndex: 0,
                 visible: true,
                 anchor: finalOptions.autoResizeMain ? Anchor.Fill : Anchor.None,
-                dockOrder: 0
+                dockOrder: 0,
+                sandbox: finalOptions.sandbox,
+                secure: finalOptions.secure,
+                isolated: finalOptions.isolated,
+                allowedChannels: finalOptions.allowedChannels,
+                trustedOrigins: finalOptions.trustedOrigins,
             }];
         }
 
@@ -1216,7 +1235,28 @@ class ServoWindow extends EventEmitter {
             }
         }
 
-        this.handle = createWindow(finalOptions);
+        if (finalOptions.allowLocalhost !== undefined) {
+            defaultSecureConstellation.allowLocalhost = Boolean(finalOptions.allowLocalhost);
+        }
+
+        const inProcessPanes = [];
+        const sandboxedPanes = [];
+        if (Array.isArray(finalOptions.panes)) {
+            for (const p of finalOptions.panes) {
+                const isSecure = !p.id.startsWith('__lotus_') && (p.sandbox === true || p.secure === true || (p.sandbox !== false && p.secure !== false && (finalOptions.sandbox === true || finalOptions.secure === true)));
+                if (isSecure) {
+                    sandboxedPanes.push(p);
+                } else {
+                    inProcessPanes.push(p);
+                }
+            }
+        }
+
+        const rustOptions = (sandboxedPanes.length > 0 && inProcessPanes.length > 0)
+            ? { ...finalOptions, panes: inProcessPanes }
+            : finalOptions;
+
+        this.handle = createWindow(rustOptions);
         this.id = this.handle.getId();
         
         // Initialize the event queue for this window immediately.
@@ -1234,7 +1274,11 @@ class ServoWindow extends EventEmitter {
 
         
         // Register all panes created atomically with the window
-        if (finalOptions.panes) {
+        if (sandboxedPanes.length > 0 && inProcessPanes.length > 0) {
+            inProcessPanes.forEach(p => {
+                this.panes.set(p.id, new Pane(this, p.id, p.visible !== false));
+            });
+        } else if (finalOptions.panes) {
             finalOptions.panes.forEach(p => {
                 this.panes.set(p.id, new Pane(this, p.id, p.visible !== false));
             });
@@ -1278,25 +1322,39 @@ class ServoWindow extends EventEmitter {
         this._finalOptions = finalOptions;
 
         // Register each pane as a distinct surface in HostSurfaceTracker
-        if (finalOptions.panes) {
-            finalOptions.panes.forEach(p => {
-                const surfaceId = `${this.id}:${p.id}`;
-                const paneObj = this.panes.get(p.id);
-                if (paneObj) paneObj.surfaceId = surfaceId;
+        const panesToTrack = (sandboxedPanes.length > 0 && inProcessPanes.length > 0)
+            ? inProcessPanes
+            : (finalOptions.panes || []);
 
-                hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
-                    secure: p.sandbox === true || p.secure === true || finalOptions.sandbox === true || finalOptions.secure === true,
-                    allowedChannels: p.allowedChannels || this._allowedChannels,
-                    trustedOrigins: p.trustedOrigins || this._trustedOrigins
-                });
+        panesToTrack.forEach(p => {
+            const surfaceId = `${this.id}:${p.id}`;
+            const paneObj = this.panes.get(p.id);
+            const isSecure = !p.id.startsWith('__lotus_') && (p.sandbox === true || p.secure === true || (p.sandbox !== false && p.secure !== false && (finalOptions.sandbox === true || finalOptions.secure === true)));
+            const isIsolated = isSecure && (p.isolated === true || (p.isolated !== false && finalOptions.isolated === true));
+            if (paneObj) {
+                paneObj.surfaceId = surfaceId;
+                paneObj.isIsolated = isIsolated;
+            }
 
-                const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
-                if (paneObj) {
-                    paneObj._pendingNavId = initNavId;
-                    paneObj._pendingUrl = p.url || 'about:blank';
-                }
-                hostIpcRouter.surfaceTracker.startNavigation(surfaceId, initNavId, p.url || 'about:blank');
+            hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
+                secure: isSecure,
+                allowedChannels: p.allowedChannels || this._allowedChannels,
+                trustedOrigins: p.trustedOrigins || this._trustedOrigins
             });
+
+            const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
+            if (paneObj) {
+                paneObj._pendingNavId = initNavId;
+                paneObj._pendingUrl = p.url || 'about:blank';
+            }
+            hostIpcRouter.surfaceTracker.startNavigation(surfaceId, initNavId, p.url || 'about:blank');
+        });
+
+        // Spawn and dock any declarative sandboxed panes
+        if (sandboxedPanes.length > 0 && inProcessPanes.length > 0) {
+            for (const sp of sandboxedPanes) {
+                this.createPane(sp.id, sp);
+            }
         }
 
         windows.set(this.id, this);
@@ -1329,12 +1387,15 @@ class ServoWindow extends EventEmitter {
             throw new Error(`Pane with id '${id}' already exists`);
         }
         const { url = 'about:blank', x = 0, y = 0, width = 0, height = 0, zIndex = 0, anchor = 0, dockOrder = 0, visible = true } = options;
-        const isSecure = options.sandbox === true || options.secure === true || (this._finalOptions && (this._finalOptions.sandbox === true || this._finalOptions.secure === true));
+        const isInternalPane = id.startsWith('__lotus_');
+        const isSecure = !isInternalPane && (options.sandbox === true || options.secure === true || (options.sandbox !== false && options.secure !== false && this._finalOptions && (this._finalOptions.sandbox === true || this._finalOptions.secure === true)));
+        const isIsolated = isSecure && (options.isolated === true || (options.isolated !== false && this._finalOptions && this._finalOptions.isolated === true));
         const surfaceId = `${this.id}:${id}`;
 
         const pane = new Pane(this, id, visible);
         pane.surfaceId = surfaceId;
         pane.isRemote = isSecure;
+        pane.isIsolated = isIsolated;
 
         hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
             secure: isSecure,
@@ -1361,6 +1422,7 @@ class ServoWindow extends EventEmitter {
                 pane,
                 url,
                 shm,
+                isolated: isIsolated,
             }).then(engineRes => {
                 pane._engineInstance = engineRes.instance;
                 if (engineRes.instance.controlFd && this.handle && typeof this.handle.attachRemotePaneInput === 'function') {

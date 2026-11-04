@@ -52,7 +52,7 @@ For a full walkthrough, follow [**TUTORIAL.md: Building Your First Lotus App**](
 
 ## What's New in v0.4.0
 
-* **Process-Isolated Sandboxed Panes (`sandbox: true`):** Run untrusted or third-party web content in an OS-level, multi-process sandbox (`PID_secure_engine`) managed by `lotus-supervisor`. Hardened with Landlock FS jailing, Seccomp Stage B BPF filters (`SECCOMP_FILTER_FLAG_TSYNC` on all 77 Servo threads), network namespaces (`CLONE_NEWNET`), anti-SSRF DNS-pinned proxy routing, zero-copy sealed shared memory (`memfd`), and capability-based Track 2 IPC.
+* **Process-Isolated Sandboxed Panes (`sandbox: true`, Experimental on Linux):** Mitigate the risk of untrusted or third-party web content by running panes in an OS-level, multi-process sandbox (`PID_secure_engine`) managed by `lotus-supervisor`. Hardened with Landlock FS jailing (writes only to a private `0700` scratch directory), Seccomp Stage B BPF filters (`SECCOMP_FILTER_FLAG_TSYNC`), network namespaces (`CLONE_NEWNET` with all traffic routed through the host `NetworkBroker`), CPU software rendering over read-only sealed shared memory (`memfd`), and capability-based Track 2 IPC.
 * **Multi-Pane OpenGL Compositor:** Split a single window into multiple docked or floating web views (`Pane`s) on one shared OpenGL surface using `LayoutBuilder` (`Left`, `Right`, `Top`, `Bottom`, `Fill`, `Absolute`). Hiding or showing a docked pane automatically reflows the rest of the layout in Rust on the next frame.
 * **Servo v0.7.0 Submodule:** Tracks upstream Servo v0.7.0 in-tree with a minimal 5-changed-line diff (33-line patch file: [`servo-compositor.patch`](./packages/lotus-core/servo-compositor.patch)) that passes a `target_fbo` parameter to `OffscreenRenderingContext` so multiple panes can blit into a single window's framebuffer.
 * **Native `<select>` Overlays:** HTML `<select>` dropdowns render in a pre-warmed, high-z-index overlay pane above split panes so they never clip. Supports single-select, multi-select, `<optgroup>`, and runtime theming (`'auto'`, `'dark'`, `'light'`, or custom CSS/tokens).
@@ -93,21 +93,23 @@ For trusted local UI (`lotus-resource://` and `localhost`), Node.js runs alongsi
 2. **Origin-Scoped Token Injection:** The `UserScript` populating `window.lotus.token` only runs on `lotus-resource:` and `localhost`/`127.0.0.1`. Remote origins (such as `https://example.com`) never receive credentials.
 3. **`Host` and `Origin` Header Validation:** The WebSocket upgrade handler validates that `Host` strictly targets `127.0.0.1` or `localhost` (preventing DNS rebinding).
 
-### Track 2: Process-Isolated Sandboxed Panes (`sandbox: true`)
-When embedding external websites, user-submitted HTML, or third-party web apps, set `sandbox: true` when creating the pane:
+### Track 2: Process-Isolated Sandboxed Panes (`sandbox: true` — Experimental, Linux Only)
+When embedding external websites, user-submitted HTML, or third-party web apps on Linux, set `sandbox: true` when creating the pane:
 ```javascript
-const webPane = win.createPane('browser', {
-    url: 'https://untrusted-site.org',
-    sandbox: true,                       // Spawns in an unprivileged, sandboxed child engine
-    allowedChannels: ['vault'],          // Strictly whitelist authorized capability channels
-    trustedOrigins: ['https://untrusted-site.org']
+const webPane = win.createPane('docs-viewer', {
+    url: 'https://docs.example.com',
+    sandbox: true,                              // Spawns in an unprivileged, sandboxed child engine
+    isolated: false,                            // Set true for a dedicated OS process per pane
+    allowedChannels: ['notes'],                 // Strictly whitelist authorized capability channels
+    trustedOrigins: ['https://docs.example.com']
 });
 ```
-* **OS-Level Hardened Sandbox:** Runs inside `CLONE_NEWUSER`, `CLONE_NEWNET`, and `CLONE_NEWPID` namespaces with zero capabilities, Landlock filesystem jailing (zero write access, dedicated `0o700` sandbox dir, no host `/tmp` access), and Stage B Seccomp BPF filters across all 77 Servo threads.
-* **Double-Mapped Shared Memory (SHM):** Frame pixels stream to the OpenGL compositor through read-only sealed `memfd` buffers (`0o400` + `SYS_fchmod` lockout), providing tear-free 60+ FPS rendering without network hops.
-* **Anti-SSRF NetworkBroker:** Network egress is proxy-routed through `NetworkBroker` on the host, enforcing DNS socket pinning, blocking loopback and private IP ranges (RFC 1918), and enforcing a 64 MiB payload cap.
-* **Capability Gating & Single-Use Tickets:** Sandboxed pages authenticate via `/ipc/handshake` with a constant-time bootstrap secret, receiving a single-use 256-bit ticket to upgrade to `/ipc/secure-ws`. Calls are restricted strictly to declared `allowedChannels`, and the client-side bridge uses call-stack inspection (`verifyTopRealm`) to block same-origin or `about:srcdoc` `<iframe>` attacks.
-* **Automatic Crash Recovery:** If the sandboxed engine crashes or panics, the host supervisor detects the fault, cleans up descriptors, and transparently recovers on the next navigation without crashing your application.
+* **Platform & Fail-Closed Gating:** Requires Linux (`x86_64`) with a Landlock-capable kernel (5.13+) and unprivileged user namespaces; unsupported inside Flatpak. If `sandbox: true` is used where unavailable, Lotus throws `E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM` rather than silently loading content unsandboxed.
+* **OS-Level Sandbox:** Runs inside `CLONE_NEWUSER`, `CLONE_NEWNET`, and `CLONE_NEWPID` namespaces with zero capabilities, Landlock filesystem jailing (denies writes to host directories; writes only to a private `0o700` scratch directory purged on exit), and Stage B Seccomp BPF filters (`SECCOMP_FILTER_FLAG_TSYNC`) applied before untrusted content is parsed.
+* **CPU Rendering & Shared Memory (SHM):** Sandboxed panes use CPU software rasterization (`SoftwareRenderingContext`) with no GPU device nodes (`/dev/dri`) or WebGL. Frame pixels stream to the host OpenGL compositor through read-only sealed `memfd` buffers (`0o400` + `SYS_fchmod` lockout) without network hops.
+* **Anti-SSRF NetworkBroker:** The engine has no direct network access; all HTTP/HTTPS traffic goes through `NetworkBroker` on the host, enforcing DNS socket pinning, blocking loopback (`localhost` / `127.0.0.1`) and private IP ranges (RFC 1918) by default (configurable via `app.defaultSecureConstellation.allowLocalhost = true`), and enforcing a 64 MiB payload cap.
+* **Capability Gating & Single-Use Tickets:** Trusted origins receive `window.lotus` (`invoke`, `on`, `off`) and authenticate via `/ipc/handshake` with a constant-time bootstrap secret to obtain a single-use 256-bit WebSocket ticket (`/ipc/secure-ws`). Untrusted origins and subframes see `window.lotus === undefined`.
+* **Crash Isolation & Pooling:** By default, `sandbox: true` panes share a pooled child engine (or pass `isolated: true` for a dedicated process per pane). If a sandboxed engine crashes, the host process and local UI panes stay up, the crashed pane stops updating, and `app.defaultSecureConstellation` emits a `'crashed'` event.
 
 ---
 

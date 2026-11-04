@@ -52,12 +52,16 @@ class SecureConstellationManager extends EventEmitter {
                     const docId = surface.pendingNavigationId || surface.activeDocumentId;
                     const secret = surface.bootstrapSecret;
                     const boundPort = instance ? instance.enginePort : ipcPort;
+                    const trustedOrigins = surface.trustedOrigins && surface.trustedOrigins.size > 0
+                        ? Array.from(surface.trustedOrigins)
+                        : null;
                     bridgeScript = lotusCore.hostIpcPolicy.generateSecureBridgeScript({
                         surfaceId,
                         documentId: docId,
                         bootstrapSecret: secret,
                         enginePort: ipcPort,
                         wsPort: boundPort || ipcPort,
+                        trustedOrigins,
                     });
                 }
             }

@@ -682,7 +682,7 @@ class HostIpcPolicyRouter {
             throw new Error(`E_EVENT_NOT_REGISTERED: Outbound event "${eventName}" is not registered`);
         }
 
-        const projected = validateAndProjectOutput(eventSpec.options.schema, payload);
+        const projected = validateAndProjectOutput(eventSpec.options.returns || eventSpec.options.schema, payload);
 
         return {
             eventName,
@@ -695,13 +695,26 @@ class HostIpcPolicyRouter {
 /**
  * Generates client-side bridge script for Track 2 secure surfaces.
  */
-function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, enginePort, wsPort, endpoints = {} }) {
+function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, enginePort, wsPort, trustedOrigins = null, endpoints = {} }) {
     const handshakePath = endpoints.handshake || '/ipc/handshake';
     const wsPath = endpoints.secure_ws || '/ipc/secure-ws';
+    const trustedOriginsList = Array.isArray(trustedOrigins) ? trustedOrigins : null;
 
     return `(() => {
     'use strict';
     if (window.parent !== window || window.top !== window) return; // subframes denied bridge
+
+    const trustedOrigins = ${JSON.stringify(trustedOriginsList)};
+    if (Array.isArray(trustedOrigins)) {
+        const loc = window.location;
+        const effectiveOrigin = (loc && loc.origin && loc.origin !== 'null')
+            ? loc.origin
+            : (loc && loc.protocol ? (loc.protocol + '//' + (loc.host || 'localhost')) : 'null');
+        const isLotusResource = loc && loc.protocol === 'lotus-resource:' && trustedOrigins.indexOf('lotus-resource://localhost') !== -1;
+        if (trustedOrigins.indexOf(effectiveOrigin) === -1 && !isLotusResource) {
+            return; // untrusted origin: window.lotus remains undefined
+        }
+    }
 
     const TopObject = window.Object;
     const TopFunction = window.Function;
