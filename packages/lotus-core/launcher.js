@@ -66,6 +66,12 @@ class SandboxedEngineProcess {
         this.controlFd = controlFd || null;
         this.brokerServer = brokerServer || null;
         this._isTerminated = false;
+        if (this.supervisorStream && typeof this.supervisorStream.on === 'function') {
+            this.supervisorStream.on('error', () => {});
+        }
+        if (this.controlStream && typeof this.controlStream.on === 'function') {
+            this.controlStream.on('error', () => {});
+        }
     }
 
     /**

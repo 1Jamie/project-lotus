@@ -1957,6 +1957,7 @@ module.exports = {
     NetworkBroker: require('./network_broker.js').NetworkBroker,
     isAllowedPublicIp: require('./network_broker.js').isAllowedPublicIp,
     secureConstellation: require('./secure_constellation.js'),
+    SecureConstellationManager: require('./secure_constellation.js').SecureConstellationManager,
     originDerivation: require('./origin_derivation.js'),
     hostIpcPolicy,
     hostIpcRouter,

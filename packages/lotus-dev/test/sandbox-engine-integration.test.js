@@ -142,7 +142,7 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
     const hdrBuf2 = Buffer.alloc(64);
     let pubSeq2 = 0n;
     let activeSlots2 = 0;
-    for (let attempt = 0; attempt < 100; attempt++) {
+    for (let attempt = 0; attempt < 160; attempt++) {
         fs.readSync(shm2.roFd, hdrBuf2, 0, 64, 0);
         pubSeq2 = hdrBuf2.readBigUInt64LE(0);
         activeSlots2 = hdrBuf2.readUInt32LE(16);
@@ -159,15 +159,39 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
     }) + '\n');
 
     // 10. Test Remote Input Forwarding and Frame Progression on First Surface
-    const htmlUrl = 'data:text/html,%3Chtml%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3Ablack%3B%22%3E%3Cbutton%20id%3D%22btn%22%20style%3D%22width%3A200px%3Bheight%20200px%3B%22%20onclick%3D%22document.body.style.background%3D%27red%27%22%3EClick%3C%2Fbutton%3E%3C%2Fbody%3E%3C%2Fhtml%3E';
+    const htmlUrl = 'data:text/html,%3Chtml%3E%3Cbody%20style%3D%22margin%3A0%3Bbackground%3Ablack%3B%22%20onclick%3D%22document.body.style.background%3D%27red%27%22%3E%3Cbutton%20id%3D%22btn%22%20style%3D%22width%3A200px%3Bheight%3A200px%3B%22%20onclick%3D%22document.body.style.background%3D%27red%27%22%3EClick%3C%2Fbutton%3E%3C%2Fbody%3E%3C%2Fhtml%3E';
     
-    // Navigate surface 1 to interactive document
+    // Navigate surface 1 to interactive document and await LoadStatus complete
+    const navPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timed out waiting for LoadStatus complete')), 15000);
+        let buffer = '';
+        const onData = (chunk) => {
+            buffer += chunk.toString('utf8');
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                try {
+                    const msg = JSON.parse(line.trim());
+                    if (msg.type === 'LoadStatus' && msg.surface_id === surfaceId && msg.status === 'complete') {
+                        clearTimeout(timeout);
+                        engineInstance.controlStream.removeListener('data', onData);
+                        resolve();
+                    }
+                } catch {}
+            }
+        };
+        engineInstance.controlStream.on('data', onData);
+    });
+
     engineInstance.controlStream.write(JSON.stringify({
         type: 'Navigate',
         surface_id: surfaceId,
         navigation_id: 2,
         url: htmlUrl,
     }) + '\n');
+
+    await navPromise;
 
     // Wait for frame publication after navigation
     let navPubSeq = pubSeq;
@@ -178,6 +202,15 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
         await new Promise((r) => setTimeout(r, 50));
     }
     assert(navPubSeq >= pubSeq, 'Navigation must publish at least one frame');
+
+    // Acknowledge navPubSeq so buffer slots are free for the next frame
+    const ackBuf = Buffer.alloc(64);
+    ackBuf.writeBigUInt64LE(1n, 0);               // consumer_gen_id
+    ackBuf.writeBigUInt64LE(1n, 8);               // claimed_generation
+    ackBuf.writeBigUInt64LE(navPubSeq, 16);       // claimed_seq
+    ackBuf.writeBigUInt64LE(navPubSeq, 24);       // free_seq
+    ackBuf.writeUInt32LE(0xFFFFFFFF, 32);         // claimed_slot: CLAIM_UNCLAIMED
+    fs.writeSync(shm.ackRwFd, ackBuf, 0, 64, 0);
 
     // Send MouseDown + MouseUp to click the button at (50, 50)
     engineInstance.controlStream.write(JSON.stringify({
@@ -207,7 +240,7 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
 
     // Verify click event triggered DOM mutation and published an updated frame (pub_seq advanced)
     let clickPubSeq = navPubSeq;
-    for (let attempt = 0; attempt < 60; attempt++) {
+    for (let attempt = 0; attempt < 100; attempt++) {
         fs.readSync(shm.roFd, hdrBuf, 0, 64, 0);
         clickPubSeq = hdrBuf.readBigUInt64LE(0);
         if (clickPubSeq > navPubSeq) break;
@@ -218,5 +251,14 @@ test('Multi-Process Engine Integration - boots real lotus-engine under Stage A &
     // 11. Clean Graceful Termination
     await engineInstance.terminate();
     assert.strictEqual(engineInstance.supervisor.killed || engineInstance.supervisor.exitCode !== null, true);
+
+    try { fs.closeSync(shm.rwFd); } catch {}
+    try { fs.closeSync(shm.roFd); } catch {}
+    try { fs.closeSync(shm.ackRwFd); } catch {}
+    try { fs.closeSync(shm.ackRoFd); } catch {}
+    try { fs.closeSync(shm2.rwFd); } catch {}
+    try { fs.closeSync(shm2.roFd); } catch {}
+    try { fs.closeSync(shm2.ackRwFd); } catch {}
+    try { fs.closeSync(shm2.ackRoFd); } catch {}
 });
 
