@@ -54,7 +54,7 @@ For a full walkthrough, follow [**TUTORIAL.md: Building Your First Lotus App**](
 
 * **Process-Isolated Sandboxed Panes (`sandbox: true`, Experimental on Linux):** Mitigate the risk of untrusted or third-party web content by running panes in an OS-level, multi-process sandbox (`PID_secure_engine`) managed by `lotus-supervisor`. Hardened with Landlock FS jailing (writes only to a private `0700` scratch directory), Seccomp Stage B BPF filters (`SECCOMP_FILTER_FLAG_TSYNC`), network namespaces (`CLONE_NEWNET` with all traffic routed through the host `NetworkBroker`), CPU software rendering over read-only sealed shared memory (`memfd`), and capability-based Track 2 IPC.
 * **Multi-Pane OpenGL Compositor:** Split a single window into multiple docked or floating web views (`Pane`s) on one shared OpenGL surface using `LayoutBuilder` (`Left`, `Right`, `Top`, `Bottom`, `Fill`, `Absolute`). Hiding or showing a docked pane automatically reflows the rest of the layout in Rust on the next frame.
-* **Servo v0.7.0 Submodule:** Tracks upstream Servo v0.7.0 in-tree with a minimal 5-changed-line diff (33-line patch file: [`servo-compositor.patch`](./packages/lotus-core/servo-compositor.patch)) that passes a `target_fbo` parameter to `OffscreenRenderingContext` so multiple panes can blit into a single window's framebuffer.
+* **Servo v0.7.0 from crates.io:** The engine is the published `servo` crate. Trusted panes paint through Lotus's own `RenderingContext` into per-pane framebuffers, which the window compositor blits into one scene.
 * **Native `<select>` Overlays:** HTML `<select>` dropdowns render in a pre-warmed, high-z-index overlay pane above split panes so they never clip. Supports single-select, multi-select, `<optgroup>`, and runtime theming (`'auto'`, `'dark'`, `'light'`, or custom CSS/tokens).
 * **Injected Overlay Scrollbars:** Auto-fading, GPU-positioned (`translate3d`) overlay scrollbars that expand on hover while staying decoupled from frameless window resize borders.
 * **Encrypted VFS (`--encrypt`):** Package your `ui/` directory into an AEAD-encrypted (AES-256-GCM) virtual file system with native key sharding across ELF/PE binary sections and a 128MB byte-limited LRU cache.
@@ -329,7 +329,7 @@ npm run build:debug
 npm run build
 ```
 
-The first compile builds the Servo engine from the submodule and takes a long time. Subsequent incremental builds only recompile what changed.
+The first compile builds the Servo engine from crates.io and takes a long time. Subsequent incremental builds only recompile what changed.
 
 ---
 
@@ -346,7 +346,7 @@ PRs, bug reports, and ideas are welcome. Please keep the `winit` 0.30 and `gluti
 
 ## Pieces of the Puzzle
 
-* **[Servo](https://servo.org/) ([GitHub](https://github.com/servo/servo)):** The memory-safe, parallel browser engine written in Rust. Tracked directly at upstream v0.7.0 as a git submodule (not a custom fork), with 5 changed lines (33-line diff in [`servo-compositor.patch`](./packages/lotus-core/servo-compositor.patch)) exposing the target FBO ID for multi-pane blitting.
+* **[Servo](https://servo.org/) ([GitHub](https://github.com/servo/servo)):** The memory-safe, parallel browser engine written in Rust, consumed as the published `servo` 0.7.0 crate. Multi-pane compositing is implemented by Lotus's `RenderingContext`.
 * **[Node.js](https://nodejs.org/) ([GitHub](https://github.com/nodejs/node)):** The JavaScript runtime that drives your application logic and OS integration.
 * **[Winit](https://winit.rs/) ([GitHub](https://github.com/rust-windowing/winit)):** Cross-platform window creation, input handling, and event loop management in Rust.
 * **[window-vibrancy](https://github.com/tauri-apps/window-vibrancy):** Native OS window transparency and vibrancy effects.

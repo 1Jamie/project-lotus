@@ -1,10 +1,10 @@
 {
-    "name": "LotusSecureApp",
+    "name": "LotusSandboxApp",
     "version": "1.0.0",
     "license": "ISC",
     "description": "Showcase of Process-Isolated Sandboxed Engine & Dual-Track IPC",
     "main": "main.js",
-    "executableName": "lotus-secure-test",
+    "executableName": "lotus-sandbox-test",
     "icon": "./assets/icon.png",
     "resources": [
         "ui",
@@ -12,7 +12,7 @@
     ],
     "build": {
         "linux": {
-            "wmClass": "lotus-secure-app",
+            "wmClass": "lotus-sandbox-app",
             "categories": [
                 "Development"
             ]

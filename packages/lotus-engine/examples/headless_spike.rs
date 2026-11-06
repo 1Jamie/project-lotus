@@ -282,7 +282,7 @@ fn run_headless_render_pipeline(test_html_path: &PathBuf, apply_lockdown: bool) 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let test_app_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../lotus-core/test_apps/secure_test_app/ui/index.html");
+        .join("../lotus-core/test_apps/sandbox_test_app/ui/sandboxed.html");
 
     assert!(
         test_app_path.exists(),

@@ -168,6 +168,8 @@ fn main() {
         // (Panics with "No CA certificates were loaded from the system" if omitted; recorded exception in plan §2.3)
         "/etc/ssl",
         "/etc/pki",
+        // CPU topology for thread affinity detection in Servo threadboost
+        "/sys/devices/system/cpu",
     ];
     for p in &ro_system_paths {
         if let Ok(d) = landlock::open_landlock_dir(p, false) {
@@ -288,10 +290,18 @@ fn is_forbidden_landlock_write_dir(path: &std::path::Path) -> bool {
     envs_c.push(CString::new(format!("LOTUS_CONTROL_FD={}", config.control_fd)).unwrap());
     envs_c.push(CString::new(format!("LOTUS_LIVENESS_FD={}", liveness_read_fd)).unwrap());
     envs_c.push(CString::new(format!("LOTUS_IPC_LISTENER_FD={}", target_listener_fd)).unwrap());
+    envs_c.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
+    envs_c.push(CString::new("GALLIUM_DRIVER=llvmpipe").unwrap());
+    envs_c.push(CString::new("EGL_PLATFORM=surfaceless").unwrap());
+    envs_c.push(CString::new("GST_REGISTRY_FORK=no").unwrap());
+    envs_c.push(CString::new("GST_REGISTRY_DISABLE=yes").unwrap());
+    envs_c.push(CString::new("PULSE_SERVER=").unwrap());
+    envs_c.push(CString::new("PULSE_AUTOSPAWN=0").unwrap());
     if let Some(ref temp_path) = config.temp_dir {
         envs_c.push(CString::new(format!("TMPDIR={}", temp_path)).unwrap());
         envs_c.push(CString::new(format!("TEMP={}", temp_path)).unwrap());
         envs_c.push(CString::new(format!("TMP={}", temp_path)).unwrap());
+        envs_c.push(CString::new(format!("XDG_RUNTIME_DIR={}", temp_path)).unwrap());
     }
     for (k, v) in env::vars() {
         if k != "LOTUS_CONTROL_FD"
@@ -301,6 +311,12 @@ fn is_forbidden_landlock_write_dir(path: &std::path::Path) -> bool {
             && k != "TMPDIR"
             && k != "TEMP"
             && k != "TMP"
+            && k != "DISPLAY"
+            && k != "WAYLAND_DISPLAY"
+            && k != "WAYLAND_SOCKET"
+            && k != "XAUTHORITY"
+            && k != "XDG_SESSION_TYPE"
+            && k != "XDG_RUNTIME_DIR"
         {
             if let Ok(c) = CString::new(format!("{}={}", k, v)) {
                 envs_c.push(c);

@@ -7,7 +7,9 @@ use dpi::PhysicalSize as ServoPhysicalSize;
 use euclid::Point2D;
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
-use servo::{Code, Key, Modifiers, WindowRenderingContext, OffscreenRenderingContext};
+use servo::{Code, Key, Modifiers, WindowRenderingContext};
+
+use crate::gl::LotusPaneContext;
 use winit::window::Window;
 
 use crate::layout::{PaneAnchor, StagedLayout, StagedPaneLayout};
@@ -60,6 +62,7 @@ out vec4 f_color;
 uniform sampler2D u_texture;
 uniform vec2 u_size;
 uniform float u_radius;
+uniform int u_flip_y;
 
 float sdRoundedBox(vec2 p, vec2 b, float r) {
     vec2 q = abs(p) - b + r;
@@ -75,7 +78,8 @@ void main() {
     float smoothing = fwidth(distance); // Auto-adjusts for HiDPI/Scaling
     float alpha_mask = 1.0 - smoothstep(-smoothing, smoothing, distance);
     
-    vec4 tex_color = texture(u_texture, v_uv);
+    vec2 uv = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+    vec4 tex_color = texture(u_texture, uv);
     // Premultiplied alpha blending: multiply texture alpha by the mask
     f_color = tex_color * alpha_mask;
 }
@@ -220,7 +224,7 @@ pub struct PaneInstance {
     pub is_visible: bool,
     pub drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
     pub no_drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
-    pub offscreen_ctx: Rc<OffscreenRenderingContext>,
+    pub offscreen_ctx: Rc<LotusPaneContext>,
     pub servo_busy: bool,
     pub pending_servo_size: Option<ServoPhysicalSize<u32>>,
     pub requested_servo_size: ServoPhysicalSize<u32>,
@@ -237,6 +241,7 @@ pub struct PaneInstance {
     pub is_remote: bool,
     pub remote_consumer: Option<crate::gl::RemotePaneConsumer>,
     pub remote_input_fd: Option<std::os::unix::io::RawFd>,
+    pub resize_generation: u64,
 }
 
 impl Drop for PaneInstance {
@@ -268,6 +273,7 @@ pub struct ScrollbarConfig {
 }
 
 pub struct WindowInstance {
+    pub window_id: String,
     pub panes: HashMap<String, PaneInstance>,
     pub active_layout: StagedLayout,
     pub staged_layout: StagedLayout,
@@ -299,6 +305,7 @@ pub struct WindowInstance {
     pub comp_vbo: Option<glow::NativeBuffer>,
     pub u_comp_size_loc: Option<glow::UniformLocation>,
     pub u_comp_radius_loc: Option<glow::UniformLocation>,
+    pub u_comp_flip_loc: Option<glow::UniformLocation>,
     pub comp_tex_size: Option<winit::dpi::PhysicalSize<u32>>,
     pub scene_fbo: Option<glow::NativeFramebuffer>,
     pub scene_tex: Option<glow::NativeTexture>,
@@ -385,6 +392,7 @@ impl WindowInstance {
 
             self.u_comp_size_loc = self.gl.get_uniform_location(program, "u_size");
             self.u_comp_radius_loc = self.gl.get_uniform_location(program, "u_radius");
+            self.u_comp_flip_loc = self.gl.get_uniform_location(program, "u_flip_y");
             self.comp_program = Some(program);
 
             let vao = self.gl.create_vertex_array().expect("Cannot create VAO");
@@ -513,7 +521,31 @@ impl WindowInstance {
                 euclid::Size2D::new(pane_phys.size.width as f32 / scale_factor, pane_phys.size.height as f32 / scale_factor)
             );
 
-            if pane.last_notified_rect != Some(logical_rect) || pane.is_dirty {
+            if pane.is_remote {
+                pane.last_physical_rect = pane_phys;
+                pane.requested_servo_size = servo_size;
+                let size_changed = servo_size != pane.current_servo_size;
+                if size_changed && servo_size.width > 0 && servo_size.height > 0 {
+                    if let Some(fd) = pane.remote_input_fd {
+                        pane.current_servo_size = servo_size;
+                        pane.resize_generation += 1;
+                        let gen = pane.resize_generation;
+                        if let Some(consumer) = &mut pane.remote_consumer {
+                            consumer.update_active_resize_gen(gen);
+                        }
+                        let surface_id = format!("{}:{}", self.window_id, pane.id);
+                        let resize_msg = serde_json::json!({
+                            "type": "Resize",
+                            "surface_id": surface_id,
+                            "generation": gen,
+                            "width": servo_size.width,
+                            "height": servo_size.height,
+                            "scale_factor": scale_factor,
+                        }).to_string();
+                        crate::app::forward_remote_input(fd, &resize_msg);
+                    }
+                }
+            } else if pane.last_notified_rect != Some(logical_rect) || pane.is_dirty {
                 pane.pending_physical_rect = Some(pane_phys);
                 let size_changed = servo_size != pane.current_servo_size || !pane.first_frame_painted;
 
@@ -541,7 +573,7 @@ impl WindowInstance {
         };
 
         if can_commit {
-            let needs_transaction = self.panes.values().any(|p| {
+            let needs_transaction = self.active_window_size != size || self.panes.values().any(|p| {
                 if let Some(staged) = self.staged_layout.panes.get(&p.id) {
                     if let Some(active) = self.active_layout.panes.get(&p.id) {
                         return staged.rect != active.rect || staged.visible != active.visible;
@@ -560,6 +592,9 @@ impl WindowInstance {
         // --- LOCK-STEP DISPATCHER ---
         // Forces Servo to render exactly what the locked transaction is waiting for.
         for pane in self.panes.values_mut() {
+            if pane.is_remote {
+                continue;
+            }
             if !pane.servo_busy {
                 if let Some(committed) = &self.committed_layout {
                     if let Some(staged) = committed.panes.get(&pane.id) {

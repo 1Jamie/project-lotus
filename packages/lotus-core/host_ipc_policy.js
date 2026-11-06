@@ -308,6 +308,7 @@ class HostSurfaceTracker {
         surface.pendingTargetUrl = targetUrl;
         surface.pendingOrigin = normalizeOrigin(targetUrl);
         if (surface._initialCommitPending) {
+            surface.currentOrigin = surface.pendingOrigin;
             surface.activeDocumentId = navigationId;
             syncSurfacePolicyToNative(surface);
         }
@@ -720,6 +721,7 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
     const TopFunction = window.Function;
     const TopArray = window.Array;
     const TopError = window.Error;
+    const TopAsyncFunctionProto = Object.getPrototypeOf(async function() {});
 
     function throwSecurityError() {
         const err = new TopError('SecurityError: Lotus IPC is restricted exclusively to top-level browsing contexts');
@@ -760,7 +762,8 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
             }
         }
         if (callback !== undefined && callback !== null) {
-            if (typeof callback !== 'function' || !(callback instanceof TopFunction) || Object.getPrototypeOf(callback) !== TopFunction.prototype) {
+            const proto = Object.getPrototypeOf(callback);
+            if (typeof callback !== 'function' || !(callback instanceof TopFunction) || (proto !== TopFunction.prototype && proto !== TopAsyncFunctionProto)) {
                 throwSecurityError();
             }
         }
@@ -790,6 +793,7 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
 
     async function initBridge() {
         try {
+            console.log('[bridge] Starting initBridge for surfaceId:', surfaceId, 'docId:', documentId, 'handshakeUrl:', handshakeUrl);
             const resp = await fetch(handshakeUrl, {
                 method: 'POST',
                 headers: {
@@ -798,18 +802,55 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
                 },
                 body: JSON.stringify({ surfaceId, documentId })
             });
-            if (!resp.ok) return;
+            if (!resp.ok) {
+                console.error('[bridge] Handshake HTTP failed:', resp.status, resp.statusText, await resp.text());
+                return;
+            }
             const data = await resp.json();
             const ticket = data.ticket;
+            console.log('[bridge] Handshake succeeded, ticket acquired:', ticket ? ticket.slice(0, 8) + '...' : null);
 
             const wsUrl = wsBaseUrl + '?surfaceId=' + encodeURIComponent(surfaceId) +
                 '&documentId=' + encodeURIComponent(documentId) +
                 '&ticket=' + encodeURIComponent(ticket);
 
+            console.log('[bridge] Connecting WebSocket to:', wsUrl);
             ws = new WebSocket(wsUrl);
+            let isUnloading = false;
+            if (typeof window !== 'undefined') {
+                window.addEventListener('beforeunload', () => {
+                    isUnloading = true;
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        try { ws.close(1000, 'Page unloading'); } catch {}
+                    }
+                });
+                window.addEventListener('pagehide', () => {
+                    isUnloading = true;
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        try { ws.close(1000, 'Page hiding'); } catch {}
+                    }
+                });
+            }
+            ws.onopen = () => {
+                console.log('[bridge] WebSocket OPEN successfully!');
+            };
+            ws.onerror = (err) => {
+                if (!isUnloading) {
+                    console.error('[bridge] WebSocket error:', err);
+                }
+            };
+            ws.onclose = (ev) => {
+                if (!isUnloading && ev.code !== 1000 && ev.code !== 1001) {
+                    console.warn('[bridge] WebSocket closed:', ev.code, ev.reason);
+                }
+            };
             ws.onmessage = (event) => {
                 try {
-                    const msg = JSON.parse(event.data);
+                    let text = event.data;
+                    if (typeof ArrayBuffer !== 'undefined' && event.data instanceof ArrayBuffer) {
+                        text = new TextDecoder().decode(event.data);
+                    }
+                    const msg = JSON.parse(text);
                     if (msg.type === 'reply' && pendingInvocations.has(msg.id)) {
                         const { resolve, reject } = pendingInvocations.get(msg.id);
                         pendingInvocations.delete(msg.id);
@@ -819,9 +860,13 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
                         const cbs = eventListeners.get(msg.eventName);
                         cbs.forEach(cb => cb(msg.payload));
                     }
-                } catch (e) {}
+                } catch (e) {
+                    console.error('[bridge] onmessage parse error:', e);
+                }
             };
-        } catch (e) {}
+        } catch (e) {
+            console.error('[bridge] initBridge uncaught error:', e);
+        }
     }
 
     window.lotus = Object.freeze({

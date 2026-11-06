@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Surface 4 // IPC Packet Tape & Compositor Topology</title>
+    <style>
+        :root {
+            --bg-base: #09090b;
+            --bg-panel: #101013;
+            --bg-header: #141418;
+            --border-hairline: #26262c;
+            --border-subtle: #18181c;
+            --text-primary: #e4e4e7;
+            --text-muted: #71717a;
+            --accent-trusted: #10b981;
+            --accent-sandbox: #f59e0b;
+            --accent-danger: #ef4444;
+            --accent-blue: #3b82f6;
+            --accent-purple: #a855f7;
+            --accent-cyan: #06b6d4;
+            --font-mono: 'JetBrains Mono', 'Iosevka', 'Fira Code', ui-monospace, SFMono-Regular, monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            border-radius: 0 !important;
+            user-select: none;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg-base);
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+            font-size: 11px;
+            line-height: 1.35;
+            font-variant-numeric: tabular-nums;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border-top: 1px solid var(--border-hairline);
+        }
+
+        .tape-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 3px 8px;
+            background: var(--bg-header);
+            border-bottom: 1px solid var(--border-hairline);
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            color: var(--text-muted);
+            min-height: 22px;
+            white-space: nowrap;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .header-title-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+            flex-shrink: 1;
+            white-space: nowrap;
+        }
+
+        .status-led {
+            width: 6px;
+            height: 6px;
+            background: var(--accent-trusted);
+            display: inline-block;
+            flex-shrink: 0;
+        }
+
+        .tag-pill {
+            display: inline-block;
+            font-size: 8.5px;
+            padding: 1px 4px;
+            border: 1px solid var(--border-hairline);
+            background: #1c1c22;
+            color: var(--text-primary);
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .header-controls {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+
+        button {
+            background: #1c1c22;
+            color: var(--text-primary);
+            border: 1px solid #32323c;
+            padding: 2px 7px;
+            font-family: var(--font-mono);
+            font-size: 9.5px;
+            cursor: pointer;
+            height: 18px;
+            line-height: 1;
+            transition: all 0.1s ease;
+        }
+
+        button:hover {
+            background: #272730;
+            border-color: #52525b;
+        }
+
+        button.active {
+            background: var(--text-primary);
+            color: var(--bg-base);
+            font-weight: 600;
+        }
+
+        .section-title {
+            padding: 3px 8px;
+            background: #121217;
+            border-bottom: 1px solid var(--border-hairline);
+            font-size: 9px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        /* 2-Pane Content: Left Topology (390px) | Right Packet Inspector (Flex) */
+        .inspector-body {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        /* Left 390px: 2D OpenGL Viewport Topology */
+        .topology-col {
+            width: 390px;
+            min-width: 390px;
+            max-width: 390px;
+            border-right: 1px solid var(--border-hairline);
+            background: var(--bg-panel);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .topology-container {
+            display: flex;
+            align-items: center;
+            padding: 5px 8px;
+            flex: 1;
+            gap: 10px;
+            background: #0b0b0e;
+        }
+
+        .topology-svg-wrap {
+            width: 144px;
+            height: 90px;
+            flex-shrink: 0;
+            position: relative;
+        }
+
+        #topology-map {
+            width: 144px;
+            height: 90px;
+            background: #040406;
+            border: 1px solid #26262c;
+            display: block;
+        }
+
+        .topology-legend {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            height: 90px;
+            font-size: 9px;
+        }
+
+        .legend-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 2px 6px;
+            border-left: 2px solid transparent;
+            background: #121216;
+            line-height: 1.25;
+            white-space: nowrap;
+        }
+
+        .legend-row.s1-row { border-color: var(--accent-trusted); }
+        .legend-row.s2-row { border-color: var(--accent-sandbox); }
+        .legend-row.s3-row { border-color: var(--accent-purple); }
+        .legend-row.s3-row.crashed {
+            border-color: var(--accent-danger);
+            background: rgba(239, 68, 68, 0.15);
+        }
+        .legend-row.s4-row { border-color: var(--accent-blue); }
+
+        .legend-badge {
+            font-weight: 600;
+            flex-shrink: 0;
+            font-size: 8.5px;
+        }
+        .s1-row .legend-badge { color: #34d399; }
+        .s2-row .legend-badge { color: #fbbf24; }
+        .s3-row .legend-badge { color: #c084fc; }
+        .s3-row.crashed .legend-badge { color: #f87171; }
+        .s4-row .legend-badge { color: #93c5fd; }
+
+        .legend-rect {
+            color: #d4d4d8;
+            font-size: 8.5px;
+            font-variant-numeric: tabular-nums;
+            flex-shrink: 0;
+            text-align: right;
+            margin-left: 6px;
+        }
+
+        /* Right Column: Tabular Event Log */
+        .tape-col {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background: var(--bg-panel);
+        }
+
+        .table-head {
+            display: grid;
+            grid-template-columns: 75px 125px 95px 150px 75px 55px 1fr;
+            padding: 3px 8px;
+            background: #121216;
+            border-bottom: 1px solid var(--border-hairline);
+            font-size: 9.5px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+
+        .table-body {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            background: var(--bg-base);
+        }
+
+        .table-body::-webkit-scrollbar {
+            width: 4px;
+        }
+        .table-body::-webkit-scrollbar-track {
+            background: var(--bg-base);
+        }
+        .table-body::-webkit-scrollbar-thumb {
+            background: #26262c;
+        }
+
+        .pkt-row {
+            display: grid;
+            grid-template-columns: 75px 125px 95px 150px 75px 55px 1fr;
+            padding: 2px 8px;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 10px;
+            line-height: 1.4;
+            align-items: center;
+            white-space: nowrap;
+        }
+
+        .pkt-row:hover {
+            background: #141419;
+        }
+
+        .pkt-row.violation {
+            background: rgba(239, 68, 68, 0.12) !important;
+            border-bottom: 1px solid rgba(239, 68, 68, 0.25) !important;
+        }
+
+        .pkt-row.violation:hover {
+            background: rgba(239, 68, 68, 0.2) !important;
+        }
+
+        .pkt-time {
+            color: var(--text-muted);
+            font-size: 9.5px;
+        }
+
+        .dir-tag {
+            font-size: 9px;
+            font-weight: 600;
+            padding: 0 4px;
+            display: inline-block;
+            border: 1px solid transparent;
+            line-height: 1.3;
+        }
+
+        .dir-t1-host { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+        .dir-host-t1 { background: rgba(16, 185, 129, 0.1); color: #10b981; border-color: rgba(16, 185, 129, 0.2); }
+        .dir-t2-host { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border-color: rgba(245, 158, 11, 0.3); }
+        .dir-host-t2 { background: rgba(245, 158, 11, 0.1); color: #f59e0b; border-color: rgba(245, 158, 11, 0.2); }
+        .dir-violation { background: rgba(239, 68, 68, 0.25); color: #f87171; border-color: rgba(239, 68, 68, 0.5); font-weight: 700; }
+        .dir-kernel { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border-color: rgba(239, 68, 68, 0.4); }
+        .dir-compositor { background: rgba(59, 130, 246, 0.15); color: #93c5fd; border-color: rgba(59, 130, 246, 0.3); }
+        .dir-bridge { background: rgba(6, 182, 212, 0.15); color: #67e8f9; border-color: rgba(6, 182, 212, 0.3); }
+
+        .pkt-channel {
+            color: #93c5fd;
+            font-size: 9.5px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .pkt-method {
+            color: #e4e4e7;
+            font-weight: 500;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .status-pill {
+            font-size: 8.5px;
+            padding: 0 4px;
+            display: inline-block;
+            border: 1px solid #333;
+            text-align: center;
+            line-height: 1.3;
+        }
+
+        .status-pill.ok { background: rgba(16, 185, 129, 0.15); color: #34d399; border-color: rgba(16, 185, 129, 0.3); }
+        .status-pill.blocked { background: rgba(239, 68, 68, 0.2); color: #f87171; border-color: rgba(239, 68, 68, 0.4); font-weight: 700; }
+        .status-pill.crash { background: rgba(239, 68, 68, 0.25); color: #ef4444; border-color: rgba(239, 68, 68, 0.5); }
+        .status-pill.resize { background: rgba(59, 130, 246, 0.15); color: #93c5fd; border-color: rgba(59, 130, 246, 0.3); }
+        .status-pill.respawn { background: rgba(6, 182, 212, 0.15); color: #67e8f9; border-color: rgba(6, 182, 212, 0.3); }
+
+        .pkt-rtt {
+            color: #a1a1aa;
+            text-align: right;
+            padding-right: 8px;
+            font-size: 9.5px;
+        }
+
+        .pkt-preview {
+            color: #71717a;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            padding-left: 4px;
+            font-size: 9.5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="tape-header">
+        <div class="header-title-group">
+            <span class="status-led"></span>
+            <span>SURFACE 4 // TRACK 1: COMPOSITOR TOPOLOGY & IPC WIRE TAPE</span>
+            <span class="tag-pill">[SCISSOR INSPECTOR]</span>
+            <span id="packet-counter" style="color: var(--text-primary); font-weight: 500;">0 EVENTS</span>
+        </div>
+        <div class="header-controls">
+            <button class="active" id="btn-filter-all">ALL</button>
+            <button id="btn-filter-t1">T1 // HOST</button>
+            <button id="btn-filter-t2">T2 // SANDBOX</button>
+            <button id="btn-filter-faults">VIOLATIONS</button>
+            <span style="color: #3f3f46;">|</span>
+            <button id="btn-toggle-scroll">AUTOSCROLL: ON</button>
+            <button id="btn-clear-tape">CLEAR</button>
+        </div>
+    </div>
+
+    <div class="inspector-body">
+        <!-- Left: 2D OpenGL Viewport Topology -->
+        <div class="topology-col">
+            <div class="section-title">
+                <span>2D OPENGL VIEWPORT TOPOLOGY</span>
+                <span class="tag-pill" id="viewport-summary">1280×800 VIRTUAL SCREEN</span>
+            </div>
+            <div class="topology-container">
+                <div class="topology-svg-wrap">
+                    <svg id="topology-map" viewBox="0 0 1280 800">
+                        <!-- S1: Track 1 Left Dock (Green) -->
+                        <rect id="map-s1" x="0" y="0" width="300" height="620" fill="rgba(16, 185, 129, 0.2)" stroke="#10b981" stroke-width="6" />
+                        <text id="text-s1" x="150" y="320" fill="#34d399" font-size="80" font-family="monospace" text-anchor="middle" font-weight="700">S1</text>
+                        <text id="subtext-s1" x="150" y="380" fill="#10b981" font-size="44" font-family="monospace" text-anchor="middle">T1 DOCK</text>
+
+                        <!-- S2: Track 2 Sandboxed Pool A (Amber) -->
+                        <rect id="map-s2" x="300" y="0" width="640" height="620" fill="rgba(245, 158, 11, 0.2)" stroke="#f59e0b" stroke-width="6" />
+                        <text id="text-s2" x="620" y="320" fill="#fbbf24" font-size="80" font-family="monospace" text-anchor="middle" font-weight="700">S2</text>
+                        <text id="subtext-s2" x="620" y="380" fill="#f59e0b" font-size="44" font-family="monospace" text-anchor="middle">T2 POOL A (SHM)</text>
+
+                        <!-- S3: Track 2 Isolated Pool B (Purple / Red on Crash) -->
+                        <rect id="map-s3" x="940" y="0" width="340" height="620" fill="rgba(168, 85, 247, 0.2)" stroke="#a855f7" stroke-width="6" />
+                        <text id="text-s3" x="1110" y="320" fill="#c084fc" font-size="80" font-family="monospace" text-anchor="middle" font-weight="700">S3</text>
+                        <text id="subtext-s3" x="1110" y="380" fill="#a855f7" font-size="44" font-family="monospace" text-anchor="middle">T2 POOL B</text>
+
+                        <!-- S4: Track 1 Inspector Tape (Blue) -->
+                        <rect id="map-s4" x="0" y="620" width="1280" height="180" fill="rgba(59, 130, 246, 0.2)" stroke="#3b82f6" stroke-width="6" />
+                        <text id="text-s4" x="640" y="730" fill="#93c5fd" font-size="70" font-family="monospace" text-anchor="middle" font-weight="700">S4: TRACK 1 INSPECTOR TAPE</text>
+                    </svg>
+                </div>
+                <div class="topology-legend">
+                    <div class="legend-row s1-row" id="legend-row-s1" title="S1 Dock [T1 In-Process]">
+                        <span class="legend-badge">S1: DOCK [T1]</span>
+                        <span class="legend-rect" id="legend-s1">[0, 0, 300, 620]</span>
+                    </div>
+                    <div class="legend-row s2-row" id="legend-row-s2" title="S2 Workspace Pool A [T2 Sandboxed]">
+                        <span class="legend-badge">S2: POOL A [T2]</span>
+                        <span class="legend-rect" id="legend-s2">[300, 0, 640, 620]</span>
+                    </div>
+                    <div class="legend-row s3-row" id="legend-row-s3" title="S3 Fault-Isolation Pool B [T2 Isolated]">
+                        <span class="legend-badge" id="s3-legend-label">S3: POOL B [T2]</span>
+                        <span class="legend-rect" id="legend-s3">[940, 0, 340, 620]</span>
+                    </div>
+                    <div class="legend-row s4-row" id="legend-row-s4" title="S4 IPC Wire Inspector [T1 In-Process]">
+                        <span class="legend-badge">S4: TAPE [T1]</span>
+                        <span class="legend-rect" id="legend-s4">[0, 620, 1280, 180]</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right: Real-time Tabular Event Log -->
+        <div class="tape-col">
+            <div class="section-title">
+                <span>IPC EVENT & WIRE INSPECTOR</span>
+                <span class="tag-pill" id="tape-active-filter">[FILTER: ALL]</span>
+            </div>
+            <div class="table-head">
+                <div>TIME</div>
+                <div>FLOW</div>
+                <div>CHANNEL</div>
+                <div>ACTION / METHOD</div>
+                <div>STATUS</div>
+                <div style="text-align: right; padding-right: 8px;">RTT</div>
+                <div>DETAILS / WIRE PAYLOAD</div>
+            </div>
+            <div class="table-body" id="packet-list"></div>
+        </div>
+    </div>
+
+    <script>
+        const packetList = document.getElementById('packet-list');
+        const packetCounter = document.getElementById('packet-counter');
+        const tapeActiveFilter = document.getElementById('tape-active-filter');
+
+        // SVG Topology Rects & Texts
+        const mapS1 = document.getElementById('map-s1');
+        const mapS2 = document.getElementById('map-s2');
+        const mapS3 = document.getElementById('map-s3');
+        const mapS4 = document.getElementById('map-s4');
+        const textS1 = document.getElementById('text-s1');
+        const subtextS1 = document.getElementById('subtext-s1');
+        const textS2 = document.getElementById('text-s2');
+        const subtextS2 = document.getElementById('subtext-s2');
+        const textS3 = document.getElementById('text-s3');
+        const subtextS3 = document.getElementById('subtext-s3');
+        const textS4 = document.getElementById('text-s4');
+
+        const legendS1 = document.getElementById('legend-s1');
+        const legendS2 = document.getElementById('legend-s2');
+        const legendS3 = document.getElementById('legend-s3');
+        const legendS4 = document.getElementById('legend-s4');
+        const legendRowS3 = document.getElementById('legend-row-s3');
+        const s3LegendLabel = document.getElementById('s3-legend-label');
+
+        let allPackets = [];
+        let currentFilter = 'all';
+        let autoScroll = true;
+
+        // ---------------------------------------------------------------------
+        // 1. Live 2D Topology Map Updater
+        // ---------------------------------------------------------------------
+        function updateGeometryMap(geometry) {
+            if (!geometry) return;
+            const s1 = geometry.trusted || { x: 0, y: 0, w: 300, h: 620 };
+            const s2 = geometry.sandboxed || { x: 300, y: 0, w: 640, h: 620 };
+            const s3 = geometry.aux_sandbox || { x: 940, y: 0, w: 340, h: 620 };
+            const s4 = geometry.tape || { x: 0, y: 620, w: 1280, h: 180 };
+
+            // Update S1
+            mapS1.setAttribute('x', s1.x);
+            mapS1.setAttribute('y', s1.y);
+            mapS1.setAttribute('width', s1.w);
+            mapS1.setAttribute('height', s1.h);
+            textS1.setAttribute('x', s1.x + s1.w / 2);
+            textS1.setAttribute('y', s1.y + s1.h / 2);
+            subtextS1.setAttribute('x', s1.x + s1.w / 2);
+            subtextS1.setAttribute('y', s1.y + s1.h / 2 + 50);
+            legendS1.textContent = `[${s1.x}, ${s1.y}, ${s1.w}, ${s1.h}]`;
+
+            // Update S2
+            mapS2.setAttribute('x', s2.x);
+            mapS2.setAttribute('y', s2.y);
+            mapS2.setAttribute('width', s2.w);
+            mapS2.setAttribute('height', s2.h);
+            textS2.setAttribute('x', s2.x + s2.w / 2);
+            textS2.setAttribute('y', s2.y + s2.h / 2);
+            subtextS2.setAttribute('x', s2.x + s2.w / 2);
+            subtextS2.setAttribute('y', s2.y + s2.h / 2 + 50);
+            legendS2.textContent = `[${s2.x}, ${s2.y}, ${s2.w}, ${s2.h}]`;
+
+            // Update S3
+            mapS3.setAttribute('x', s3.x);
+            mapS3.setAttribute('y', s3.y);
+            mapS3.setAttribute('width', s3.w);
+            mapS3.setAttribute('height', s3.h);
+            textS3.setAttribute('x', s3.x + s3.w / 2);
+            textS3.setAttribute('y', s3.y + s3.h / 2);
+            subtextS3.setAttribute('x', s3.x + s3.w / 2);
+            subtextS3.setAttribute('y', s3.y + s3.h / 2 + 50);
+            legendS3.textContent = `[${s3.x}, ${s3.y}, ${s3.w}, ${s3.h}]`;
+
+            // Update S4
+            mapS4.setAttribute('x', s4.x);
+            mapS4.setAttribute('y', s4.y);
+            mapS4.setAttribute('width', s4.w);
+            mapS4.setAttribute('height', s4.h);
+            textS4.setAttribute('x', s4.x + s4.w / 2);
+            textS4.setAttribute('y', s4.y + s4.h / 2 + 20);
+            legendS4.textContent = `[${s4.x}, ${s4.y}, ${s4.w}, ${s4.h}]`;
+
+            // Update row tooltips
+            try {
+                document.getElementById('legend-row-s1').title = `S1 Dock [T1]: [${s1.x}, ${s1.y}, ${s1.w}, ${s1.h}]`;
+                document.getElementById('legend-row-s2').title = `S2 Pool A [T2]: [${s2.x}, ${s2.y}, ${s2.w}, ${s2.h}]`;
+                document.getElementById('legend-row-s3').title = `S3 Pool B [T2]: [${s3.x}, ${s3.y}, ${s3.w}, ${s3.h}]`;
+                document.getElementById('legend-row-s4').title = `S4 Tape [T1]: [${s4.x}, ${s4.y}, ${s4.w}, ${s4.h}]`;
+            } catch (_) {}
+        }
+
+        function setS3CrashedState(isCrashed) {
+            if (isCrashed) {
+                mapS3.setAttribute('fill', 'rgba(239, 68, 68, 0.4)');
+                mapS3.setAttribute('stroke', '#ef4444');
+                textS3.textContent = 'SIGSYS';
+                textS3.setAttribute('fill', '#fca5a5');
+                subtextS3.textContent = 'CONTAINER DEAD';
+                subtextS3.setAttribute('fill', '#ef4444');
+                legendRowS3.classList.add('crashed');
+                s3LegendLabel.textContent = 'S3: KILLED [SIGSYS]';
+            } else {
+                mapS3.setAttribute('fill', 'rgba(168, 85, 247, 0.2)');
+                mapS3.setAttribute('stroke', '#a855f7');
+                textS3.textContent = 'S3';
+                textS3.setAttribute('fill', '#c084fc');
+                subtextS3.textContent = 'T2 POOL B';
+                subtextS3.setAttribute('fill', '#a855f7');
+                legendRowS3.classList.remove('crashed');
+                s3LegendLabel.textContent = 'S3: POOL B [T2]';
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 2. Formatting & Rendering IPC Table Rows
+        // ---------------------------------------------------------------------
+        function getFlowClass(flow) {
+            if (!flow) return 'dir-t1-host';
+            const f = flow.toUpperCase();
+            if (f.includes('VIOLATION') || f.includes('BLOCKED')) return 'dir-violation';
+            if (f.includes('KERNEL') || f.includes('SIGSYS')) return 'dir-kernel';
+            if (f.includes('COMPOSITOR')) return 'dir-compositor';
+            if (f.includes('BRIDGE') || f.includes('T1 <-> HOST')) return 'dir-bridge';
+            if (f.startsWith('T1') || f.includes('HOST -> T1')) return f.startsWith('T1') ? 'dir-t1-host' : 'dir-host-t1';
+            if (f.startsWith('T2') || f.includes('HOST -> T2')) return f.startsWith('T2') ? 'dir-t2-host' : 'dir-host-t2';
+            return 'dir-t1-host';
+        }
+
+        function getStatusClass(status) {
+            if (!status) return 'ok';
+            const s = status.toUpperCase();
+            if (s.includes('BLOCKED') || s.includes('VIOLATION') || s.includes('DENIED') || s.includes('ERROR')) return 'blocked';
+            if (s.includes('CRASH') || s.includes('KILL')) return 'crash';
+            if (s.includes('RESIZE') || s.includes('PRESET')) return 'resize';
+            if (s.includes('RESPAWN') || s.includes('ONLINE')) return 'respawn';
+            return 'ok';
+        }
+
+        function renderRow(pkt) {
+            const row = document.createElement('div');
+            row.className = 'pkt-row';
+            const flow = pkt.flow || pkt.direction || 'T1 -> HOST';
+            const action = pkt.action || pkt.method || 'invoke';
+            const status = pkt.status || '200 OK';
+            const rtt = pkt.latencyMs !== undefined ? `${pkt.latencyMs}ms` : '0.04ms';
+
+            const flowCls = getFlowClass(flow);
+            const statusCls = getStatusClass(status);
+
+            if (flowCls === 'dir-violation' || statusCls === 'blocked' || statusCls === 'crash') {
+                row.classList.add('violation');
+            }
+
+            const preview = (pkt.preview || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+            row.innerHTML = `
+                <div class="pkt-time">${pkt.timestamp || '00:00:00.000'}</div>
+                <div><span class="dir-tag ${flowCls}">${flow}</span></div>
+                <div class="pkt-channel">${pkt.channel || 'system'}</div>
+                <div class="pkt-method" title="${action}">${action}</div>
+                <div><span class="status-pill ${statusCls}">${status}</span></div>
+                <div class="pkt-rtt">${rtt}</div>
+                <div class="pkt-preview" title="${preview}">${preview}</div>
+            `;
+            return row;
+        }
+
+        function appendPacket(pkt) {
+            allPackets.push(pkt);
+            if (packetCounter) packetCounter.textContent = `${allPackets.length} EVENTS`;
+
+            const flow = (pkt.flow || pkt.direction || '').toUpperCase();
+            const status = (pkt.status || '').toUpperCase();
+            const isT1 = flow.includes('T1');
+            const isT2 = flow.includes('T2');
+            const isFault = flow.includes('VIOLATION') || flow.includes('BLOCKED') || flow.includes('KERNEL') || status.includes('CRASH') || status.includes('BLOCKED');
+
+            if (currentFilter === 't1' && !isT1) return;
+            if (currentFilter === 't2' && !isT2) return;
+            if (currentFilter === 'faults' && !isFault) return;
+
+            const row = renderRow(pkt);
+            packetList.appendChild(row);
+
+            if (autoScroll) {
+                packetList.scrollTop = packetList.scrollHeight;
+            }
+        }
+
+        function refreshFilter() {
+            packetList.innerHTML = '';
+            for (const pkt of allPackets) {
+                const flow = (pkt.flow || pkt.direction || '').toUpperCase();
+                const status = (pkt.status || '').toUpperCase();
+                const isT1 = flow.includes('T1');
+                const isT2 = flow.includes('T2');
+                const isFault = flow.includes('VIOLATION') || flow.includes('BLOCKED') || flow.includes('KERNEL') || status.includes('CRASH') || status.includes('BLOCKED');
+
+                if (currentFilter === 't1' && !isT1) continue;
+                if (currentFilter === 't2' && !isT2) continue;
+                if (currentFilter === 'faults' && !isFault) continue;
+
+                packetList.appendChild(renderRow(pkt));
+            }
+            if (autoScroll) {
+                packetList.scrollTop = packetList.scrollHeight;
+            }
+        }
+
+        // Filter button handlers
+        document.getElementById('btn-filter-all').addEventListener('click', (e) => {
+            setActiveFilterBtn(e.target);
+            currentFilter = 'all';
+            refreshFilter();
+        });
+        document.getElementById('btn-filter-t1').addEventListener('click', (e) => {
+            setActiveFilterBtn(e.target);
+            currentFilter = 't1';
+            refreshFilter();
+        });
+        document.getElementById('btn-filter-t2').addEventListener('click', (e) => {
+            setActiveFilterBtn(e.target);
+            currentFilter = 't2';
+            refreshFilter();
+        });
+        document.getElementById('btn-filter-faults').addEventListener('click', (e) => {
+            setActiveFilterBtn(e.target);
+            currentFilter = 'faults';
+            refreshFilter();
+        });
+
+        function setActiveFilterBtn(btn) {
+            document.querySelectorAll('.header-controls button').forEach(b => {
+                if (b.id.startsWith('btn-filter')) b.classList.remove('active');
+            });
+            btn.classList.add('active');
+            if (tapeActiveFilter) tapeActiveFilter.textContent = `[FILTER: ${currentFilter.toUpperCase()}]`;
+        }
+
+        const btnToggleScroll = document.getElementById('btn-toggle-scroll');
+        btnToggleScroll.addEventListener('click', () => {
+            autoScroll = !autoScroll;
+            btnToggleScroll.textContent = `AUTOSCROLL: ${autoScroll ? 'ON' : 'OFF'}`;
+            btnToggleScroll.classList.toggle('active', autoScroll);
+        });
+
+        document.getElementById('btn-clear-tape').addEventListener('click', () => {
+            allPackets = [];
+            packetList.innerHTML = '';
+            if (packetCounter) packetCounter.textContent = '0 EVENTS';
+        });
+
+        // ---------------------------------------------------------------------
+        // 3. Prepopulate Clean Boot Handshake Packets
+        // ---------------------------------------------------------------------
+        const bootEvents = [
+            { id: 1, timestamp: '00:00:00.012', flow: 'T1 -> HOST', channel: 'system', action: 'app.warmup', status: '200 OK', latencyMs: 0.02, preview: '{"glScissor":true,"glViewport":true,"surfaces":4}' },
+            { id: 2, timestamp: '00:00:00.045', flow: 'HOST -> T2', channel: 'networkBroker', action: 'ipc/handshake', status: '200 OK', latencyMs: 0.11, preview: '{"surfaceId":"sandboxed","ticket":"tk_8f93b1e7..."}' },
+            { id: 3, timestamp: '00:00:00.080', flow: 'HOST -> T2', channel: 'supervisor', action: 'STAGE_B_BPF_LOCKED', status: 'ENFORCED', latencyMs: 0.01, preview: '{"seccomp":2,"noNewPrivs":1,"landlock":true}' },
+            { id: 4, timestamp: '00:00:00.095', flow: 'T2 -> HOST', channel: 'supervisor', action: 'ENGINE_READY', status: 'ONLINE', latencyMs: 0.01, preview: '{"tripleBuffer":true,"memfdSeqlock":true}' },
+        ];
+        for (const evt of bootEvents) appendPacket(evt);
+
+        // ---------------------------------------------------------------------
+        // 4. Host IPC Communication Setup
+        // ---------------------------------------------------------------------
+        const lotus = window.lotus?.ipc || window.lotus;
+
+        // Fetch initial geometry
+        if (lotus && typeof lotus.invoke === 'function') {
+            lotus.invoke('compositor.getGeometry').then(geo => {
+                if (geo) updateGeometryMap(geo);
+            }).catch(() => {});
+        }
+
+        // Register event listeners
+        const eventSource = window.lotus?.on ? window.lotus : (window.lotus?.ipc?.on ? window.lotus.ipc : null);
+        if (eventSource && typeof eventSource.on === 'function') {
+            eventSource.on('packet.recorded', (pkt) => {
+                appendPacket(pkt);
+            });
+
+            eventSource.on('compositor.geometryUpdated', (geom) => {
+                updateGeometryMap(geom);
+            });
+
+            eventSource.on('system.crashEvent', (evt) => {
+                setS3CrashedState(true);
+            });
+
+            eventSource.on('system.poolBRespawned', (info) => {
+                setS3CrashedState(false);
+            });
+        }
+    </script>
+</body>
+</html>

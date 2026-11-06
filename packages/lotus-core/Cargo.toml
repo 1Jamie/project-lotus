@@ -14,7 +14,7 @@ napi = { version = "2", features = ["napi4"] }
 napi-derive = "2"
 winit = { version = "0.30" }
 euclid = "0.22"
-servo-url = { path = "servo/components/url" }
+servo-url = "=0.7.0"
 
 # Cross-platform dependencies
 aes-gcm = "0.10"
@@ -38,6 +38,8 @@ tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws", "macros"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 glow = "0.17"
+gleam = "0.15"
+surfman = "0.14.0"
 futures-util = "0.3"
 dashmap = "5"
 bytemuck = "1.16"
@@ -51,7 +53,7 @@ dark-light = "1.0"
 
 # Linux-only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
-servo = { path = "servo/components/servo", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
+servo = { version = "=0.7.0", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
 winit = { version = "0.30", features = ["x11", "wayland"] }
 glutin = "0.32"
 glutin-winit = "0.5"
@@ -59,12 +61,12 @@ raw-window-handle = "0.6"
 
 # Windows-only dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
-servo = { path = "servo/components/servo", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "webcrypto", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
+servo = { version = "=0.7.0", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "webcrypto", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
 windows-sys = { version = "0.52", features = ["Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_Foundation"] }
 
 # For any other platform (like macOS)
 [target.'cfg(not(any(target_os = "linux", target_os = "windows")))'.dependencies]
-servo = { path = "servo/components/servo", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
+servo = { version = "=0.7.0", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
 
 [build-dependencies]
 napi-build = "2"

@@ -126,6 +126,37 @@ class IpcMain extends EventEmitter {
             if (!replyId) return; // not an invoke() call; ignore
             const payload = Object.assign({}, data);
             delete payload._replyId;
+
+            // Security Boundary: Sandboxed surfaces (Track 2) cannot invoke privileged Track 1 host handlers!
+            if (fromClientId) {
+                let surface = hostIpcRouter.surfaceTracker.getSurface(fromClientId);
+                if (!surface && !fromClientId.includes(':')) {
+                    surface = hostIpcRouter.surfaceTracker.getSurface(`${fromClientId}:main`);
+                }
+                if (surface && surface.secure) {
+                    const errMessage = `E_UNAUTHORIZED: Sandboxed surface "${fromClientId}" cannot invoke privileged host handler "${channel}"`;
+                    const replyEnvelope = {
+                        type: 'reply',
+                        id: replyId,
+                        error: errMessage
+                    };
+                    const jsonBuf = Buffer.from(JSON.stringify(replyEnvelope));
+                    if (typeof dispatchToSurface === 'function') {
+                        try {
+                            dispatchToSurface(surface.surfaceId, jsonBuf);
+                        } catch (_) {}
+                    }
+                    this.emit('security-violation', {
+                        surfaceId: fromClientId,
+                        method: channel,
+                        error: errMessage,
+                        payload
+                    });
+                    this.sendTo(fromClientId, replyId, { _error: errMessage });
+                    return;
+                }
+            }
+
             try {
                 const result = await handler(payload);
                 // Reply to the originating client (window or pane) if possible.
@@ -212,7 +243,16 @@ class IpcMain extends EventEmitter {
                     this.send(replyId, safeResult);
                 }
             } catch (err) {
-                const errPayload = { _error: err?.message ?? String(err) };
+                const errMessage = err?.message ?? String(err);
+                if (errMessage.includes('E_CHANNEL_FORBIDDEN') || errMessage.includes('E_SURFACE_SECURE_MISMATCH') || errMessage.includes('E_IPC_INELIGIBLE')) {
+                    this.emit('security-violation', {
+                        surfaceId: fromClientId || 'main-window:main',
+                        method,
+                        error: errMessage,
+                        payload
+                    });
+                }
+                const errPayload = { _error: errMessage };
                 const targetClientId = fromClientId || 'main-window:main';
                 let surface = hostIpcRouter.surfaceTracker.getSurface(targetClientId);
                 if (!surface && !targetClientId.includes(':')) {
@@ -629,6 +669,42 @@ function ensureApp() {
             }
         }
 
+        function handleInboundInvoke(clientId, json) {
+            if (!json || json.type !== 'invoke') return;
+            const targetClientId = clientId || 'main-window:main';
+            let surface = hostIpcRouter.surfaceTracker.getSurface(targetClientId);
+            if (!surface && !targetClientId.includes(':')) {
+                surface = hostIpcRouter.surfaceTracker.getSurface(`${targetClientId}:main`);
+            }
+
+            if (surface && surface.secure) {
+                if (!hostIpcRouter.track2Methods.has(json.method)) {
+                    const errMessage = `E_METHOD_NOT_FOUND: Method "${json.method}" is not authorized for sandboxed surface`;
+                    const replyEnvelope = {
+                        type: 'reply',
+                        id: json.id,
+                        error: errMessage
+                    };
+                    const jsonBuf = Buffer.from(JSON.stringify(replyEnvelope));
+                    if (typeof dispatchToSurface === 'function') {
+                        try { dispatchToSurface(surface.surfaceId, jsonBuf); } catch (_) {}
+                    }
+                    ipcMain.emit('security-violation', {
+                        surfaceId: targetClientId,
+                        method: json.method,
+                        error: errMessage,
+                        payload: json.payload
+                    });
+                    return;
+                }
+            }
+
+            const payload = Object.assign({}, json.payload || {});
+            payload._replyId = json.id;
+            payload._documentId = json.documentId;
+            ipcMain.emit(json.method, payload, clientId);
+        }
+
         globalApp = new App((clientId, messages) => {
             if (!msgpackr) return;
             const unpacker = getUnpacker(clientId);
@@ -645,12 +721,7 @@ function ensureApp() {
                         } catch (unpackErr) {
                             if (data[1] === 0x7B) {
                                 const json = JSON.parse(data.subarray(1).toString('utf8'));
-                                if (json && json.type === 'invoke') {
-                                    const payload = Object.assign({}, json.payload || {});
-                                    payload._replyId = json.id;
-                                    payload._documentId = json.documentId;
-                                    ipcMain.emit(json.method, payload, clientId);
-                                }
+                                handleInboundInvoke(clientId, json);
                             } else {
                                 throw unpackErr;
                             }
@@ -660,12 +731,7 @@ function ensureApp() {
                     } else if (type === 0x7B) { // '{' character - Track 2 JSON frame
                         try {
                             const json = JSON.parse(data.toString('utf8'));
-                            if (json && json.type === 'invoke') {
-                                const payload = Object.assign({}, json.payload || {});
-                                payload._replyId = json.id;
-                                payload._documentId = json.documentId;
-                                ipcMain.emit(json.method, payload, clientId);
-                            }
+                            handleInboundInvoke(clientId, json);
                         } catch (e) {
                             console.error(`[lotus] Failed to process Track 2 JSON frame for ${clientId}:`, e);
                         }
@@ -717,6 +783,9 @@ function processEvent(win, msg) {
             if (msg.logicalWidth && msg.logicalHeight) {
                 win._logicalWidth = msg.logicalWidth;
                 win._logicalHeight = msg.logicalHeight;
+                if (msg.width && msg.logicalWidth > 0) {
+                    win._scaleFactor = msg.width / msg.logicalWidth;
+                }
                 const resizePayload = {
                     width: msg.width,
                     height: msg.height,
@@ -825,8 +894,6 @@ function processEvent(win, msg) {
 
     if (msg.event === 'window-closed') {
         if (win) {
-            win.emit('close');
-            win.emit('closed');
             for (const [p, paneObj] of win.panes.entries()) {
                 const surfaceId = `${windowId}:${p}`;
                 if (paneObj && paneObj.isRemote) {
@@ -835,8 +902,11 @@ function processEvent(win, msg) {
                 hostIpcRouter.surfaceTracker.removeSurface(surfaceId);
             }
             windows.delete(windowId);
+            win.emit('close');
+            win.emit('closed');
         }
         if (windows.size === 0) {
+            defaultSecureConstellation.terminateAll().catch(() => {});
             if (globalApp && typeof globalApp.quit === 'function') {
                 globalApp.quit();
             }
@@ -882,6 +952,9 @@ function processEvent(win, msg) {
             if (msg.logicalWidth && msg.logicalHeight) {
                 win._logicalWidth = msg.logicalWidth;
                 win._logicalHeight = msg.logicalHeight;
+                if (msg.width && msg.logicalWidth > 0) {
+                    win._scaleFactor = msg.width / msg.logicalWidth;
+                }
             }
             const payload = {
                 width: msg.width,
@@ -1252,6 +1325,18 @@ class ServoWindow extends EventEmitter {
             }
         }
 
+        // Step 1: If any non-isolated sandboxed pane will be used, immediately pre-warm
+        // the sandboxed engine into a ready wait-state in parallel while the host window
+        // and in-process panes are constructed.
+        if (sandboxedPanes.length > 0) {
+            const hasSharedSandboxedPane = sandboxedPanes.some(
+                p => !(p.isolated === true || (p.isolated !== false && finalOptions.isolated === true))
+            );
+            if (hasSharedSandboxedPane && typeof defaultSecureConstellation.prewarm === 'function') {
+                defaultSecureConstellation.prewarm();
+            }
+        }
+
         const rustOptions = (sandboxedPanes.length > 0 && inProcessPanes.length > 0)
             ? { ...finalOptions, panes: inProcessPanes }
             : finalOptions;
@@ -1409,16 +1494,40 @@ class ServoWindow extends EventEmitter {
         hostIpcRouter.surfaceTracker.startNavigation(surfaceId, initNavId, url);
 
         if (isSecure && typeof allocateRemotePaneShm === 'function') {
-            const shmWidth = Math.max(1, width || this._logicalWidth || 800);
-            const shmHeight = Math.max(1, height || this._logicalHeight || 600);
-            const shm = allocateRemotePaneShm(surfaceId, shmWidth, shmHeight);
+            let targetWidth = width;
+            let targetHeight = height;
+            if ((!targetWidth || !targetHeight) && anchor !== Anchor.None) {
+                let availW = this._logicalWidth || 800;
+                let availH = this._logicalHeight || 600;
+                if (this.panes) {
+                    for (const existingPane of this.panes.values()) {
+                        if (existingPane.id === id) continue;
+                        const pOpt = this._finalOptions?.panes?.find(p => p.id === existingPane.id);
+                        if (!pOpt) continue;
+                        if (pOpt.anchor === Anchor.Left || pOpt.anchor === Anchor.Right) {
+                            availW -= (pOpt.width || 0);
+                        } else if (pOpt.anchor === Anchor.Top || pOpt.anchor === Anchor.Bottom) {
+                            availH -= (pOpt.height || 0);
+                        }
+                    }
+                }
+                if (!targetWidth) targetWidth = Math.max(1, availW);
+                if (!targetHeight) targetHeight = Math.max(1, availH);
+            }
+            const shmWidth = Math.max(1, targetWidth || this._logicalWidth || 800);
+            const shmHeight = Math.max(1, targetHeight || this._logicalHeight || 600);
+            const maxShmWidth = Math.max(shmWidth, 3840);
+            const maxShmHeight = Math.max(shmHeight, 2160);
+            const shm = allocateRemotePaneShm(surfaceId, maxShmWidth, maxShmHeight);
+            shm.width = shmWidth;
+            shm.height = shmHeight;
+            shm.maxWidth = maxShmWidth;
+            shm.maxHeight = maxShmHeight;
             pane._shm = shm;
 
             const pixelRoFd = shm.pixelRoFd ?? shm.roFd;
             const ackRwFd = shm.ackRwFd ?? -1;
-            const paneW = width > 0 ? width : shmWidth;
-            const paneH = height > 0 ? height : shmHeight;
-            this.handle.createRemotePane(id, pixelRoFd, shm.totalSize, ackRwFd, x, y, paneW, paneH, zIndex, anchor, dockOrder, visible);
+            this.handle.createRemotePane(id, pixelRoFd, shm.totalSize, ackRwFd, x, y, width, height, zIndex, anchor, dockOrder, visible, maxShmWidth, maxShmHeight);
 
             defaultSecureConstellation.acquireSecureEngine(surfaceId, {
                 pane,
@@ -1433,16 +1542,6 @@ class ServoWindow extends EventEmitter {
                     } catch (e) {
                         console.error('[createPane] attachRemotePaneInput error:', e);
                     }
-                }
-                if (url && url !== 'about:blank') {
-                    try {
-                        engineRes.instance.controlStream.write(JSON.stringify({
-                            type: 'Navigate',
-                            surface_id: surfaceId,
-                            navigation_id: 1,
-                            url,
-                        }) + '\n');
-                    } catch {}
                 }
             }).catch(err => {
                 pane.emit('error', err);
@@ -1779,6 +1878,17 @@ class ServoWindow extends EventEmitter {
     }
 
     sendToRenderer(channel, data, immediate = false) {
+        const mainPane = this.panes.get('main');
+        if (mainPane && mainPane.isRemote) {
+            const jsonMsg = JSON.stringify({
+                type: 'event',
+                eventName: channel,
+                payload: data,
+            });
+            this.handle.sendToRenderer(Buffer.from(jsonMsg));
+            return;
+        }
+
         if (!msgpackr) {
             console.error('[Lotus] msgpackr not loaded, cannot sendToRenderer');
             return;
@@ -1800,6 +1910,17 @@ class ServoWindow extends EventEmitter {
     }
 
     sendToPaneRenderer(paneId, channel, data, immediate = false) {
+        const pane = this.panes.get(paneId);
+        if (pane && pane.isRemote) {
+            const jsonMsg = JSON.stringify({
+                type: 'event',
+                eventName: channel,
+                payload: data,
+            });
+            this.handle.sendToPaneRenderer(paneId, Buffer.from(jsonMsg));
+            return;
+        }
+
         if (!msgpackr) {
             console.error('[Lotus] msgpackr not loaded, cannot sendToPaneRenderer');
             return;
@@ -1934,6 +2055,7 @@ module.exports = {
     ipcMain,
     app: {
         quit: () => {
+            defaultSecureConstellation.terminateAll().catch(() => {});
             if (globalApp && typeof globalApp.quit === 'function') {
                 globalApp.quit();
             }
@@ -1949,6 +2071,7 @@ module.exports = {
             }
         },
         exit: (code = 0) => {
+            defaultSecureConstellation.terminateAll().catch(() => {});
             if (globalApp && typeof globalApp.exit === 'function') {
                 globalApp.exit(code);
             } else {

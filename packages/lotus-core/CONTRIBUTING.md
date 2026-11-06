@@ -6,7 +6,7 @@ Thanks for your interest in contributing to Lotus! Because Lotus is organized as
 
 ## Building Locally
 
-> **Note:** By default, `npm install` downloads pre-built `.node` binaries for end-users. When working on the Rust code (`src/*.rs`) or the Servo submodule (`servo/`), run the build scripts below to compile your local changes.
+> **Note:** By default, `npm install` downloads pre-built `.node` binaries for end-users. When working on the Rust code (`src/*.rs`), run the build scripts below to compile your local changes. Servo comes from the published `servo` crate.
 
 ### From the Monorepo Root
 ```bash
@@ -49,13 +49,6 @@ npm run benchmark
 
 ---
 
-## Patching the Servo Submodule
+## Servo
 
-Lotus tracks upstream Servo v0.7.0 directly in `packages/lotus-core/servo` (not a custom fork). Before building, Lotus applies a minimal patch with 5 changed lines (33-line diff in `servo-compositor.patch`) to `components/shared/paint/rendering_context.rs` that passes a `target_fbo` ID into `OffscreenRenderingContext`'s blit callback so multiple panes can composite onto a single window surface.
-
-* The patch is applied automatically before `npm run build` via `scripts/apply-patches.js`.
-* You can also apply it manually at any time with:
-  ```bash
-  cd packages/lotus-core
-  npm run patch
-  ```
+Lotus depends on the published `servo` crate at version 0.7.0. Trusted panes use `LotusPaneContext`, a `RenderingContext` in this crate, so each pane paints into its own framebuffer on the window GL context. The compositor blits those framebuffers into the scene.

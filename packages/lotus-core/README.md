@@ -454,7 +454,7 @@ For contributor build instructions and Linux/Windows system prerequisites, see [
 ├── test_apps/
 │   ├── test_app/            # Single-window showcase app
 │   ├── multi_pane_test_app/ # Multi-pane workspace & command palette showcase
-│   └── secure_test_app/     # Process-isolated sandbox & Track 2 showcase
+│   └── sandbox_test_app/    # Process-isolated sandbox & Track 2 showcase
 ```
 
 ## License

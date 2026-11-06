@@ -24,6 +24,21 @@ class SecureConstellationManager extends EventEmitter {
         this._isolatedInstances = new Map(); // surfaceId -> { instance, instanceId, surfaceInfo }
         this._idleTimer = null;
         this._spawnPromise = null;
+
+        process.once('exit', () => {
+            if (this._activeInstance?.supervisor) {
+                try {
+                    this._activeInstance.supervisor.kill('SIGKILL');
+                } catch {}
+            }
+            for (const entry of this._isolatedInstances.values()) {
+                if (entry?.instance?.supervisor) {
+                    try {
+                        entry.instance.supervisor.kill('SIGKILL');
+                    } catch {}
+                }
+            }
+        });
     }
 
     setIdleTimeout(ms) {
@@ -71,6 +86,9 @@ class SecureConstellationManager extends EventEmitter {
                 surface_id: surfaceId,
                 width: surfaceInfo.shm.width || 800,
                 height: surfaceInfo.shm.height || 600,
+                max_width: surfaceInfo.shm.maxWidth || surfaceInfo.shm.max_width || surfaceInfo.shm.width || 800,
+                max_height: surfaceInfo.shm.maxHeight || surfaceInfo.shm.max_height || surfaceInfo.shm.height || 600,
+                scale_factor: surfaceInfo.pane?.window?._scaleFactor || 1.0,
                 url: surfaceInfo.url || 'about:blank',
                 bridge_script: bridgeScript,
             }) + '\n';
@@ -101,6 +119,68 @@ class SecureConstellationManager extends EventEmitter {
                 } catch {}
             }
         });
+    }
+
+    /**
+     * Pre-warms the shared sandboxed engine process into an ENGINE_READY wait state
+     * so it can boot in parallel while the host window and in-process panes initialize.
+     */
+    prewarm() {
+        if (this._idleTimer) {
+            clearTimeout(this._idleTimer);
+            this._idleTimer = null;
+        }
+        if (this._activeInstance && !this._activeInstance._isTerminated) {
+            return Promise.resolve({
+                instance: this._activeInstance,
+                instanceId: this._engineInstanceId,
+                enginePid: this._activeInstance.enginePid,
+                enginePort: this._activeInstance.enginePort,
+                isolated: false,
+            });
+        }
+        if (this._spawnPromise) {
+            return this._spawnPromise;
+        }
+
+        this._spawnPromise = (async () => {
+            this._engineInstanceId++;
+            const instanceId = this._engineInstanceId;
+
+            const lotusCore = require('./lotus.js');
+            const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
+
+            const instance = await spawnSandboxedEngine({
+                supervisorBin: this.supervisorBin,
+                engineBin: this.engineBin,
+                passFds: [],
+                engineArgs: [],
+                networkBroker: this.networkBroker,
+                allowLocalhost: this.allowLocalhost,
+                ipcPort,
+            });
+
+            this._activeInstance = instance;
+            this._attachControlStream(instance);
+
+            instance.supervisor.once('exit', (code, sig) => {
+                this._handleEngineCrash(instanceId, code, sig);
+            });
+
+            return {
+                instance,
+                instanceId,
+                enginePid: instance.enginePid,
+                enginePort: instance.enginePort,
+                isolated: false,
+            };
+        })();
+
+        this._spawnPromise.finally(() => {
+            this._spawnPromise = null;
+        }).catch(() => {});
+
+        return this._spawnPromise;
     }
 
     /**
@@ -333,6 +413,7 @@ class SecureConstellationManager extends EventEmitter {
                             lotusCore.hostIpcRouter.surfaceTracker.commitNavigation(surfaceId, navId, finalUrl);
                         }
                     } catch (e) {
+                        console.error('[SecureConstellationManager] commitNavigation error:', e);
                         const surface = lotusCore.hostIpcRouter?.surfaceTracker?.getSurface(surfaceId);
                         if (surface) {
                             surface.navigationState = 'failed';
@@ -340,10 +421,12 @@ class SecureConstellationManager extends EventEmitter {
                         }
                     }
                     pane.emit('load-status', 'complete');
+                    if (pane.window) pane.window.emit('load-status', 'complete', pane.id);
                 }
             } else if (evt.status === 'started') {
                 if (pane) {
                     pane.emit('load-status', 'started');
+                    if (pane.window) pane.window.emit('load-status', 'started', pane.id);
                 }
             } else if (evt.status === 'failed') {
                 if (pane) {
@@ -353,6 +436,7 @@ class SecureConstellationManager extends EventEmitter {
                         lotusCore.hostIpcRouter.surfaceTracker.failNavigation(surfaceId);
                     }
                     pane.emit('load-status', 'failed');
+                    if (pane.window) pane.window.emit('load-status', 'failed', pane.id);
                 }
             }
         } else if (evt.type === 'TitleChanged') {
@@ -362,8 +446,38 @@ class SecureConstellationManager extends EventEmitter {
         } else if (evt.type === 'FramePublished') {
             if (pane) {
                 pane.emit('frame-published', evt.slot_idx, evt.pub_seq);
+                if (pane.window && pane.window.handle && typeof pane.window.handle.requestRedraw === 'function') {
+                    pane.window.handle.requestRedraw();
+                }
             }
         }
+    }
+
+    /**
+     * Immediately terminates all active engine and supervisor instances.
+     */
+    async terminateAll() {
+        if (this._idleTimer) {
+            clearTimeout(this._idleTimer);
+            this._idleTimer = null;
+        }
+        const promises = [];
+        for (const [sid, entry] of this._isolatedInstances.entries()) {
+            if (entry && entry.instance) {
+                promises.push(entry.instance.terminate().catch(() => {}));
+            }
+        }
+        this._isolatedInstances.clear();
+        this._surfaces.clear();
+        this._refCount = 0;
+
+        if (this._activeInstance) {
+            const inst = this._activeInstance;
+            this._activeInstance = null;
+            promises.push(inst.terminate().catch(() => {}));
+        }
+
+        await Promise.all(promises);
     }
 
     async _teardownEngine() {

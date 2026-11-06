@@ -19,6 +19,8 @@ pub struct RemotePaneConsumer {
     pub texture: Option<glow::Texture>,
     pub tex_width: u32,
     pub tex_height: u32,
+    pub max_width: u32,
+    pub max_height: u32,
     local_ack_fallback: Option<Box<ConsumerAckHeader>>,
 }
 
@@ -30,8 +32,8 @@ impl RemotePaneConsumer {
         ro_fd: RawFd,
         mapped_size: usize,
         ack_rw_fd: RawFd,
-        initial_width: u32,
-        initial_height: u32,
+        max_width: u32,
+        max_height: u32,
     ) -> Result<Self, &'static str> {
         if ro_fd < 0 {
             return Err("E_SHM_INVALID_FD");
@@ -100,10 +102,16 @@ impl RemotePaneConsumer {
             active_resize_gen: 1,
             last_rendered_seq: 0,
             texture: None,
-            tex_width: initial_width,
-            tex_height: initial_height,
+            tex_width: max_width,
+            tex_height: max_height,
+            max_width,
+            max_height,
             local_ack_fallback,
         })
+    }
+
+    pub fn update_active_resize_gen(&mut self, gen: u64) {
+        self.active_resize_gen = gen;
     }
 
     pub fn ack_header(&self) -> &ConsumerAckHeader {
@@ -154,7 +162,7 @@ impl RemotePaneConsumer {
         )?;
 
         // 2. Execute 15-Point Independent Untrusted Producer Validation Protocol
-        let geom = match calculate_shm_geometry(self.tex_width.max(1), self.tex_height.max(1)) {
+        let geom = match calculate_shm_geometry(self.max_width.max(1), self.max_height.max(1)) {
             Ok(g) => g,
             Err(e) => {
                 release_slot_claim(consumer_ack, claimed_seq);
@@ -168,8 +176,8 @@ impl RemotePaneConsumer {
             prod_hdr,
             consumer_ack,
             self.active_resize_gen,
-            self.tex_width.max(1),
-            self.tex_height.max(1),
+            self.max_width.max(1),
+            self.max_height.max(1),
             geom.slot_stride_bytes,
             geom.total_pixel_bytes,
         ) {
@@ -203,6 +211,9 @@ impl RemotePaneConsumer {
             let frame_len = validated.stride * (validated.height as usize);
             let slice = std::slice::from_raw_parts(pixel_ptr, frame_len);
 
+            let row_length = (validated.stride / 4) as i32;
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, row_length);
+
             // Reallocate texture surface if dimensions changed or if this is the first upload for this texture
             if is_new_texture || self.tex_width != validated.width || self.tex_height != validated.height {
                 gl.tex_image_2d(
@@ -232,6 +243,7 @@ impl RemotePaneConsumer {
                 );
             }
 
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
             gl.bind_texture(glow::TEXTURE_2D, None);
         }
 

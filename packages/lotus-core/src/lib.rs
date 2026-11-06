@@ -94,6 +94,13 @@ impl WindowHandle {
     }
 
     #[napi]
+    pub fn request_redraw(&self) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::RedrawWindow(self.id.clone()));
+        }
+    }
+
+    #[napi]
     pub fn show(&self) {
          if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::ShowWindow(self.id.clone()));
@@ -236,6 +243,8 @@ impl WindowHandle {
         anchor: Option<u32>,
         dock_order: Option<u32>,
         visible: Option<bool>,
+        max_shm_width: Option<u32>,
+        max_shm_height: Option<u32>,
     ) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let rect: euclid::Rect<f32, servo::DeviceIndependentPixel> = euclid::Rect::new(
@@ -253,6 +262,8 @@ impl WindowHandle {
                 anchor: PaneAnchor::from(anchor.unwrap_or(0)),
                 dock_order: dock_order.unwrap_or(0),
                 visible: visible.unwrap_or(true),
+                max_shm_width,
+                max_shm_height,
             });
         }
     }

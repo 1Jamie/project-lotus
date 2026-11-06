@@ -83,6 +83,11 @@ class SandboxedEngineProcess {
         this._isTerminated = true;
 
         try {
+            if (this.controlStream && !this.controlStream.destroyed) {
+                try {
+                    this.controlStream.write('SHUTDOWN\n');
+                } catch {}
+            }
             if (this.supervisorStream && !this.supervisorStream.destroyed) {
                 this.supervisorStream.write('SHUTDOWN\n');
             } else {
@@ -214,8 +219,20 @@ async function spawnSandboxedEngine(options = {}) {
         }
     }
 
+    const supervisorEnv = { ...process.env };
+    if (tempDir) {
+        supervisorEnv.XDG_RUNTIME_DIR = tempDir;
+    } else {
+        delete supervisorEnv.XDG_RUNTIME_DIR;
+    }
+    supervisorEnv.GST_REGISTRY_FORK = 'no';
+    supervisorEnv.GST_REGISTRY_DISABLE = 'yes';
+    supervisorEnv.PULSE_SERVER = '';
+    supervisorEnv.PULSE_AUTOSPAWN = '0';
+
     const supervisorProc = spawn(supervisorBin, supArgs, {
-        stdio
+        stdio,
+        env: supervisorEnv,
     });
 
     if (controlSocketPair) {

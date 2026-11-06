@@ -22,7 +22,7 @@ use dpi::PhysicalSize;
 use euclid::Point2D;
 use servo::resources::{self, Resource};
 use servo::{
-    Code, DeviceIntPoint, DeviceIntRect, DeviceIntSize, EventLoopWaker, InputEvent as ServoInputEvent,
+    Code, ConsoleLogLevel, DeviceIntPoint, DeviceIntRect, DeviceIntSize, EventLoopWaker, InputEvent as ServoInputEvent,
     Key, KeyboardEvent as ServoKeyboardEvent, KeyState, LoadStatus, Location, Modifiers,
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     NamedKey, RenderingContext, ServoBuilder, SoftwareRenderingContext, UserContentManager,
@@ -40,6 +40,22 @@ mod protocol;
 use protocol::{ControlMessage, EngineEvent, InputEvent};
 
 use std::io::Write;
+
+fn is_verbose() -> bool {
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERBOSE.get_or_init(|| {
+        std::env::var("LOTUS_ENGINE_DEBUG").map(|v| v == "1" || v == "true").unwrap_or(false)
+    })
+}
+
+macro_rules! log_debug {
+    ($($arg:tt)*) => {{
+        if is_verbose() {
+            eprintln!($($arg)*);
+            let _ = std::io::stderr().flush();
+        }
+    }};
+}
 
 macro_rules! log_engine {
     ($($arg:tt)*) => {{
@@ -133,7 +149,7 @@ struct EngineDelegate {
 
 impl WebViewDelegate for EngineDelegate {
     fn notify_load_status_changed(&self, webview: servo::WebView, status: LoadStatus) {
-        eprintln!("[lotus-engine] notify_load_status_changed: status={:?}, url={:?}", status, webview.url());
+        log_debug!("[lotus-engine] notify_load_status_changed: status={:?}, url={:?}", status, webview.url());
         if status == LoadStatus::Complete {
             if let Some(u) = webview.url() {
                 *self.last_url.lock().unwrap() = Some(u.to_string());
@@ -144,7 +160,18 @@ impl WebViewDelegate for EngineDelegate {
     }
 
     fn notify_new_frame_ready(&self, _webview: servo::WebView) {
+        log_debug!("[lotus-engine] notify_new_frame_ready for {}", self.surface_id);
         self.frame_ready.store(true, Ordering::SeqCst);
+    }
+
+    fn show_console_message(&self, _webview: servo::WebView, level: ConsoleLogLevel, message: String) {
+        if is_verbose() || matches!(level, ConsoleLogLevel::Error | ConsoleLogLevel::Warn) {
+            log_engine!("[lotus-engine] Console [{:?}]: {}", level, message);
+        }
+    }
+
+    fn notify_crashed(&self, _webview: servo::WebView, reason: String, backtrace: Option<String>) {
+        log_engine!("[lotus-engine] CRASH in webview: {} {:?}", reason, backtrace);
     }
 
     fn notify_page_title_changed(&self, _webview: servo::WebView, title: Option<String>) {
@@ -196,15 +223,29 @@ fn create_surface(
     surface_id: String,
     width: u32,
     height: u32,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+    scale_factor: Option<f32>,
     shm_fd: RawFd,
     ack_fd: RawFd,
     initial_url: Option<String>,
     bridge_script: Option<String>,
-    rendering_ctx: Rc<SoftwareRenderingContext>,
     servo: &servo::Servo,
 ) -> Result<SurfaceState, String> {
-    log_engine!("[lotus-engine] create_surface entered: sid={}, shm_fd={}, ack_fd={}", surface_id, shm_fd, ack_fd);
-    let geom = calculate_shm_geometry(width, height).map_err(|e| format!("{:?}", e))?;
+    log_debug!("[lotus-engine] create_surface entered: sid={}, width={}, height={}, max_w={:?}, max_h={:?}, shm_fd={}, ack_fd={}", surface_id, width, height, max_width, max_height, shm_fd, ack_fd);
+    let mut geom_w = max_width.unwrap_or(width).max(width);
+    let mut geom_h = max_height.unwrap_or(height).max(height);
+    let mut geom = calculate_shm_geometry(geom_w, geom_h).map_err(|e| format!("{:?}", e))?;
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(shm_fd, &mut stat) } == 0 && stat.st_size > 0 {
+        let actual_size = stat.st_size as usize;
+        if 256 + geom.total_pixel_bytes > actual_size {
+            geom_w = width;
+            geom_h = height;
+            geom = calculate_shm_geometry(geom_w, geom_h).map_err(|e| format!("{:?}", e))?;
+        }
+    }
     let total_shm_size = 256 + geom.total_pixel_bytes;
 
     let rw_ptr = unsafe {
@@ -272,11 +313,18 @@ fn create_surface(
         last_title: last_title.clone(),
     };
 
+    let rendering_ctx = Rc::new(
+        SoftwareRenderingContext::new(PhysicalSize::new(width, height))
+            .map_err(|e| format!("SoftwareRenderingContext::new ({}x{}) failed: {:?}", width, height, e))?,
+    );
+
+    let sf = scale_factor.unwrap_or(1.0);
     let mut builder = WebViewBuilder::new(servo, rendering_ctx.clone())
+        .hidpi_scale_factor(euclid::Scale::new(sf))
         .delegate(Rc::new(delegate));
 
     if let Some(ref script) = bridge_script {
-        let mut ucm = UserContentManager::new(servo);
+        let ucm = UserContentManager::new(servo);
         ucm.add_script(Rc::new(UserScript::from(script.as_str())));
         builder = builder.user_content_manager(Rc::new(ucm));
     }
@@ -284,7 +332,7 @@ fn create_surface(
     if let Some(ref u_str) = initial_url {
         match Url::parse(u_str) {
             Ok(u) => {
-                log_engine!("[lotus-engine] Initializing WebView with URL {}", u);
+                log_debug!("[lotus-engine] Initializing WebView with URL {}", u);
                 builder = builder.url(u);
             }
             Err(e) => {
@@ -293,9 +341,11 @@ fn create_surface(
         }
     }
 
-    log_engine!("[lotus-engine] calling builder.build() for {}", surface_id);
+    rendering_ctx.resize(PhysicalSize::new(width, height));
+    log_debug!("[lotus-engine] calling builder.build() for {}", surface_id);
     let webview = builder.build();
-    log_engine!("[lotus-engine] webview built ok for {}", surface_id);
+    log_debug!("[lotus-engine] webview built ok for {}", surface_id);
+    webview.resize(PhysicalSize::new(width, height));
 
     Ok(SurfaceState {
         surface_id,
@@ -515,6 +565,23 @@ fn parse_config() -> EngineConfig {
 // =========================================================================
 
 fn main() {
+    // Force headless software rendering without attempting X11/Wayland/DRI connection
+    std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+    std::env::set_var("GALLIUM_DRIVER", "llvmpipe");
+    std::env::set_var("EGL_PLATFORM", "surfaceless");
+    std::env::set_var("GST_REGISTRY_FORK", "no");
+    std::env::set_var("GST_REGISTRY_DISABLE", "yes");
+    std::env::set_var("PULSE_SERVER", "");
+    std::env::set_var("PULSE_AUTOSPAWN", "0");
+    std::env::remove_var("DISPLAY");
+    std::env::remove_var("WAYLAND_DISPLAY");
+    std::env::remove_var("XAUTHORITY");
+    if std::env::var("XDG_RUNTIME_DIR").is_err() {
+        if let Ok(tmp) = std::env::var("TMPDIR") {
+            std::env::set_var("XDG_RUNTIME_DIR", tmp);
+        }
+    }
+
     let config = parse_config();
     let width = config.width;
     let height = config.height;
@@ -580,10 +647,10 @@ fn main() {
     prefs.shell_background_color_rgba = [0.0, 0.0, 0.0, 1.0];
 
     // Initialize local proxy forwarder to host network broker if listener_fd and broker_socket are present
-    eprintln!("[lotus-engine] Broker config: listener_fd={:?}, broker_socket={:?}", config.listener_fd, config.broker_socket);
+    log_debug!("[lotus-engine] Broker config: listener_fd={:?}, broker_socket={:?}", config.listener_fd, config.broker_socket);
     if let (Some(l_fd), Some(broker_path)) = (config.listener_fd, config.broker_socket.clone()) {
         let listener = unsafe { std::net::TcpListener::from_raw_fd(l_fd) };
-        eprintln!("[lotus-engine] listener.local_addr() = {:?}", listener.local_addr());
+        log_debug!("[lotus-engine] listener.local_addr() = {:?}", listener.local_addr());
         if let Ok(addr) = listener.local_addr() {
             let bound_port = addr.port();
             let proxy_uri = format!("http://127.0.0.1:{}", bound_port);
@@ -595,9 +662,9 @@ fn main() {
             std::thread::Builder::new()
                 .name("lotus-net-proxy".into())
                 .spawn(move || {
-                    eprintln!("[lotus-engine] lotus-net-proxy thread started, listening on {:?}", listener.local_addr());
+                    log_debug!("[lotus-engine] lotus-net-proxy thread started, listening on {:?}", listener.local_addr());
                     for incoming in listener.incoming() {
-                        eprintln!("[lotus-engine] lotus-net-proxy incoming connection: {:?}", incoming);
+                        log_debug!("[lotus-engine] lotus-net-proxy incoming connection: {:?}", incoming);
                         match incoming {
                             Ok(client_stream) => {
                                 if active_conns.load(Ordering::Relaxed) >= 32 {
@@ -649,15 +716,11 @@ fn main() {
         }
     }
 
-    let primary_rendering_ctx = Rc::new(
-        SoftwareRenderingContext::new(PhysicalSize::new(width, height))
-            .expect("SoftwareRenderingContext::new"),
-    );
-
     let servo = ServoBuilder::default()
         .event_loop_waker(Box::new(waker))
         .preferences(prefs)
         .build();
+    servo.setup_logging();
 
     // 5. Initialize Surfaces Map & Optional Initial Surface from CLI
     let mut surfaces: HashMap<String, SurfaceState> = HashMap::new();
@@ -666,11 +729,13 @@ fn main() {
             config.surface_id.clone(),
             width,
             height,
+            None,
+            None,
+            None,
             sfd,
             afd,
             Some(config.initial_url.clone()),
             config.bridge_script.clone(),
-            primary_rendering_ctx.clone(),
             &servo,
         ) {
             Ok(initial_surface) => {
@@ -722,7 +787,7 @@ fn main() {
             match recv_control_msg_with_fds(ctrl_fd, &mut control_read_buf) {
                 Ok((lines, fds)) => {
                     if !lines.is_empty() || !fds.is_empty() {
-                        eprintln!("[lotus-engine] recv_control: lines={:?}, fds={:?}", lines, fds);
+                        log_debug!("[lotus-engine] recv_control: lines={:?}, fds={:?}", lines, fds);
                     }
                     if control_read_buf.len() > 64 * 1024 {
                         control_read_buf.clear();
@@ -741,11 +806,11 @@ fn main() {
                         match serde_json::from_str::<ControlMessage>(&trimmed) {
                             Ok(msg) => {
                                 match msg {
-                                    ControlMessage::CreateSurface { surface_id, width: s_w, height: s_h, url, bridge_script } => {
+                                    ControlMessage::CreateSurface { surface_id, width: s_w, height: s_h, max_width, max_height, scale_factor, url, bridge_script } => {
                                         if pending_fds.len() >= 2 {
                                             let sfd = pending_fds.remove(0);
                                             let afd = pending_fds.remove(0);
-                                            match create_surface(surface_id.clone(), s_w, s_h, sfd, afd, url, bridge_script, primary_rendering_ctx.clone(), &servo) {
+                                            match create_surface(surface_id.clone(), s_w, s_h, max_width, max_height, scale_factor, sfd, afd, url, bridge_script, &servo) {
                                                 Ok(surf) => {
                                                     surfaces.insert(surface_id, surf);
                                                 }
@@ -765,11 +830,11 @@ fn main() {
                                         surfaces.remove(&surface_id);
                                     }
                                     ControlMessage::Navigate { surface_id, url, .. } => {
-                                        eprintln!("[lotus-engine] Navigate received: sid={}, url={}", surface_id, url);
+                                        log_debug!("[lotus-engine] Navigate received: sid={}, url={}", surface_id, url);
                                         if let Some(surf) = surfaces.get_mut(&surface_id) {
                                             match Url::parse(&url) {
                                                 Ok(u) => {
-                                                    eprintln!("[lotus-engine] Navigate loading url: {}", u);
+                                                    log_debug!("[lotus-engine] Navigate loading url: {}", u);
                                                     surf.webview.load(u);
                                                     surf.paint_needed = false;
                                                 }
@@ -781,16 +846,21 @@ fn main() {
                                             eprintln!("[lotus-engine] Navigate surface not found: {}", surface_id);
                                         }
                                     }
-                                    ControlMessage::Resize { surface_id, generation, width: new_w, height: new_h, .. } => {
+                                    ControlMessage::Resize { surface_id, generation, width: new_w, height: new_h, scale_factor } => {
                                         if let Some(surf) = surfaces.get_mut(&surface_id) {
                                             if new_w > 0 && new_h > 0 {
                                                 if (new_w as usize) * 4 <= surf.geom.stride && (new_h as usize) * surf.geom.stride <= surf.geom.slot_stride_bytes {
-                                                    surf.width = new_w;
-                                                    surf.height = new_h;
-                                                    surf.rendering_ctx.resize(PhysicalSize::new(new_w, new_h));
-                                                    surf.webview.resize(PhysicalSize::new(new_w, new_h));
                                                     let prod_hdr = unsafe { &mut *(surf.rw_ptr as *mut ProducerControlHeader) };
                                                     prod_hdr.prod_resize_gen.store(generation, Ordering::Release);
+                                                    if scale_factor > 0.0 {
+                                                        surf.webview.set_hidpi_scale_factor(euclid::Scale::new(scale_factor));
+                                                    }
+                                                    surf.width = new_w;
+                                                    surf.height = new_h;
+                                                    // IMPORTANT: Do NOT call surf.rendering_ctx.resize() before surf.webview.resize()!
+                                                    // Servo's painter.resize_rendering_context() checks `if self.rendering_context.size() == new_size { return; }`
+                                                    // and resizes `rendering_context` itself before updating the WebView viewport and notifying Layout/WebRender.
+                                                    surf.webview.resize(PhysicalSize::new(new_w, new_h));
                                                     surf.paint_needed = true;
                                                 } else {
                                                     eprintln!("[lotus-engine] Resize rejected: {}x{} exceeds SHM bounds (stride={}, slot_stride={})",
@@ -874,7 +944,11 @@ fn main() {
                     DeviceIntSize::new(surf.width as i32, surf.height as i32),
                 );
 
-                if let Some(image) = surf.rendering_ctx.read_to_image(rect) {
+                let image = surf.rendering_ctx.read_to_image(rect);
+                surf.rendering_ctx.present();
+                let image = image.or_else(|| surf.rendering_ctx.read_to_image(rect));
+
+                if let Some(image) = image {
                     let raw_pixels = image.into_raw();
                     let expected_len = (surf.width as usize) * (surf.height as usize) * 4;
                     if raw_pixels.len() == expected_len {
@@ -917,7 +991,7 @@ fn main() {
                                     &mut surf.last_pub_seq,
                                 ) {
                                     Ok(pub_seq) => {
-                                        log_engine!("[lotus-engine] publish_slot OK for {}: slot={}, pub_seq={}", surface_id, slot_idx, pub_seq);
+                                        log_debug!("[lotus-engine] publish_slot OK for {}: slot={}, pub_seq={}", surface_id, slot_idx, pub_seq);
                                         if let Some(ctrl_fd) = config.control_fd {
                                             send_engine_event(
                                                 ctrl_fd,

@@ -1,5 +1,5 @@
 {
-    "name": "lotus-secure-test-app",
+    "name": "lotus-sandbox-test-app",
     "version": "1.0.0",
     "description": "Showcase of Process-Isolated Sandboxed Engine & Dual-Track IPC",
     "main": "main.js",

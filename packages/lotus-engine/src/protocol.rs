@@ -11,6 +11,12 @@ pub enum ControlMessage {
         surface_id: String,
         width: u32,
         height: u32,
+        #[serde(default)]
+        max_width: Option<u32>,
+        #[serde(default)]
+        max_height: Option<u32>,
+        #[serde(default)]
+        scale_factor: Option<f32>,
         url: Option<String>,
         #[serde(default)]
         bridge_script: Option<String>,

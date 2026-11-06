@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Surface 1 // Compositor & Scene Controller</title>
+    <style>
+        :root {
+            --bg-base: #09090b;
+            --bg-panel: #101013;
+            --bg-header: #141418;
+            --border-hairline: #26262c;
+            --border-subtle: #18181c;
+            --text-primary: #e4e4e7;
+            --text-muted: #71717a;
+            --accent-trusted: #10b981;
+            --accent-sandbox: #f59e0b;
+            --accent-danger: #ef4444;
+            --accent-blue: #3b82f6;
+            --font-mono: 'JetBrains Mono', 'Iosevka', 'Fira Code', ui-monospace, SFMono-Regular, monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            border-radius: 0 !important;
+            user-select: none;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg-base);
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+            font-size: 11px;
+            line-height: 1.4;
+            font-variant-numeric: tabular-nums;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+            overflow-x: hidden;
+            border-right: 1px solid var(--border-hairline);
+        }
+
+        body::-webkit-scrollbar {
+            width: 4px;
+        }
+        body::-webkit-scrollbar-track {
+            background: var(--bg-base);
+        }
+        body::-webkit-scrollbar-thumb {
+            background: #26262c;
+        }
+
+        .surface-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 8px;
+            background: var(--bg-header);
+            border-bottom: 1px solid var(--border-hairline);
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-muted);
+            min-height: 24px;
+            white-space: nowrap;
+            overflow: hidden;
+        }
+
+        .section-title {
+            padding: 4px 8px;
+            background: #101014;
+            border-bottom: 1px solid var(--border-hairline);
+            border-top: 1px solid var(--border-hairline);
+            font-size: 9.5px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            white-space: nowrap;
+        }
+
+        .status-led {
+            width: 6px;
+            height: 6px;
+            background: var(--accent-trusted);
+            display: inline-block;
+            flex-shrink: 0;
+        }
+
+        .tag-pill {
+            display: inline-block;
+            font-size: 8.5px;
+            padding: 1px 4px;
+            border: 1px solid var(--border-hairline);
+            background: #1c1c22;
+            color: var(--text-primary);
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .tag-pill.green {
+            border-color: rgba(16, 185, 129, 0.4);
+            color: #6ee7b7;
+        }
+
+        .control-panel {
+            padding: 6px 8px;
+            background: var(--bg-panel);
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 4px;
+        }
+
+        button {
+            background: #18181d;
+            color: var(--text-primary);
+            border: 1px solid #2e2e38;
+            padding: 4px 8px;
+            font-family: var(--font-mono);
+            font-size: 10px;
+            cursor: pointer;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            flex: 1;
+        }
+
+        button:hover {
+            background: #24242c;
+            border-color: #52525b;
+        }
+
+        button.active {
+            background: var(--text-primary);
+            color: var(--bg-base);
+            font-weight: 600;
+            border-color: var(--text-primary);
+        }
+
+        .slider-row {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            margin-top: 2px;
+        }
+
+        .slider-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 9.5px;
+            color: var(--text-muted);
+        }
+
+        input[type=range] {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 4px;
+            background: #26262c;
+            outline: none;
+            margin: 4px 0;
+        }
+
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 12px;
+            height: 12px;
+            background: #10b981;
+            cursor: pointer;
+            border: none;
+        }
+
+        /* 3-Metric Readout Grid */
+        .metric-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px;
+            margin-top: 2px;
+        }
+
+        .metric-card {
+            background: #0d0d10;
+            border: 1px solid var(--border-subtle);
+            padding: 4px 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .metric-card.full {
+            grid-column: span 2;
+        }
+
+        .metric-card-label {
+            font-size: 8.5px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .metric-card-val {
+            font-size: 12px;
+            font-weight: 600;
+            color: #34d399;
+        }
+
+        .metric-card-val.blue {
+            color: #93c5fd;
+        }
+
+        .kv-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 3px 8px;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 10px;
+        }
+
+        .kv-key {
+            color: var(--text-muted);
+            text-transform: uppercase;
+            font-size: 9.5px;
+        }
+
+        .kv-val {
+            color: #79c0ff;
+            text-align: right;
+        }
+    </style>
+</head>
+<body>
+    <div class="surface-header">
+        <div style="display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap;">
+            <span class="status-led"></span>
+            <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">SURFACE 1 // SCENE CONTROLLER</span>
+        </div>
+        <span class="tag-pill green">[IN-PROCESS]</span>
+    </div>
+
+    <!-- 1. Live Viewport & Layout Presets -->
+    <div class="section-title">
+        <span>COMPOSITOR VIEWPORT PRESETS</span>
+        <span style="color: var(--accent-trusted);">[glScissor]</span>
+    </div>
+    <div class="control-panel">
+        <div class="btn-group">
+            <button class="active" id="btn-preset-default">3-COLUMN</button>
+            <button id="btn-preset-wide">WIDE WS</button>
+            <button id="btn-preset-split">50/50 SPLIT</button>
+        </div>
+        <div class="slider-row">
+            <div class="slider-label">
+                <span>POOL A / B SPLIT RATIO</span>
+                <span id="split-ratio-label">65% / 35%</span>
+            </div>
+            <input type="range" id="split-slider" min="25" max="80" value="65" />
+        </div>
+    </div>
+
+    <!-- 2. IPC Bridge Stress Test -->
+    <div class="section-title">
+        <span>IPC BRIDGE STRESS & THROUGHPUT</span>
+        <span style="color: #6ee7b7;">[ZERO-COPY]</span>
+    </div>
+    <div class="control-panel">
+        <button id="btn-toggle-stream" style="border-color: #3b82f6; color: #93c5fd;">START 60HZ IPC STREAM</button>
+        <button id="btn-send-1mb">SEND 1MB BINARY PAYLOAD</button>
+        
+        <div class="metric-grid">
+            <div class="metric-card">
+                <span class="metric-card-label">ROUNDTRIP LATENCY</span>
+                <span class="metric-card-val" id="metric-latency">0.05 ms</span>
+            </div>
+            <div class="metric-card">
+                <span class="metric-card-label">MESSAGES / SEC</span>
+                <span class="metric-card-val" id="metric-rate">0 msg/s</span>
+            </div>
+            <div class="metric-card full">
+                <span class="metric-card-label">ACTIVE TRANSPORT TRACK</span>
+                <span class="metric-card-val blue" id="metric-transport" style="font-size: 10.5px;">TRACK 1: IN-PROCESS PIPELINE</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 3. Privileged Host Capability Check -->
+    <div class="section-title">
+        <span>PRIVILEGED HOST ACCESS</span>
+        <span class="tag-pill">[NODE.JS FS]</span>
+    </div>
+    <div class="control-panel">
+        <button id="btn-read-host-file">AUDIT HOST CONFIG FILE</button>
+        <div id="fs-audit-result" style="font-size: 9.5px; color: var(--text-muted); margin-top: 2px;">
+            Ready to perform authorized Node.js fs.readFileSync
+        </div>
+    </div>
+
+    <!-- 4. Pool B Fault Isolation & Host Supervisor Recovery -->
+    <div class="section-title">
+        <span>POOL B SUPERVISOR RECOVERY</span>
+        <span class="tag-pill" id="poolb-dock-status" style="border-color: rgba(16,185,129,0.3); color: #34d399;">[POOL B: HEALTHY]</span>
+    </div>
+    <div class="control-panel" style="background: #0d0d11;">
+        <div style="font-size: 8.5px; color: var(--text-muted); line-height: 1.35; margin-bottom: 4px;">
+            Pool B runs in a dedicated container. When killed by SIGSYS, this host dock survives and can instantly command supervisor resurrection.
+        </div>
+        <button id="btn-dock-respawn-poolb" style="display: none; background: #991b1b; border-color: #ef4444; color: #fff; font-weight: 700;">
+            ⚡ RESPAWN DEAD POOL B (SUPERVISOR)
+        </button>
+        <div id="dock-respawn-stat" style="font-size: 9px; color: #34d399; margin-top: 2px;"></div>
+    </div>
+
+    <!-- 5. Host Process Baseline -->
+    <div class="section-title" style="margin-top: auto;">
+        <span>HOST BASELINE METRICS</span>
+        <span style="color: var(--text-muted);">[ACTIVE]</span>
+    </div>
+    <div style="background: var(--bg-panel); border-bottom: 1px solid var(--border-hairline);">
+        <div class="kv-row">
+            <span class="kv-key">HOST NODE.JS PID</span>
+            <span class="kv-val" id="metric-pid">...</span>
+        </div>
+        <div class="kv-row">
+            <span class="kv-key">CONSTELLATION SURFACES</span>
+            <span class="kv-val" id="metric-surfaces">2 [Pool A, Pool B]</span>
+        </div>
+        <div class="kv-row">
+            <span class="kv-key">HOST RSS MEMORY</span>
+            <span class="kv-val" id="metric-rss">...</span>
+        </div>
+        <div class="kv-row">
+            <span class="kv-key">PLATFORM / ARCH</span>
+            <span class="kv-val" id="metric-platform">Linux x86_64</span>
+        </div>
+    </div>
+
+    <script>
+        // 1. Host Telemetry Baseline
+        async function refreshHostTelemetry() {
+            const lotus = window.lotus?.ipc || window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                try {
+                    const data = await lotus.invoke('system.getHostMetrics');
+                    document.getElementById('metric-pid').textContent = `PID ${data.pid}`;
+                    document.getElementById('metric-rss').textContent = `${data.rssMb} MB`;
+                    if (data.platform) document.getElementById('metric-platform').textContent = data.platform;
+                } catch (e) {}
+            }
+        }
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', refreshHostTelemetry);
+        } else {
+            refreshHostTelemetry();
+        }
+        window.addEventListener('load', refreshHostTelemetry);
+        setTimeout(refreshHostTelemetry, 60);
+        setInterval(refreshHostTelemetry, 3000);
+
+        // 2. Viewport & Layout Presets
+        const btnPresetDefault = document.getElementById('btn-preset-default');
+        const btnPresetWide = document.getElementById('btn-preset-wide');
+        const btnPresetSplit = document.getElementById('btn-preset-split');
+        const presetButtons = [btnPresetDefault, btnPresetWide, btnPresetSplit];
+
+        function setActivePresetBtn(btn) {
+            presetButtons.forEach(b => b.classList.remove('active'));
+            if (btn) btn.classList.add('active');
+        }
+
+        btnPresetDefault.addEventListener('click', async () => {
+            setActivePresetBtn(btnPresetDefault);
+            const lotus = window.lotus?.ipc || window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                await lotus.invoke('compositor.setLayoutPreset', { preset: 'default' });
+            }
+        });
+
+        btnPresetWide.addEventListener('click', async () => {
+            setActivePresetBtn(btnPresetWide);
+            const lotus = window.lotus?.ipc || window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                await lotus.invoke('compositor.setLayoutPreset', { preset: 'wide_workspace' });
+            }
+        });
+
+        btnPresetSplit.addEventListener('click', async () => {
+            setActivePresetBtn(btnPresetSplit);
+            const lotus = window.lotus?.ipc || window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                await lotus.invoke('compositor.setLayoutPreset', { preset: 'dual_split' });
+            }
+        });
+
+        const splitSlider = document.getElementById('split-slider');
+        const splitRatioLabel = document.getElementById('split-ratio-label');
+        let splitDebounceTimer = null;
+
+        splitSlider.addEventListener('input', () => {
+            const val = parseInt(splitSlider.value, 10);
+            splitRatioLabel.textContent = `${val}% / ${100 - val}%`;
+            setActivePresetBtn(null);
+
+            if (splitDebounceTimer) cancelAnimationFrame(splitDebounceTimer);
+            splitDebounceTimer = requestAnimationFrame(async () => {
+                const lotus = window.lotus?.ipc || window.lotus;
+                if (lotus && typeof lotus.invoke === 'function') {
+                    await lotus.invoke('compositor.setSplitPosition', { ratio: val / 100 });
+                }
+            });
+        });
+
+        // 3. High-Frequency IPC Stress Test
+        let streamActive = false;
+        let streamInterval = null;
+        let streamSeq = 0;
+        let pingsSent = 0;
+        let pingsReceived = 0;
+        let rateCounter = 0;
+        let movingLatencyMs = 0.05;
+
+        const btnToggleStream = document.getElementById('btn-toggle-stream');
+        const metricLatency = document.getElementById('metric-latency');
+        const metricRate = document.getElementById('metric-rate');
+
+        btnToggleStream.addEventListener('click', () => {
+            streamActive = !streamActive;
+            if (streamActive) {
+                btnToggleStream.textContent = 'STOP 60HZ IPC STREAM';
+                btnToggleStream.style.borderColor = '#10b981';
+                btnToggleStream.style.color = '#34d399';
+                pingsSent = 0;
+                pingsReceived = 0;
+                rateCounter = 0;
+
+                streamInterval = setInterval(async () => {
+                    const lotus = window.lotus?.ipc || window.lotus;
+                    if (!lotus || typeof lotus.invoke !== 'function') return;
+                    const seq = ++streamSeq;
+                    const sendTime = performance.now();
+                    pingsSent++;
+                    try {
+                        await lotus.invoke('stress.ping', { seq, sendTime });
+                        const rtt = performance.now() - sendTime;
+                        movingLatencyMs = movingLatencyMs * 0.8 + rtt * 0.2;
+                        pingsReceived++;
+                        rateCounter++;
+                        metricLatency.textContent = `${movingLatencyMs.toFixed(2)} ms`;
+                    } catch (_) {}
+                }, 16); // 60Hz ticker
+            } else {
+                clearInterval(streamInterval);
+                btnToggleStream.textContent = 'START 60HZ IPC STREAM';
+                btnToggleStream.style.borderColor = '#3b82f6';
+                btnToggleStream.style.color = '#93c5fd';
+                metricRate.textContent = '0 msg/s';
+            }
+        });
+
+        setInterval(() => {
+            if (streamActive) {
+                metricRate.textContent = `${rateCounter} msg/s`;
+                rateCounter = 0;
+            }
+        }, 1000);
+
+        // 1MB Binary Payload Echo (Real wire transport & serialization)
+        const btnSend1mb = document.getElementById('btn-send-1mb');
+        btnSend1mb.addEventListener('click', async () => {
+            const lotus = window.lotus?.ipc || window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                btnSend1mb.textContent = 'TRANSMITTING 1MB TYPED ARRAY...';
+                const startTime = performance.now();
+                // Create real 1MB binary array
+                const rawBinary = new Uint8Array(1024 * 1024);
+                rawBinary.fill(0x42);
+                try {
+                    const res = await lotus.invoke('stress.echoBinary', { data: rawBinary });
+                    const rtt = performance.now() - startTime;
+                    metricLatency.textContent = `${rtt.toFixed(2)} ms`;
+                    const throughput = ((1024 * 1024) / (rtt / 1000) / 1024 / 1024).toFixed(1);
+                    btnSend1mb.textContent = `1MB ECHOED (${rtt.toFixed(1)}ms | ${throughput} MB/s)`;
+                    setTimeout(() => { btnSend1mb.textContent = 'SEND 1MB BINARY PAYLOAD'; }, 2500);
+                } catch (e) {
+                    btnSend1mb.textContent = 'ECHO FAILED';
+                    setTimeout(() => { btnSend1mb.textContent = 'SEND 1MB BINARY PAYLOAD'; }, 2000);
+                }
+            }
+        });
+
+        // 4. Privileged Host File Audit
+        const btnReadHostFile = document.getElementById('btn-read-host-file');
+        const fsAuditResult = document.getElementById('fs-audit-result');
+        btnReadHostFile.addEventListener('click', async () => {
+            const lotus = window.lotus?.ipc || window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                try {
+                    const res = await lotus.invoke('system.readHostFile');
+                    if (res.success) {
+                        fsAuditResult.style.color = '#34d399';
+                        fsAuditResult.textContent = `✔ 200 OK: Read ${res.name} v${res.version} from host fs`;
+                    } else {
+                        fsAuditResult.style.color = '#ef4444';
+                        fsAuditResult.textContent = `✖ Failed: ${res.error}`;
+                    }
+                } catch (err) {
+                    fsAuditResult.style.color = '#ef4444';
+                    fsAuditResult.textContent = `✖ Call error: ${err.message}`;
+                }
+            }
+        });
+
+        // 5. Pool B Failure Domain & Host Supervisor Recovery
+        const poolbDockStatus = document.getElementById('poolb-dock-status');
+        const btnDockRespawn = document.getElementById('btn-dock-respawn-poolb');
+        const dockRespawnStat = document.getElementById('dock-respawn-stat');
+
+        btnDockRespawn.addEventListener('click', async () => {
+            const lotus = window.lotus?.ipc || window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                btnDockRespawn.textContent = 'COMMANDING SUPERVISOR RESPAWN...';
+                try {
+                    const res = await lotus.invoke('system.respawnAuxEngine');
+                    if (res.respawned) {
+                        poolbDockStatus.style.borderColor = 'rgba(16,185,129,0.3)';
+                        poolbDockStatus.style.color = '#34d399';
+                        poolbDockStatus.textContent = `[POOL B: HEALTHY (PID ${res.newPid})]`;
+                        dockRespawnStat.style.color = '#34d399';
+                        dockRespawnStat.textContent = `✔ Container restored in ${res.latencyMs.toFixed(1)}ms (New PID ${res.newPid})`;
+                        btnDockRespawn.style.display = 'none';
+                        setTimeout(() => { dockRespawnStat.textContent = ''; }, 4000);
+                    }
+                } catch (err) {
+                    dockRespawnStat.style.color = '#ef4444';
+                    dockRespawnStat.textContent = `✖ Respawn error: ${err.message}`;
+                }
+            }
+        });
+
+        const eventSrc = window.lotus?.on ? window.lotus : (window.lotus?.ipc?.on ? window.lotus.ipc : null);
+        if (eventSrc && typeof eventSrc.on === 'function') {
+            eventSrc.on('system.crashEvent', (evt) => {
+                poolbDockStatus.style.borderColor = '#ef4444';
+                poolbDockStatus.style.color = '#f87171';
+                poolbDockStatus.textContent = `[POOL B: DEAD (${evt.sig || 'TERMINATED'})]`;
+                btnDockRespawn.style.display = 'block';
+                btnDockRespawn.textContent = '⚡ RESPAWN DEAD POOL B (SUPERVISOR)';
+                dockRespawnStat.style.color = '#ef4444';
+                dockRespawnStat.textContent = `Pool B process died via ${evt.sig || 'SIGSYS'}. Surviving Host Dock is ready to recover.`;
+            });
+
+            eventSrc.on('system.poolBRespawned', (info) => {
+                poolbDockStatus.style.borderColor = 'rgba(16,185,129,0.3)';
+                poolbDockStatus.style.color = '#34d399';
+                poolbDockStatus.textContent = `[POOL B: HEALTHY (PID ${info.newPid})]`;
+                btnDockRespawn.style.display = 'none';
+            });
+        }
+    </script>
+</body>
+</html>

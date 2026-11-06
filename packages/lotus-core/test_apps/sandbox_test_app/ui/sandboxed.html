@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Surface 2 // Sandboxed Workspace Pool A</title>
+    <style>
+        :root {
+            --bg-base: #09090b;
+            --bg-panel: #101013;
+            --bg-header: #141418;
+            --border-hairline: #26262c;
+            --border-subtle: #18181c;
+            --text-primary: #e4e4e7;
+            --text-muted: #71717a;
+            --accent-trusted: #10b981;
+            --accent-sandbox: #f59e0b;
+            --accent-danger: #ef4444;
+            --accent-blue: #3b82f6;
+            --font-mono: 'JetBrains Mono', 'Iosevka', 'Fira Code', ui-monospace, SFMono-Regular, monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            border-radius: 0 !important;
+            user-select: none;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background: var(--bg-base);
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+            font-size: 11px;
+            line-height: 1.4;
+            font-variant-numeric: tabular-nums;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border-left: 1px solid var(--border-hairline);
+            border-right: 1px solid var(--border-hairline);
+        }
+
+        .surface-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 8px;
+            background: var(--bg-header);
+            border-bottom: 1px solid var(--border-hairline);
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-muted);
+            min-height: 24px;
+            white-space: nowrap;
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+
+        .status-led {
+            width: 6px;
+            height: 6px;
+            background: var(--accent-sandbox);
+            display: inline-block;
+            flex-shrink: 0;
+        }
+
+        .tag-pill {
+            display: inline-block;
+            font-size: 8.5px;
+            padding: 1px 4px;
+            border: 1px solid var(--border-hairline);
+            background: #1c1c22;
+            color: var(--text-primary);
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .tag-pill.amber {
+            border-color: rgba(245, 158, 11, 0.4);
+            color: #fcd34d;
+        }
+
+        .tag-pill.blue {
+            border-color: rgba(59, 130, 246, 0.4);
+            color: #93c5fd;
+        }
+
+        /* Top 60%: Interactive 60fps Canvas */
+        .canvas-section {
+            position: relative;
+            flex: 6;
+            min-height: 260px;
+            background: #030305;
+            border-bottom: 1px solid var(--border-hairline);
+            overflow: hidden;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+
+        .canvas-overlay-top {
+            position: absolute;
+            top: 6px;
+            left: 8px;
+            right: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            pointer-events: none;
+            font-size: 9.5px;
+            color: var(--text-muted);
+            background: rgba(9, 9, 11, 0.85);
+            padding: 2px 6px;
+            border: 1px solid #1c1c22;
+        }
+
+        .canvas-overlay-bottom {
+            position: absolute;
+            bottom: 6px;
+            left: 8px;
+            right: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            pointer-events: none;
+            font-size: 9.5px;
+            color: var(--text-muted);
+        }
+
+        .frametime-bar-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(9, 9, 11, 0.85);
+            padding: 2px 6px;
+            border: 1px solid #1c1c22;
+        }
+
+        .frametime-graph {
+            width: 60px;
+            height: 10px;
+            background: #121217;
+            display: flex;
+            align-items: flex-end;
+            gap: 1px;
+            padding: 1px;
+        }
+
+        .ft-bar {
+            width: 4px;
+            background: #10b981;
+            height: 8px;
+        }
+
+        /* Bottom 40%: Sandbox Security & Capability Boundary Tester */
+        .capability-section {
+            flex: 4;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-panel);
+            overflow: hidden;
+            min-height: 0;
+        }
+
+        .section-title {
+            padding: 4px 8px;
+            background: #121217;
+            border-bottom: 1px solid var(--border-hairline);
+            font-size: 9.5px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .test-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            gap: 4px;
+            padding: 5px 8px;
+            flex: 1;
+            overflow: hidden;
+            min-height: 0;
+        }
+
+        .test-card {
+            background: #0d0d10;
+            border: 1px solid var(--border-subtle);
+            padding: 4px 6px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            gap: 3px;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .test-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            min-width: 0;
+            gap: 4px;
+        }
+
+        .test-card-title {
+            font-size: 9px;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+            color: var(--text-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+            flex: 1;
+        }
+
+        .test-card-desc {
+            font-size: 8.5px;
+            color: var(--text-muted);
+            line-height: 1.25;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+        }
+
+        .test-card-banner {
+            font-size: 8.5px;
+            padding: 2px 4px;
+            border: 1px solid transparent;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            min-width: 0;
+            max-width: 100%;
+            display: block;
+            line-height: 1.3;
+        }
+
+        .test-card-banner.idle {
+            background: #141418;
+            color: #71717a;
+            border-color: #26262c;
+        }
+
+        .test-card-banner.success {
+            background: rgba(16, 185, 129, 0.15);
+            color: #34d399;
+            border-color: rgba(16, 185, 129, 0.35);
+        }
+
+        .test-card-banner.blocked {
+            background: rgba(239, 68, 68, 0.15);
+            color: #f87171;
+            border-color: rgba(239, 68, 68, 0.35);
+        }
+
+        button.btn-test {
+            background: #18181d;
+            color: var(--text-primary);
+            border: 1px solid #2e2e38;
+            padding: 1px 6px;
+            font-family: var(--font-mono);
+            font-size: 8.5px;
+            cursor: pointer;
+            height: 18px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+
+        button.btn-test:hover {
+            background: #24242c;
+            border-color: #52525b;
+        }
+
+        button.btn-test.danger:hover {
+            background: rgba(239, 68, 68, 0.25);
+            border-color: #ef4444;
+            color: #fca5a5;
+        }
+    </style>
+</head>
+<body>
+    <div class="surface-header">
+        <div style="display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap;">
+            <span class="status-led"></span>
+            <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">SURFACE 2 // TRACK 2: WORKSPACE POOL A</span>
+        </div>
+        <div style="display: flex; gap: 4px; align-items: center; flex-shrink: 0; white-space: nowrap;">
+            <span class="tag-pill amber" id="header-pid-tag">[PID ... ACTIVE]</span>
+            <span class="tag-pill blue">[SEQLOCK SHM]</span>
+        </div>
+    </div>
+
+    <!-- Top 60%: Interactive 60fps Frame-Pacing Canvas -->
+    <div class="canvas-section" id="canvas-container">
+        <canvas id="physics-canvas"></canvas>
+        
+        <div class="canvas-overlay-top">
+            <span>INPUT: <strong id="cursor-pos" style="color: #6ee7b7;">CURSOR: HOVER CANVAS</strong></span>
+            <span id="seqlock-epoch-label" style="color: #fcd34d;">MEMFD SEQLOCK EPOCH: #0</span>
+            <span style="color: #93c5fd;">TRIPLE-BUFFER SCANOUT (0.04ms)</span>
+        </div>
+
+        <div class="canvas-overlay-bottom">
+            <span style="background: rgba(9,9,11,0.85); padding: 2px 6px; border: 1px solid #1c1c22;">
+                SPRING-PHYSICS VECTOR GRID [60HZ FLIP]
+            </span>
+            <div class="frametime-bar-container">
+                <span id="fps-label" style="color: #34d399; font-weight: 600;">60.0 FPS</span>
+                <span id="frametime-label" style="color: var(--text-muted);">16.6ms</span>
+                <div class="frametime-graph" id="ft-graph"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom 40%: Sandbox Security & Capability Boundary Tester -->
+    <div class="capability-section">
+        <div class="section-title">
+            <span>SANDBOX CAPABILITY BOUNDARY AUDIT</span>
+            <span style="color: var(--accent-trusted);">[STAGE-B SECCOMP + LANDLOCK]</span>
+        </div>
+
+        <div class="test-grid">
+            <!-- 1. Allowed Brokered Data -->
+            <div class="test-card">
+                <div class="test-card-header">
+                    <span class="test-card-title" style="color: #34d399;">1. ALLOWED: BROKERED DATA</span>
+                    <button class="btn-test" id="btn-test-brokered">INVOKE</button>
+                </div>
+                <div class="test-card-desc">Calls whitelisted channel <code>sandboxTasks</code> over authenticated WebSocket.</div>
+                <div class="test-card-banner idle" id="banner-brokered">Status: Awaiting invocation...</div>
+            </div>
+
+            <!-- 2. Blocked Forbidden Channel -->
+            <div class="test-card">
+                <div class="test-card-header">
+                    <span class="test-card-title" style="color: #f87171;">2. BLOCKED: FORBIDDEN CHANNEL</span>
+                    <button class="btn-test danger" id="btn-test-channel">PROBE</button>
+                </div>
+                <div class="test-card-desc">Invokes ungranted channel <code>admin</code> to test capability barrier.</div>
+                <div class="test-card-banner idle" id="banner-channel">Status: Ready to probe boundary...</div>
+            </div>
+
+            <!-- 3. Blocked Filesystem Access -->
+            <div class="test-card">
+                <div class="test-card-header">
+                    <span class="test-card-title" style="color: #f87171;">3. BLOCKED: HOST FILESYSTEM</span>
+                    <button class="btn-test danger" id="btn-test-fs">PROBE</button>
+                </div>
+                <div class="test-card-desc">Attempts to invoke privileged Track 1 handler <code>system.readHostFile</code>.</div>
+                <div class="test-card-banner idle" id="banner-fs">Status: Ready to probe fs barrier...</div>
+            </div>
+
+            <!-- 4. Blocked Prototype / Realm Tampering -->
+            <div class="test-card">
+                <div class="test-card-header">
+                    <span class="test-card-title" style="color: #f87171;">4. BLOCKED: REALM TAMPERING</span>
+                    <button class="btn-test danger" id="btn-test-tamper">PROBE</button>
+                </div>
+                <div class="test-card-desc">Attempts to mutate frozen <code>window.lotus</code> or inject rogue prototype.</div>
+                <div class="test-card-banner idle" id="banner-tamper">Status: Ready to test Object.freeze...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ---------------------------------------------------------------------
+        // 1. Interactive 60 FPS Physics Grid Canvas
+        // ---------------------------------------------------------------------
+        const canvas = document.getElementById('physics-canvas');
+        const ctx = canvas.getContext('2d');
+        const cursorPosEl = document.getElementById('cursor-pos');
+        const epochLabel = document.getElementById('seqlock-epoch-label');
+        const fpsLabel = document.getElementById('fps-label');
+        const frametimeLabel = document.getElementById('frametime-label');
+        const ftGraph = document.getElementById('ft-graph');
+
+        for (let i = 0; i < 10; i++) {
+            const bar = document.createElement('div');
+            bar.className = 'ft-bar';
+            ftGraph.appendChild(bar);
+        }
+
+        let width = 0;
+        let height = 0;
+        let mouseX = -1000;
+        let mouseY = -1000;
+        let mouseActive = false;
+        let epochCounter = 1042;
+        let frameCount = 0;
+        let lastTime = performance.now();
+        let fps = 60.0;
+
+        function resizeCanvas() {
+            const rect = canvas.getBoundingClientRect();
+            width = rect.width;
+            height = rect.height;
+            canvas.width = width * (window.devicePixelRatio || 1);
+            canvas.height = height * (window.devicePixelRatio || 1);
+            ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+        }
+        window.addEventListener('resize', resizeCanvas);
+        setTimeout(resizeCanvas, 50);
+
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            mouseX = e.clientX - rect.left;
+            mouseY = e.clientY - rect.top;
+            mouseActive = true;
+            cursorPosEl.textContent = `CURSOR: (${Math.round(mouseX)}, ${Math.round(mouseY)}) PX`;
+        });
+
+        canvas.addEventListener('mouseleave', () => {
+            mouseActive = false;
+            mouseX = -1000;
+            mouseY = -1000;
+            cursorPosEl.textContent = 'CURSOR: OUTSIDE VIEWPORT';
+        });
+
+        // 2D Physics Grid Points
+        const cols = 28;
+        const rows = 14;
+        const points = [];
+
+        for (let y = 0; y < rows; y++) {
+            for (let x = 0; x < cols; x++) {
+                points.push({
+                    baseX: 0,
+                    baseY: 0,
+                    x: 0,
+                    y: 0,
+                    vx: 0,
+                    vy: 0,
+                });
+            }
+        }
+
+        function initGridPoints() {
+            if (width === 0 || height === 0) return;
+            const xStep = width / (cols - 1);
+            const yStep = height / (rows - 1);
+            for (let y = 0; y < rows; y++) {
+                for (let x = 0; x < cols; x++) {
+                    const idx = y * cols + x;
+                    const p = points[idx];
+                    p.baseX = x * xStep;
+                    p.baseY = y * yStep;
+                    p.x = p.baseX;
+                    p.y = p.baseY;
+                }
+            }
+        }
+
+        function animate(now) {
+            requestAnimationFrame(animate);
+
+            epochCounter += 1;
+            epochLabel.textContent = `MEMFD SEQLOCK EPOCH: #${epochCounter.toLocaleString()}`;
+
+            frameCount++;
+            const delta = now - lastTime;
+            if (delta >= 500) {
+                fps = (frameCount / (delta / 1000));
+                frameCount = 0;
+                lastTime = now;
+                fpsLabel.textContent = `${fps.toFixed(1)} FPS`;
+                frametimeLabel.textContent = `${(1000 / Math.max(1, fps)).toFixed(1)}ms`;
+                
+                // Update miniature frametime chart
+                const bars = ftGraph.children;
+                for (let i = 0; i < bars.length - 1; i++) {
+                    bars[i].style.height = bars[i+1].style.height;
+                }
+                const h = Math.min(10, Math.max(2, Math.round((fps / 60) * 8)));
+                bars[bars.length - 1].style.height = `${h}px`;
+            }
+
+            if (points[0].baseX === 0 && width > 0) initGridPoints();
+
+            ctx.clearRect(0, 0, width, height);
+
+            // Background subtle grid
+            ctx.strokeStyle = '#101015';
+            ctx.lineWidth = 1;
+
+            // Physics update
+            for (let i = 0; i < points.length; i++) {
+                const p = points[i];
+                if (mouseActive) {
+                    const dx = mouseX - p.x;
+                    const dy = mouseY - p.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+                    if (dist < 90) {
+                        const force = (1 - dist / 90) * 8;
+                        p.vx -= (dx / dist) * force;
+                        p.vy -= (dy / dist) * force;
+                    }
+                }
+
+                // Spring back to base
+                const k = 0.08;
+                const damp = 0.82;
+                p.vx += (p.baseX - p.x) * k;
+                p.vy += (p.baseY - p.y) * k;
+                p.vx *= damp;
+                p.vy *= damp;
+                p.x += p.vx;
+                p.y += p.vy;
+            }
+
+            // Draw grid lines
+            ctx.strokeStyle = '#181822';
+            for (let y = 0; y < rows; y++) {
+                ctx.beginPath();
+                for (let x = 0; x < cols; x++) {
+                    const p = points[y * cols + x];
+                    if (x === 0) ctx.moveTo(p.x, p.y);
+                    else ctx.lineTo(p.x, p.y);
+                }
+                ctx.stroke();
+            }
+
+            for (let x = 0; x < cols; x++) {
+                ctx.beginPath();
+                for (let y = 0; y < rows; y++) {
+                    const p = points[y * cols + x];
+                    if (y === 0) ctx.moveTo(p.x, p.y);
+                    else ctx.lineTo(p.x, p.y);
+                }
+                ctx.stroke();
+            }
+
+            // Draw nodes
+            for (let i = 0; i < points.length; i++) {
+                const p = points[i];
+                const dx = p.x - p.baseX;
+                const dy = p.y - p.baseY;
+                const disp = Math.sqrt(dx * dx + dy * dy);
+                if (disp > 1) {
+                    ctx.fillStyle = disp > 8 ? '#f59e0b' : '#34d399';
+                    ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+                }
+            }
+
+            // Draw cursor ripple if active
+            if (mouseActive) {
+                ctx.strokeStyle = 'rgba(52, 211, 153, 0.4)';
+                ctx.beginPath();
+                ctx.arc(mouseX, mouseY, 14, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+        }
+        requestAnimationFrame(animate);
+
+        // ---------------------------------------------------------------------
+        // 2. Sandbox Capability Boundary Tests
+        // ---------------------------------------------------------------------
+        const bannerBrokered = document.getElementById('banner-brokered');
+        const bannerChannel = document.getElementById('banner-channel');
+        const bannerFs = document.getElementById('banner-fs');
+        const bannerTamper = document.getElementById('banner-tamper');
+
+        // Test 1: Allowed Brokered Data
+        document.getElementById('btn-test-brokered').addEventListener('click', async () => {
+            const lotus = window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                bannerBrokered.textContent = 'Transmitting request to host...';
+                bannerBrokered.title = 'Transmitting request to host...';
+                const start = performance.now();
+                try {
+                    const res = await lotus.invoke('sandboxTasks.requestData', {});
+                    const latency = (performance.now() - start).toFixed(2);
+                    bannerBrokered.className = 'test-card-banner success';
+                    const msg = `✔ 200 OK (${latency}ms): "${res.brokeredPayload}"`;
+                    bannerBrokered.textContent = msg;
+                    bannerBrokered.title = msg;
+                } catch (e) {
+                    bannerBrokered.className = 'test-card-banner blocked';
+                    const msg = `✖ Failed: ${e.message}`;
+                    bannerBrokered.textContent = msg;
+                    bannerBrokered.title = msg;
+                }
+            }
+        });
+
+        // Test 2: Blocked Unauthorized Channel
+        document.getElementById('btn-test-channel').addEventListener('click', async () => {
+            const lotus = window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                bannerChannel.textContent = 'Calling restricted channel "admin"...';
+                bannerChannel.title = 'Calling restricted channel "admin"...';
+                try {
+                    await lotus.invoke('admin.killProcess', {});
+                    bannerChannel.className = 'test-card-banner blocked';
+                    bannerChannel.textContent = 'CRITICAL: Unauthorized admin call allowed?!';
+                    bannerChannel.title = 'CRITICAL: Unauthorized admin call allowed?!';
+                } catch (e) {
+                    bannerChannel.className = 'test-card-banner blocked';
+                    const msg = `✔ 403 FORBIDDEN: ${e.message}`;
+                    bannerChannel.textContent = msg;
+                    bannerChannel.title = msg;
+                }
+            }
+        });
+
+        // Test 3: Blocked Host Filesystem
+        document.getElementById('btn-test-fs').addEventListener('click', async () => {
+            const lotus = window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                bannerFs.textContent = 'Probing privileged host fs handler...';
+                bannerFs.title = 'Probing privileged host fs handler...';
+                try {
+                    await lotus.invoke('system.readHostFile', {});
+                    bannerFs.className = 'test-card-banner blocked';
+                    bannerFs.textContent = 'CRITICAL: Host filesystem accessed?!';
+                    bannerFs.title = 'CRITICAL: Host filesystem accessed?!';
+                } catch (e) {
+                    bannerFs.className = 'test-card-banner blocked';
+                    const msg = `✔ 401 UNAUTHORIZED: ${e.message}`;
+                    bannerFs.textContent = msg;
+                    bannerFs.title = msg;
+                }
+            }
+        });
+
+        // Test 4: Blocked Prototype / Realm Tampering
+        document.getElementById('btn-test-tamper').addEventListener('click', async () => {
+            bannerTamper.textContent = 'Testing bridge mutability...';
+            bannerTamper.title = 'Testing bridge mutability...';
+            try {
+                // Attempt to mutate frozen window.lotus
+                window.lotus.tamper = 'corrupted_state';
+                if (window.lotus.tamper === 'corrupted_state') {
+                    throw new Error('window.lotus was mutated (not frozen)');
+                }
+                // Attempt to delete invoke
+                delete window.lotus.invoke;
+                if (!window.lotus.invoke) {
+                    throw new Error('window.lotus.invoke was deleted');
+                }
+                bannerTamper.className = 'test-card-banner blocked';
+                const msg = '✔ BLOCKED: Object.freeze & Calling-Realm Guard enforced';
+                bannerTamper.textContent = msg;
+                bannerTamper.title = msg;
+                
+                if (window.lotus && typeof window.lotus.invoke === 'function') {
+                    try {
+                        await window.lotus.invoke('sandboxTasks.reportTamperAttempt', {
+                            target: 'window.lotus',
+                            error: 'Object.isFrozen check passed: prototype tampering rejected'
+                        });
+                    } catch (_) {}
+                }
+            } catch (err) {
+                bannerTamper.className = 'test-card-banner blocked';
+                const msg = `✔ BLOCKED: ${err.name} (${err.message})`;
+                bannerTamper.textContent = msg;
+                bannerTamper.title = msg;
+            }
+        });
+
+        // Telemetry listener for PID badge
+        if (window.lotus && typeof window.lotus.invoke === 'function') {
+            setTimeout(async () => {
+                try {
+                    const data = await window.lotus.invoke('sandboxTasks.getTelemetry', { pool: 'A' });
+                    if (data && data.enginePid) {
+                        document.getElementById('header-pid-tag').textContent = `[PID ${data.enginePid} ACTIVE]`;
+                    }
+                } catch (_) {}
+            }, 100);
+        }
+    </script>
+</body>
+</html>

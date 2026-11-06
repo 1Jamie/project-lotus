@@ -857,6 +857,19 @@ class NetworkBroker {
             } catch {}
         }
 
+        const getEffectiveIpcPort = () => {
+            if (options.ipcPort) return options.ipcPort;
+            if (this.ipcPort) return this.ipcPort;
+            try {
+                const lotusCore = require('./lotus.js');
+                if (typeof lotusCore.getIpcPort === 'function') {
+                    const p = lotusCore.getIpcPort();
+                    if (p) return p;
+                }
+            } catch {}
+            return 0;
+        };
+
         const server = http.createServer(async (req, res) => {
             let slotReleased = false;
             const releaseSlot = () => {
@@ -881,7 +894,8 @@ class NetworkBroker {
 
                 // Check for Track 2 host IPC handshake routing
                 const targetPort = parseInt(parsed.port, 10) || 80;
-                const isHostIpcHandshake = options.ipcPort &&
+                const effectiveIpcPort = getEffectiveIpcPort();
+                const isHostIpcHandshake = effectiveIpcPort &&
                     (cleanHostname === '127.0.0.1' || cleanHostname === 'localhost') &&
                     parsed.pathname === '/ipc/handshake';
 
@@ -926,7 +940,7 @@ class NetworkBroker {
                 const reqHeaders = { ...req.headers };
                 delete reqHeaders['proxy-connection'];
                 if (isHostIpcHandshake) {
-                    reqHeaders['host'] = `127.0.0.1:${options.ipcPort}`;
+                    reqHeaders['host'] = `127.0.0.1:${effectiveIpcPort}`;
                 }
 
                 if (surfaceId && topOrigin && !isHostIpcHandshake) {
@@ -937,7 +951,7 @@ class NetworkBroker {
                 }
 
                 const requestTargetUrl = isHostIpcHandshake
-                    ? `http://127.0.0.1:${options.ipcPort}/ipc/handshake`
+                    ? `http://127.0.0.1:${effectiveIpcPort}/ipc/handshake`
                     : targetUrl;
 
                 const proxyReq = http.request(requestTargetUrl, {
@@ -1006,9 +1020,10 @@ class NetworkBroker {
                 }
 
                 let targetIp = targetHost;
-                const isHostIpcConnect = options.ipcPort &&
+                const effectiveIpcPort = getEffectiveIpcPort();
+                const isHostIpcConnect = effectiveIpcPort &&
                     (targetHost === '127.0.0.1' || targetHost === 'localhost') &&
-                    targetPort === options.ipcPort;
+                    targetPort === effectiveIpcPort;
 
                 if (!isHostIpcConnect && net.isIP(targetIp)) {
                     if (!isAllowedPublicIp(targetIp, this.allowLocalhost)) {
@@ -1066,7 +1081,8 @@ class NetworkBroker {
                 }
 
                 const targetPort = parseInt(parsed.port, 10) || 80;
-                const isHostIpcWs = options.ipcPort &&
+                const effectiveIpcPort = getEffectiveIpcPort();
+                const isHostIpcWs = effectiveIpcPort &&
                     (cleanHostname === '127.0.0.1' || cleanHostname === 'localhost') &&
                     parsed.pathname === '/ipc/secure-ws';
 
@@ -1075,11 +1091,11 @@ class NetworkBroker {
                     return clientSocket.destroy();
                 }
 
-                const wsTarget = net.connect(options.ipcPort, '127.0.0.1', () => {
+                const wsTarget = net.connect(effectiveIpcPort, '127.0.0.1', () => {
                     wsTarget.write(`${req.method} ${parsed.pathname}${parsed.search} HTTP/1.1\r\n`);
                     for (const [k, v] of Object.entries(req.headers)) {
                         if (k.toLowerCase() === 'host') {
-                            wsTarget.write(`host: 127.0.0.1:${options.ipcPort}\r\n`);
+                            wsTarget.write(`host: 127.0.0.1:${effectiveIpcPort}\r\n`);
                         } else {
                             wsTarget.write(`${k}: ${v}\r\n`);
                         }

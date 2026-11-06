@@ -84,7 +84,10 @@ pub fn composite_panes_to_scene(
             // Remote Out-Of-Process Pane SHM Compositing Path
             if pane.is_remote {
                 if let Some(consumer) = &mut pane.remote_consumer {
-                    let _ = consumer.consume_latest_frame(&instance.gl);
+                    let res = consumer.consume_latest_frame(&instance.gl);
+                    if let Err(e) = res {
+                        log::warn!("Compositor: Failed to consume remote frame for pane '{}': {}", pane.id, e);
+                    }
                     if let Some(remote_tex) = consumer.get_texture() {
                         instance.gl.bind_framebuffer(glow::FRAMEBUFFER, instance.scene_fbo);
                         instance.gl.viewport(layout_px, layout_py, layout_pw, layout_ph);
@@ -102,6 +105,7 @@ pub fn composite_panes_to_scene(
                             instance.gl.uniform_2_f32(instance.u_comp_size_loc.as_ref(), layout_pw as f32, layout_ph as f32);
                             let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
                             instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), radius);
+                            instance.gl.uniform_1_i32(instance.u_comp_flip_loc.as_ref(), 1);
 
                             instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                             instance.gl.bind_vertex_array(None);
@@ -124,8 +128,7 @@ pub fn composite_panes_to_scene(
 
             let freeze_this_pane = (is_locked || pane.is_resizing || is_hiding) && pane.ghost_tex_size.is_some();
 
-            if let Some(callback) = pane.offscreen_ctx.render_to_parent_callback() {
-                if let (Some(comp_fbo), Some(comp_tex)) = (instance.comp_fbo, instance.comp_tex) {
+            if let (Some(comp_fbo), Some(comp_tex)) = (instance.comp_fbo, instance.comp_tex) {
                     if pane.ghost_tex.is_none() {
                         pane.ghost_tex = Some(instance.gl.create_texture().unwrap());
                     }
@@ -145,6 +148,7 @@ pub fn composite_panes_to_scene(
                             instance.gl.uniform_2_f32(instance.u_comp_size_loc.as_ref(), active_w as f32, active_h as f32);
                             let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
                             instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), radius);
+                            instance.gl.uniform_1_i32(instance.u_comp_flip_loc.as_ref(), 0);
 
                             instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                             instance.gl.bind_vertex_array(None);
@@ -162,7 +166,7 @@ pub fn composite_panes_to_scene(
                             euclid::default::Point2D::new(layout_px, layout_py),
                             euclid::default::Size2D::new(layout_pw, layout_ph)
                         );
-                        callback(&instance.gl, target_rect, comp_fbo.0.get());
+                        pane.offscreen_ctx.blit_into(&instance.gl, comp_fbo, target_rect);
 
                         instance.gl.bind_texture(glow::TEXTURE_2D, pane.ghost_tex);
                         if pane.ghost_tex_size != Some(current_safe_size) {
@@ -189,12 +193,12 @@ pub fn composite_panes_to_scene(
                             instance.gl.uniform_2_f32(instance.u_comp_size_loc.as_ref(), active_w as f32, active_h as f32);
                             let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
                             instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), radius);
+                            instance.gl.uniform_1_i32(instance.u_comp_flip_loc.as_ref(), 0);
                             instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                             instance.gl.bind_vertex_array(None);
                         }
                     }
                 }
-            }
         }
 
         instance.gl.color_mask(true, true, true, true);
@@ -226,6 +230,7 @@ pub fn blit_scene_to_window(
                 instance.gl.uniform_2_f32(instance.u_comp_size_loc.as_ref(), live_w as f32, live_h as f32);
                 let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
                 instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), radius);
+                instance.gl.uniform_1_i32(instance.u_comp_flip_loc.as_ref(), 0);
 
                 instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 instance.gl.bind_vertex_array(None);

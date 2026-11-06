@@ -346,6 +346,8 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             libc::SYS_fstatfs as u32,
             libc::SYS_getdents as u32,
             libc::SYS_umask as u32,
+            libc::SYS_fsync as u32,
+            libc::SYS_fdatasync as u32,
             // Memory management
             libc::SYS_mmap as u32,
             libc::SYS_mprotect as u32,
@@ -576,6 +578,12 @@ mod tests {
                 unsafe { libc::close(sock) };
             } else if unsafe { *libc::__errno_location() } == libc::EPERM {
                 unsafe { libc::_exit(10) };
+            }
+
+            // 9. SYS_fsync must be permitted (not killed by SIGSYS; -1 with EBADF on dummy fd is expected)
+            let fsync_ret = unsafe { libc::fsync(-1) };
+            if fsync_ret != -1 || unsafe { *libc::__errno_location() } != libc::EBADF {
+                unsafe { libc::_exit(11) };
             }
 
             unsafe { libc::_exit(0) };

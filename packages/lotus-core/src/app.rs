@@ -1015,6 +1015,7 @@ pub enum EngineCommand {
     FocusWindow(String), // window_id
     AnimatingChanged(String, String, bool), // window_id, pane_id, animating
     NewFrameReady(String, String), // window_id, pane_id
+    RedrawWindow(String), // window_id
     SetMinInnerSize(String, Option<winit::dpi::PhysicalSize<u32>>), // window_id, size (None = remove constraint)
     SetMaxInnerSize(String, Option<winit::dpi::PhysicalSize<u32>>), // window_id, size (None = remove constraint)
 
@@ -1031,6 +1032,8 @@ pub enum EngineCommand {
         anchor: PaneAnchor,
         dock_order: u32,
         visible: bool,
+        max_shm_width: Option<u32>,
+        max_shm_height: Option<u32>,
     },
     RemovePane(String, String), // window_id, pane_id
     SetPaneRect(String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>), // window_id, pane_id, rect
@@ -1219,7 +1222,7 @@ fn map_winit_physical_key(k: winit::keyboard::PhysicalKey) -> String {
     }
 }
 
-fn forward_remote_input(fd: std::os::unix::io::RawFd, json: &str) {
+pub(crate) fn forward_remote_input(fd: std::os::unix::io::RawFd, json: &str) {
     let mut bytes = json.as_bytes().to_vec();
     bytes.push(b'\n');
     unsafe {
@@ -1489,7 +1492,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     let p_physical_w = p_physical_w.max(1);
                     let p_physical_h = p_physical_h.max(1);
 
-                    let p_offscreen = Rc::new(rendering_context.offscreen_context(ServoPhysicalSize::new(p_physical_w, p_physical_h)));
+                    let p_offscreen = Rc::new(crate::gl::LotusPaneContext::new(
+                        rendering_context.clone(),
+                        ServoPhysicalSize::new(p_physical_w, p_physical_h),
+                    ));
                     let p_ready_to_repaint = Arc::new(AtomicBool::new(true));
                     let p_delegate = Rc::new(LotusPaneDelegate {
                         window: window.clone(),
@@ -1583,6 +1589,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         is_remote: false,
                         remote_consumer: None,
                         remote_input_fd: None,
+                        resize_generation: 0,
                     };
                     panes.insert(pane_opt.id.clone(), pane);
                 }
@@ -1601,6 +1608,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 };
 
                 let mut instance = WindowInstance {
+                    window_id: window_id.clone(),
                     panes,
                     active_layout: initial_layout.clone(),
                     staged_layout: initial_layout,
@@ -1632,6 +1640,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     comp_vbo: None,
                     u_comp_size_loc: None,
                     u_comp_radius_loc: None,
+                    u_comp_flip_loc: None,
                     comp_tex_size: None,
                     scene_fbo: None,
                     scene_tex: None,
@@ -1945,6 +1954,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     }
                 }
             },
+            EngineCommand::RedrawWindow(window_id) => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    instance.window.request_redraw();
+                }
+            },
             EngineCommand::SetMinInnerSize(window_id, size) => {
                 if let Some(instance) = self.windows.get(&window_id) {
                     instance.window.set_min_inner_size(size);
@@ -2029,7 +2043,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         servo_size.width.max(1),
                         servo_size.height.max(1)
                     );
-                    let offscreen_ctx = Rc::new(instance.rendering_context.offscreen_context(servo_size));
+                    let offscreen_ctx = Rc::new(crate::gl::LotusPaneContext::new(
+                        instance.rendering_context.clone(),
+                        servo_size,
+                    ));
 
                     let mut webview_builder = WebViewBuilder::new(&servo, offscreen_ctx.clone())
                         .delegate(delegate)
@@ -2086,6 +2103,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         is_remote: false,
                         remote_consumer: None,
                         remote_input_fd: None,
+                        resize_generation: 0,
                     };
                     instance.panes.insert(pane_id, pane);
                     let physical_size = instance.window.inner_size();
@@ -2105,6 +2123,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 anchor,
                 dock_order,
                 visible,
+                max_shm_width,
+                max_shm_height,
             } => {
                 let servo = self.ensure_servo().clone();
                 if let Some(instance) = self.windows.get_mut(&window_id) {
@@ -2115,10 +2135,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     let hidpi_scale_factor_val = instance.window.scale_factor() as f32;
                     let width = (rect.size.width * hidpi_scale_factor_val).round() as u32;
                     let height = (rect.size.height * hidpi_scale_factor_val).round() as u32;
+                    let max_w = max_shm_width.unwrap_or(width).max(1);
+                    let max_h = max_shm_height.unwrap_or(height).max(1);
                     let servo_size = ServoPhysicalSize::new(width.max(1), height.max(1));
-                    let offscreen_ctx = Rc::new(instance.rendering_context.offscreen_context(servo_size));
+                    let offscreen_ctx = Rc::new(crate::gl::LotusPaneContext::new(
+                        instance.rendering_context.clone(),
+                        servo_size,
+                    ));
 
-                    let consumer = match RemotePaneConsumer::new(ro_fd, shm_size, ack_rw_fd, width.max(1), height.max(1)) {
+                    let consumer = match RemotePaneConsumer::new(ro_fd, shm_size, ack_rw_fd, max_w, max_h) {
                         Ok(c) => Some(c),
                         Err(e) => {
                             error!("Rust: Failed to create RemotePaneConsumer for pane '{}': {:?}", pane_id, e);
@@ -2134,7 +2159,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         rect,
                         last_notified_rect: None,
                         last_physical_rect: euclid::default::Rect::new(
-                            euclid::default::Point2D::new(0, 0),
+                            euclid::default::Point2D::new((rect.origin.x * hidpi_scale_factor_val).round() as i32, (rect.origin.y * hidpi_scale_factor_val).round() as i32),
                             euclid::default::Size2D::new(servo_size.width as i32, servo_size.height as i32),
                         ),
                         z_index,
@@ -2150,7 +2175,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         servo_busy: false,
                         pending_servo_size: None,
                         requested_servo_size: servo_size,
-                        current_servo_size: servo_size,
+                        current_servo_size: ServoPhysicalSize::new(0, 0),
                         ready_to_repaint: Arc::new(AtomicBool::new(true)),
                         ready_frame_size: None,
                         first_frame_painted: true,
@@ -2163,6 +2188,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         is_remote: true,
                         remote_consumer: consumer,
                         remote_input_fd: None,
+                        resize_generation: 0,
                     };
                     instance.panes.insert(pane_id, pane);
                     let physical_size = instance.window.inner_size();
@@ -2249,14 +2275,23 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             EngineCommand::AttachRemotePaneInput(window_id, pane_id, fd) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
+                    let mut attached = false;
                     if let Some(pane) = instance.panes.get_mut(&pane_id) {
                         if let Some(old_fd) = pane.remote_input_fd.replace(fd) {
                             if old_fd >= 0 {
                                 unsafe { libc::close(old_fd) };
                             }
                         }
+                        pane.current_servo_size = ServoPhysicalSize::new(0, 0);
+                        attached = true;
                     } else {
                         unsafe { libc::close(fd); }
+                    }
+                    if attached {
+                        let physical_size = instance.window.inner_size();
+                        let scale_factor = instance.window.scale_factor() as f32;
+                        instance.recalculate_layout(physical_size, scale_factor);
+                        instance.window.request_redraw();
                     }
                 } else {
                     unsafe { libc::close(fd); }
@@ -2588,6 +2623,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             // 1. UNIVERSAL PAINT BLOCK
                             // Paint any panes that have new rendered frames ready in Servo
                             for p in instance.panes.values_mut() {
+                                if p.is_remote {
+                                    continue;
+                                }
                                 if p.needs_repaint {
                                     if let Some(target_size) = p.ready_frame_size {
                                         let safe_size = ServoPhysicalSize::new(target_size.width.max(1), target_size.height.max(1));
@@ -2618,6 +2656,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 for (id, staged_pane) in &committed.panes {
                                     if staged_pane.visible {
                                         if let Some(pane) = instance.panes.get(id) {
+                                            if pane.is_remote {
+                                                continue;
+                                            }
                                             let target_size = ServoPhysicalSize::new(
                                                 (staged_pane.rect.size.width as u32).max(1), 
                                                 (staged_pane.rect.size.height as u32).max(1)
@@ -2792,14 +2833,30 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         if instance.is_mouse_down {
                             if let Some(pane_id) = &instance.last_mouse_down_pane_id {
                                 if let Some(pane) = instance.panes.get_mut(pane_id) {
-                                    let (px, py) = if pane.anchor != PaneAnchor::None {
-                                        (pane.last_physical_rect.origin.x as f32, pane.last_physical_rect.origin.y as f32)
+                                    let (px, py, pw, ph) = if pane.anchor != PaneAnchor::None {
+                                        (
+                                            pane.last_physical_rect.origin.x as f32,
+                                            pane.last_physical_rect.origin.y as f32,
+                                            pane.last_physical_rect.size.width as f32,
+                                            pane.last_physical_rect.size.height as f32,
+                                        )
                                     } else {
                                         let physical_rect = pane.rect.scale(scale_factor, scale_factor);
-                                        (physical_rect.origin.x.round(), physical_rect.origin.y.round())
+                                        (
+                                            physical_rect.origin.x.round(),
+                                            physical_rect.origin.y.round(),
+                                            physical_rect.size.width.round(),
+                                            physical_rect.size.height.round(),
+                                        )
                                     };
-                                    let translated_point = Point2D::new(point.x - px, point.y - py);
+                                    let mut translated_point = Point2D::new(point.x - px, point.y - py);
                                     if pane.is_remote {
+                                        if let Some(ref consumer) = pane.remote_consumer {
+                                            if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
+                                                translated_point.x *= consumer.tex_width as f32 / pw;
+                                                translated_point.y *= consumer.tex_height as f32 / ph;
+                                            }
+                                        }
                                         if let Some(fd) = pane.remote_input_fd {
                                             let surface_id = format!("{}:{}", uuid, pane.id);
                                             let msg = serde_json::json!({
@@ -2932,15 +2989,31 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
 
                                 // Route MouseMove to the hovered pane with translated physical coordinates
-                                let (px, py) = if pane.anchor != PaneAnchor::None {
-                                    (pane.last_physical_rect.origin.x as f32, pane.last_physical_rect.origin.y as f32)
+                                let (px, py, pw, ph) = if pane.anchor != PaneAnchor::None {
+                                    (
+                                        pane.last_physical_rect.origin.x as f32,
+                                        pane.last_physical_rect.origin.y as f32,
+                                        pane.last_physical_rect.size.width as f32,
+                                        pane.last_physical_rect.size.height as f32,
+                                    )
                                 } else {
                                     let physical_rect = pane.rect.scale(scale_factor, scale_factor);
-                                    (physical_rect.origin.x.round(), physical_rect.origin.y.round())
+                                    (
+                                        physical_rect.origin.x.round(),
+                                        physical_rect.origin.y.round(),
+                                        physical_rect.size.width.round(),
+                                        physical_rect.size.height.round(),
+                                    )
                                 };
-                                let translated_point = Point2D::new(point.x - px, point.y - py);
+                                let mut translated_point = Point2D::new(point.x - px, point.y - py);
 
                                 if pane.is_remote {
+                                    if let Some(ref consumer) = pane.remote_consumer {
+                                        if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
+                                            translated_point.x *= consumer.tex_width as f32 / pw;
+                                            translated_point.y *= consumer.tex_height as f32 / ph;
+                                        }
+                                    }
                                     if let Some(fd) = pane.remote_input_fd {
                                         let surface_id = format!("{}:{}", uuid, pane.id);
                                         let msg = format!(
@@ -2980,8 +3053,14 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
 
                                 if rect.contains(point) {
-                                    let translated_point = Point2D::new(point.x - px, point.y - py);
+                                    let mut translated_point = Point2D::new(point.x - px, point.y - py);
                                     if pane.is_remote {
+                                        if let Some(ref consumer) = pane.remote_consumer {
+                                            if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
+                                                translated_point.x *= consumer.tex_width as f32 / pw;
+                                                translated_point.y *= consumer.tex_height as f32 / ph;
+                                            }
+                                        }
                                         if let Some(fd) = pane.remote_input_fd {
                                             let surface_id = format!("{}:{}", uuid, pane.id);
                                             let msg = serde_json::json!({
@@ -3120,13 +3199,31 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         if let Some(pane_id) = target_pane_id {
                             if let Some(pane) = instance.panes.get_mut(&pane_id) {
                                     // Unified physical coordinate translation
-                                    let (px, py) = if pane.anchor != PaneAnchor::None {
-                                        (pane.last_physical_rect.origin.x as f32, pane.last_physical_rect.origin.y as f32)
+                                    let (px, py, pw, ph) = if pane.anchor != PaneAnchor::None {
+                                        (
+                                            pane.last_physical_rect.origin.x as f32,
+                                            pane.last_physical_rect.origin.y as f32,
+                                            pane.last_physical_rect.size.width as f32,
+                                            pane.last_physical_rect.size.height as f32,
+                                        )
                                     } else {
                                         let physical_rect = pane.rect.scale(scale_factor, scale_factor);
-                                        (physical_rect.origin.x.round(), physical_rect.origin.y.round())
+                                        (
+                                            physical_rect.origin.x.round(),
+                                            physical_rect.origin.y.round(),
+                                            physical_rect.size.width.round(),
+                                            physical_rect.size.height.round(),
+                                        )
                                     };
-                                    let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+                                    let mut translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+                                    if pane.is_remote {
+                                        if let Some(ref consumer) = pane.remote_consumer {
+                                            if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
+                                                translated_point.x *= consumer.tex_width as f32 / pw;
+                                                translated_point.y *= consumer.tex_height as f32 / ph;
+                                            }
+                                        }
+                                    }
 
                                     if is_pressed && button == winit::event::MouseButton::Left && instance.frameless {
                                         let size = instance.window.inner_size();
@@ -3209,7 +3306,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     instance.active_pane_id = pane.id.clone();
                                 }
 
-                                let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
                                 if pane.is_remote {
                                     if let Some(fd) = pane.remote_input_fd {
                                         let surface_id = format!("{}:{}", uuid, pane.id);
@@ -3315,46 +3411,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             }
                         }
 
-                        if instance.is_mouse_down {
-                            if let Some(pane_id) = &instance.last_mouse_down_pane_id {
-                                if let Some(pane) = instance.panes.get_mut(pane_id) {
-                                    let (px, py) = if pane.anchor != PaneAnchor::None {
-                                        (pane.last_physical_rect.origin.x as f32, pane.last_physical_rect.origin.y as f32)
-                                    } else {
-                                        let physical_rect = pane.rect.scale(scale_factor, scale_factor);
-                                        (physical_rect.origin.x.round(), physical_rect.origin.y.round())
-                                    };
-                                    let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
-                                    if pane.is_remote {
-                                        if let Some(fd) = pane.remote_input_fd {
-                                            let surface_id = format!("{}:{}", uuid, pane.id);
-                                            let msg = serde_json::json!({
-                                                "type": "Input",
-                                                "event": {
-                                                    "kind": "MouseWheel",
-                                                    "surface_id": surface_id,
-                                                    "generation": 1,
-                                                    "x": translated_point.x,
-                                                    "y": translated_point.y,
-                                                    "dx": x,
-                                                    "dy": y,
-                                                    "modifiers": instance.modifiers.bits(),
-                                                }
-                                            }).to_string();
-                                            forward_remote_input(fd, &msg);
-                                        }
-                                    } else {
-                                        pane.webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
-                                            wheel_delta,
-                                            servo::WebViewPoint::Device(translated_point)
-                                        )));
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-
-                        let mut sorted_panes: Vec<_> = instance.panes.values().collect();
+                        let mut sorted_panes: Vec<_> = instance.panes.values_mut().collect();
                         sorted_panes.sort_by_key(|p| -p.z_index);
                         for pane in sorted_panes {
                             if !pane.is_visible { continue; }
@@ -3377,8 +3434,14 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
 
                             if rect.contains(instance.last_mouse_pos) {
-                                let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+                                let mut translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
                                 if pane.is_remote {
+                                    if let Some(ref consumer) = pane.remote_consumer {
+                                        if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
+                                            translated_point.x *= consumer.tex_width as f32 / pw;
+                                            translated_point.y *= consumer.tex_height as f32 / ph;
+                                        }
+                                    }
                                     if let Some(fd) = pane.remote_input_fd {
                                         let surface_id = format!("{}:{}", uuid, pane.id);
                                         let msg = serde_json::json!({
@@ -3401,7 +3464,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         wheel_delta,
                                         servo::WebViewPoint::Device(translated_point)
                                     )));
+                                    pane.needs_repaint = true;
                                 }
+                                instance.window.request_redraw();
                                 break;
                             }
                         }
@@ -3568,11 +3633,13 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 }
             }
         }
+
+        if let Some(servo) = &self.servo {
+            servo.spin_event_loop();
+        }
     }
 }
 
 // ------------------------------------------------------------------
 // APP STRUCT - Manages global event loop
 // ------------------------------------------------------------------
-
-
