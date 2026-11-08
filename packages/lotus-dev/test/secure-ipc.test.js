@@ -657,3 +657,55 @@ test('Audit 4 Q4 - Initial navigation preserves grants while cross-origin subseq
     assert.strictEqual(surface.allowedChannels.size, 0);
     assert.strictEqual(surface.trustedOrigins.size, 0);
 });
+
+test('Per-document bridge lifecycle - commit rotates documentId; reinject needed when baked creds stale', () => {
+    const tracker = new HostSurfaceTracker();
+    const surface = tracker.createSurface('win-bridge:main', {
+        secure: true,
+        documentId: 'nav-first',
+        origin: 'https://app.example.com',
+        trustedOrigins: ['https://app.example.com'],
+        bootstrapSecret: 'secret-initial',
+    });
+
+    // Simulate CreateSurface bake
+    surface._bridgeDocumentId = 'nav-first';
+    surface._bridgeSecret = 'secret-initial';
+
+    tracker.startNavigation('win-bridge:main', 'nav-first', 'https://app.example.com');
+    tracker.commitNavigation('win-bridge:main', 'nav-first', 'https://app.example.com');
+    assert.strictEqual(surface.activeDocumentId, 'nav-first');
+    assert.strictEqual(surface.bootstrapSecret, 'secret-initial');
+    // Initial commit keeps baked credentials current — no reinject required
+    assert.strictEqual(surface._bridgeDocumentId, surface.activeDocumentId);
+    assert.strictEqual(surface._bridgeSecret, surface.bootstrapSecret);
+
+    // Same-origin subsequent navigation: new documentId, secret preserved
+    tracker.startNavigation('win-bridge:main', 'nav-second', 'https://app.example.com/page2');
+    tracker.commitNavigation('win-bridge:main', 'nav-second', 'https://app.example.com/page2');
+    assert.strictEqual(surface.activeDocumentId, 'nav-second');
+    assert.strictEqual(surface.bootstrapSecret, 'secret-initial');
+    assert.notStrictEqual(surface._bridgeDocumentId, surface.activeDocumentId,
+        'baked bridge documentId must be stale after subsequent commit');
+
+    // Cross-origin subsequent navigation: secret rotates as well
+    const preCrossSecret = surface.bootstrapSecret;
+    surface._bridgeDocumentId = surface.activeDocumentId;
+    surface._bridgeSecret = surface.bootstrapSecret;
+    tracker.startNavigation('win-bridge:main', 'nav-cross', 'https://evil.example.com');
+    tracker.commitNavigation('win-bridge:main', 'nav-cross', 'https://evil.example.com');
+    assert.strictEqual(surface.activeDocumentId, 'nav-cross');
+    assert.notStrictEqual(surface.bootstrapSecret, preCrossSecret);
+    assert.notStrictEqual(surface._bridgeSecret, surface.bootstrapSecret,
+        'baked bridge secret must be stale after cross-origin rotation');
+
+    const script = generateSecureBridgeScript({
+        surfaceId: 'win-bridge:main',
+        documentId: surface.activeDocumentId,
+        bootstrapSecret: surface.bootstrapSecret,
+        enginePort: 12345,
+        wsPort: 12345,
+    });
+    assert.ok(script.includes('scheduleBridgeRetry'), 'bridge must retry handshake after transient failure');
+    assert.ok(script.includes('MAX_BRIDGE_ATTEMPTS'), 'bridge must bound handshake retries');
+});

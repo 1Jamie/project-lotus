@@ -275,3 +275,52 @@ test('Isolated Sandbox Mode (isolated: true): Spawns Dedicated Engine Process an
     await manager._activeInstance.terminate();
 });
 
+test('Isolated spawn must not drop shared-pool LoadStatus generation (E_NAVIGATION_NOT_COMMITTED)', async () => {
+    if (process.platform !== 'linux') return;
+
+    const supervisorBin = path.resolve(__dirname, '../../lotus-supervisor/target/debug/lotus-supervisor');
+    const engineBin = path.resolve(__dirname, '../../lotus-supervisor/target/debug/lotus-sandbox-probe');
+
+    const manager = new SecureConstellationManager({
+        supervisorBin,
+        engineBin,
+        enableNetwork: false,
+    });
+
+    const shared = await manager.acquireSecureEngine('pane-pool-a', { url: 'about:blank' });
+    const sharedGen = manager._sharedEngineInstanceId;
+    assert.strictEqual(shared.instanceId, sharedGen);
+
+    // Pool B (isolated) used to bump the global counter and poison shared event filters.
+    const isolated = await manager.acquireSecureEngine('pane-pool-b', {
+        url: 'about:blank',
+        isolated: true,
+    });
+    assert.notStrictEqual(isolated.instanceId, shared.instanceId);
+    assert.strictEqual(
+        manager._sharedEngineInstanceId,
+        sharedGen,
+        'Isolated acquire must not change shared-pool generation'
+    );
+    assert.strictEqual(
+        manager._isCurrentEventSource(
+            { surface_id: 'pane-pool-a' },
+            { instanceId: sharedGen, isolated: false }
+        ),
+        true,
+        'Shared LoadStatus/FramePublished must still be accepted after isolated spawn'
+    );
+
+    // Re-acquire another shared surface — must report the shared generation, not the
+    // global counter (which isolated already advanced).
+    const shared2 = await manager.acquireSecureEngine('pane-pool-a-2', { url: 'about:blank' });
+    assert.strictEqual(shared2.instanceId, sharedGen);
+
+    await manager.releaseSecureEngine('pane-pool-b');
+    await manager.releaseSecureEngine('pane-pool-a');
+    await manager.releaseSecureEngine('pane-pool-a-2');
+    if (manager._activeInstance) {
+        await manager._activeInstance.terminate();
+    }
+});
+

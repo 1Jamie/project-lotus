@@ -56,18 +56,22 @@ const {
     App,
     createWindow,
     allocateRemotePaneShm,
+    resetRemotePaneShm,
     createControlSocketPair,
     sendFdsOverSocket,
     registerSurfacePolicy,
     dispatchToSurface
 } = require('./index.js');
 const { SecureConstellationManager } = require('./secure_constellation.js');
+const { isEngineInstanceAlive } = require('./launcher.js');
 const EventEmitter = require('events');
 const crypto = require('node:crypto');
 
+// LOTUS_NATIVE_PROFILE=release → use target/release binaries (perf testing).
+const nativeProfile = process.env.LOTUS_NATIVE_PROFILE === 'release' ? 'release' : 'debug';
 const defaultSecureConstellation = new SecureConstellationManager({
-    engineBin: path.resolve(__dirname, '../lotus-engine/target/debug/lotus-engine'),
-    supervisorBin: path.resolve(__dirname, '../lotus-supervisor/target/debug/lotus-supervisor'),
+    engineBin: path.resolve(__dirname, `../lotus-engine/target/${nativeProfile}/lotus-engine`),
+    supervisorBin: path.resolve(__dirname, `../lotus-supervisor/target/${nativeProfile}/lotus-supervisor`),
 });
 let msgpackr;
 try {
@@ -78,6 +82,7 @@ try {
 
 const hostIpcPolicy = require('./host_ipc_policy.js');
 const hostIpcRouter = new hostIpcPolicy.HostIpcPolicyRouter();
+const { normalizeOrigin } = require('./network_broker.js');
 
 class IpcMain extends EventEmitter {
     constructor() {
@@ -519,6 +524,509 @@ ipcMain.on('__lotus_select_ready', (_payload, clientId) => {
     }
 });
 
+function crashChromePaneId(paneId) {
+    return `__lotus_crash_${paneId}`;
+}
+
+function parseSurfaceId(surfaceId) {
+    if (!surfaceId || typeof surfaceId !== 'string') return null;
+    const idx = surfaceId.indexOf(':');
+    if (idx <= 0 || idx >= surfaceId.length - 1) return null;
+    return {
+        windowId: surfaceId.slice(0, idx),
+        paneId: surfaceId.slice(idx + 1),
+    };
+}
+
+const CRASH_CHROME_Z_INDEX = 2_000_000;
+
+function ensureCrashChromePane(win, pane) {
+    const crashId = crashChromePaneId(pane.id);
+    let crash = win.panes.get(crashId);
+    if (crash) return crash;
+
+    const layout = pane._layout || {};
+    // Absolute high-z overlay — never participates in dock layout. The remote keeps its
+    // dock slot (and vsync) underneath while chrome covers the slot visually.
+    crash = win.createPane(crashId, {
+        url: 'lotus-resource://localhost/surface-crash.html',
+        x: layout.x || 0,
+        y: layout.y || 0,
+        width: layout.width || 0,
+        height: layout.height || 0,
+        zIndex: CRASH_CHROME_Z_INDEX,
+        anchor: Anchor.None,
+        dockOrder: 0,
+        visible: false,
+        sandbox: false,
+        secure: false,
+    });
+    return crash;
+}
+
+function coverRemoteWithCrashChrome(win, pane, crash) {
+    if (!win?.handle || !pane || !crash) return;
+    if (typeof win.handle.coverRemoteWithCrashChrome === 'function') {
+        win.handle.coverRemoteWithCrashChrome(pane.id, crash.id);
+        crash.visible = true;
+        pane.visible = true;
+        return;
+    }
+    // Fallback without native cover helper: keep remote in the compositor and stack chrome.
+    win.handle.setPaneVisible(pane.id, true);
+    crash.visible = true;
+    win.handle.setPaneVisible(crash.id, true);
+}
+
+const AUTO_RESPAWN_HEALTHY_MS = 5000;
+const AUTO_RESPAWN_BACKOFF_MS = 250;
+
+function clearAutoRespawnHealthyTimer(pane) {
+    if (pane?._autoRespawnHealthyTimer) {
+        clearTimeout(pane._autoRespawnHealthyTimer);
+        pane._autoRespawnHealthyTimer = null;
+    }
+}
+
+function resetAutoRespawnStreak(pane) {
+    if (!pane) return;
+    clearAutoRespawnHealthyTimer(pane);
+    pane._autoRespawnFailures = 0;
+}
+
+function armAutoRespawnHealthyReset(pane) {
+    if (!pane) return;
+    clearAutoRespawnHealthyTimer(pane);
+    pane._autoRespawnHealthyTimer = setTimeout(() => {
+        pane._autoRespawnHealthyTimer = null;
+        pane._autoRespawnFailures = 0;
+    }, AUTO_RESPAWN_HEALTHY_MS);
+    if (typeof pane._autoRespawnHealthyTimer.unref === 'function') {
+        pane._autoRespawnHealthyTimer.unref();
+    }
+}
+
+function sanitizePaneShm(pane) {
+    if (!pane?._shm || typeof resetRemotePaneShm !== 'function') return;
+    const pixelRwFd = pane._shm.pixelRwFd ?? pane._shm.rwFd ?? -1;
+    const ackRwFd = pane._shm.ackRwFd ?? -1;
+    try {
+        resetRemotePaneShm(pixelRwFd, ackRwFd);
+    } catch (_) {}
+}
+
+function showHostCrashChrome(surfaceId, crashInfo = {}) {
+    const parsed = parseSurfaceId(surfaceId);
+    if (!parsed) return;
+    const win = windows.get(parsed.windowId);
+    if (!win) return;
+    const pane = win.panes.get(parsed.paneId);
+    if (!pane || !pane.isRemote) return;
+
+    // Fault-injection demos stash a human label (SIGSYS/SIGABRT/watchdog) because the
+    // process is always terminated with SIGKILL (blockable signals are unreliable).
+    const fault = pane._faultInjection || null;
+    pane._faultInjection = null;
+    if (fault?.sig && (!crashInfo.sig || crashInfo.sig === 'SIGKILL')) {
+        crashInfo.sig = fault.sig;
+    }
+    if (fault?.reason && !crashInfo.reason) {
+        crashInfo.reason = fault.reason;
+    }
+
+    pane._crashed = {
+        code: crashInfo.code ?? null,
+        sig: fault?.sig || crashInfo.sig || null,
+        reason: fault?.reason || crashInfo.reason || null,
+        isolated: crashInfo.isolated === true,
+        instanceId: crashInfo.instanceId,
+        autoRespawnFailures: pane._autoRespawnFailures || 0,
+    };
+    pane._engineInstance = null;
+    pane._respawning = false;
+
+    // Sanitize SHM ring buffer immediately so dead-engine frames cannot be consumed.
+    sanitizePaneShm(pane);
+
+    const crash = ensureCrashChromePane(win, pane);
+    // Keep the remote docked+visible under opaque host chrome so a later respawn already
+    // has a compositor slot / vsync path — never swap to a frozen SHM flash.
+    coverRemoteWithCrashChrome(win, pane, crash);
+    win.sendToPaneRenderer(crash.id, 'crash-info', {
+        paneId: pane.id,
+        surfaceId,
+        code: pane._crashed.code,
+        sig: pane._crashed.sig,
+        reason: pane._crashed.reason,
+        isolated: pane._crashed.isolated,
+        autoRespawnFailures: pane._crashed.autoRespawnFailures,
+    }, true);
+}
+
+const _respawnInFlight = new Map();
+const RESPAWN_FIRST_FRAME_MS = 20000;
+
+/**
+ * Arm before acquireSecureEngine. Ready requires BOTH:
+ * 1. Verified navigation commit (`load-status === 'complete'`), AND
+ * 2. Verified post-load host GL texture upload (`remote-frame-composited`).
+ */
+function waitForRespawnReady(pane, win, timeoutMs) {
+    return new Promise((resolve) => {
+        let settled = false;
+        let loadComplete = false;
+        let compositedAfterLoad = false;
+        let latestCompositedSeq = 0;
+        let postLoadFallbackTimer = null;
+
+        const finish = (ok, reason) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (postLoadFallbackTimer) clearTimeout(postLoadFallbackTimer);
+            pane.removeListener('remote-frame-composited', onComposited);
+            pane.removeListener('load-status', onLoad);
+            resolve({ ok, reason, pubSeq: latestCompositedSeq });
+        };
+
+        const onComposited = (pubSeq) => {
+            const seq = Number(pubSeq) || 0;
+            if (seq > latestCompositedSeq) {
+                latestCompositedSeq = seq;
+            } else if (latestCompositedSeq === 0) {
+                latestCompositedSeq = 1;
+            }
+            if (loadComplete) {
+                compositedAfterLoad = true;
+                finish(true, 'verified-load-and-composited');
+            }
+        };
+
+        const onLoad = (status) => {
+            if (status === 'failed') {
+                finish(false, 'load-failed');
+                return;
+            }
+            if (status === 'complete') {
+                loadComplete = true;
+                if (win?.handle && typeof win.handle.requestRedraw === 'function') {
+                    win.handle.requestRedraw();
+                }
+                if (compositedAfterLoad || latestCompositedSeq >= 2) {
+                    finish(true, 'verified-load-and-composited');
+                } else if (!postLoadFallbackTimer) {
+                    postLoadFallbackTimer = setTimeout(() => {
+                        postLoadFallbackTimer = null;
+                        if (win?.handle && typeof win.handle.requestRedraw === 'function') {
+                            win.handle.requestRedraw();
+                        }
+                        if (latestCompositedSeq >= 1) {
+                            finish(true, 'verified-load-and-initial-composited');
+                        }
+                    }, 120);
+                }
+            }
+        };
+
+        const timer = setTimeout(() => finish(false, 'timeout'), timeoutMs);
+        pane.on('remote-frame-composited', onComposited);
+        pane.on('load-status', onLoad);
+    });
+}
+
+function restoreSurfaceGrants(pane) {
+    if (!pane?.surfaceId || !hostIpcRouter?.surfaceTracker) return;
+    const surface = hostIpcRouter.surfaceTracker.getSurface(pane.surfaceId);
+    if (!surface) return;
+    const channels = Array.isArray(pane._allowedChannels) ? pane._allowedChannels : [];
+    const origins = Array.isArray(pane._trustedOrigins) ? pane._trustedOrigins : [];
+    surface.allowedChannels = new Set(channels);
+    surface.trustedOrigins = new Set(origins.map((o) => {
+        try {
+            return normalizeOrigin(o);
+        } catch (_) {
+            return o;
+        }
+    }));
+    // Dying-generation failNavigation leaves navigationState=failed and empty grants.
+    // Re-arm so CreateSurface can bake a coherent bridge for the successor.
+    if (surface.navigationState === 'failed') {
+        surface.navigationState = 'provisional';
+        surface.ipcEligible = false;
+    }
+    if (typeof hostIpcPolicy.syncSurfacePolicyToNative === 'function') {
+        hostIpcPolicy.syncSurfacePolicyToNative(surface);
+    }
+}
+
+function revealRemoteAfterRespawn(win, pane, crash) {
+    pane._crashed = null;
+    pane._respawning = false;
+    // Remote was already visible under chrome (vsync path). Only lift the cover.
+    if (crash) {
+        crash.visible = false;
+        win.handle.setPaneVisible(crash.id, false);
+    }
+    pane.visible = true;
+    win.handle.setPaneVisible(pane.id, true);
+    if (typeof win.handle.clearRemoteCrashCover === 'function') {
+        win.handle.clearRemoteCrashCover(pane.id);
+    }
+}
+
+async function respawnCrashedSurface(surfaceId) {
+    const parsed = parseSurfaceId(surfaceId);
+    if (!parsed) {
+        return { respawned: false, error: 'Invalid surfaceId' };
+    }
+    if (_respawnInFlight.has(surfaceId)) {
+        return _respawnInFlight.get(surfaceId);
+    }
+
+    const run = (async () => {
+        const win = windows.get(parsed.windowId);
+        if (!win) return { respawned: false, error: 'Window not found' };
+        const pane = win.panes.get(parsed.paneId);
+        if (!pane || !pane.isRemote) return { respawned: false, error: 'Remote pane not found' };
+        if (!pane._shm) return { respawned: false, error: 'Remote pane SHM missing' };
+
+        // Verified idempotency: check actual OS process liveness (not just JS flags)
+        // so a recently SIGKILLed engine whose exit event hasn't fired is still respawned.
+        if (!pane._crashed && !pane._respawning && isEngineInstanceAlive(pane._engineInstance)) {
+            return {
+                respawned: true,
+                alreadyHealthy: true,
+                newPid: pane._engineInstance.enginePid,
+                surfaceId,
+                paneId: pane.id,
+            };
+        }
+
+        const crashId = crashChromePaneId(pane.id);
+        let crash = win.panes.get(crashId);
+        const url = pane._url || pane._pendingUrl || 'about:blank';
+        // Manual / chrome path covers with Aw Snap. Silent autoRespawn must not flash chrome.
+        const useCrashChrome = Boolean(pane._crashed) || Boolean(crash?.visible);
+
+        try {
+            pane._respawning = true;
+
+            // Step 1: Retire prior isolated instance and verify its OS process is reaped
+            // before sanitizing SHM, so the dying engine cannot write a stale frame.
+            if (pane.isIsolated === true && typeof defaultSecureConstellation._retireIsolatedInstance === 'function') {
+                await defaultSecureConstellation._retireIsolatedInstance(surfaceId);
+            }
+
+            // Step 2: Synchronously zero SHM producer & consumer headers on the host.
+            sanitizePaneShm(pane);
+
+            // Step 3: Cover and arm the host compositor BEFORE spawning the successor engine.
+            if (useCrashChrome) {
+                if (!crash) {
+                    crash = ensureCrashChromePane(win, pane);
+                }
+                coverRemoteWithCrashChrome(win, pane, crash);
+            } else {
+                pane.visible = true;
+                win.handle.setPaneVisible(pane.id, true);
+            }
+            if (typeof win.handle.armCrashCoverFreshFrame === 'function') {
+                win.handle.armCrashCoverFreshFrame(pane.id);
+            }
+
+            // Step 4: Restore surface grants and begin listening for verified load + frame.
+            restoreSurfaceGrants(pane);
+            pane._pendingNavId = null;
+            pane._pendingUrl = url;
+
+            const readyWait = waitForRespawnReady(pane, win, RESPAWN_FIRST_FRAME_MS);
+
+            // Step 5: Spawn successor engine and send CreateSurface.
+            const acquireOpts = {
+                pane,
+                url,
+                shm: pane._shm,
+                isolated: pane.isIsolated === true,
+            };
+            let engineRes;
+            try {
+                engineRes = await defaultSecureConstellation.acquireSecureEngine(surfaceId, acquireOpts);
+            } catch (firstErr) {
+                // Transient spawn race vs. dying supervisor teardown — one retry.
+                await new Promise((r) => setTimeout(r, 150));
+                sanitizePaneShm(pane);
+                restoreSurfaceGrants(pane);
+                pane._pendingNavId = null;
+                pane._pendingUrl = url;
+                try {
+                    engineRes = await defaultSecureConstellation.acquireSecureEngine(surfaceId, acquireOpts);
+                } catch (retryErr) {
+                    throw new Error(
+                        (retryErr && retryErr.message) ||
+                        (firstErr && firstErr.message) ||
+                        String(retryErr || firstErr)
+                    );
+                }
+            }
+
+            // Step 6: Attach successor controlFd for input/vsync/resize lockstep.
+            pane._engineInstance = engineRes.instance;
+            pane._engineInstanceId = engineRes.instanceId;
+            if (engineRes.instance.controlFd && win.handle?.attachRemotePaneInput) {
+                win.handle.attachRemotePaneInput(pane.id, engineRes.instance.controlFd);
+            }
+            if (typeof win.handle.requestRedraw === 'function') {
+                win.handle.requestRedraw();
+            }
+
+            // Step 7: Wait for verified navigation commit AND post-load GL texture upload.
+            const ready = await readyWait;
+            if (!ready.ok) {
+                pane._respawning = false;
+                pane._engineInstance = null;
+                // Drop the half-ready successor so a later Respawn starts clean.
+                try {
+                    await defaultSecureConstellation.releaseSecureEngine(surfaceId);
+                } catch (_) {}
+                sanitizePaneShm(pane);
+                if (useCrashChrome) {
+                    coverRemoteWithCrashChrome(win, pane, crash);
+                }
+                return {
+                    respawned: false,
+                    error: ready.reason === 'load-failed'
+                        ? 'Respawn load failed'
+                        : 'Respawn timed out waiting for first frame',
+                    newPid: engineRes.enginePid,
+                };
+            }
+
+            // Step 8: Reveal verified surface and broadcast canonical lifecycle recovery.
+            revealRemoteAfterRespawn(win, pane, useCrashChrome ? crash : null);
+            resetAutoRespawnStreak(pane);
+            armAutoRespawnHealthyReset(pane);
+
+            const respawnedEvt = {
+                surfaceId,
+                paneId: pane.id,
+                newPid: engineRes.enginePid,
+                isolated: pane.isIsolated === true,
+                pubSeq: ready.pubSeq || 1,
+            };
+            pane.emit('respawned', respawnedEvt);
+            ipcMain.emit('system.remoteSurfaceRespawned', respawnedEvt);
+            ipcMain.send('system.remoteSurfaceRespawned', respawnedEvt);
+
+            return {
+                respawned: true,
+                newPid: engineRes.enginePid,
+                surfaceId,
+                paneId: pane.id,
+            };
+        } catch (err) {
+            pane._respawning = false;
+            return { respawned: false, error: err?.message || String(err) };
+        }
+    })();
+
+    _respawnInFlight.set(surfaceId, run);
+    try {
+        return await run;
+    } finally {
+        _respawnInFlight.delete(surfaceId);
+    }
+}
+
+async function handleRemoteSurfaceCrash(surfaceId, crashInfo = {}) {
+    const parsed = parseSurfaceId(surfaceId);
+    if (!parsed) return;
+    const win = windows.get(parsed.windowId);
+    if (!win) return;
+    const pane = win.panes.get(parsed.paneId);
+    if (!pane || !pane.isRemote) return;
+
+    // Ignore late crash notifications if a respawn is already in flight or if a
+    // newer engine generation is already attached to this pane.
+    if (_respawnInFlight.has(surfaceId) || pane._respawning) {
+        return;
+    }
+    if (
+        crashInfo.instanceId != null &&
+        pane._engineInstanceId != null &&
+        crashInfo.instanceId !== pane._engineInstanceId &&
+        isEngineInstanceAlive(pane._engineInstance)
+    ) {
+        return;
+    }
+
+    clearAutoRespawnHealthyTimer(pane);
+    pane._engineInstance = null;
+
+    const maxAttempts = pane.autoRespawnMaxAttempts > 0 ? pane.autoRespawnMaxAttempts : 3;
+    if (pane.autoRespawn === true) {
+        pane._autoRespawnFailures = (pane._autoRespawnFailures || 0) + 1;
+        if (pane._autoRespawnFailures <= maxAttempts) {
+            // Silent heal: no crash chrome. Remote stays compositor-visible for vsync.
+            pane._crashed = null;
+            if (AUTO_RESPAWN_BACKOFF_MS > 0) {
+                await new Promise((r) => setTimeout(r, AUTO_RESPAWN_BACKOFF_MS));
+            }
+            const result = await respawnCrashedSurface(surfaceId);
+            if (result?.respawned) {
+                return;
+            }
+            // Fall through to chrome when the heal attempt itself fails.
+        }
+    }
+
+    showHostCrashChrome(surfaceId, crashInfo);
+}
+
+defaultSecureConstellation.on('crashed', (event) => {
+    const surfaces = Array.isArray(event?.surfaces) ? event.surfaces : [];
+    for (const surfaceId of surfaces) {
+        handleRemoteSurfaceCrash(surfaceId, event).catch((err) => {
+            console.error('[Lotus] handleRemoteSurfaceCrash error:', err);
+            showHostCrashChrome(surfaceId, event);
+        });
+    }
+});
+
+ipcMain.on('__lotus_crash_respawn', async (payload, clientId) => {
+    const paneId = payload?.paneId;
+    if (!paneId || !clientId) return;
+    const windowId = clientId.split(':')[0];
+    const win = windows.get(windowId);
+    const pane = win?.panes.get(paneId);
+    const surfaceId = pane?.surfaceId || `${windowId}:${paneId}`;
+    const result = await respawnCrashedSurface(surfaceId);
+    if (win) {
+        const crashId = crashChromePaneId(paneId);
+        // Only ack the crash chrome while it is still the visible slot. After a
+        // successful reveal the chrome pane is hidden; a late result is harmless.
+        win.sendToPaneRenderer(crashId, 'crash-respawn-result', result, true);
+    }
+});
+
+ipcMain.on('__lotus_crash_ready', (_payload, clientId) => {
+    if (!clientId) return;
+    const [windowId, crashPaneId] = clientId.split(':');
+    if (!windowId || !crashPaneId || !crashPaneId.startsWith('__lotus_crash_')) return;
+    const paneId = crashPaneId.slice('__lotus_crash_'.length);
+    const win = windows.get(windowId);
+    const pane = win?.panes.get(paneId);
+    if (!win || !pane?._crashed) return;
+    win.sendToPaneRenderer(crashPaneId, 'crash-info', {
+        paneId,
+        surfaceId: pane.surfaceId,
+        code: pane._crashed.code,
+        sig: pane._crashed.sig,
+        reason: pane._crashed.reason,
+        isolated: pane._crashed.isolated,
+        autoRespawnFailures: pane._crashed.autoRespawnFailures,
+    }, true);
+});
+
 function ensureApp() {
     if (!globalApp) {
         if (isProfiling) console.log("[PROFILE] Initializing Lotus App...");
@@ -892,6 +1400,14 @@ function processEvent(win, msg) {
         return;
     }
 
+    if (msg.event === 'remote-frame-composited') {
+        if (win && paneId) {
+            const pane = win.panes.get(paneId);
+            if (pane) pane.emit('remote-frame-composited', msg.pub_seq);
+        }
+        return;
+    }
+
     if (msg.event === 'window-closed') {
         if (win) {
             for (const [p, paneObj] of win.panes.entries()) {
@@ -1021,10 +1537,264 @@ const Anchor = {
     Bottom: 5
 };
 
+const _napiWarnedOnce = new Set();
+
+function _callNapiOptional(handle, method, ...args) {
+    const fn = handle && handle[method];
+    if (typeof fn === 'function') {
+        fn.apply(handle, args);
+        return true;
+    }
+    if (!_napiWarnedOnce.has(method)) {
+        _napiWarnedOnce.add(method);
+        console.warn(`[Lotus] Native ${method} is not available yet; layout mutation was a no-op.`);
+    }
+    return false;
+}
+
+function _resolveLayoutCallbackArgs(optsOrFn, maybeFn) {
+    if (typeof optsOrFn === 'function') {
+        return { containerOpts: {}, fn: optsOrFn };
+    }
+    if (typeof optsOrFn === 'object' && optsOrFn !== null) {
+        return {
+            containerOpts: optsOrFn,
+            fn: typeof maybeFn === 'function' ? maybeFn : () => {},
+        };
+    }
+    return { containerOpts: {}, fn: typeof maybeFn === 'function' ? maybeFn : () => {} };
+}
+
+function _splitChildFieldsFromOpts(opts, direction) {
+    const o = opts || {};
+    let size;
+    if (o.size !== undefined) {
+        size = { kind: 'fixed', value: Number(o.size) };
+    } else if (o.weight !== undefined) {
+        size = { kind: 'weight', value: Number(o.weight) };
+    } else if (direction === 'horizontal' && o.width !== undefined) {
+        size = { kind: 'fixed', value: Number(o.width) };
+    } else if (direction === 'vertical' && o.height !== undefined) {
+        size = { kind: 'fixed', value: Number(o.height) };
+    } else {
+        size = { kind: 'weight', value: 1 };
+    }
+    return {
+        size,
+        min: o.min !== undefined ? Number(o.min) : 1,
+        max: o.max !== undefined ? Number(o.max) : null,
+        resizable: Boolean(o.resizable),
+        visible: o.visible !== false,
+        detached: Boolean(o.detached),
+    };
+}
+
+function _paneOptsFromSizingOpts(opts) {
+    if (!opts || typeof opts !== 'object') return {};
+    const {
+        size, weight, min, max, resizable, detached, width, height,
+        ...rest
+    } = opts;
+    return rest;
+}
+
+class LayoutScope {
+    constructor(builder, direction, splitId, containerOpts) {
+        this._builder = builder;
+        this._direction = direction;
+        this._splitId = splitId;
+        this._containerOpts = containerOpts || {};
+        this._children = [];
+    }
+
+    pane(id, sizeOrOpts, maybeOpts) {
+        let sizingOpts;
+        if (typeof sizeOrOpts === 'number') {
+            sizingOpts = { size: sizeOrOpts, ...(maybeOpts || {}) };
+        } else if (typeof sizeOrOpts === 'object' && sizeOrOpts !== null) {
+            sizingOpts = { ...(maybeOpts || {}), ...sizeOrOpts };
+        } else {
+            sizingOpts = maybeOpts || {};
+        }
+        const child = _splitChildFieldsFromOpts(sizingOpts, this._direction);
+        this._builder._registerTreeLeaf(id, _paneOptsFromSizingOpts(sizingOpts));
+        this._children.push({
+            ...child,
+            node: { type: 'leaf', paneId: id },
+        });
+        return this;
+    }
+
+    row(id, optsOrFn, maybeFn) {
+        return this._nestedContainer('horizontal', id, optsOrFn, maybeFn);
+    }
+
+    col(id, optsOrFn, maybeFn) {
+        return this._nestedContainer('vertical', id, optsOrFn, maybeFn);
+    }
+
+    split(id, opts, fn) {
+        const direction = opts && opts.direction === 'vertical' ? 'vertical' : 'horizontal';
+        const callback = typeof fn === 'function' ? fn : () => {};
+        const inner = new LayoutScope(this._builder, direction, id, opts || {});
+        callback(inner);
+        const splitNode = {
+            type: 'split',
+            id,
+            direction,
+            children: inner._children,
+        };
+        const child = _splitChildFieldsFromOpts(opts || {}, this._direction);
+        this._children.push({ ...child, node: splitNode });
+        return this;
+    }
+
+    _nestedContainer(direction, id, optsOrFn, maybeFn) {
+        const { containerOpts, fn } = _resolveLayoutCallbackArgs(optsOrFn, maybeFn);
+        const inner = new LayoutScope(this._builder, direction, id, containerOpts);
+        fn(inner);
+        const splitNode = {
+            type: 'split',
+            id,
+            direction,
+            children: inner._children,
+        };
+        const child = _splitChildFieldsFromOpts(containerOpts, this._direction);
+        this._children.push({ ...child, node: splitNode });
+        return this;
+    }
+}
+
 class LayoutBuilder {
     constructor() {
         this._panes = [];
         this._currentDockOrder = 0;
+        this._fillTree = null;
+        this._fillUsesSplit = false;
+    }
+
+    _registerTreeLeaf(id, options = {}) {
+        this._panes.push({
+            ...options,
+            id,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            anchor: Anchor.None,
+            visible: options.visible !== false,
+            zIndex: options.zIndex || 0,
+        });
+    }
+
+    _setRootSplit(direction, id, optsOrFn, maybeFn) {
+        const { containerOpts, fn } = _resolveLayoutCallbackArgs(optsOrFn, maybeFn);
+        if (this._fillTree && this._fillUsesSplit) {
+            console.warn('[Lotus] LayoutBuilder: replacing previous Fill-slot split');
+        }
+        const scope = new LayoutScope(this, direction, id, containerOpts);
+        fn(scope);
+        this._fillTree = {
+            type: 'split',
+            id,
+            direction,
+            children: scope._children,
+        };
+        this._fillUsesSplit = true;
+        return this;
+    }
+
+    row(id, optsOrFn, maybeFn) {
+        return this._setRootSplit('horizontal', id, optsOrFn, maybeFn);
+    }
+
+    col(id, optsOrFn, maybeFn) {
+        return this._setRootSplit('vertical', id, optsOrFn, maybeFn);
+    }
+
+    split(id, opts, fn) {
+        const direction = opts && opts.direction === 'vertical' ? 'vertical' : 'horizontal';
+        const callback = typeof fn === 'function' ? fn : () => {};
+        if (this._fillTree && this._fillUsesSplit) {
+            console.warn('[Lotus] LayoutBuilder: replacing previous Fill-slot split');
+        }
+        const scope = new LayoutScope(this, direction, id, opts || {});
+        callback(scope);
+        this._fillTree = {
+            type: 'split',
+            id,
+            direction,
+            children: scope._children,
+        };
+        this._fillUsesSplit = true;
+        return this;
+    }
+
+    _buildLayoutTree() {
+        const dockChildren = [];
+        const docked = this._panes
+            .filter(p => p.anchor !== undefined && p.anchor !== Anchor.None)
+            .slice()
+            .sort((a, b) => (a.dockOrder || 0) - (b.dockOrder || 0));
+
+        let fillDocked = false;
+        for (const p of docked) {
+            if (p.anchor === Anchor.Fill) {
+                fillDocked = true;
+                if (this._fillUsesSplit && this._fillTree) {
+                    dockChildren.push({
+                        anchor: Anchor.Fill,
+                        node: this._fillTree,
+                        size: { kind: 'weight', value: 1 },
+                        min: p.min !== undefined ? Number(p.min) : 1,
+                        max: p.max !== undefined ? Number(p.max) : null,
+                        resizable: Boolean(p.resizable),
+                        visible: p.visible !== false,
+                        detached: false,
+                    });
+                    continue;
+                }
+            }
+
+            let fixedVal = 0;
+            if (p.anchor === Anchor.Left || p.anchor === Anchor.Right) {
+                fixedVal = Math.max(1, Number(p.width) || 0);
+            } else if (p.anchor === Anchor.Top || p.anchor === Anchor.Bottom) {
+                fixedVal = Math.max(1, Number(p.height) || 0);
+            }
+
+            const node = p.anchor === Anchor.Fill
+                ? { type: 'leaf', paneId: p.id }
+                : { type: 'leaf', paneId: p.id };
+
+            dockChildren.push({
+                anchor: p.anchor,
+                node,
+                size: p.anchor === Anchor.Fill
+                    ? { kind: 'weight', value: 1 }
+                    : { kind: 'fixed', value: fixedVal },
+                min: p.min !== undefined ? Number(p.min) : 1,
+                max: p.max !== undefined ? Number(p.max) : null,
+                resizable: Boolean(p.resizable),
+                visible: p.visible !== false,
+                detached: false,
+            });
+        }
+
+        if (this._fillUsesSplit && this._fillTree && !fillDocked) {
+            dockChildren.push({
+                anchor: Anchor.Fill,
+                node: this._fillTree,
+                size: { kind: 'weight', value: 1 },
+                min: 1,
+                max: null,
+                resizable: false,
+                visible: true,
+                detached: false,
+            });
+        }
+
+        return { type: 'dockRoot', children: dockChildren };
     }
 
     left(id, width, options = {}) {
@@ -1101,7 +1871,10 @@ class LayoutBuilder {
     }
 
     config() {
-        return { panes: this._panes };
+        return {
+            panes: this._panes,
+            layout: this._buildLayoutTree(),
+        };
     }
 }
 
@@ -1118,9 +1891,25 @@ class Pane extends EventEmitter {
         this.isIsolated = false;
         this._engineInstance = null;
         this._shm = null;
+        this._url = 'about:blank';
+        this._layout = {
+            anchor: Anchor.None,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            zIndex: 0,
+            dockOrder: 0,
+        };
+        this._crashed = null;
+        this.autoRespawn = false;
+        this.autoRespawnMaxAttempts = 3;
+        this._autoRespawnFailures = 0;
+        this._autoRespawnHealthyTimer = null;
     }
 
     loadUrl(url) {
+        this._url = url;
         const navId = `nav-${crypto.randomBytes(8).toString('hex')}`;
         this._pendingNavId = navId;
         this._pendingUrl = url;
@@ -1155,7 +1944,62 @@ class Pane extends EventEmitter {
     }
 
     setRect(x, y, width, height) {
+        if (this._layout) {
+            this._layout.x = x;
+            this._layout.y = y;
+            this._layout.width = width;
+            this._layout.height = height;
+            // Rust SetPaneRect permanently undocks the pane; keep JS in sync.
+            this._layout.anchor = Anchor.None;
+        }
         this.window.handle.setPaneRect(this.id, x, y, width, height);
+    }
+
+    /**
+     * Update dock thickness without clearing the pane's anchor.
+     * Left/Right use width; Top/Bottom use height; Fill/None are no-ops.
+     * Accepts a single scalar for the consumed axis: pane.setSize(240).
+     */
+    setSize(width, height) {
+        const anchor = this._layout ? this._layout.anchor : Anchor.None;
+        if (anchor === Anchor.Fill || anchor === Anchor.None) {
+            return;
+        }
+
+        const w = Number(width);
+        const h = height === undefined ? w : Number(height);
+        const safeW = Number.isFinite(w) ? w : 0;
+        const safeH = Number.isFinite(h) ? h : 0;
+
+        if (this._layout) {
+            if (anchor === Anchor.Left || anchor === Anchor.Right) {
+                this._layout.width = Math.max(1, safeW);
+            } else if (anchor === Anchor.Top || anchor === Anchor.Bottom) {
+                this._layout.height = Math.max(1, safeH);
+            }
+        }
+
+        const apply = () => {
+            if (typeof this.window.handle.setPaneSize === 'function') {
+                this.window.handle.setPaneSize(this.id, safeW, safeH);
+            }
+        };
+        if (this.window._layoutBatchDepth > 0) {
+            this.window._queueLayoutMutation(apply);
+        } else {
+            apply();
+        }
+    }
+
+    setWeight(weight) {
+        const w = Number(weight);
+        const safeW = Number.isFinite(w) ? Math.max(0, w) : 0;
+        const apply = () => _callNapiOptional(this.window.handle, 'setPaneWeight', this.id, safeW);
+        if (this.window._layoutBatchDepth > 0) {
+            this.window._queueLayoutMutation(apply);
+        } else {
+            apply();
+        }
     }
 
     remove() {
@@ -1163,7 +2007,22 @@ class Pane extends EventEmitter {
     }
 
     setVisible(visible) {
-        this.visible = Boolean(visible);
+        const want = Boolean(visible);
+        this.visible = want;
+        // Crash / respawn cover mode: remote stays compositor-visible (vsync) under chrome.
+        if (this.isRemote && (this._crashed || this._respawning)) {
+            const crash = this.window.panes.get(crashChromePaneId(this.id));
+            if (want && crash) {
+                coverRemoteWithCrashChrome(this.window, this, crash);
+            } else {
+                this.window.handle.setPaneVisible(this.id, false);
+                if (crash) {
+                    crash.visible = false;
+                    crash.window.handle.setPaneVisible(crash.id, false);
+                }
+            }
+            return;
+        }
         this.window.handle.setPaneVisible(this.id, this.visible);
     }
 
@@ -1328,6 +2187,8 @@ class ServoWindow extends EventEmitter {
         // Step 1: If any non-isolated sandboxed pane will be used, immediately pre-warm
         // the sandboxed engine into a ready wait-state in parallel while the host window
         // and in-process panes are constructed.
+        // Isolated panes intentionally do not keep a hot spare — a full lotus-engine is
+        // hundreds of MB; crash recovery force-kills and cold-spawns instead.
         if (sandboxedPanes.length > 0) {
             const hasSharedSandboxedPane = sandboxedPanes.some(
                 p => !(p.isolated === true || (p.isolated !== false && finalOptions.isolated === true))
@@ -1337,9 +2198,12 @@ class ServoWindow extends EventEmitter {
             }
         }
 
-        const rustOptions = (sandboxedPanes.length > 0 && inProcessPanes.length > 0)
+        let rustOptions = (sandboxedPanes.length > 0 && inProcessPanes.length > 0)
             ? { ...finalOptions, panes: inProcessPanes }
-            : finalOptions;
+            : { ...finalOptions };
+        if (rustOptions.layout && typeof rustOptions.layout === 'object') {
+            rustOptions = { ...rustOptions, layout: JSON.stringify(rustOptions.layout) };
+        }
 
         this.handle = createWindow(rustOptions);
         this.id = this.handle.getId();
@@ -1356,6 +2220,9 @@ class ServoWindow extends EventEmitter {
         this._paneBatchQueues = new Map();
         this._paneBatchBytes = new Map();
         this._batchTimer = null;
+        this._layoutBatchDepth = 0;
+        this._layoutBatchQueue = [];
+        this._layout = finalOptions.layout || null;
 
         
         // Register all panes created atomically with the window
@@ -1416,15 +2283,31 @@ class ServoWindow extends EventEmitter {
             const paneObj = this.panes.get(p.id);
             const isSecure = !p.id.startsWith('__lotus_') && (p.sandbox === true || p.secure === true || (p.sandbox !== false && p.secure !== false && (finalOptions.sandbox === true || finalOptions.secure === true)));
             const isIsolated = isSecure && (p.isolated === true || (p.isolated !== false && finalOptions.isolated === true));
+            const paneChannels = Array.from(p.allowedChannels || this._allowedChannels || []);
+            const paneOrigins = Array.from(p.trustedOrigins || this._trustedOrigins || []);
             if (paneObj) {
                 paneObj.surfaceId = surfaceId;
                 paneObj.isIsolated = isIsolated;
+                paneObj._allowedChannels = paneChannels;
+                paneObj._trustedOrigins = paneOrigins;
+                if (p.url) paneObj._url = p.url;
+                // Seed layout from declarative options so setSize can see the real anchor.
+                // (createPane does this for late-added panes; constructor-registered ones need it too.)
+                paneObj._layout = {
+                    anchor: p.anchor !== undefined ? p.anchor : Anchor.None,
+                    x: p.x || 0,
+                    y: p.y || 0,
+                    width: p.width || 0,
+                    height: p.height || 0,
+                    zIndex: p.zIndex || 0,
+                    dockOrder: p.dockOrder || 0,
+                };
             }
 
             hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
                 secure: isSecure,
-                allowedChannels: p.allowedChannels || this._allowedChannels,
-                trustedOrigins: p.trustedOrigins || this._trustedOrigins
+                allowedChannels: paneChannels,
+                trustedOrigins: paneOrigins
             });
 
             const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
@@ -1481,11 +2364,32 @@ class ServoWindow extends EventEmitter {
         pane.surfaceId = surfaceId;
         pane.isRemote = isSecure;
         pane.isIsolated = isIsolated;
+        pane.autoRespawn = options.autoRespawn === true;
+        pane.autoRespawnMaxAttempts = Number.isFinite(options.autoRespawnMaxAttempts)
+            ? Math.max(1, Math.floor(options.autoRespawnMaxAttempts))
+            : 3;
+        pane._autoRespawnFailures = 0;
+        pane._url = url;
+        pane._allowedChannels = Array.from(
+            options.allowedChannels || this._allowedChannels || ['vault', 'telemetry']
+        );
+        pane._trustedOrigins = Array.from(
+            options.trustedOrigins || this._trustedOrigins || []
+        );
+        pane._layout = {
+            anchor,
+            x,
+            y,
+            width,
+            height,
+            zIndex,
+            dockOrder,
+        };
 
         hostIpcRouter.surfaceTracker.createSurface(surfaceId, {
             secure: isSecure,
-            allowedChannels: options.allowedChannels || this._allowedChannels || ['vault', 'telemetry'],
-            trustedOrigins: options.trustedOrigins || this._trustedOrigins || []
+            allowedChannels: pane._allowedChannels,
+            trustedOrigins: pane._trustedOrigins
         });
 
         const initNavId = `nav-init-${crypto.randomBytes(8).toString('hex')}`;
@@ -1577,6 +2481,67 @@ class ServoWindow extends EventEmitter {
 
     getPane(id) {
         return this.panes.get(id);
+    }
+
+    _queueLayoutMutation(fn) {
+        if (typeof fn === 'function') {
+            this._layoutBatchQueue.push(fn);
+        }
+    }
+
+    _flushLayoutBatch() {
+        // Queued mutations (setPaneSize / setSplitWeights / …) already hit NAPI.
+        // beginLayoutBatch/endLayoutBatch bracket the flush so Rust recalculates once.
+        const queue = this._layoutBatchQueue || [];
+        this._layoutBatchQueue = [];
+        for (const fn of queue) {
+            try {
+                fn();
+            } catch (e) {
+                console.error('[Lotus] layout batch mutation failed:', e);
+            }
+        }
+    }
+
+    batchLayout(fn) {
+        this._layoutBatchDepth++;
+        if (this._layoutBatchDepth === 1) {
+            _callNapiOptional(this.handle, 'beginLayoutBatch');
+        }
+        try {
+            if (typeof fn === 'function') {
+                fn();
+            }
+        } finally {
+            this._layoutBatchDepth = Math.max(0, this._layoutBatchDepth - 1);
+            if (this._layoutBatchDepth === 0) {
+                try {
+                    this._flushLayoutBatch();
+                } finally {
+                    _callNapiOptional(this.handle, 'endLayoutBatch');
+                }
+            }
+        }
+    }
+
+    setSplitWeights(splitId, mapOrArray) {
+        const payloadJson = JSON.stringify(mapOrArray ?? {});
+        const apply = () => _callNapiOptional(this.handle, 'setSplitWeights', splitId, payloadJson);
+        if (this._layoutBatchDepth > 0) {
+            this._queueLayoutMutation(apply);
+        } else {
+            apply();
+        }
+    }
+
+    setSplitSizes(splitId, mapOrArray) {
+        const payloadJson = JSON.stringify(mapOrArray ?? {});
+        const apply = () => _callNapiOptional(this.handle, 'setSplitSizes', splitId, payloadJson);
+        if (this._layoutBatchDepth > 0) {
+            this._queueLayoutMutation(apply);
+        } else {
+            apply();
+        }
     }
 
     _resolveSelectTheme(theme) {
@@ -1889,6 +2854,25 @@ class ServoWindow extends EventEmitter {
             return;
         }
 
+        // If this window has remote Track-2 sub-panes, route per-pane so Track-1 panes
+        // receive MessagePack and Track-2 panes receive JSON envelopes (preventing raw
+        // binary MessagePack broadcasts from hitting Track-2 JSON WebSocket listeners).
+        let hasRemoteSubPane = false;
+        for (const p of this.panes.values()) {
+            if (p.isRemote && p.id !== 'main') {
+                hasRemoteSubPane = true;
+                break;
+            }
+        }
+        if (hasRemoteSubPane) {
+            for (const p of this.panes.values()) {
+                if (!p.id.startsWith('__lotus_')) {
+                    this.sendToPaneRenderer(p.id, channel, data, immediate);
+                }
+            }
+            return;
+        }
+
         if (!msgpackr) {
             console.error('[Lotus] msgpackr not loaded, cannot sendToRenderer');
             return;
@@ -2053,6 +3037,8 @@ module.exports = {
     LayoutBuilder,
     Anchor,
     ipcMain,
+    respawnCrashedSurface,
+    showHostCrashChrome,
     app: {
         quit: () => {
             defaultSecureConstellation.terminateAll().catch(() => {});
@@ -2128,6 +3114,7 @@ module.exports = {
         hostIpcRouter,
         defaultSecureConstellation,
         allocateRemotePaneShm,
+        resetRemotePaneShm,
         createControlSocketPair,
         sendFdsOverSocket,
         registerSurfacePolicy,
@@ -2149,7 +3136,10 @@ module.exports = {
     hostIpcPolicy,
     hostIpcRouter,
     defaultSecureConstellation,
+    respawnCrashedSurface,
+    showHostCrashChrome,
     allocateRemotePaneShm,
+    resetRemotePaneShm,
     createControlSocketPair,
     sendFdsOverSocket,
     registerSurfacePolicy,

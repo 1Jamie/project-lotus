@@ -9,6 +9,75 @@ export enum Anchor {
   Bottom = 5
 }
 
+export type LayoutLengthJson =
+  | { kind: 'fixed'; value: number }
+  | { kind: 'weight'; value: number };
+
+export interface LayoutLeafNode {
+  type: 'leaf';
+  paneId: string;
+}
+
+export interface LayoutSplitNode {
+  type: 'split';
+  id: string;
+  direction: 'horizontal' | 'vertical';
+  children: LayoutSplitChild[];
+}
+
+export interface LayoutSplitChild {
+  node: LayoutNodeJson;
+  size: LayoutLengthJson;
+  min: number;
+  max: number | null;
+  resizable: boolean;
+  visible: boolean;
+  detached: boolean;
+}
+
+export interface LayoutDockChild {
+  anchor: Anchor;
+  node: LayoutNodeJson;
+  size: LayoutLengthJson;
+  min: number;
+  max: number | null;
+  resizable: boolean;
+  visible: boolean;
+  detached: boolean;
+}
+
+export interface LayoutDockRootNode {
+  type: 'dockRoot';
+  children: LayoutDockChild[];
+}
+
+export type LayoutNodeJson =
+  | LayoutLeafNode
+  | LayoutSplitNode
+  | LayoutDockRootNode;
+
+export interface LayoutScope {
+  pane(id: string, sizeOrOpts?: number | Partial<PaneOptions & SplitChildOptions>, maybeOpts?: Partial<PaneOptions & SplitChildOptions>): this;
+  row(id: string, fn: (scope: LayoutScope) => void): this;
+  row(id: string, opts: SplitChildOptions, fn: (scope: LayoutScope) => void): this;
+  col(id: string, fn: (scope: LayoutScope) => void): this;
+  col(id: string, opts: SplitChildOptions, fn: (scope: LayoutScope) => void): this;
+  split(id: string, opts: { direction?: 'horizontal' | 'vertical' } & SplitChildOptions, fn: (scope: LayoutScope) => void): this;
+}
+
+export interface SplitChildOptions {
+  size?: number;
+  weight?: number;
+  width?: number;
+  height?: number;
+  min?: number;
+  max?: number;
+  /** Enables native gutter drag on Weight↔Weight (either side) or Fixed seams (Fixed side). */
+  resizable?: boolean;
+  visible?: boolean;
+  detached?: boolean;
+}
+
 export declare class LayoutBuilder {
   constructor();
   left(id: string, width: number, options?: Partial<PaneOptions>): this;
@@ -17,7 +86,12 @@ export declare class LayoutBuilder {
   bottom(id: string, height: number, options?: Partial<PaneOptions>): this;
   fill(id: string, options?: Partial<PaneOptions>): this;
   absolute(id: string, x: number, y: number, width: number, height: number, options?: Partial<PaneOptions>): this;
-  config(): { panes: PaneOptions[] };
+  row(id: string, fn: (scope: LayoutScope) => void): this;
+  row(id: string, opts: SplitChildOptions, fn: (scope: LayoutScope) => void): this;
+  col(id: string, fn: (scope: LayoutScope) => void): this;
+  col(id: string, opts: SplitChildOptions, fn: (scope: LayoutScope) => void): this;
+  split(id: string, opts: { direction?: 'horizontal' | 'vertical' } & SplitChildOptions, fn: (scope: LayoutScope) => void): this;
+  config(): { panes: PaneOptions[]; layout: LayoutDockRootNode };
 }
 
 export interface PaneOptions {
@@ -131,6 +205,8 @@ export interface WindowOptions {
   visible?: boolean;
   autoResizeMain?: boolean;
   panes?: Array<Partial<PaneOptions>>;
+  /** Virtual layout tree from LayoutBuilder.config().layout */
+  layout?: LayoutDockRootNode;
   id?: string;
   wmClass?: string;
   /** Alias for !frameless */
@@ -163,7 +239,19 @@ export declare class Pane extends EventEmitter {
   
   loadUrl(url: string): void;
   executeScript(script: string): void;
+  /**
+   * Reposition/resize a floating pane. Permanently sets Anchor.None
+   * (detaches the pane from automatic window-resize reflow).
+   */
   setRect(x: number, y: number, width: number, height: number): void;
+  /**
+   * Update dock thickness without clearing the pane's anchor.
+   * Left/Right consume width; Top/Bottom consume height; Fill/None are no-ops.
+   * A single scalar is enough for the consumed axis: `pane.setSize(240)`.
+   */
+  setSize(width: number, height?: number): void;
+  /** Update Weight sizing for a leaf in the layout tree (tree-backed layouts). */
+  setWeight(weight: number): void;
   setVisible(visible: boolean): void;
   isVisible(): boolean;
   toggleVisible(): boolean;
@@ -194,6 +282,11 @@ export declare class ServoWindow extends EventEmitter {
   addPane(id: string, options?: Partial<PaneOptions>): Pane;
   getPane(id: string): Pane | undefined;
   removePane(id: string): void;
+
+  /** Coalesce layout tree mutations; single native reflow when the callback returns. */
+  batchLayout(fn: () => void): void;
+  setSplitWeights(splitId: string, weights: Record<string, number> | number[]): void;
+  setSplitSizes(splitId: string, sizes: Record<string, number> | number[]): void;
 
   setSelectMenuTheme(theme: 'auto' | 'light' | 'dark' | SelectMenuTheme): void;
   setSelectMenuCss(css: string): void;

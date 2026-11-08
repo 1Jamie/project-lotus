@@ -268,7 +268,8 @@ class HostSurfaceTracker {
     createSurface(surfaceId, options = {}) {
         const surface = {
             surfaceId,
-            secure: options.sandbox === true || options.secure === true,
+            // Accept both sandbox:true (app API) and secure:true (internal createPane).
+            secure: options.sandbox === true || options.secure === true || options.secure === 1,
             navigationState: 'committed',
             activeDocumentId: options.documentId || `doc-${crypto.randomBytes(8).toString('hex')}`,
             currentOrigin: options.origin ? normalizeOrigin(options.origin) : 'null',
@@ -360,15 +361,15 @@ class HostSurfaceTracker {
         surface.navigationState = 'committed';
 
         // Q4: On initial commit that establishes surface origin, preserve initial grants & credentials.
-        // On subsequent cross-origin navigation, revoke all granted channels and rotate bootstrap secret.
+        // On subsequent *cross-origin* navigation, revoke grants and rotate bootstrap secret.
+        // Same-origin reloads / Pool B respawns must keep the bootstrap secret that was baked into
+        // the bridge script — rotating here causes handshake/auth failures after CreateSurface.
         if (surface._initialCommitPending) {
             surface._initialCommitPending = false;
-        } else {
+        } else if (previousOrigin !== surface.currentOrigin) {
             surface.bootstrapSecret = crypto.randomBytes(32).toString('hex');
-            if (previousOrigin !== surface.currentOrigin) {
-                surface.allowedChannels = new Set();
-                surface.trustedOrigins = new Set();
-            }
+            surface.allowedChannels = new Set();
+            surface.trustedOrigins = new Set();
         }
 
         syncSurfacePolicyToNative(surface);
@@ -790,10 +791,45 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
     let pendingInvocations = new Map();
     let eventListeners = new Map();
     let invocationCounter = 0;
+    let bridgeGeneration = 0;
+    let isUnloading = false;
+    const MAX_BRIDGE_ATTEMPTS = 12;
 
-    async function initBridge() {
+    if (typeof window !== 'undefined') {
+        window.addEventListener('beforeunload', () => {
+            isUnloading = true;
+            bridgeGeneration++;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                try { ws.close(1000, 'Page unloading'); } catch {}
+            }
+        });
+        window.addEventListener('pagehide', () => {
+            isUnloading = true;
+            bridgeGeneration++;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                try { ws.close(1000, 'Page hiding'); } catch {}
+            }
+        });
+    }
+
+    function scheduleBridgeRetry(attempt, generation) {
+        if (isUnloading || generation !== bridgeGeneration || attempt >= MAX_BRIDGE_ATTEMPTS) {
+            return;
+        }
+        const delay = Math.min(1000, 50 * Math.pow(2, Math.min(attempt, 5)));
+        setTimeout(() => {
+            if (!isUnloading && generation === bridgeGeneration) {
+                initBridge(attempt + 1, generation);
+            }
+        }, delay);
+    }
+
+    async function initBridge(attempt, generation) {
+        attempt = attempt || 0;
+        generation = generation === undefined ? ++bridgeGeneration : generation;
+        if (isUnloading || generation !== bridgeGeneration) return;
         try {
-            console.log('[bridge] Starting initBridge for surfaceId:', surfaceId, 'docId:', documentId, 'handshakeUrl:', handshakeUrl);
+            console.log('[bridge] Starting initBridge attempt', attempt, 'for surfaceId:', surfaceId, 'docId:', documentId, 'handshakeUrl:', handshakeUrl);
             const resp = await fetch(handshakeUrl, {
                 method: 'POST',
                 headers: {
@@ -802,8 +838,10 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
                 },
                 body: JSON.stringify({ surfaceId, documentId })
             });
+            if (generation !== bridgeGeneration) return;
             if (!resp.ok) {
                 console.error('[bridge] Handshake HTTP failed:', resp.status, resp.statusText, await resp.text());
+                scheduleBridgeRetry(attempt, generation);
                 return;
             }
             const data = await resp.json();
@@ -815,50 +853,59 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
                 '&ticket=' + encodeURIComponent(ticket);
 
             console.log('[bridge] Connecting WebSocket to:', wsUrl);
-            ws = new WebSocket(wsUrl);
-            let isUnloading = false;
-            if (typeof window !== 'undefined') {
-                window.addEventListener('beforeunload', () => {
-                    isUnloading = true;
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        try { ws.close(1000, 'Page unloading'); } catch {}
-                    }
-                });
-                window.addEventListener('pagehide', () => {
-                    isUnloading = true;
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        try { ws.close(1000, 'Page hiding'); } catch {}
-                    }
-                });
+            if (ws) {
+                try { ws.onclose = null; ws.onerror = null; ws.close(); } catch {}
             }
+            ws = new WebSocket(wsUrl);
+            // Match in-process IPC bootstrap: binary frames as ArrayBuffer, not Blob.
+            // Without this, JSON.parse(Blob) coerces to "[object Blob]" (column-2 SyntaxError).
+            try { ws.binaryType = 'arraybuffer'; } catch (_) {}
             ws.onopen = () => {
                 console.log('[bridge] WebSocket OPEN successfully!');
             };
             ws.onerror = (err) => {
-                if (!isUnloading) {
+                if (!isUnloading && generation === bridgeGeneration) {
                     console.error('[bridge] WebSocket error:', err);
                 }
             };
             ws.onclose = (ev) => {
-                if (!isUnloading && ev.code !== 1000 && ev.code !== 1001) {
+                if (isUnloading || generation !== bridgeGeneration) return;
+                if (ev.code !== 1000 && ev.code !== 1001) {
                     console.warn('[bridge] WebSocket closed:', ev.code, ev.reason);
+                    scheduleBridgeRetry(attempt, generation);
                 }
             };
             ws.onmessage = (event) => {
-                try {
-                    let text = event.data;
-                    if (typeof ArrayBuffer !== 'undefined' && event.data instanceof ArrayBuffer) {
-                        text = new TextDecoder().decode(event.data);
+                const handleText = (text) => {
+                    try {
+                        const msg = JSON.parse(text);
+                        if (msg.type === 'reply' && pendingInvocations.has(msg.id)) {
+                            const { resolve, reject } = pendingInvocations.get(msg.id);
+                            pendingInvocations.delete(msg.id);
+                            if (msg.error) reject(new Error(msg.error));
+                            else resolve(msg.result);
+                        } else if (msg.type === 'event' && eventListeners.has(msg.eventName)) {
+                            const cbs = eventListeners.get(msg.eventName);
+                            cbs.forEach(cb => cb(msg.payload));
+                        }
+                    } catch (e) {
+                        console.error('[bridge] onmessage parse error:', e);
                     }
-                    const msg = JSON.parse(text);
-                    if (msg.type === 'reply' && pendingInvocations.has(msg.id)) {
-                        const { resolve, reject } = pendingInvocations.get(msg.id);
-                        pendingInvocations.delete(msg.id);
-                        if (msg.error) reject(new Error(msg.error));
-                        else resolve(msg.result);
-                    } else if (msg.type === 'event' && eventListeners.has(msg.eventName)) {
-                        const cbs = eventListeners.get(msg.eventName);
-                        cbs.forEach(cb => cb(msg.payload));
+                };
+                try {
+                    const data = event.data;
+                    if (typeof data === 'string') {
+                        handleText(data);
+                    } else if (typeof ArrayBuffer !== 'undefined' && data instanceof ArrayBuffer) {
+                        handleText(new TextDecoder().decode(data));
+                    } else if (typeof Uint8Array !== 'undefined' && ArrayBuffer.isView(data)) {
+                        handleText(new TextDecoder().decode(data));
+                    } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+                        data.text().then(handleText).catch((e) => {
+                            console.error('[bridge] onmessage parse error:', e);
+                        });
+                    } else {
+                        handleText(String(data));
                     }
                 } catch (e) {
                     console.error('[bridge] onmessage parse error:', e);
@@ -866,6 +913,7 @@ function generateSecureBridgeScript({ surfaceId, documentId, bootstrapSecret, en
             };
         } catch (e) {
             console.error('[bridge] initBridge uncaught error:', e);
+            scheduleBridgeRetry(attempt, generation);
         }
     }
 
@@ -927,5 +975,6 @@ module.exports = {
     validateAndProjectOutput,
     HostSurfaceTracker,
     HostIpcPolicyRouter,
-    generateSecureBridgeScript
+    generateSecureBridgeScript,
+    syncSurfacePolicyToNative,
 };

@@ -69,16 +69,6 @@
             flex-shrink: 0;
         }
 
-        .status-led.danger {
-            background: var(--accent-danger);
-            animation: pulse-red 0.8s infinite;
-        }
-
-        @keyframes pulse-red {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
-
         .tag-pill {
             display: inline-block;
             font-size: 8.5px;
@@ -98,54 +88,45 @@
             font-size: 9.5px;
             font-weight: 600;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            letter-spacing: 0.04em;
             color: var(--text-muted);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            white-space: nowrap;
             flex-shrink: 0;
         }
 
-        /* 1. Live 60 FPS Heartbeat Canvas */
-        .heartbeat-container {
-            padding: 12px 8px;
-            background: #060608;
+        .control-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding: 8px;
+            background: var(--bg-panel);
             border-bottom: 1px solid var(--border-hairline);
+        }
+
+        .heartbeat-container {
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
+            padding: 16px 8px 12px;
+            background: #0b0b0e;
+            border-bottom: 1px solid var(--border-hairline);
             gap: 8px;
-            position: relative;
-        }
-
-        canvas#heartbeat-canvas {
-            width: 140px;
-            height: 140px;
-            display: block;
+            flex-shrink: 0;
         }
 
         .heartbeat-badge {
-            font-size: 10.5px;
-            font-weight: 600;
+            font-size: 10px;
+            font-weight: 700;
             letter-spacing: 0.04em;
             color: #34d399;
-            text-align: center;
         }
 
         .heartbeat-uptime {
-            font-size: 9.5px;
+            font-size: 9px;
             color: var(--text-muted);
-        }
-
-        /* 2. Fault Injection Controls */
-        .control-panel {
-            padding: 8px;
-            background: var(--bg-panel);
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
         }
 
         .fault-btn {
@@ -179,57 +160,13 @@
             text-transform: none;
         }
 
-        /* 3. Crash & Diagnostic Overlay */
-        .crash-overlay {
-            display: none;
-            position: absolute;
-            top: 24px;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(9, 9, 11, 0.96);
-            border: 2px solid var(--accent-danger);
-            padding: 12px;
-            flex-direction: column;
-            gap: 10px;
-            z-index: 999;
-        }
-
-        .crash-title {
-            color: var(--accent-danger);
-            font-weight: 700;
-            font-size: 11px;
-            letter-spacing: 0.05em;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-
-        .crash-body {
-            font-size: 9.5px;
-            line-height: 1.45;
-            color: #e4e4e7;
-            background: rgba(239, 68, 68, 0.08);
-            border: 1px solid rgba(239, 68, 68, 0.3);
-            padding: 8px;
-        }
-
-        button.btn-respawn {
-            background: #10b981;
-            color: #09090b;
-            border: none;
-            padding: 6px 10px;
-            font-family: var(--font-mono);
-            font-size: 10.5px;
-            font-weight: 700;
-            cursor: pointer;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            height: 28px;
-        }
-
-        button.btn-respawn:hover {
-            background: #34d399;
+        .corner-dim {
+            margin-top: auto;
+            padding: 4px 8px;
+            font-size: 8.5px;
+            color: var(--text-muted);
+            border-top: 1px solid var(--border-hairline);
+            flex-shrink: 0;
         }
     </style>
 </head>
@@ -242,14 +179,12 @@
         <span class="tag-pill" id="aux-domain-tag">[ISOLATED]</span>
     </div>
 
-    <!-- 1. Live Heartbeat Indicator -->
     <div class="heartbeat-container">
         <canvas id="heartbeat-canvas" width="140" height="140"></canvas>
         <div class="heartbeat-badge" id="heartbeat-badge">POOL B STATUS: HEALTHY</div>
         <div class="heartbeat-uptime" id="heartbeat-uptime">PID: ... | UPTIME: 0s</div>
     </div>
 
-    <!-- 2. Fault Injection Controls -->
     <div class="section-title">
         <span>FAULT INJECTION & CRASH TESTS</span>
         <span style="color: var(--accent-danger);">[INDEPENDENT FAILURE DOMAIN]</span>
@@ -258,17 +193,17 @@
     <div class="control-panel">
         <button class="fault-btn" id="btn-kill-seccomp">
             <span>1. DISPATCH KERNEL SIGSYS (SECCOMP TRAP)</span>
-            <span class="subtext">Dispatches SIGSYS trap to container PID to verify process boundary</span>
+            <span class="subtext">Kills this container; host crash chrome replaces this surface</span>
         </button>
 
         <button class="fault-btn" id="btn-freeze-thread">
             <span>2. TRIGGER INFINITE JS THREAD FREEZE</span>
-            <span class="subtext">Locks main thread in while(true); Host watchdog detects hang & auto-recovers</span>
+            <span class="subtext">Locks main thread; host watchdog SIGKILLs and shows crash chrome</span>
         </button>
 
         <button class="fault-btn" id="btn-alloc-fault">
             <span>3. TRIGGER OOM ALLOCATION FAULT</span>
-            <span class="subtext">Simulates fatal out-of-memory abort (SIGABRT) to verify host RSS protection</span>
+            <span class="subtext">Simulates fatal abort; host crash chrome owns recovery</span>
         </button>
     </div>
 
@@ -277,23 +212,7 @@
         <span style="color: #6ee7b7;">[VERIFIED]</span>
     </div>
     <div style="padding: 6px 8px; font-size: 9.5px; color: var(--text-muted); line-height: 1.45; background: var(--bg-panel);">
-        Pool B executes inside a dedicated Linux PID and mount namespace. Any fatal crash or thread lock here terminates strictly within its own boundary. The Host Deck (Surface 1) and Primary Pool A (Surface 2) stay locked at 60 FPS without dropping a single frame.
-    </div>
-
-    <!-- 3. Crash & Recovery Diagnostic Modal -->
-    <div class="crash-overlay" id="crash-overlay">
-        <div class="crash-title">
-            <span style="font-size: 14px;">✖</span>
-            <span id="crash-reason-title">CONTAINER TERMINATED (SIGSYS)</span>
-        </div>
-        <div class="crash-body" id="crash-reason-body">
-            <strong>Linux Kernel Seccomp BPF Trap:</strong><br>
-            Surface 3 process encountered an unhandled fatal signal. The container process has terminated.<br><br>
-            <strong>Isolation Proof:</strong><br>
-            Surfaces 1, 2, and 4 continue rendering at locked 60 FPS. Zero host memory corruption.
-        </div>
-        <button class="btn-respawn" id="btn-respawn">RESPAWN ISOLATED POOL B</button>
-        <div id="respawn-latency-msg" style="font-size: 9.5px; color: #34d399; text-align: center;"></div>
+        Pool B executes inside a dedicated Linux PID and mount namespace with autoRespawn disabled. When this engine dies, Lotus replaces this slot with host crash chrome; recovery is a Respawn button press.
     </div>
 
     <div class="corner-dim" id="corner-dim">[340 × 620 px @ 1.0x]</div>
@@ -311,180 +230,148 @@
 
         let livePid = null;
         let uptimeSec = 0;
-        let isDead = false;
+        let hostVisible = !document.hidden;
 
-        // 1. Rotating Geometric Heartbeat Canvas (60 FPS)
         const hbCanvas = document.getElementById('heartbeat-canvas');
-        const hbCtx = hbCanvas.getContext('2d');
+        const hbGl = hbCanvas.getContext('webgl', { antialias: true, alpha: true });
         let angle = 0;
+        let hbProgram = null;
+        let hbPos = -1;
+        let hbColor = -1;
+        let hbBuf = null;
+        let hbRaf = 0;
+
+        function hbCompile(type, src) {
+            const sh = hbGl.createShader(type);
+            hbGl.shaderSource(sh, src);
+            hbGl.compileShader(sh);
+            return sh;
+        }
+
+        if (hbGl) {
+            const vs = hbCompile(hbGl.VERTEX_SHADER, `
+                attribute vec2 a_pos;
+                attribute vec3 a_color;
+                varying vec3 v_color;
+                void main() {
+                    vec2 clip = (a_pos / 70.0) - 1.0;
+                    gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+                    gl_PointSize = 6.0;
+                    v_color = a_color;
+                }
+            `);
+            const fs = hbCompile(hbGl.FRAGMENT_SHADER, `
+                precision mediump float;
+                varying vec3 v_color;
+                void main() { gl_FragColor = vec4(v_color, 1.0); }
+            `);
+            hbProgram = hbGl.createProgram();
+            hbGl.attachShader(hbProgram, vs);
+            hbGl.attachShader(hbProgram, fs);
+            hbGl.linkProgram(hbProgram);
+            hbPos = hbGl.getAttribLocation(hbProgram, 'a_pos');
+            hbColor = hbGl.getAttribLocation(hbProgram, 'a_color');
+            hbBuf = hbGl.createBuffer();
+        }
+
+        function demoShouldPaint() {
+            return hostVisible && !document.hidden;
+        }
 
         function drawHeartbeat() {
-            if (isDead) return;
-            requestAnimationFrame(drawHeartbeat);
-
-            hbCtx.clearRect(0, 0, 140, 140);
-            angle += 0.035;
-
-            // Outer pulse circle
-            const pulse = 40 + Math.sin(angle * 2.5) * 5;
-            hbCtx.strokeStyle = 'rgba(52, 211, 153, 0.2)';
-            hbCtx.lineWidth = 1;
-            hbCtx.beginPath();
-            hbCtx.arc(70, 70, pulse + 12, 0, Math.PI * 2);
-            hbCtx.stroke();
-
-            // Rotating geometric ring
-            hbCtx.save();
-            hbCtx.translate(70, 70);
-            hbCtx.rotate(angle);
-
-            hbCtx.strokeStyle = '#34d399';
-            hbCtx.lineWidth = 2;
-            hbCtx.strokeRect(-25, -25, 50, 50);
-
-            hbCtx.rotate(Math.PI / 4);
-            hbCtx.strokeStyle = 'rgba(245, 158, 11, 0.7)';
-            hbCtx.strokeRect(-22, -22, 44, 44);
-
-            hbCtx.restore();
-
-            // Center status dot
-            hbCtx.fillStyle = '#34d399';
-            hbCtx.beginPath();
-            hbCtx.arc(70, 70, 4, 0, Math.PI * 2);
-            hbCtx.fill();
-        }
-        requestAnimationFrame(drawHeartbeat);
-
-        setInterval(() => {
-            if (!isDead) {
-                uptimeSec++;
-                document.getElementById('heartbeat-uptime').textContent = `PID: ${livePid || 'Active'} | UPTIME: ${uptimeSec}s`;
+            if (!hbGl || !hbProgram) return;
+            angle += 0.04;
+            const verts = [];
+            for (let i = 0; i < 36; i++) {
+                const a = angle + (i / 36) * Math.PI * 2;
+                const r = 48 + Math.sin(a * 3.0 + angle) * 10;
+                verts.push(70 + Math.cos(a) * r, 70 + Math.sin(a) * r, 0.2, 0.85, 0.55);
             }
-        }, 1000);
+            hbGl.viewport(0, 0, hbCanvas.width, hbCanvas.height);
+            hbGl.clearColor(0, 0, 0, 0);
+            hbGl.clear(hbGl.COLOR_BUFFER_BIT);
+            hbGl.useProgram(hbProgram);
+            hbGl.bindBuffer(hbGl.ARRAY_BUFFER, hbBuf);
+            hbGl.bufferData(hbGl.ARRAY_BUFFER, new Float32Array(verts), hbGl.DYNAMIC_DRAW);
+            hbGl.enableVertexAttribArray(hbPos);
+            hbGl.vertexAttribPointer(hbPos, 2, hbGl.FLOAT, false, 20, 0);
+            hbGl.enableVertexAttribArray(hbColor);
+            hbGl.vertexAttribPointer(hbColor, 3, hbGl.FLOAT, false, 20, 8);
+            hbGl.drawArrays(hbGl.POINTS, 0, 36);
+        }
 
-        // Fetch initial telemetry for PID
+        function scheduleHeartbeat() {
+            if (hbRaf) return;
+            const tick = () => {
+                hbRaf = 0;
+                if (!demoShouldPaint()) return;
+                drawHeartbeat();
+                uptimeSec += 1 / 60;
+                document.getElementById('heartbeat-uptime').textContent =
+                    `PID: ${livePid || '...'} | UPTIME: ${uptimeSec.toFixed(0)}s`;
+                hbRaf = requestAnimationFrame(tick);
+            };
+            hbRaf = requestAnimationFrame(tick);
+        }
+        scheduleHeartbeat();
+
         async function fetchAuxPid() {
             if (window.lotus && typeof window.lotus.invoke === 'function') {
                 try {
                     const data = await window.lotus.invoke('sandboxTasks.getTelemetry', { pool: 'B' });
                     if (data && data.enginePid) {
                         livePid = data.enginePid;
-                        document.getElementById('heartbeat-uptime').textContent = `PID: ${livePid} | UPTIME: ${uptimeSec}s`;
+                        document.getElementById('heartbeat-uptime').textContent =
+                            `PID: ${livePid} | UPTIME: ${uptimeSec.toFixed(0)}s`;
                     }
                 } catch (_) {}
             }
         }
         setTimeout(fetchAuxPid, 80);
 
-        // 600ms Heartbeat Ping to Host Supervisor Watchdog
         setInterval(async () => {
-            if (!isDead && window.lotus && typeof window.lotus.invoke === 'function') {
+            if (window.lotus && typeof window.lotus.invoke === 'function') {
                 try {
                     await window.lotus.invoke('sandboxTasks.heartbeat', {});
                 } catch (_) {}
             }
         }, 600);
 
-        // 2. Fault Injection Handlers
-        const crashOverlay = document.getElementById('crash-overlay');
-        const crashTitle = document.getElementById('crash-reason-title');
-        const crashBody = document.getElementById('crash-reason-body');
-        const auxLed = document.getElementById('aux-led');
-        const hbBadge = document.getElementById('heartbeat-badge');
-
-        function triggerDeadState(reason, details) {
-            isDead = true;
-            auxLed.className = 'status-led danger';
-            hbBadge.style.color = '#ef4444';
-            hbBadge.textContent = 'POOL B STATUS: FAULT DETECTED';
-            crashTitle.textContent = reason;
-            crashBody.innerHTML = details;
-            crashOverlay.style.display = 'flex';
-        }
-
-        // 1. Seccomp Kill
         document.getElementById('btn-kill-seccomp').addEventListener('click', async () => {
             if (window.lotus && typeof window.lotus.invoke === 'function') {
                 try {
                     await window.lotus.invoke('sandboxTasks.triggerCrashTest', { signal: 'SIGSYS' });
                 } catch (_) {}
             }
-            triggerDeadState(
-                'CONTAINER TERMINATED (SIGSYS)',
-                '<strong>Linux Kernel Seccomp BPF Trap:</strong><br>Pool B attempted an unauthorized syscall and was terminated with SIGSYS by the kernel.<br><br><strong>Surviving Host Recovery:</strong> Surface 1 Host Dock is active and commanding supervisor resurrection.'
-            );
         });
 
-        // 2. Infinite JS Freeze (Triggers Host Watchdog)
         document.getElementById('btn-freeze-thread').addEventListener('click', () => {
-            triggerDeadState(
-                'MAIN THREAD LOCKED (while(true))',
-                '<strong>Thread Deadlock Injected:</strong><br>Pool B JavaScript main thread is permanently locked in while(true).<br><br><strong>Host Watchdog Auto-Recovery:</strong> The host watchdog detects missed heartbeats (>2s), terminates the hung PID, and auto-respawns Pool B.'
-            );
             setTimeout(() => {
                 while (true) {}
             }, 30);
         });
 
-        // 3. Memory Exhaustion
         document.getElementById('btn-alloc-fault').addEventListener('click', async () => {
             if (window.lotus && typeof window.lotus.invoke === 'function') {
                 try {
                     await window.lotus.invoke('sandboxTasks.triggerCrashTest', { signal: 'SIGABRT' });
                 } catch (_) {}
             }
-            triggerDeadState(
-                'MEMORY EXHAUSTION (ALLOC FAULT)',
-                '<strong>Simulated Heap Exhaustion:</strong><br>Isolated container hit memory ceiling and aborted.<br><br><strong>Zero Host Impact:</strong> Host Node.js RSS memory was completely protected.'
-            );
         });
 
-        // 3. Respawn Isolated Pool B (Fallback / Local)
-        document.getElementById('btn-respawn').addEventListener('click', async () => {
-            const btnRespawn = document.getElementById('btn-respawn');
-            const respawnMsg = document.getElementById('respawn-latency-msg');
-            btnRespawn.textContent = 'SPINNING UP FRESH CONTAINER...';
-            btnRespawn.disabled = true;
-
-            if (window.lotus && typeof window.lotus.invoke === 'function') {
-                try {
-                    const res = await window.lotus.invoke('sandboxTasks.respawnAuxEngine', {});
-                    if (res && res.respawned) {
-                        respawnMsg.textContent = `✔ Respawned in ${res.latencyMs.toFixed(1)}ms (New PID: ${res.newPid})`;
-                        setTimeout(() => {
-                            crashOverlay.style.display = 'none';
-                            btnRespawn.textContent = 'RESPAWN ISOLATED POOL B';
-                            btnRespawn.disabled = false;
-                            isDead = false;
-                            uptimeSec = 0;
-                            livePid = res.newPid;
-                            auxLed.className = 'status-led';
-                            hbBadge.style.color = '#34d399';
-                            hbBadge.textContent = 'POOL B STATUS: HEALTHY';
-                            requestAnimationFrame(drawHeartbeat);
-                        }, 500);
-                    }
-                } catch (e) {
-                    btnRespawn.textContent = 'RESPAWN FAILED';
-                    respawnMsg.textContent = e.message;
-                    setTimeout(() => { btnRespawn.disabled = false; }, 1000);
-                }
-            }
-        });
-
-        // Listen for supervisor recovery events
         const evtSource = window.lotus?.on ? window.lotus : (window.lotus?.ipc?.on ? window.lotus.ipc : null);
         if (evtSource && typeof evtSource.on === 'function') {
+            evtSource.on('app.visibility', (payload) => {
+                hostVisible = payload?.visible !== false;
+                if (demoShouldPaint()) scheduleHeartbeat();
+            });
             evtSource.on('system.poolBRespawned', (info) => {
-                crashOverlay.style.display = 'none';
-                isDead = false;
                 uptimeSec = 0;
                 livePid = info.newPid;
-                auxLed.className = 'status-led';
-                hbBadge.style.color = '#34d399';
-                hbBadge.textContent = 'POOL B STATUS: HEALTHY';
-                requestAnimationFrame(drawHeartbeat);
+                document.getElementById('heartbeat-badge').textContent = 'POOL B STATUS: HEALTHY';
+                document.getElementById('heartbeat-badge').style.color = '#34d399';
+                scheduleHeartbeat();
+                fetchAuxPid();
             });
         }
     </script>

@@ -16,9 +16,18 @@ pub struct RemotePaneConsumer {
     pub ack_ptr: *mut ConsumerAckHeader,
     pub active_resize_gen: u64,
     pub last_rendered_seq: u64,
+    /// Last-good pixels composited (stretch interim source).
     pub texture: Option<glow::Texture>,
     pub tex_width: u32,
     pub tex_height: u32,
+    /// Upload target while a Resize is in flight — not shown until promote.
+    staging_texture: Option<glow::Texture>,
+    staging_width: u32,
+    staging_height: u32,
+    /// Frames uploaded to staging since the last resize-gen bump. The first is
+    /// usually a cleared FB; the 2nd+ is treated as painted and becomes the new
+    /// stretch source (step-through interim).
+    staging_frames_since_resize: u32,
     pub max_width: u32,
     pub max_height: u32,
     local_ack_fallback: Option<Box<ConsumerAckHeader>>,
@@ -104,6 +113,10 @@ impl RemotePaneConsumer {
             texture: None,
             tex_width: max_width,
             tex_height: max_height,
+            staging_texture: None,
+            staging_width: 0,
+            staging_height: 0,
+            staging_frames_since_resize: 0,
             max_width,
             max_height,
             local_ack_fallback,
@@ -112,17 +125,46 @@ impl RemotePaneConsumer {
 
     pub fn update_active_resize_gen(&mut self, gen: u64) {
         self.active_resize_gen = gen;
+        self.staging_frames_since_resize = 0;
+    }
+
+    pub fn staging_frames_since_resize(&self) -> u32 {
+        self.staging_frames_since_resize
     }
 
     pub fn ack_header(&self) -> &ConsumerAckHeader {
         unsafe { &*self.ack_ptr }
     }
 
+    /// True when the producer has published a frame newer than `last_rendered_seq`.
+    pub fn has_unread_frame(&self) -> bool {
+        let prod_hdr = unsafe { &*(self.ro_ptr as *const ProducerControlHeader) };
+        prod_hdr.pub_seq.load(Ordering::Acquire) > self.last_rendered_seq
+    }
+
+    /// Size of the most recently uploaded frame (staging while holding display, else display).
+    pub fn latest_upload_size(&self) -> (u32, u32) {
+        if self.staging_width > 0 && self.staging_height > 0 {
+            (self.staging_width, self.staging_height)
+        } else {
+            (self.tex_width, self.tex_height)
+        }
+    }
+
     /// Checks the producer control header, claims the latest published frame,
     /// verifies the 15-point untrusted producer validation protocol, and uploads
     /// the verified pixel buffer into an OpenGL texture.
+    ///
+    /// When `preserve_display` is true (resize in flight), pixels go to a staging
+    /// texture so composite can keep stretching the last-good display frame.
+    /// Call [`promote_staging_to_display`] on nuclear flip.
+    ///
     /// Returns Ok(true) if a new frame was consumed and uploaded, Ok(false) if no new frame.
-    pub fn consume_latest_frame(&mut self, gl: &glow::Context) -> Result<bool, &'static str> {
+    pub fn consume_latest_frame(
+        &mut self,
+        gl: &glow::Context,
+        preserve_display: bool,
+    ) -> Result<bool, &'static str> {
         let prod_hdr = unsafe { &*(self.ro_ptr as *const ProducerControlHeader) };
         let latest_pub_seq = prod_hdr.pub_seq.load(Ordering::Acquire);
 
@@ -133,7 +175,10 @@ impl RemotePaneConsumer {
 
         let consumer_ack = unsafe { &*self.ack_ptr };
 
-        // Find the slot with the highest published sequence that is in STATE_READY
+        // Find the slot with the highest published sequence that is in STATE_READY.
+        // Ignore slots whose seq is ahead of the producer header — after a respawn
+        // CreateSurface resets pub_seq to 0 but may leave prior-life READY slots in
+        // the ring; consuming those re-paints the crash-stale frame under chrome.
         let mut target_slot: Option<usize> = None;
         let mut best_seq = self.last_rendered_seq;
 
@@ -141,6 +186,9 @@ impl RemotePaneConsumer {
             let slot = &prod_hdr.slots[i];
             if slot.state.load(Ordering::Acquire) == STATE_READY {
                 let seq = slot.pub_seq.load(Ordering::Acquire);
+                if seq > latest_pub_seq {
+                    continue;
+                }
                 if seq > best_seq {
                     best_seq = seq;
                     target_slot = Some(i);
@@ -189,33 +237,81 @@ impl RemotePaneConsumer {
             }
         };
 
-        // 3. Upload verified frame to OpenGL texture
+        // 3. Upload verified frame to OpenGL texture.
+        //
+        // NEVER set GL_UNPACK_ROW_LENGTH here. LotusPaneContext / Servo / WebRender share
+        // this window GL context; a non-zero unpack row length makes Webrender's next
+        // texture upload compute src_size with our SHM stride and assert:
+        //   src_size <= len * size_of::<T>()  (webrender gl.rs).
+        // Instead, tightly pack RGBA rows when SHM stride has padding.
+        //
+        // While preserve_display: upload to staging so composite keeps last-good.
+        // Steady state: upload straight to display (and drop stale staging).
+        let hold = preserve_display && self.texture.is_some();
         unsafe {
-            let is_new_texture = self.texture.is_none();
-            let tex = match self.texture {
-                Some(t) => t,
-                None => {
-                    let new_tex = gl.create_texture().map_err(|_| "E_GL_CREATE_TEXTURE")?;
-                    self.texture = Some(new_tex);
-                    new_tex
-                }
+            let (tex_slot, is_new, prev_w, prev_h) = if hold {
+                let is_new = self.staging_texture.is_none();
+                let tex = match self.staging_texture {
+                    Some(t) => t,
+                    None => {
+                        let new_tex = gl.create_texture().map_err(|_| "E_GL_CREATE_TEXTURE")?;
+                        self.staging_texture = Some(new_tex);
+                        new_tex
+                    }
+                };
+                (tex, is_new, self.staging_width, self.staging_height)
+            } else {
+                let is_new = self.texture.is_none();
+                let tex = match self.texture {
+                    Some(t) => t,
+                    None => {
+                        let new_tex = gl.create_texture().map_err(|_| "E_GL_CREATE_TEXTURE")?;
+                        self.texture = Some(new_tex);
+                        new_tex
+                    }
+                };
+                (tex, is_new, self.tex_width, self.tex_height)
             };
 
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex_slot));
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
 
             let pixel_ptr = self.ro_ptr.add(256 + validated.slot_offset);
-            let frame_len = validated.stride * (validated.height as usize);
-            let slice = std::slice::from_raw_parts(pixel_ptr, frame_len);
+            let tight_stride = (validated.width as usize).saturating_mul(4);
+            let height = validated.height as usize;
+            if tight_stride == 0 || height == 0 || validated.stride < tight_stride {
+                release_slot_claim(consumer_ack, claimed_seq);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                return Err("E_SHM_BAD_STRIDE");
+            }
 
-            let row_length = (validated.stride / 4) as i32;
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, row_length);
+            // Ensure default unpack state before upload (in case a prior caller leaked).
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
 
-            // Reallocate texture surface if dimensions changed or if this is the first upload for this texture
-            if is_new_texture || self.tex_width != validated.width || self.tex_height != validated.height {
+            let packed: Vec<u8>;
+            let upload_slice: &[u8] = if validated.stride == tight_stride {
+                std::slice::from_raw_parts(pixel_ptr, tight_stride.saturating_mul(height))
+            } else {
+                packed = {
+                    let mut buf = Vec::with_capacity(tight_stride.saturating_mul(height));
+                    for y in 0..height {
+                        let row = std::slice::from_raw_parts(
+                            pixel_ptr.add(y.saturating_mul(validated.stride)),
+                            tight_stride,
+                        );
+                        buf.extend_from_slice(row);
+                    }
+                    buf
+                };
+                packed.as_slice()
+            };
+
+            // Reallocate texture surface if dimensions changed or if this is the first upload.
+            if is_new || prev_w != validated.width || prev_h != validated.height {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
@@ -225,10 +321,8 @@ impl RemotePaneConsumer {
                     0,
                     glow::RGBA,
                     glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(Some(slice)),
+                    glow::PixelUnpackData::Slice(Some(upload_slice)),
                 );
-                self.tex_width = validated.width;
-                self.tex_height = validated.height;
             } else {
                 gl.tex_sub_image_2d(
                     glow::TEXTURE_2D,
@@ -239,28 +333,109 @@ impl RemotePaneConsumer {
                     validated.height as i32,
                     glow::RGBA,
                     glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(Some(slice)),
+                    glow::PixelUnpackData::Slice(Some(upload_slice)),
                 );
             }
-
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
             gl.bind_texture(glow::TEXTURE_2D, None);
+
+            if hold {
+                self.staging_width = validated.width;
+                self.staging_height = validated.height;
+                self.staging_frames_since_resize =
+                    self.staging_frames_since_resize.saturating_add(1);
+            } else {
+                self.tex_width = validated.width;
+                self.tex_height = validated.height;
+                // Steady-state path: drop any leftover staging from a prior resize.
+                if let Some(st) = self.staging_texture.take() {
+                    gl.delete_texture(st);
+                }
+                self.staging_width = 0;
+                self.staging_height = 0;
+                self.staging_frames_since_resize = 0;
+            }
         }
 
         // 4. Release claim and advance last_rendered_seq
         release_slot_claim(consumer_ack, validated.pub_seq);
         self.last_rendered_seq = validated.pub_seq;
 
+        // Step-through: once we have a painted frame at the new size (2nd+ after
+        // resize), promote it to display immediately so the next stretch interim
+        // uses fresh pixels — without ever showing the cleared first buffer.
+        if hold && self.staging_frames_since_resize >= 2 {
+            self.promote_staging_to_display(gl);
+        }
+
         trace!(
-            "SHM Consumer: Consumed frame seq {} ({}x{}) from slot {}",
-            validated.pub_seq, validated.width, validated.height, slot_idx
+            "SHM Consumer: Consumed frame seq {} ({}x{}) from slot {} (preserve_display={}, staging_frames={})",
+            validated.pub_seq, validated.width, validated.height, slot_idx, hold,
+            self.staging_frames_since_resize
         );
 
         Ok(true)
     }
 
+    /// Swap staging into display so the new size becomes the stretch source.
+    pub fn promote_staging_to_display(&mut self, gl: &glow::Context) {
+        let Some(staging) = self.staging_texture.take() else {
+            return;
+        };
+        unsafe {
+            if let Some(old) = self.texture.take() {
+                gl.delete_texture(old);
+            }
+        }
+        self.texture = Some(staging);
+        self.tex_width = self.staging_width;
+        self.tex_height = self.staging_height;
+        self.staging_width = 0;
+        self.staging_height = 0;
+        // Keep staging_frames_since_resize so callers know we had painted content.
+    }
+
+    /// Promote only when staging has a post-clear painted frame; otherwise drop it.
+    pub fn promote_painted_or_discard_staging(&mut self, gl: &glow::Context) {
+        if self.staging_frames_since_resize >= 2 {
+            self.promote_staging_to_display(gl);
+        } else {
+            self.discard_staging(gl);
+        }
+    }
+
+    /// Drop staging without touching display — avoids flashing a cleared FB.
+    pub fn discard_staging(&mut self, gl: &glow::Context) {
+        if let Some(st) = self.staging_texture.take() {
+            unsafe {
+                gl.delete_texture(st);
+            }
+        }
+        self.staging_width = 0;
+        self.staging_height = 0;
+    }
+
     pub fn get_texture(&self) -> Option<glow::Texture> {
         self.texture
+    }
+
+    /// Drop the cached GL texture and align `last_rendered_seq` to the current
+    /// producer header so a crash-stale upload cannot be redrawn under cover chrome.
+    pub fn invalidate_cached_frame(&mut self, gl: &glow::Context) {
+        unsafe {
+            if let Some(tex) = self.texture.take() {
+                gl.delete_texture(tex);
+            }
+            if let Some(tex) = self.staging_texture.take() {
+                gl.delete_texture(tex);
+            }
+        }
+        self.tex_width = 0;
+        self.tex_height = 0;
+        self.staging_width = 0;
+        self.staging_height = 0;
+        self.staging_frames_since_resize = 0;
+        let prod_hdr = unsafe { &*(self.ro_ptr as *const ProducerControlHeader) };
+        self.last_rendered_seq = prod_hdr.pub_seq.load(Ordering::Acquire);
     }
 }
 
@@ -286,6 +461,7 @@ impl Drop for RemotePaneConsumer {
                 libc::close(self.ack_rw_fd);
             }
         }
+        // GL textures are owned by the window context; host must invalidate before drop.
     }
 }
 

@@ -17,6 +17,7 @@ use crate::window::SelectPromptWrapper;
 use crate::{APP_STATE, EVENT_LOOP_PROXY, EngineCommand};
 
 pub const SELECT_MENU_HTML: &str = include_str!("../resources/select-menu.html");
+pub const SURFACE_CRASH_HTML: &str = include_str!("../resources/surface-crash.html");
 
 pub struct LotusPaneDelegate {
     pub window: Arc<Window>,
@@ -143,6 +144,18 @@ impl WebViewDelegate for LotusPaneDelegate {
                     .status_code(StatusCode::OK);
                 let mut intercepted = load.intercept(response);
                 intercepted.send_body_data(SELECT_MENU_HTML.as_bytes().to_vec());
+                intercepted.finish();
+                return;
+            }
+
+            if relative_path == "surface-crash.html" || relative_path == "__lotus_surface_crash.html" {
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+                let response = WebResourceResponse::new(url)
+                    .headers(headers)
+                    .status_code(StatusCode::OK);
+                let mut intercepted = load.intercept(response);
+                intercepted.send_body_data(SURFACE_CRASH_HTML.as_bytes().to_vec());
                 intercepted.finish();
                 return;
             }

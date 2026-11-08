@@ -97,6 +97,7 @@ jobs:
                 export CC=/tmp/cc-glslopt-shim
                 git config --global --add safe.directory '*'
                 git config --global gitoxide.objects.allocLimitIfReducedTrust 0
+                bash scripts/apply-servo-patch.sh
                 npm install
                 npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
                 mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
@@ -112,6 +113,8 @@ jobs:
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -Force
         shell: powershell
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       # MSVC/mozangle still hit legacy MAX_PATH under deep GitHub workspaces (e.g. packages/lotus-core/target/...).
       - name: Short Cargo and temp dirs (Windows)
         if: runner.os == 'Windows'

@@ -490,6 +490,13 @@
             const s2 = geometry.sandboxed || { x: 300, y: 0, w: 640, h: 620 };
             const s3 = geometry.aux_sandbox || { x: 940, y: 0, w: 340, h: 620 };
             const s4 = geometry.tape || { x: 0, y: 620, w: 1280, h: 180 };
+            const vp = geometry.viewport || { w: 1280, h: 800 };
+            const topo = document.getElementById('topology-map');
+            if (topo) topo.setAttribute('viewBox', `0 0 ${vp.w} ${vp.h}`);
+            const viewportSummary = document.getElementById('viewport-summary');
+            if (viewportSummary) {
+                viewportSummary.textContent = `${vp.w}×${vp.h} LAYOUT`;
+            }
 
             // Update S1
             mapS1.setAttribute('x', s1.x);

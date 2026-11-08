@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Surface crashed</title>
+    <style>
+        :root {
+            --bg: #0c0c0e;
+            --panel: #16161a;
+            --border: #3f1d1d;
+            --text: #e4e4e7;
+            --muted: #a1a1aa;
+            --danger: #ef4444;
+            --ok: #10b981;
+            --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+        * { box-sizing: border-box; user-select: none; }
+        html, body {
+            margin: 0;
+            height: 100%;
+            background: var(--bg);
+            color: var(--text);
+            font-family: var(--font);
+        }
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            text-align: center;
+            border-left: 2px solid var(--danger);
+        }
+        h1 {
+            margin: 0 0 8px;
+            font-size: 22px;
+            font-weight: 650;
+            color: var(--danger);
+        }
+        p {
+            margin: 0 0 10px;
+            max-width: 420px;
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.45;
+        }
+        .meta {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 11px;
+            color: #fca5a5;
+            margin-bottom: 18px;
+            word-break: break-all;
+        }
+        button#btn-respawn {
+            min-width: 160px;
+            height: 36px;
+            border: none;
+            background: var(--ok);
+            color: #09090b;
+            font: 650 13px/1 var(--font);
+            cursor: pointer;
+            padding: 0 16px;
+        }
+        button#btn-respawn:hover:not(:disabled) { filter: brightness(1.08); }
+        button#btn-respawn:disabled {
+            opacity: 0.55;
+            cursor: default;
+        }
+        #status {
+            min-height: 18px;
+            margin-top: 12px;
+            font-size: 12px;
+            color: #6ee7b7;
+        }
+        #status.error { color: #fca5a5; }
+    </style>
+</head>
+<body>
+    <h1>This surface crashed</h1>
+    <p>
+        The sandboxed engine for this pane exited. This page is rendered by the host,
+        not by the crashed process. You can respawn the surface without restarting the window.
+    </p>
+    <div class="meta" id="meta">Waiting for crash details…</div>
+    <button type="button" id="btn-respawn" disabled>Respawn surface</button>
+    <div id="status"></div>
+    <script>
+        let paneId = null;
+        const btn = document.getElementById('btn-respawn');
+        const meta = document.getElementById('meta');
+        const status = document.getElementById('status');
+
+        function setStatus(text, isError) {
+            status.textContent = text || '';
+            status.className = isError ? 'error' : '';
+        }
+
+        function applyCrashInfo(info) {
+            paneId = info && info.paneId ? info.paneId : paneId;
+            const parts = [];
+            if (info && info.paneId) parts.push('pane ' + info.paneId);
+            if (info && info.sig) parts.push(String(info.sig));
+            if (info && info.reason) parts.push(String(info.reason));
+            if (info && (info.code !== null && info.code !== undefined)) parts.push('code ' + info.code);
+            if (info && info.isolated) parts.push('isolated');
+            meta.textContent = parts.length ? parts.join(' · ') : 'Surface offline';
+            btn.disabled = !paneId;
+            btn.textContent = 'Respawn surface';
+            setStatus('');
+        }
+
+        function wireLotus() {
+            if (!window.lotus) return false;
+            window.lotus.on('crash-info', applyCrashInfo);
+            window.lotus.on('crash-respawn-result', (result) => {
+                if (result && result.respawned) {
+                    setStatus(result.newPid ? ('Restored (PID ' + result.newPid + ')') : 'Restored');
+                    btn.disabled = true;
+                    btn.textContent = 'Online';
+                    return;
+                }
+                setStatus((result && result.error) || 'Respawn failed', true);
+                btn.disabled = !paneId;
+                btn.textContent = 'Respawn surface';
+            });
+            window.lotus.send('__lotus_crash_ready', {}, { urgent: true });
+            return true;
+        }
+
+        if (!wireLotus()) {
+            const timer = setInterval(() => {
+                if (wireLotus()) clearInterval(timer);
+            }, 50);
+        }
+
+        btn.addEventListener('click', () => {
+            if (!paneId || !window.lotus || btn.disabled) return;
+            btn.disabled = true;
+            btn.textContent = 'Respawning…';
+            setStatus('');
+            window.lotus.send('__lotus_crash_respawn', { paneId: paneId });
+        });
+    </script>
+</body>
+</html>

@@ -45,6 +45,7 @@ pub fn pidfd_send_signal(pidfd: i32, sig: libc::c_int) -> i32 {
 struct SupervisorConfig {
     supervisor_fd: i32,
     control_fd: i32,
+    gpu_fd: Option<i32>,
     engine_bin: String,
     engine_args: Vec<String>,
     cache_dir: Option<String>,
@@ -58,6 +59,9 @@ fn parse_args() -> Result<SupervisorConfig, String> {
         .ok()
         .and_then(|v| v.parse().ok());
     let mut control_fd: Option<i32> = env::var("LOTUS_CONTROL_FD")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let mut gpu_fd: Option<i32> = env::var("LOTUS_GPU_FD")
         .ok()
         .and_then(|v| v.parse().ok());
     let mut engine_bin: Option<String> = env::var("LOTUS_ENGINE_BIN").ok();
@@ -79,6 +83,12 @@ fn parse_args() -> Result<SupervisorConfig, String> {
                 i += 1;
                 if i < args.len() {
                     control_fd = args[i].parse().ok();
+                }
+            }
+            "--gpu-fd" => {
+                i += 1;
+                if i < args.len() {
+                    gpu_fd = args[i].parse().ok();
                 }
             }
             "--engine-bin" => {
@@ -132,15 +142,33 @@ fn parse_args() -> Result<SupervisorConfig, String> {
     let control_fd = control_fd.ok_or("Missing --control-fd or LOTUS_CONTROL_FD")?;
     let engine_bin = engine_bin.ok_or("Missing --engine-bin or LOTUS_ENGINE_BIN")?;
 
+    if let Some(g) = gpu_fd {
+        if !pass_fds.contains(&g) {
+            pass_fds.push(g);
+        }
+    }
+
     Ok(SupervisorConfig {
         supervisor_fd,
         control_fd,
+        gpu_fd,
         engine_bin,
         engine_args,
         cache_dir,
         temp_dir,
         pass_fds,
     })
+}
+
+fn is_forbidden_landlock_write_dir(path: &std::path::Path) -> bool {
+    let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let forbidden = ["/", "/tmp", "/var", "/var/tmp", "/home", "/run", "/etc", "/usr", "/root"];
+    for f in &forbidden {
+        if p == std::path::Path::new(f) {
+            return true;
+        }
+    }
+    false
 }
 
 fn main() {
@@ -204,16 +232,6 @@ fn main() {
             landlock_fds.push(d);
         }
     }
-fn is_forbidden_landlock_write_dir(path: &std::path::Path) -> bool {
-    let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let forbidden = ["/", "/tmp", "/var", "/var/tmp", "/home", "/run", "/etc", "/usr", "/root"];
-    for f in &forbidden {
-        if p == std::path::Path::new(f) {
-            return true;
-        }
-    }
-    false
-}
 
     // Allow explicit temp_dir for temporary files (only if provided and not a system directory)
     if let Some(ref temp_path) = config.temp_dir {
@@ -288,6 +306,9 @@ fn is_forbidden_landlock_write_dir(path: &std::path::Path) -> bool {
     assert!(target_listener_fd != config.control_fd && target_listener_fd != liveness_read_fd, "target_listener_fd conflicts with control or liveness fd");
     let mut envs_c = Vec::new();
     envs_c.push(CString::new(format!("LOTUS_CONTROL_FD={}", config.control_fd)).unwrap());
+    if let Some(gpu_fd) = config.gpu_fd {
+        envs_c.push(CString::new(format!("LOTUS_GPU_FD={}", gpu_fd)).unwrap());
+    }
     envs_c.push(CString::new(format!("LOTUS_LIVENESS_FD={}", liveness_read_fd)).unwrap());
     envs_c.push(CString::new(format!("LOTUS_IPC_LISTENER_FD={}", target_listener_fd)).unwrap());
     envs_c.push(CString::new("LIBGL_ALWAYS_SOFTWARE=1").unwrap());
@@ -305,6 +326,7 @@ fn is_forbidden_landlock_write_dir(path: &std::path::Path) -> bool {
     }
     for (k, v) in env::vars() {
         if k != "LOTUS_CONTROL_FD"
+            && k != "LOTUS_GPU_FD"
             && k != "LOTUS_LIVENESS_FD"
             && k != "LOTUS_IPC_LISTENER_FD"
             && k != "LOTUS_SUPERVISOR_FD"

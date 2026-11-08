@@ -12,7 +12,9 @@ use servo::{Code, Key, Modifiers, WindowRenderingContext};
 use crate::gl::LotusPaneContext;
 use winit::window::Window;
 
-use crate::layout::{PaneAnchor, StagedLayout, StagedPaneLayout};
+use crate::layout::{
+    ActiveGutterDrag, HitTestGutter, LayoutNode, PaneAnchor, StagedLayout, StagedPaneLayout,
+};
 
 pub const STENCIL_VS: &str = r#"
 #version 330 core
@@ -242,6 +244,12 @@ pub struct PaneInstance {
     pub remote_consumer: Option<crate::gl::RemotePaneConsumer>,
     pub remote_input_fd: Option<std::os::unix::io::RawFd>,
     pub resize_generation: u64,
+    /// Host crash chrome is covering this remote — still pull SHM/vsync, but do not
+    /// draw the (possibly stale) texture into the scene.
+    pub under_crash_cover: bool,
+    /// After a respawn, emit `remote-frame-composited` once a fresh SHM frame is
+    /// uploaded so JS can lift crash chrome without flashing the prior life.
+    pub await_host_composited_frame: bool,
 }
 
 impl Drop for PaneInstance {
@@ -251,6 +259,38 @@ impl Drop for PaneInstance {
                 unsafe { libc::close(fd) };
             }
         }
+    }
+}
+
+impl PaneInstance {
+    /// Physical hit/input rect. Prefer pending/staged layout, then last committed,
+    /// then scaled logical — so tree-backed leaves (often Anchor::None) still receive input.
+    pub fn input_physical_rect(&self, scale_factor: f32) -> (f32, f32, f32, f32) {
+        if let Some(p) = self.pending_physical_rect {
+            if p.size.width > 0 && p.size.height > 0 {
+                return (
+                    p.origin.x as f32,
+                    p.origin.y as f32,
+                    p.size.width as f32,
+                    p.size.height as f32,
+                );
+            }
+        }
+        if self.last_physical_rect.size.width > 0 && self.last_physical_rect.size.height > 0 {
+            return (
+                self.last_physical_rect.origin.x as f32,
+                self.last_physical_rect.origin.y as f32,
+                self.last_physical_rect.size.width as f32,
+                self.last_physical_rect.size.height as f32,
+            );
+        }
+        let physical_rect = self.rect.scale(scale_factor, scale_factor);
+        (
+            physical_rect.origin.x.round(),
+            physical_rect.origin.y.round(),
+            physical_rect.size.width.round(),
+            physical_rect.size.height.round(),
+        )
     }
 }
 
@@ -316,9 +356,74 @@ pub struct WindowInstance {
     pub active_select: Option<ActiveSelectPrompt>,
     pub scrollbar_config: ScrollbarConfig,
     pub trusted_origins: Vec<String>,
+    /// Native monitor refresh rate in millihertz (e.g. 60000 = 60 Hz).
+    pub monitor_refresh_rate_millihertz: u32,
+    /// Effective rate pushed to sandboxed engines (may be throttled while unfocused).
+    pub refresh_rate_millihertz: u32,
+    /// Last OS focus state for this window (drives background vsync throttle).
+    pub os_focused: bool,
+    /// Fully occluded when the platform reports it (X11 / macOS; not Wayland).
+    pub os_occluded: bool,
+    /// Minimized when the platform reports it (`Window::is_minimized`; `None` on Wayland).
+    pub os_minimized: bool,
+    /// Inner size collapsed to 0×0 (minimize proxy on some backends).
+    pub zero_size: bool,
+    /// Virtual layout tree (geometry only). Leaves map to pane ids in `panes`.
+    pub layout_root: LayoutNode,
+    /// >0 while JS `batchLayout` is open — defer recalculate_layout until depth returns to 0.
+    pub layout_batch_depth: u32,
+    /// Hit-only gutters from the latest solve (physical space).
+    pub gutters: Vec<HitTestGutter>,
+    /// Active splitter drag (ids + start snapshot). Applied via `pending_gutter_delta` on tick.
+    pub active_gutter_drag: Option<ActiveGutterDrag>,
+    /// Total Δ from drag start awaiting the next redraw apply.
+    pub pending_gutter_delta: Option<i32>,
+    /// Currently hovered gutter key `(left_id, right_id)` for leave/cursor restore.
+    pub gutter_hover: Option<(String, String)>,
+    /// Last pane that received a routed MouseMove (for synthetic leave on gutter entry).
+    pub hover_pane_id: Option<String>,
 }
 
 impl WindowInstance {
+    /// Apply pending gutter Δ (from start snapshot) once per frame. Returns true if layout mutated.
+    pub fn flush_pending_gutter_drag(&mut self, scale_factor: f32) -> bool {
+        let (drag, delta) = match (
+            self.active_gutter_drag.clone(),
+            self.pending_gutter_delta.take(),
+        ) {
+            (Some(d), Some(delta)) => (d, delta),
+            _ => return false,
+        };
+        match crate::layout::apply_gutter_drag(&mut self.layout_root, &drag, delta, scale_factor) {
+            Ok(changed) => changed,
+            Err(crate::layout::DragCancel::MissingParticipant) => {
+                self.active_gutter_drag = None;
+                self.pending_gutter_delta = None;
+                self.gutter_hover = None;
+                false
+            }
+        }
+    }
+
+    /// Escape: restore start snapshot then clear capture.
+    pub fn cancel_gutter_drag_revert(&mut self, scale_factor: f32) -> bool {
+        let Some(drag) = self.active_gutter_drag.take() else {
+            self.pending_gutter_delta = None;
+            return false;
+        };
+        self.pending_gutter_delta = None;
+        self.gutter_hover = None;
+        let _ = crate::layout::apply_gutter_drag(&mut self.layout_root, &drag, 0, scale_factor);
+        true
+    }
+
+    /// Blur / CursorLeft / structural: keep current geometry, drop capture.
+    pub fn cancel_gutter_drag_keep(&mut self) {
+        self.active_gutter_drag = None;
+        self.pending_gutter_delta = None;
+        self.gutter_hover = None;
+    }
+
     pub fn init_stencil_program(&mut self) {
         use glow::HasContext;
         unsafe {
@@ -426,9 +531,9 @@ impl WindowInstance {
     }
 
     pub fn recalculate_layout(&mut self, size: winit::dpi::PhysicalSize<u32>, scale_factor: f32) {
-        let mut available_phys = euclid::Rect::new(
+        let window_rect = euclid::Rect::new(
             euclid::default::Point2D::new(0, 0),
-            euclid::default::Size2D::new(size.width as i32, size.height as i32)
+            euclid::default::Size2D::new(size.width as i32, size.height as i32),
         );
 
         let mut next_staged = StagedLayout {
@@ -440,7 +545,6 @@ impl WindowInstance {
         let mut sorted_ids: Vec<_> = self.panes.keys().cloned().collect();
         sorted_ids.sort_by_key(|id| self.panes.get(id).map(|p| p.dock_order).unwrap_or(0));
 
-        // Pre-populate staged layout with current values to ensure all panes are tracked
         for id in &sorted_ids {
             let pane = self.panes.get(id).unwrap();
             next_staged.panes.insert(id.clone(), StagedPaneLayout {
@@ -449,67 +553,67 @@ impl WindowInstance {
             });
         }
 
+        // Tree solve (physical space) → leaf rects + hit-only gutters.
+        let solved_out = crate::layout::solve_layout(&self.layout_root, window_rect, scale_factor);
+        let solved = solved_out.rects;
+        self.gutters = solved_out.gutters;
+        // Cancel drag if either participant vanished / stopped participating.
+        if let Some(ref drag) = self.active_gutter_drag {
+            let left_ok = drag.left_id == crate::layout::DOCK_INNER_ID
+                || self.layout_root.child_participating(&drag.left_id);
+            let right_ok = drag.right_id == crate::layout::DOCK_INNER_ID
+                || self.layout_root.child_participating(&drag.right_id);
+            if !left_ok || !right_ok {
+                self.active_gutter_drag = None;
+                self.pending_gutter_delta = None;
+                self.gutter_hover = None;
+            }
+        }
+
+        // Crash-chrome mirrors covered leaf rect every tick.
+        let mut chrome_mirrors: Vec<(String, euclid::default::Rect<i32>)> = Vec::new();
+        for (id, pane) in self.panes.iter() {
+            if pane.under_crash_cover {
+                if let Some(leaf_rect) = solved.get(id) {
+                    let crash_id = format!("__lotus_crash_{}", id);
+                    chrome_mirrors.push((crash_id, *leaf_rect));
+                }
+            }
+        }
+
         for id in sorted_ids {
             let pane = self.panes.get_mut(&id).unwrap();
 
-            if !pane.pending_visible {
-                continue;
-            }
-
-            let mut pane_phys = euclid::Rect::new(
-                available_phys.origin,
-                euclid::default::Size2D::new(0, 0)
-            );
-
-            match pane.anchor {
-                PaneAnchor::Left => {
-                    let pw = (pane.rect.size.width * scale_factor).round() as i32;
-                    let clamped_w = pw.min(available_phys.size.width).max(0);
-                    pane_phys.size = euclid::default::Size2D::new(clamped_w, available_phys.size.height);
-                    available_phys.origin.x += clamped_w;
-                    available_phys.size.width -= clamped_w;
-                },
-                PaneAnchor::Right => {
-                    let pw = (pane.rect.size.width * scale_factor).round() as i32;
-                    let clamped_w = pw.min(available_phys.size.width).max(0);
-                    pane_phys.origin.x = available_phys.origin.x + available_phys.size.width - clamped_w;
-                    pane_phys.size = euclid::default::Size2D::new(clamped_w, available_phys.size.height);
-                    available_phys.size.width -= clamped_w;
-                },
-                PaneAnchor::Top => {
-                    let ph = (pane.rect.size.height * scale_factor).round() as i32;
-                    let clamped_h = ph.min(available_phys.size.height).max(0);
-                    pane_phys.size = euclid::default::Size2D::new(available_phys.size.width, clamped_h);
-                    pane_phys.origin.y += clamped_h;
-                    available_phys.size.height -= clamped_h;
-                },
-                PaneAnchor::Bottom => {
-                    let ph = (pane.rect.size.height * scale_factor).round() as i32;
-                    let clamped_h = ph.min(available_phys.size.height).max(0);
-                    pane_phys.origin.y = available_phys.origin.y + available_phys.size.height - clamped_h;
-                    pane_phys.size = euclid::default::Size2D::new(available_phys.size.width, clamped_h);
-                    available_phys.size.height -= clamped_h;
-                },
-                PaneAnchor::Fill => {
-                    pane_phys = available_phys;
-                    available_phys.size = euclid::default::Size2D::new(0, 0); // Consumed
-                },
-                PaneAnchor::None => {
-                    // For non-anchored, use their specified rect snapped to physical
+            let pane_phys = if let Some(rect) = solved.get(&id) {
+                if !pane.pending_visible {
+                    continue;
+                }
+                *rect
+            } else if pane.anchor == PaneAnchor::None {
+                if !pane.pending_visible {
+                    continue;
+                }
+                // Absolute / overlay (incl. crash chrome before mirror apply)
+                if let Some((_, mirrored)) = chrome_mirrors.iter().find(|(cid, _)| cid == &id) {
+                    *mirrored
+                } else {
                     let phys_x = (pane.rect.origin.x * scale_factor).round() as i32;
                     let phys_y = (pane.rect.origin.y * scale_factor).round() as i32;
                     let phys_w = (pane.rect.size.width * scale_factor).round() as i32;
                     let phys_h = (pane.rect.size.height * scale_factor).round() as i32;
-                    pane_phys = euclid::Rect::new(
+                    euclid::Rect::new(
                         euclid::default::Point2D::new(phys_x, phys_y),
-                        euclid::default::Size2D::new(phys_w, phys_h)
-                    );
+                        euclid::default::Size2D::new(phys_w, phys_h),
+                    )
                 }
-            }
+            } else {
+                // Docked pane not in tree solve output (hidden/detached) — skip
+                continue;
+            };
 
-            // Record target in staged layout
             if let Some(staged) = next_staged.panes.get_mut(&id) {
                 staged.rect = pane_phys;
+                staged.visible = pane.pending_visible;
             }
 
             let servo_size = ServoPhysicalSize::new(
@@ -521,43 +625,29 @@ impl WindowInstance {
                 euclid::Size2D::new(pane_phys.size.width as f32 / scale_factor, pane_phys.size.height as f32 / scale_factor)
             );
 
-            if pane.is_remote {
-                pane.last_physical_rect = pane_phys;
-                pane.requested_servo_size = servo_size;
-                let size_changed = servo_size != pane.current_servo_size;
-                if size_changed && servo_size.width > 0 && servo_size.height > 0 {
-                    if let Some(fd) = pane.remote_input_fd {
-                        pane.current_servo_size = servo_size;
-                        pane.resize_generation += 1;
-                        let gen = pane.resize_generation;
-                        if let Some(consumer) = &mut pane.remote_consumer {
-                            consumer.update_active_resize_gen(gen);
-                        }
-                        let surface_id = format!("{}:{}", self.window_id, pane.id);
-                        let resize_msg = serde_json::json!({
-                            "type": "Resize",
-                            "surface_id": surface_id,
-                            "generation": gen,
-                            "width": servo_size.width,
-                            "height": servo_size.height,
-                            "scale_factor": scale_factor,
-                        }).to_string();
-                        crate::app::forward_remote_input(fd, &resize_msg);
-                    }
-                }
-            } else if pane.last_notified_rect != Some(logical_rect) || pane.is_dirty {
+            // Always sync logical rect from the tree solve (incl. Anchor::None split leaves).
+            pane.rect = logical_rect;
+
+            // Same-window: arm pending for *every* solved pane every tick so input +
+            // composite never mix last_physical on one neighbor with pending on another
+            // (that mismatch is the cross-pane black bar when resizing 1|2 affects 3).
+            // Window-size changes must not — staged is ahead of active_window_size.
+            if size == self.active_window_size {
                 pane.pending_physical_rect = Some(pane_phys);
+            } else {
+                pane.pending_physical_rect = None;
+            }
+
+            if pane.last_notified_rect != Some(logical_rect) || pane.is_dirty {
                 let size_changed = servo_size != pane.current_servo_size || !pane.first_frame_painted;
-
-                // EVERY layout change (even position only) joins the transactional "Nuclear Flip"
                 pane.is_resizing = true;
-
                 if size_changed {
                     pane.pending_servo_size = Some(servo_size);
                 }
-
                 pane.last_notified_rect = Some(logical_rect);
                 pane.is_dirty = false;
+            } else if pane.last_physical_rect != pane_phys {
+                pane.is_resizing = true;
             }
         }
         self.staged_layout = next_staged;
@@ -590,23 +680,61 @@ impl WindowInstance {
         }
 
         // --- LOCK-STEP DISPATCHER ---
-        // Forces Servo to render exactly what the locked transaction is waiting for.
+        // Forces Servo / remote engines to render exactly what the locked transaction
+        // is waiting for. Remotes must take the same queue-of-1 path as locals:
+        // one in-flight Resize (servo_busy) until a matching SHM frame arrives and
+        // nuclear flip commits. Dispatching Resize early on every layout tick is what
+        // desynced sandbox WebGL/broker sizes on scale-up.
+        //
+        // Locals: never webview.resize() while a frame is waiting to paint — resize()
+        // updates the Webrender document view + FB immediately.
         for pane in self.panes.values_mut() {
-            if pane.is_remote {
+            let can_dispatch = if pane.is_remote {
+                !pane.servo_busy
+            } else {
+                !pane.servo_busy && !pane.needs_repaint
+            };
+            if !can_dispatch {
                 continue;
             }
-            if !pane.servo_busy {
-                if let Some(committed) = &self.committed_layout {
-                    if let Some(staged) = committed.panes.get(&pane.id) {
-                        let target_size = ServoPhysicalSize::new(
-                            (staged.rect.size.width as u32).max(1),
-                            (staged.rect.size.height as u32).max(1)
-                        );
-                        if pane.current_servo_size != target_size || !pane.first_frame_painted {
+            if let Some(committed) = &self.committed_layout {
+                if let Some(staged) = committed.panes.get(&pane.id) {
+                    let target_size = ServoPhysicalSize::new(
+                        (staged.rect.size.width as u32).max(1),
+                        (staged.rect.size.height as u32).max(1)
+                    );
+                    if pane.current_servo_size != target_size || !pane.first_frame_painted {
+                        if pane.is_remote {
+                            if let Some(fd) = pane.remote_input_fd {
+                                if target_size.width > 0 && target_size.height > 0 {
+                                    pane.resize_generation += 1;
+                                    let gen = pane.resize_generation;
+                                    if let Some(consumer) = &mut pane.remote_consumer {
+                                        consumer.update_active_resize_gen(gen);
+                                    }
+                                    let surface_id = format!("{}:{}", self.window_id, pane.id);
+                                    let resize_msg = serde_json::json!({
+                                        "type": "Resize",
+                                        "surface_id": surface_id,
+                                        "generation": gen,
+                                        "width": target_size.width,
+                                        "height": target_size.height,
+                                        "scale_factor": scale_factor,
+                                    }).to_string();
+                                    crate::app::forward_remote_input(fd, &resize_msg);
+                                    pane.requested_servo_size = target_size;
+                                    pane.servo_busy = true;
+                                    pane.pending_servo_size = None;
+                                    pane.is_resizing = true;
+                                    // Drop stale readiness — flip waits for a frame at target_size.
+                                    pane.ready_frame_size = None;
+                                }
+                            }
+                        } else {
                             pane.webview.resize(target_size);
                             pane.requested_servo_size = target_size;
                             pane.servo_busy = true;
-                            pane.pending_servo_size = None; // Wipe any spurious queued sizes
+                            pane.pending_servo_size = None;
                             pane.is_resizing = true;
                         }
                     }
@@ -647,6 +775,8 @@ pub struct WindowOptions {
     pub scrollbar_auto_hide: Option<bool>,
     pub scrollbar_width: Option<u32>,
     pub trusted_origins: Option<Vec<String>>,
+    /// Optional virtual layout tree from LayoutBuilder.config().layout (JSON string).
+    pub layout: Option<String>,
 }
 
 #[napi(object)]
@@ -690,6 +820,7 @@ impl Default for WindowOptions {
             scrollbar_auto_hide: None,
             scrollbar_width: None,
             trusted_origins: None,
+            layout: None,
         }
     }
 }

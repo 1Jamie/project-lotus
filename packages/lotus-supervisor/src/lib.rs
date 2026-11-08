@@ -1,7 +1,9 @@
 //! lotus-supervisor library modules
 
+pub mod canvas_plane;
 pub mod caps;
 pub mod fd;
+pub mod gpu_frame;
 pub mod landlock;
 pub mod ns;
 pub mod seccomp;

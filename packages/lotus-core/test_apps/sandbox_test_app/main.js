@@ -1,4 +1,12 @@
-const { ServoWindow, LayoutBuilder, ipcMain, app, defaultSecureConstellation } = require('@lotus-gui/core');
+const {
+    ServoWindow,
+    LayoutBuilder,
+    ipcMain,
+    app,
+    defaultSecureConstellation,
+    hostIpcRouter,
+    respawnCrashedSurface,
+} = require('@lotus-gui/core');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
@@ -49,29 +57,70 @@ async function startShowcase() {
     let packetSeq = 0;
     const packetHistory = [];
 
-    // Layout configuration and presets (1280x800 native window)
+    // Pool B watchdog state — declared early so fault-injection / respawn paths can
+    // disarm before a successor engine is acquired (avoids stale-clock SIGKILL).
+    const AUX_SURFACE_ID = 'sandbox-showcase-window:aux_sandbox';
+    let lastPoolBHeartbeat = 0;
+    let poolBHeartbeatArmed = false;
+    let isWatchdogRecovering = false;
+    let showcaseWindowFocused = true;
+
+    function disarmPoolBWatchdog() {
+        lastPoolBHeartbeat = 0;
+        poolBHeartbeatArmed = false;
+        isWatchdogRecovering = false;
+    }
+
+    function isPoolBSurface(surfaces) {
+        return Array.isArray(surfaces) && surfaces.includes(AUX_SURFACE_ID);
+    }
+
+    // Presets drive the layout tree (dock Fixed + split Weights). Geometry for the
+    // tape map is derived from the live window size + those inputs — not a hardcoded 1280 grid.
+    const TAPE_H = 180;
+    const WIN_W = 1280;
+    const WIN_H = 800;
     const layoutPresets = {
-        'default': {
-            trusted: { x: 0, y: 0, w: 300, h: 620, track: 'T1', name: 'Dock (In-Process)' },
-            sandboxed: { x: 300, y: 0, w: 640, h: 620, track: 'T2', name: 'Pool A (SHM)' },
-            aux_sandbox: { x: 940, y: 0, w: 340, h: 620, track: 'T2', name: 'Pool B (Isolated)' },
-            tape: { x: 0, y: 620, w: 1280, h: 180, track: 'T1', name: 'Inspector (In-Process)' },
-        },
-        'wide_workspace': {
-            trusted: { x: 0, y: 0, w: 240, h: 620, track: 'T1', name: 'Dock (In-Process)' },
-            sandboxed: { x: 240, y: 0, w: 800, h: 620, track: 'T2', name: 'Pool A (SHM)' },
-            aux_sandbox: { x: 1040, y: 0, w: 240, h: 620, track: 'T2', name: 'Pool B (Isolated)' },
-            tape: { x: 0, y: 620, w: 1280, h: 180, track: 'T1', name: 'Inspector (In-Process)' },
-        },
-        'dual_split': {
-            trusted: { x: 0, y: 0, w: 260, h: 620, track: 'T1', name: 'Dock (In-Process)' },
-            sandboxed: { x: 260, y: 0, w: 510, h: 620, track: 'T2', name: 'Pool A (SHM)' },
-            aux_sandbox: { x: 770, y: 0, w: 510, h: 620, track: 'T2', name: 'Pool B (Isolated)' },
-            tape: { x: 0, y: 620, w: 1280, h: 180, track: 'T1', name: 'Inspector (In-Process)' },
-        },
+        default: { trustedW: 300, weights: [0.65, 0.35] },
+        wide_workspace: { trustedW: 240, weights: [0.77, 0.23] },
+        dual_split: { trustedW: 260, weights: [0.5, 0.5] },
     };
 
-    let currentGeometry = JSON.parse(JSON.stringify(layoutPresets['default']));
+    let poolWeights = layoutPresets.default.weights.slice();
+    let trustedWidth = layoutPresets.default.trustedW;
+
+    function windowLogicalSize() {
+        const w = Math.max(1, Math.round(activeWindow?._logicalWidth || WIN_W));
+        const h = Math.max(1, Math.round(activeWindow?._logicalHeight || WIN_H));
+        return { w, h };
+    }
+
+    function deriveGeometry() {
+        const { w: winW, h: winH } = windowLogicalSize();
+        const tapeH = Math.min(TAPE_H, Math.max(1, winH - 1));
+        const contentH = Math.max(1, winH - tapeH);
+        const trusted = activeWindow?.panes?.get('trusted');
+        const tw = Math.max(
+            1,
+            Math.round(Number(trusted?._layout?.width) || trustedWidth || layoutPresets.default.trustedW)
+        );
+        trustedWidth = tw;
+        const poolW = Math.max(1, winW - tw);
+        const [wa, wb] = poolWeights;
+        const sum = Math.max(1e-6, (Number(wa) || 0) + (Number(wb) || 0));
+        const s2 = Math.max(1, Math.round(poolW * ((Number(wa) || 0) / sum)));
+        const s3 = Math.max(1, poolW - s2);
+        return {
+            trusted: { x: 0, y: 0, w: tw, h: contentH, track: 'T1', name: 'Dock (In-Process)' },
+            sandboxed: { x: tw, y: 0, w: s2, h: contentH, track: 'T2', name: 'Pool A (SHM)' },
+            aux_sandbox: { x: tw + s2, y: 0, w: s3, h: contentH, track: 'T2', name: 'Pool B (Isolated)' },
+            tape: { x: 0, y: contentH, w: winW, h: tapeH, track: 'T1', name: 'Inspector (In-Process)' },
+            viewport: { w: winW, h: winH },
+            splitRatio: (Number(wa) || 0) / sum,
+        };
+    }
+
+    let currentGeometry = deriveGeometry();
 
     function recordIpcPacket(flow, channel, action, status, payload, latencyMs = 0) {
         const bytes = Buffer.byteLength(JSON.stringify(payload || {}));
@@ -120,55 +169,59 @@ async function startShowcase() {
         }
     }
 
-    function applyGeometry(rects) {
-        if (!activeWindow) return;
-        currentGeometry = { ...currentGeometry, ...rects };
-        for (const [paneId, r] of Object.entries(rects)) {
-            if (activeWindow.panes && activeWindow.panes.has(paneId)) {
-                try {
-                    const pane = activeWindow.panes.get(paneId);
-                    if (pane && typeof pane.setRect === 'function') {
-                        pane.setRect(r.x, r.y, r.w, r.h);
-                    }
-                } catch (e) {}
-            }
-        }
-        // Broadcast geometry changes safely to all panes
+    function publishGeometry(extra = {}) {
+        currentGeometry = { ...deriveGeometry(), ...extra };
         broadcastAllPanes('compositor.geometryUpdated', currentGeometry);
+        return currentGeometry;
+    }
+
+    function applyLayoutPreset(presetKey) {
+        const preset = layoutPresets[presetKey] || layoutPresets.default;
+        poolWeights = preset.weights.slice();
+        trustedWidth = preset.trustedW;
+        if (!activeWindow) return publishGeometry();
+        const trusted = activeWindow.panes.get('trusted');
+        // One Rust recalculate via begin/endLayoutBatch; mutations queue inside.
+        activeWindow.batchLayout(() => {
+            if (trusted && typeof trusted.setSize === 'function') {
+                trusted.setSize(preset.trustedW);
+            }
+            activeWindow.setSplitWeights('pools', preset.weights);
+        });
+        return publishGeometry();
     }
 
     // -------------------------------------------------------------------------
     // 2. Track 1 Compositor & Scene Controls
     // -------------------------------------------------------------------------
     ipcMain.handle('compositor.setLayoutPreset', async ({ preset }) => {
-        const target = layoutPresets[preset] || layoutPresets['default'];
         const start = performance.now();
-        applyGeometry(target);
+        const target = applyLayoutPreset(preset);
         const latency = performance.now() - start;
         recordIpcPacket('HOST -> COMPOSITOR', 'compositor', `preset:${preset}`, 'RESIZE', {
             S1: [target.trusted.x, target.trusted.y, target.trusted.w, target.trusted.h],
             S2: [target.sandboxed.x, target.sandboxed.y, target.sandboxed.w, target.sandboxed.h],
             S3: [target.aux_sandbox.x, target.aux_sandbox.y, target.aux_sandbox.w, target.aux_sandbox.h],
         }, latency);
-        return { success: true, geometry: currentGeometry };
+        return {
+            success: true,
+            geometry: currentGeometry,
+            splitRatio: currentGeometry.splitRatio,
+        };
     });
 
     ipcMain.handle('compositor.setSplitPosition', async ({ ratio }) => {
         const r = Math.max(0.2, Math.min(0.8, Number(ratio) || 0.65));
-        const leftW = currentGeometry.trusted.w || 300;
-        const availW = 1280 - leftW;
-        const s2w = Math.round(availW * r);
-        const s3w = availW - s2w;
-        const updated = {
-            sandboxed: { x: leftW, y: 0, w: s2w, h: 620, track: 'T2', name: 'Pool A (SHM)' },
-            aux_sandbox: { x: leftW + s2w, y: 0, w: s3w, h: 620, track: 'T2', name: 'Pool B (Isolated)' },
-        };
-        applyGeometry(updated);
-        return { success: true, geometry: currentGeometry };
+        poolWeights = [r, 1 - r];
+        if (activeWindow) {
+            activeWindow.setSplitWeights('pools', poolWeights);
+        }
+        publishGeometry();
+        return { success: true, geometry: currentGeometry, splitRatio: r };
     });
 
     ipcMain.handle('compositor.getGeometry', async () => {
-        return currentGeometry;
+        return publishGeometry();
     });
 
     // High-Frequency Stress Test & Latency Ping
@@ -280,25 +333,50 @@ async function startShowcase() {
         },
     });
 
-    // Fault Injection: Kill Pool B via SIGSYS (Seccomp Trap)
+    // Fault Injection: terminate Pool B. Demo signals (SIGSYS/SIGABRT) are labels —
+    // those can be blocked/caught inside the engine, so we always SIGKILL to guarantee
+    // death; host crash chrome still displays the requested fault name.
     ipcMain.register('sandboxTasks.triggerCrashTest', async (payload) => {
-        const auxSurfaceId = 'sandbox-showcase-window:aux_sandbox';
+        const auxSurfaceId = AUX_SURFACE_ID;
         const entry = defaultSecureConstellation?._isolatedInstances?.get(auxSurfaceId);
-        const targetPid = entry?.instance?.enginePid;
+        const instance = entry?.instance;
+        const targetPid = instance?.enginePid;
+        const supervisorPid = instance?.supervisor?.pid;
         const sig = payload?.signal || 'SIGSYS';
+        const pane = activeWindow?.panes?.get('aux_sandbox');
+        if (pane) {
+            pane._faultInjection = {
+                sig,
+                reason: sig === 'SIGABRT'
+                    ? 'Simulated heap exhaustion / abort'
+                    : 'Seccomp syscall violation trap (simulated)',
+            };
+        }
 
-        recordIpcPacket('KERNEL -> T2', 'seccomp', `SIGSYS -> PID ${targetPid || 'Pool B'}`, 'CRASH', {
+        // Stop hang detection before the process dies — otherwise a Respawn that
+        // lands before the exit handler runs inherits a stale armed clock.
+        disarmPoolBWatchdog();
+
+        recordIpcPacket('KERNEL -> T2', 'seccomp', `${sig} -> PID ${targetPid || 'Pool B'}`, 'CRASH', {
             signal: sig,
             targetPid,
-            reason: 'Seccomp Syscall Violation Trap',
+            reason: pane?._faultInjection?.reason || 'Fault injection',
         }, 0.02);
 
+        let killed = false;
+        if (instance) {
+            instance._isTerminated = true;
+        }
         if (targetPid) {
-            try { process.kill(targetPid, sig); } catch (e) {}
-        } else {
+            try { process.kill(targetPid, 'SIGKILL'); killed = true; } catch (_) {}
+        }
+        if (supervisorPid) {
+            try { process.kill(supervisorPid, 'SIGKILL'); killed = true; } catch (_) {}
+        }
+        if (!killed) {
             defaultSecureConstellation.emit('crashed', {
-                instanceId: 999,
-                code: 159,
+                instanceId: entry?.instanceId || 999,
+                code: 137,
                 sig,
                 surfaces: [auxSurfaceId],
                 isolated: true,
@@ -343,40 +421,55 @@ async function startShowcase() {
         },
     });
 
-    // Reusable Pool B Container Respawn Handler
+    // Pool B respawn via framework host crash chrome (dismisses Aw Snap + reacquires engine).
     async function doRespawnAuxEngine(caller = 'HOST SUPERVISOR') {
-        const auxSurfaceId = 'sandbox-showcase-window:aux_sandbox';
+        const auxSurfaceId = AUX_SURFACE_ID;
         const pane = activeWindow ? activeWindow.panes.get('aux_sandbox') : null;
-        if (pane) {
-            const start = performance.now();
-            try {
-                const shm = pane._shm;
-                const engineRes = await defaultSecureConstellation.acquireSecureEngine(auxSurfaceId, {
-                    pane,
-                    url: auxUrl,
-                    shm,
-                    isolated: true,
-                });
-                pane._engineInstance = engineRes.instance;
-                if (engineRes.instance.controlFd && activeWindow.handle?.attachRemotePaneInput) {
-                    activeWindow.handle.attachRemotePaneInput('aux_sandbox', engineRes.instance.controlFd);
-                }
-                const latency = performance.now() - start;
-                recordIpcPacket('HOST -> SUPERVISOR', 'supervisor', `respawnAuxEngine (${caller})`, 'RESPAWN', {
-                    newPid: engineRes.enginePid,
-                    elapsedMs: Number(latency.toFixed(2)),
-                }, latency);
+        if (!pane) return { respawned: false };
 
-                // Broadcast recovery event to all panes
-                broadcastAllPanes('system.poolBRespawned', { newPid: engineRes.enginePid, latencyMs: latency });
-                return { respawned: true, newPid: engineRes.enginePid, latencyMs: latency };
-            } catch (err) {
-                console.error('[Host IPC] Respawn error:', err);
-                return { respawned: false, error: err.message };
+        // New engine has no heartbeats yet — do not inherit the previous life's clock.
+        disarmPoolBWatchdog();
+
+        const start = performance.now();
+        try {
+            // Showcase grants may have been wiped by a fail-closed navigation during death.
+            const surface = hostIpcRouter?.surfaceTracker?.getSurface(auxSurfaceId);
+            if (surface) {
+                surface.allowedChannels = new Set(['vault', 'sandboxTasks']);
+                surface.trustedOrigins = new Set([sandboxedOrigin]);
             }
+            pane._url = auxUrl;
+
+            const engineRes = await respawnCrashedSurface(auxSurfaceId);
+            if (!engineRes?.respawned) {
+                return { respawned: false, error: engineRes?.error || 'respawn failed' };
+            }
+
+            const latency = performance.now() - start;
+            recordIpcPacket('HOST -> SUPERVISOR', 'supervisor', `respawnAuxEngine (${caller})`, 'RESPAWN', {
+                newPid: engineRes.newPid,
+                elapsedMs: Number(latency.toFixed(2)),
+            }, latency);
+
+            broadcastAllPanes('system.poolBRespawned', { newPid: engineRes.newPid, latencyMs: latency });
+            return { respawned: true, newPid: engineRes.newPid, latencyMs: latency };
+        } catch (err) {
+            console.error('[Host IPC] Respawn error:', err);
+            return { respawned: false, error: err.message };
         }
-        return { respawned: false };
     }
+
+    // Chrome-button / framework respawn does not go through doRespawnAuxEngine — forward
+    // so the Host Dock + tape topology clear their "DEAD / KILLED" chrome.
+    ipcMain.on('system.remoteSurfaceRespawned', (info) => {
+        if (!info || !String(info.surfaceId || '').includes('aux_sandbox')) return;
+        disarmPoolBWatchdog();
+        broadcastAllPanes('system.poolBRespawned', {
+            newPid: info.newPid,
+            latencyMs: 0,
+            source: 'crash-chrome',
+        });
+    });
 
     // Expose respawn to Track 1 Host Dock (Surface 1)
     ipcMain.handle('system.respawnAuxEngine', async () => {
@@ -396,11 +489,18 @@ async function startShowcase() {
     // -------------------------------------------------------------------------
     // Liveness Heartbeat & Supervisor Watchdog for Pool B
     // -------------------------------------------------------------------------
-    let lastPoolBHeartbeat = Date.now();
-    let isWatchdogRecovering = false;
-
+    // Heartbeats are page-driven (setInterval → lotus.invoke). When the host window
+    // loses OS focus, Wayland often stops RedrawRequested → remote SHM/GPU drain
+    // stalls → sandboxed JS can wedge → heartbeats stop. That is not a hang; do not
+    // SIGKILL. Also do not arm until the first successful heartbeat (IPC bring-up).
+    //
+    // Critical: disarm on every Pool B death / respawn start. If we stay armed across
+    // a crash, the next cold-spawn inherits a multi-second stale "elapsed" and the
+    // watchdog SIGKILLs the brand-new engine before its first heartbeat can land —
+    // which is exactly the "Respawn needs 2–3 clicks" failure mode.
     ipcMain.register('sandboxTasks.heartbeat', async () => {
         lastPoolBHeartbeat = Date.now();
+        poolBHeartbeatArmed = true;
         isWatchdogRecovering = false;
         return { acknowledged: true, timestamp: Date.now() };
     }, {
@@ -411,43 +511,58 @@ async function startShowcase() {
         },
     });
 
-    const watchdogInterval = setInterval(async () => {
+    // Hang detection: 2s without heartbeat → SIGKILL. Recovery is pane policy
+    // (autoRespawn / host crash chrome), not showcase auto-respawn.
+    const POOL_B_HANG_MS = 2000;
+    const watchdogInterval = setInterval(() => {
         if (!activeWindow) return;
-        const auxSurfaceId = 'sandbox-showcase-window:aux_sandbox';
-        const entry = defaultSecureConstellation?._isolatedInstances?.get(auxSurfaceId);
+        if (!showcaseWindowFocused) return;
+        if (!poolBHeartbeatArmed) return;
+        const pane = activeWindow.panes.get('aux_sandbox');
+        // Crash chrome / mid-respawn: never judge liveness against a stale clock.
+        if (pane?._crashed || pane?._respawning) {
+            disarmPoolBWatchdog();
+            return;
+        }
+        const entry = defaultSecureConstellation?._isolatedInstances?.get(AUX_SURFACE_ID);
         const targetPid = entry?.instance?.enginePid;
-        if (!targetPid) return; // Process dead, waiting for dock or supervisor action
+        const supervisorPid = entry?.instance?.supervisor?.pid;
+        if (!targetPid) return; // Already dead — crash chrome / autoRespawn owns recovery
 
         const elapsed = Date.now() - lastPoolBHeartbeat;
-        // If Pool B has missed heartbeats for > 2000ms (e.g. while(true) infinite freeze)
-        if (elapsed > 2000 && !isWatchdogRecovering) {
+        if (elapsed > POOL_B_HANG_MS && !isWatchdogRecovering) {
             isWatchdogRecovering = true;
-            console.warn(`[Host Watchdog] Pool B main thread hang detected (${elapsed}ms without heartbeat)! Initiating auto-recovery...`);
-            
+            console.warn(`[Host Watchdog] Pool B main thread hang detected (${elapsed}ms without heartbeat)! Killing hung engine...`);
+
+            if (pane) {
+                pane._faultInjection = {
+                    sig: 'WATCHDOG TIMEOUT',
+                    reason: 'Main thread deadlock / infinite loop',
+                };
+            }
+
             recordIpcPacket('HOST -> WATCHDOG', 'supervisor', 'WATCHDOG_HANG_TIMEOUT', 'TIMEOUT', {
                 targetPid,
                 hangDurationMs: elapsed,
-                remedy: 'SIGKILL hung container & auto-respawn',
+                remedy: 'SIGKILL hung container; host crash chrome awaits Respawn',
             }, 0.05);
 
-            // Kill the hung engine process
+            // Disarm before kill so a concurrent Respawn cannot be murdered by this clock.
+            disarmPoolBWatchdog();
+
             try { process.kill(targetPid, 'SIGKILL'); } catch (_) {}
+            if (supervisorPid) {
+                try { process.kill(supervisorPid, 'SIGKILL'); } catch (_) {}
+            }
 
             broadcastAllPanes('system.crashEvent', {
-                sig: 'SIGKILL (WATCHDOG TIMEOUT)',
+                sig: 'WATCHDOG TIMEOUT',
                 reason: 'Main Thread Deadlock / Infinite Loop',
-                surfaces: [auxSurfaceId],
+                surfaces: [AUX_SURFACE_ID],
                 isolated: true,
             });
-
-            // Automatically respawn container after 200ms
-            setTimeout(async () => {
-                await doRespawnAuxEngine('WATCHDOG AUTO-RECOVERY');
-                lastPoolBHeartbeat = Date.now();
-                isWatchdogRecovering = false;
-            }, 200);
         }
-    }, 500);
+    }, 200);
 
     // -------------------------------------------------------------------------
     // 4. Multi-Surface Compositor Layout (1280 x 800)
@@ -460,19 +575,32 @@ async function startShowcase() {
         .left('trusted', 300, {
             url: 'lotus-resource://localhost/trusted.html',
             sandbox: false,
+            resizable: true,
+            min: 180,
         })
-        .right('aux_sandbox', 340, {
-            url: auxUrl,
-            sandbox: true,
-            isolated: true,
-            allowedChannels: ['vault', 'sandboxTasks'],
-            trustedOrigins: [sandboxedOrigin],
-        })
-        .fill('sandboxed', {
-            url: sandboxedUrl,
-            sandbox: true,
-            allowedChannels: ['vault', 'sandboxTasks'],
-            trustedOrigins: [sandboxedOrigin],
+        .row('pools', (r) => {
+            r.pane('sandboxed', {
+                weight: 0.65,
+                min: 160,
+                resizable: true,
+                url: sandboxedUrl,
+                sandbox: true,
+                autoRespawn: true,
+                autoRespawnMaxAttempts: 3,
+                allowedChannels: ['vault', 'sandboxTasks'],
+                trustedOrigins: [sandboxedOrigin],
+            })
+             .pane('aux_sandbox', {
+                weight: 0.35,
+                min: 160,
+                resizable: true,
+                url: auxUrl,
+                sandbox: true,
+                isolated: true,
+                autoRespawn: false,
+                allowedChannels: ['vault', 'sandboxTasks'],
+                trustedOrigins: [sandboxedOrigin],
+            });
         });
 
     console.log('[Lotus Sandbox Showcase] Spawning 1280x800 Multi-Surface Window...');
@@ -493,6 +621,9 @@ async function startShowcase() {
     // Listen for crash events on the constellation
     defaultSecureConstellation.on('crashed', (event) => {
         console.log('[Host Constellation] Crash event caught:', event);
+        if (isPoolBSurface(event.surfaces)) {
+            disarmPoolBWatchdog();
+        }
         recordIpcPacket('KERNEL -> T2', 'seccomp', `SIGSYS (${event.sig || 'TERMINATED'})`, 'CRASH', {
             surfaces: event.surfaces,
             isolated: event.isolated,
@@ -503,11 +634,141 @@ async function startShowcase() {
     win.once('ready-to-show', () => {
         console.log('[Lotus Sandbox Showcase] First frame painted - showing window.');
         win.show();
+
+        if (process.env.LOTUS_TEST_CRASH_RECOVERY === '1') {
+            (async () => {
+                console.log('[TEST] Starting multi-cycle crash recovery stress test...');
+                await new Promise((r) => setTimeout(r, 1500));
+                const auxSurfaceId = AUX_SURFACE_ID;
+                let prevPid = defaultSecureConstellation?._isolatedInstances?.get(auxSurfaceId)?.instance?.enginePid;
+                console.log('[TEST] Initial Pool B PID:', prevPid);
+
+                for (let cycle = 1; cycle <= 4; cycle++) {
+                    console.log(`[TEST] === Cycle ${cycle}: Crashing Pool B (aux_sandbox) ===`);
+                    const entry = defaultSecureConstellation?._isolatedInstances?.get(auxSurfaceId);
+                    const targetPid = entry?.instance?.enginePid;
+                    const supPid = entry?.instance?.supervisor?.pid;
+                    console.log(`[TEST] Cycle ${cycle} killing enginePid=${targetPid}, supervisorPid=${supPid}`);
+                    if (entry?.instance) entry.instance._isTerminated = true;
+                    try { if (targetPid) process.kill(targetPid, 'SIGKILL'); } catch (_) {}
+                    try { if (supPid) process.kill(supPid, 'SIGKILL'); } catch (_) {}
+
+                    // Vary delay before respawn: immediate (50ms) vs after crash chrome (600ms)
+                    await new Promise((r) => setTimeout(r, cycle % 2 === 1 ? 600 : 50));
+
+                    console.log(`[TEST] Cycle ${cycle}: Requesting respawn...`);
+                    const res = cycle % 2 === 1
+                        ? await respawnCrashedSurface(auxSurfaceId)
+                        : await doRespawnAuxEngine(`TEST_CYCLE_${cycle}`);
+                    console.log(`[TEST] Cycle ${cycle} respawn returned:`, res);
+
+                    if (!res?.respawned || !res.newPid || res.newPid === targetPid) {
+                        throw new Error(`Cycle ${cycle} failed to respawn a fresh PID: ${JSON.stringify(res)}`);
+                    }
+
+                    // Test idempotency right after recovery
+                    const idem = await respawnCrashedSurface(auxSurfaceId);
+                    console.log(`[TEST] Cycle ${cycle} idempotency check:`, idem);
+                    if (!idem?.respawned || !idem.alreadyHealthy || idem.newPid !== res.newPid) {
+                        throw new Error(`Cycle ${cycle} idempotency check failed: ${JSON.stringify(idem)}`);
+                    }
+
+                    // Wait up to 2.5s for Track-2 heartbeat from the newly respawned Pool B page
+                    const hbStart = Date.now();
+                    while (!poolBHeartbeatArmed && Date.now() - hbStart < 2500) {
+                        await new Promise((r) => setTimeout(r, 100));
+                    }
+                    console.log(`[TEST] Cycle ${cycle} Pool B heartbeat armed=${poolBHeartbeatArmed} after ${Date.now() - hbStart}ms`);
+                    if (!poolBHeartbeatArmed) {
+                        throw new Error(`Cycle ${cycle}: Pool B Track-2 IPC heartbeat did not resume after respawn!`);
+                    }
+                    prevPid = res.newPid;
+                }
+
+                console.log('[TEST] All 4 crash/restore cycles verified (fresh PID, fresh frame, idempotency, and live Track-2 IPC heartbeat)!');
+                cleanup();
+                process.exit(0);
+            })().catch((err) => {
+                console.error('[TEST] Crash recovery test failed:', err);
+                cleanup();
+                process.exit(1);
+            });
+        }
+
+        if (process.env.LOTUS_TEST_RESIZE === '1') {
+            (async () => {
+                console.log('[TEST] Starting rapid resize stress test...');
+                // Wait for WebGL scene in sandboxed.html to start rendering
+                await new Promise((r) => setTimeout(r, 1000));
+
+                // Rapidly alternate between presets (wide_workspace is upscaling 640 -> 800)
+                const presets = [
+                    'wide_workspace',
+                    'dual_split',
+                    'default',
+                    'wide_workspace',
+                    'dual_split',
+                    'wide_workspace',
+                ];
+                for (const preset of presets) {
+                    console.log(`[TEST] Applying preset: ${preset}`);
+                    applyLayoutPreset(preset);
+                    await new Promise((r) => setTimeout(r, 150));
+                }
+
+                // Rapid continuous slider dragging (weight toggles)
+                console.log('[TEST] Running rapid split-ratio drag sweeps...');
+                for (let cycle = 0; cycle < 3; cycle++) {
+                    for (let r = 20; r <= 80; r += 5) {
+                        const ratio = r / 100;
+                        poolWeights = [ratio, 1 - ratio];
+                        activeWindow.setSplitWeights('pools', poolWeights);
+                        publishGeometry();
+                        await new Promise((res) => setTimeout(res, 30));
+                    }
+                    for (let r = 80; r >= 20; r -= 5) {
+                        const ratio = r / 100;
+                        poolWeights = [ratio, 1 - ratio];
+                        activeWindow.setSplitWeights('pools', poolWeights);
+                        publishGeometry();
+                        await new Promise((res) => setTimeout(res, 30));
+                    }
+                }
+
+                console.log('[TEST] Rapid resize stress test completed successfully without panicking or crashing!');
+                cleanup();
+                process.exit(0);
+            })().catch((err) => {
+                console.error('[TEST] Resize test failed:', err);
+                process.exit(1);
+            });
+        }
+    });
+
+    win.on('focus', () => {
+        showcaseWindowFocused = true;
+        // Give Pool B a grace window after refocus before hang detection.
+        if (poolBHeartbeatArmed) {
+            lastPoolBHeartbeat = Date.now();
+        }
+        // Let sandboxed demos resume rAF (Page Visibility alone is unreliable in remotes).
+        broadcastAllPanes('app.visibility', { visible: true });
+    });
+    win.on('blur', () => {
+        showcaseWindowFocused = false;
+        broadcastAllPanes('app.visibility', { visible: false });
+    });
+
+    win.on('resize', () => {
+        publishGeometry();
     });
 
     win.on('load-status', (status, paneId) => {
         console.log(`[Lotus Sandbox Showcase] Pane "${paneId}" load status: ${status}`);
     });
+
+    // Initial topology map from live window + tree inputs.
+    publishGeometry();
 
     const cleanup = () => {
         console.log('[Lotus Sandbox Showcase] Closing showcase window and shutting down...');

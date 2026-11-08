@@ -383,33 +383,28 @@
             if (btn) btn.classList.add('active');
         }
 
-        btnPresetDefault.addEventListener('click', async () => {
-            setActivePresetBtn(btnPresetDefault);
-            const lotus = window.lotus?.ipc || window.lotus;
-            if (lotus && typeof lotus.invoke === 'function') {
-                await lotus.invoke('compositor.setLayoutPreset', { preset: 'default' });
-            }
-        });
-
-        btnPresetWide.addEventListener('click', async () => {
-            setActivePresetBtn(btnPresetWide);
-            const lotus = window.lotus?.ipc || window.lotus;
-            if (lotus && typeof lotus.invoke === 'function') {
-                await lotus.invoke('compositor.setLayoutPreset', { preset: 'wide_workspace' });
-            }
-        });
-
-        btnPresetSplit.addEventListener('click', async () => {
-            setActivePresetBtn(btnPresetSplit);
-            const lotus = window.lotus?.ipc || window.lotus;
-            if (lotus && typeof lotus.invoke === 'function') {
-                await lotus.invoke('compositor.setLayoutPreset', { preset: 'dual_split' });
-            }
-        });
-
         const splitSlider = document.getElementById('split-slider');
         const splitRatioLabel = document.getElementById('split-ratio-label');
         let splitDebounceTimer = null;
+
+        function syncSplitSlider(ratio) {
+            const pct = Math.round(Math.max(0.2, Math.min(0.8, Number(ratio) || 0.65)) * 100);
+            splitSlider.value = String(pct);
+            splitRatioLabel.textContent = `${pct}% / ${100 - pct}%`;
+        }
+
+        async function applyPreset(btn, preset, ratio) {
+            setActivePresetBtn(btn);
+            syncSplitSlider(ratio);
+            const lotus = window.lotus?.ipc || window.lotus;
+            if (lotus && typeof lotus.invoke === 'function') {
+                await lotus.invoke('compositor.setLayoutPreset', { preset });
+            }
+        }
+
+        btnPresetDefault.addEventListener('click', () => applyPreset(btnPresetDefault, 'default', 0.65));
+        btnPresetWide.addEventListener('click', () => applyPreset(btnPresetWide, 'wide_workspace', 0.77));
+        btnPresetSplit.addEventListener('click', () => applyPreset(btnPresetSplit, 'dual_split', 0.5));
 
         splitSlider.addEventListener('input', () => {
             const val = parseInt(splitSlider.value, 10);
@@ -569,6 +564,15 @@
                 poolbDockStatus.style.color = '#34d399';
                 poolbDockStatus.textContent = `[POOL B: HEALTHY (PID ${info.newPid})]`;
                 btnDockRespawn.style.display = 'none';
+                dockRespawnStat.style.color = '#34d399';
+                dockRespawnStat.textContent = info.latencyMs > 0
+                    ? `✔ Container restored in ${Number(info.latencyMs).toFixed(1)}ms (New PID ${info.newPid})`
+                    : `✔ Container restored (New PID ${info.newPid})`;
+                setTimeout(() => {
+                    if (dockRespawnStat.textContent.startsWith('✔')) {
+                        dockRespawnStat.textContent = '';
+                    }
+                }, 4000);
             });
         }
     </script>

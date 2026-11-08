@@ -108,6 +108,16 @@ impl LotusPaneContext {
         }
     }
 
+    pub fn color_texture(&self) -> glow::NativeTexture {
+        self.framebuffer.borrow().texture
+    }
+
+    pub fn bind_color_for_read(&self, gl: &glow::Context) {
+        unsafe {
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.framebuffer.borrow().fbo));
+        }
+    }
+
     /// Blit this pane's color buffer into `target` at `target_rect`.
     ///
     /// Leaves `target` bound to `GL_FRAMEBUFFER`, matching the previous

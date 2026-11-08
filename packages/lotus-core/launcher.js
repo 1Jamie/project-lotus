@@ -76,11 +76,52 @@ class SandboxedEngineProcess {
     }
 
     /**
-     * Terminate the engine and supervisor cleanly.
+     * Terminate the engine and supervisor.
+     * @param {{ force?: boolean }} [options] When `force` is true, SIGKILL immediately and
+     *   return without waiting for a graceful SHUTDOWN (crash/respawn hot path).
      */
-    async terminate() {
-        if (this._isTerminated) return;
+    async terminate(options = {}) {
+        const force = options.force === true;
+        if (this._isTerminated && !force) return;
         this._isTerminated = true;
+
+        if (force) {
+            try {
+                if (this.enginePid) {
+                    process.kill(this.enginePid, 'SIGKILL');
+                }
+            } catch {}
+            try {
+                this.supervisor.kill('SIGKILL');
+            } catch {}
+            if (this.supervisor && this.supervisor.exitCode === null && this.supervisor.signalCode === null) {
+                await new Promise((resolve) => {
+                    const timer = setTimeout(resolve, 300);
+                    this.supervisor.once('exit', () => {
+                        clearTimeout(timer);
+                        resolve();
+                    });
+                });
+            }
+            try {
+                if (this.controlStream && !this.controlStream.destroyed) {
+                    this.controlStream.destroy();
+                }
+            } catch {}
+            if (this.brokerServer) {
+                try {
+                    await this.brokerServer.close();
+                } catch {}
+                this.brokerServer = null;
+            }
+            if (this.allocatedTempDir) {
+                try {
+                    fs.rmSync(this.allocatedTempDir, { recursive: true, force: true });
+                } catch {}
+                this.allocatedTempDir = null;
+            }
+            return;
+        }
 
         try {
             if (this.controlStream && !this.controlStream.destroyed) {
@@ -171,7 +212,7 @@ async function spawnSandboxedEngine(options = {}) {
         }
     }
 
-    const passFds = options.passFds || [];
+    const passFds = [...(options.passFds || [])];
     const supArgs = [
         '--supervisor-fd', '3',
         '--control-fd', '4',
@@ -193,6 +234,8 @@ async function spawnSandboxedEngine(options = {}) {
     let controlSocketPair = null;
     let controlSocket = null;
     let childControlFd = 'pipe';
+    let gpuSocketPair = null;
+    const GPU_CHILD_FD = 5;
     try {
         const lotusCore = require('./lotus.js');
         if (typeof lotusCore.createControlSocketPair === 'function') {
@@ -203,9 +246,22 @@ async function spawnSandboxedEngine(options = {}) {
             const net = require('net');
             controlSocket = new net.Socket({ fd: hostFd, readable: true, writable: true });
         }
+        if (typeof lotusCore.createGpuSocketPair === 'function') {
+            gpuSocketPair = lotusCore.createGpuSocketPair();
+            const gpuChild = gpuSocketPair.childFd ?? gpuSocketPair.child_fd;
+            if (typeof gpuChild === 'number' && gpuChild >= 0 && !passFds.includes(GPU_CHILD_FD)) {
+                passFds.push(GPU_CHILD_FD);
+            }
+        }
     } catch {}
 
     const stdio = ['inherit', 'inherit', 'inherit', 'pipe', childControlFd];
+    if (gpuSocketPair) {
+        const gpuChild = gpuSocketPair.childFd ?? gpuSocketPair.child_fd;
+        if (typeof gpuChild === 'number' && gpuChild >= 0) {
+            stdio[GPU_CHILD_FD] = gpuChild;
+        }
+    }
     if (passFds.length > 0) {
         for (const fd of passFds) {
             if (typeof fd === 'number' && fd >= 0) {
@@ -229,6 +285,9 @@ async function spawnSandboxedEngine(options = {}) {
     supervisorEnv.GST_REGISTRY_DISABLE = 'yes';
     supervisorEnv.PULSE_SERVER = '';
     supervisorEnv.PULSE_AUTOSPAWN = '0';
+    if (gpuSocketPair && passFds.includes(GPU_CHILD_FD)) {
+        supervisorEnv.LOTUS_GPU_FD = String(GPU_CHILD_FD);
+    }
 
     const supervisorProc = spawn(supervisorBin, supArgs, {
         stdio,
@@ -241,6 +300,26 @@ async function spawnSandboxedEngine(options = {}) {
             try { fs.closeSync(childFd); } catch {}
         }
     }
+    if (gpuSocketPair) {
+        const gChildDup = gpuSocketPair.childFd ?? gpuSocketPair.child_fd;
+        if (typeof gChildDup === 'number' && gChildDup >= 0) {
+            try { fs.closeSync(gChildDup); } catch {}
+        }
+        // Start host GPU broker before ENGINE_READY so the engine's post-ready ping/pong
+        // handshake does not block on a feeder that is only registered later.
+        try {
+            const lotusCore = require('./lotus.js');
+            if (typeof lotusCore.ensureWebglBroker === 'function') {
+                lotusCore.ensureWebglBroker();
+            }
+            const hostGpu = gpuSocketPair.hostFd ?? gpuSocketPair.host_fd;
+            if (typeof lotusCore.registerGpuWebglBroker === 'function' && typeof hostGpu === 'number' && hostGpu >= 0) {
+                lotusCore.registerGpuWebglBroker(hostGpu);
+            }
+        } catch (e) {
+            console.warn('[launcher] registerGpuWebglBroker (early) failed:', e);
+        }
+    }
 
     const supervisorStream = supervisorProc.stdio[3];
     const controlStream = controlSocket || supervisorProc.stdio[4];
@@ -248,6 +327,7 @@ async function spawnSandboxedEngine(options = {}) {
     return new Promise((resolve, reject) => {
         let enginePid = null;
         let enginePort = null;
+        let engineExitCode = null;
         let stageBLockedReceived = false;
         let startupTimeout = null;
         let verificationReport = null;
@@ -294,6 +374,8 @@ async function spawnSandboxedEngine(options = {}) {
                         enginePid = msg.engine_pid;
                         enginePort = msg.engine_port;
                         tryAudit();
+                    } else if (msg.type === 'EXITED') {
+                        engineExitCode = msg.code;
                     }
                 } catch {}
             }
@@ -445,6 +527,7 @@ async function spawnSandboxedEngine(options = {}) {
                         allocatedTempDir
                     );
                     instance.verificationReport = verificationReport;
+
                     resolve(instance);
                 }
             }
@@ -454,7 +537,7 @@ async function spawnSandboxedEngine(options = {}) {
 
         supervisorProc.on('error', cleanupAndReject);
         supervisorProc.on('exit', (code, sig) => {
-            cleanupAndReject(new Error(`Supervisor exited unexpectedly during launch: code=${code}, sig=${sig}`));
+            cleanupAndReject(new Error(`Supervisor exited unexpectedly during launch: code=${code}, sig=${sig}, engineExitCode=${engineExitCode}`));
         });
     });
 }
@@ -463,11 +546,33 @@ function stageBLOCKEDPassed(flag) {
     return flag === true;
 }
 
+function isEngineInstanceAlive(instance) {
+    if (!instance || instance._isTerminated) return false;
+    if (instance.supervisor && (instance.supervisor.exitCode !== null || instance.supervisor.signalCode !== null)) {
+        return false;
+    }
+    const pid = instance.enginePid;
+    if (!pid || typeof pid !== 'number' || pid <= 0) return false;
+    try {
+        process.kill(pid, 0);
+    } catch {
+        return false;
+    }
+    const status = parseProcStatus(pid);
+    if (!status) return false;
+    const state = String(status.State || '');
+    if (state.startsWith('Z') || state.startsWith('X') || state.startsWith('x')) {
+        return false;
+    }
+    return true;
+}
+
 module.exports = {
     spawnSandboxedEngine,
     SandboxedEngineProcess,
     parseProcStatus,
     readNamespaceInodes,
     readProcessFds,
+    isEngineInstanceAlive,
 };
 

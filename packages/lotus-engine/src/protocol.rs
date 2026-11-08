@@ -29,6 +29,12 @@ pub enum ControlMessage {
         navigation_id: u64,
         url: String,
     },
+    /// Inject / re-run a script in the surface's active document (per-document
+    /// secure IPC bridge after navigation credential rotation).
+    EvaluateScript {
+        surface_id: String,
+        script: String,
+    },
     Resize {
         surface_id: String,
         generation: u64,
@@ -41,6 +47,15 @@ pub enum ControlMessage {
     },
     Input {
         event: InputEvent,
+    },
+    /// Authoritative display refresh rate from the host monitor (millihertz).
+    SetDisplayTiming {
+        refresh_rate_millihertz: u32,
+    },
+    /// One host compositor frame tick for a surface (drives jail RefreshDriver).
+    Vsync {
+        surface_id: String,
+        presentation_time_ns: u64,
     },
     Ping,
 }

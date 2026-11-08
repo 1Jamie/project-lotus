@@ -34,6 +34,34 @@ pub use window::{
     map_winit_modifiers, map_winit_key, map_winit_code,
 };
 
+/// Ensure the process-wide host WebGL GL thread is running.
+#[cfg(target_os = "linux")]
+#[napi(js_name = "ensureWebglBroker")]
+pub fn ensure_webgl_broker() -> napi::Result<()> {
+    crate::gl::webgl_broker::ensure_webgl_broker()
+        .map_err(|e| napi::Error::from_reason(e))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[napi(js_name = "ensureWebglBroker")]
+pub fn ensure_webgl_broker() -> napi::Result<()> {
+    Err(napi::Error::from_reason("WebGL broker is only supported on Linux"))
+}
+
+/// Register the host end of the GPU `socketpair` (from [`create_gpu_socket_pair`]) and start the feeder thread.
+#[cfg(target_os = "linux")]
+#[napi(js_name = "registerGpuWebglBroker")]
+pub fn register_gpu_webgl_broker(fd: i32) -> napi::Result<()> {
+    crate::gl::webgl_broker::register_gpu_fd(fd)
+        .map_err(|e| napi::Error::from_reason(e))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[napi(js_name = "registerGpuWebglBroker")]
+pub fn register_gpu_webgl_broker(_fd: i32) -> napi::Result<()> {
+    Err(napi::Error::from_reason("WebGL broker is only supported on Linux"))
+}
+
 
 #[napi]
 pub struct WindowHandle {
@@ -330,10 +358,106 @@ impl WindowHandle {
         }
     }
 
+    /// Update dock thickness for an anchored pane without clearing its anchor.
+    /// Left/Right use `width`; Top/Bottom use `height`; Fill/None are ignored.
+    #[napi]
+    pub fn set_pane_size(&self, pane_id: String, width: f64, height: f64) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetPaneSize(
+                self.id.clone(),
+                pane_id,
+                width as f32,
+                height as f32,
+            ));
+        }
+    }
+
+    #[napi]
+    pub fn set_pane_weight(&self, pane_id: String, weight: f64) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetPaneWeight(
+                self.id.clone(),
+                pane_id,
+                weight as f32,
+            ));
+        }
+    }
+
+    #[napi]
+    pub fn set_split_weights(&self, split_id: String, payload_json: String) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetSplitWeights(
+                self.id.clone(),
+                split_id,
+                payload_json,
+            ));
+        }
+    }
+
+    #[napi]
+    pub fn set_split_sizes(&self, split_id: String, payload_json: String) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetSplitSizes(
+                self.id.clone(),
+                split_id,
+                payload_json,
+            ));
+        }
+    }
+
+    #[napi]
+    pub fn begin_layout_batch(&self) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::BeginLayoutBatch(self.id.clone()));
+        }
+    }
+
+    #[napi]
+    pub fn end_layout_batch(&self) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::EndLayoutBatch(self.id.clone()));
+        }
+    }
+
     #[napi]
     pub fn set_pane_visible(&self, pane_id: String, visible: bool) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::SetPaneVisible(self.id.clone(), pane_id, visible));
+        }
+    }
+
+    /// Cover a docked remote with host crash chrome as a high-z overlay while keeping the
+    /// remote visible so it continues to receive compositor vsync / SHM pull.
+    #[napi]
+    pub fn cover_remote_with_crash_chrome(&self, remote_pane_id: String, crash_pane_id: String) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::CoverRemoteWithCrashChrome {
+                window_id: self.id.clone(),
+                remote_pane_id,
+                crash_pane_id,
+            });
+        }
+    }
+
+    /// After attaching a successor engine: wait for host GL upload before lifting chrome.
+    #[napi]
+    pub fn arm_crash_cover_fresh_frame(&self, remote_pane_id: String) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::ArmCrashCoverFreshFrame {
+                window_id: self.id.clone(),
+                remote_pane_id,
+            });
+        }
+    }
+
+    /// Clear under-cover / fresh-frame gates after crash chrome is dismissed.
+    #[napi]
+    pub fn clear_remote_crash_cover(&self, remote_pane_id: String) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::ClearRemoteCrashCover {
+                window_id: self.id.clone(),
+                remote_pane_id,
+            });
         }
     }
 
@@ -687,8 +811,81 @@ pub fn allocate_remote_pane_shm(name: String, width: u32, height: u32) -> napi::
     })
 }
 
+/// Synchronously sanitize both the producer control header and consumer ack header
+/// of a remote pane SHM allocation before spawning a successor engine. This guarantees
+/// that no stale `STATE_READY` frames or non-zero `pub_seq` from a dead engine
+/// can be consumed by the host compositor during crash recovery.
+#[napi]
+pub fn reset_remote_pane_shm(pixel_rw_fd: i32, ack_rw_fd: i32) -> napi::Result<()> {
+    if pixel_rw_fd >= 0 {
+        let map_len = std::mem::size_of::<lotus_supervisor::shm::ProducerControlHeader>();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                pixel_rw_fd,
+                0,
+            )
+        };
+        if ptr != libc::MAP_FAILED && !ptr.is_null() {
+            unsafe {
+                let prod_hdr = &mut *(ptr as *mut lotus_supervisor::shm::ProducerControlHeader);
+                prod_hdr.pub_seq.store(0, std::sync::atomic::Ordering::SeqCst);
+                prod_hdr.prod_resize_gen.store(1, std::sync::atomic::Ordering::SeqCst);
+                prod_hdr.active_slots = 3;
+                for slot in &prod_hdr.slots {
+                    slot.state.store(lotus_supervisor::shm::STATE_FREE, std::sync::atomic::Ordering::SeqCst);
+                    slot.pub_seq.store(0, std::sync::atomic::Ordering::SeqCst);
+                    slot.generation.store(0, std::sync::atomic::Ordering::SeqCst);
+                    slot.width.store(0, std::sync::atomic::Ordering::SeqCst);
+                    slot.height.store(0, std::sync::atomic::Ordering::SeqCst);
+                    slot.stride.store(0, std::sync::atomic::Ordering::SeqCst);
+                }
+                libc::munmap(ptr, map_len);
+            }
+        }
+    }
+
+    if ack_rw_fd >= 0 {
+        let map_len = std::mem::size_of::<lotus_supervisor::shm::ConsumerAckHeader>();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                ack_rw_fd,
+                0,
+            )
+        };
+        if ptr != libc::MAP_FAILED && !ptr.is_null() {
+            unsafe {
+                let ack_hdr = &mut *(ptr as *mut lotus_supervisor::shm::ConsumerAckHeader);
+                ack_hdr.claimed_generation.store(0, std::sync::atomic::Ordering::SeqCst);
+                ack_hdr.claimed_seq.store(0, std::sync::atomic::Ordering::SeqCst);
+                ack_hdr.free_seq.store(0, std::sync::atomic::Ordering::SeqCst);
+                ack_hdr.claimed_slot.store(
+                    lotus_supervisor::shm::CLAIM_UNCLAIMED,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                libc::munmap(ptr, map_len);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[napi(object)]
 pub struct ControlSocketPair {
+    pub host_fd: i32,
+    pub child_fd: i32,
+}
+
+#[napi(object)]
+pub struct GpuSocketPair {
     pub host_fd: i32,
     pub child_fd: i32,
 }
@@ -701,6 +898,19 @@ pub fn create_control_socket_pair() -> napi::Result<ControlSocketPair> {
         return Err(napi::Error::from_reason(format!("socketpair failed: errno {}", err)));
     }
     Ok(ControlSocketPair {
+        host_fd: fds[0],
+        child_fd: fds[1],
+    })
+}
+
+#[napi]
+pub fn create_gpu_socket_pair() -> napi::Result<GpuSocketPair> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) } != 0 {
+        let err = unsafe { *libc::__errno_location() };
+        return Err(napi::Error::from_reason(format!("socketpair (gpu) failed: errno {}", err)));
+    }
+    Ok(GpuSocketPair {
         host_fd: fds[0],
         child_fd: fds[1],
     })

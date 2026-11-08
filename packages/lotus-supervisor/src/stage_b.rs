@@ -438,6 +438,8 @@ pub fn apply_stage_b_seccomp() -> Result<(), i32> {
             libc::SYS_shutdown as u32,
             libc::SYS_sched_get_priority_min as u32,
             libc::SYS_sched_get_priority_max as u32,
+            libc::SYS_fchown as u32,
+            libc::SYS_fchmod as u32,
         ];
 
         for &nr in &allowed_syscalls {

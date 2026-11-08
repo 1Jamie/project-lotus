@@ -644,7 +644,16 @@ async fn handle_secure_ws_client(
     if let Some(pending) = crate::server::WS_PENDING.get() {
         if let Some(mut entry) = pending.get_mut(&surface_id) {
             while let Some(frame) = entry.pop_front() {
-                let _ = tx.send(WsMessage::Binary(frame.into()));
+                // Match live dispatch: JSON envelopes as Text so secure bridges can JSON.parse.
+                let msg = if frame.first() == Some(&b'{') || frame.first() == Some(&b'[') {
+                    match String::from_utf8(frame) {
+                        Ok(text) => WsMessage::Text(text),
+                        Err(err) => WsMessage::Binary(err.into_bytes()),
+                    }
+                } else {
+                    WsMessage::Binary(frame)
+                };
+                let _ = tx.send(msg);
             }
         }
     }

@@ -203,7 +203,30 @@ const win = new ServoWindow({
 | `.bottom(id, height, options?)` | Dock a pane to the bottom edge with a fixed height (`Anchor.Bottom`). |
 | `.fill(id, options?)` | Fill all remaining space after docked panes are placed (`Anchor.Fill`). |
 | `.absolute(id, x, y, width, height, options?)` | Position a floating/overlay pane at explicit logical coordinates (`Anchor.None`). Use `zIndex` in `options` to layer above docked panes. |
-| `.config()` | Returns `{ panes: PaneOptions[] }` ready to spread into `new ServoWindow({ ... })`. |
+| `.config()` | Returns `{ panes: PaneOptions[], layout: LayoutNode }` ready to spread into `new ServoWindow({ ... })`. |
+| `.row(id, fn)` / `.col(id, fn)` | Optional **Fill** slot: weighted horizontal (`row`) or vertical (`col`) splits inside the docked center. Chain children with the scoped callback: `r.pane('a', { weight: 1, url })`. |
+| `.split(id, { direction }, fn)` | Lower-level Fill-slot split with explicit `direction: 'horizontal' \| 'vertical'`. |
+
+#### Weighted Fill splits (`.row` / `.col`)
+
+Use `.row` or `.col` instead of `.fill()` when the center should be multiple panes with **Weight** sizing (defaults to `1` each → 50/50):
+
+```javascript
+const layout = new LayoutBuilder()
+    .left('sidebar', 260, { url: sidebarUrl })
+    .row('main', (r) => {
+        r.pane('editor', { weight: 2, url: editorUrl })
+         .pane('preview', { weight: 1, url: previewUrl });
+    });
+
+const win = new ServoWindow({ width: 1200, height: 800, ...layout.config() });
+win.batchLayout(() => {
+    win.getPane('sidebar').setSize(300);
+    win.setSplitWeights('main', [0.6, 0.4]);
+});
+```
+
+`win.setSplitWeights(splitId, mapOrArray)` and `win.setSplitSizes(splitId, mapOrArray)` adjust a split at runtime. `win.batchLayout(fn)` applies dock + split changes in one reflow. Tree-backed `pane.setWeight(n)` updates a single leaf’s weight.
 
 #### Managing Individual `Pane` Instances
 
@@ -216,7 +239,8 @@ When you call `pane.setVisible(false)` or `pane.toggleVisible()` on a docked pan
 | `pane.setVisible(bool)` | Show or hide the pane. Triggers an automatic native layout reflow for docked panes. |
 | `pane.isVisible()` | Returns `true` if the pane is currently visible, `false` otherwise (also accessible via `pane.visible`). |
 | `pane.toggleVisible()` | Flips the pane's visibility state (`!pane.isVisible()`) and returns the new boolean state. |
-| `pane.setRect(x, y, width, height)` | Reposition and resize an `Anchor.None` (floating/absolute) pane in logical pixels. |
+| `pane.setRect(x, y, width, height)` | Reposition and resize an `Anchor.None` (floating/absolute) pane in logical pixels. Calling this on a docked pane permanently detaches it from window-resize reflow. |
+| `pane.setSize(width, height?)` | Update dock thickness without clearing the pane's anchor. `Left`/`Right` use width; `Top`/`Bottom` use height; `Fill` has no intrinsic size. A single scalar works: `pane.setSize(240)`. |
 | `pane.focus()` | Direct keyboard input focus to this pane. |
 | `pane.loadUrl(url)` | Navigate this specific pane to a new URL. |
 | `pane.executeScript(js)` | Run JavaScript inside this pane's DOM context. |

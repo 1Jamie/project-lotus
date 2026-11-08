@@ -112,6 +112,10 @@ pub struct SealedMemfdPlane {
     pub size: usize,
 }
 
+// Host-owned mapping + fds; callers must not alias across threads without external sync.
+unsafe impl Send for SealedMemfdPlane {}
+unsafe impl Sync for SealedMemfdPlane {}
+
 impl SealedMemfdPlane {
     pub fn new(name: &str, size: usize) -> Result<Self, &'static str> {
         use std::ffi::CString;
@@ -151,8 +155,10 @@ impl SealedMemfdPlane {
         }
 
         // Apply seals: F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL
-        // Allows owning writer process to map PROT_WRITE, MAP_SHARED across process boundaries,
-        // while preventing file truncation or seal modifications.
+        // Do NOT add F_SEAL_FUTURE_WRITE: page SHM is written by the remote engine after SCM_RIGHTS
+        // transfer, and the host maps ack RW on a dup'd fd in RemotePaneConsumer. FUTURE_WRITE
+        // would make those new PROT_WRITE MAP_SHARED mmaps fail with EPERM.
+        // Write isolation for readers is the genuine O_RDONLY reopen + fchmod 0400 below.
         let seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
         if unsafe { libc::fcntl(rw_fd, F_ADD_SEALS, seals) } != 0 {
             unsafe {
@@ -539,7 +545,8 @@ mod tests {
         assert_eq!(reopened_fd, -1, "Reopening ro_fd O_RDWR must fail due to 0400 inode permissions");
         assert_eq!(unsafe { *libc::__errno_location() }, libc::EACCES);
 
-        // Verify cross-process writable mmap on rw_fd succeeds (used by remote writer)
+        // Cross-process / post-dup writable mmap on rw_fd must succeed (remote page-SHM writer,
+        // host ack consumer). F_SEAL_FUTURE_WRITE must stay off for this plane type.
         let rw_map = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

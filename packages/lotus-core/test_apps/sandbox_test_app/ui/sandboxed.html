@@ -324,7 +324,7 @@
 
         <div class="canvas-overlay-bottom">
             <span style="background: rgba(9,9,11,0.85); padding: 2px 6px; border: 1px solid #1c1c22;">
-                SPRING-PHYSICS VECTOR GRID [60HZ FLIP]
+                WEBGL SPRING GRID [HOST GPU BROKER]
             </span>
             <div class="frametime-bar-container">
                 <span id="fps-label" style="color: #34d399; font-weight: 600;">60.0 FPS</span>
@@ -386,10 +386,11 @@
 
     <script>
         // ---------------------------------------------------------------------
-        // 1. Interactive 60 FPS Physics Grid Canvas
+        // 1. Interactive 60 FPS Physics Grid (WebGL → host GPU broker)
+        // Canvas 2D stays software-composited; getContext('webgl') is the HW path.
         // ---------------------------------------------------------------------
         const canvas = document.getElementById('physics-canvas');
-        const ctx = canvas.getContext('2d');
+        const gl = canvas.getContext('webgl', { antialias: false, alpha: false, preserveDrawingBuffer: false });
         const cursorPosEl = document.getElementById('cursor-pos');
         const epochLabel = document.getElementById('seqlock-epoch-label');
         const fpsLabel = document.getElementById('fps-label');
@@ -412,13 +413,82 @@
         let lastTime = performance.now();
         let fps = 60.0;
 
+        const cols = 28;
+        const rows = 14;
+        const points = [];
+        for (let y = 0; y < rows; y++) {
+            for (let x = 0; x < cols; x++) {
+                points.push({ baseX: 0, baseY: 0, x: 0, y: 0, vx: 0, vy: 0 });
+            }
+        }
+
+        let program = null;
+        let aPos = -1;
+        let aColor = -1;
+        let uRes = null;
+        let lineBuf = null;
+        let pointBuf = null;
+        let lineVerts = null;
+        let pointVerts = null;
+        const lineSegCount = rows * (cols - 1) + cols * (rows - 1);
+
+        function compileShader(type, src) {
+            const sh = gl.createShader(type);
+            gl.shaderSource(sh, src);
+            gl.compileShader(sh);
+            if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+                console.error('[webgl] shader compile:', gl.getShaderInfoLog(sh));
+            }
+            return sh;
+        }
+
+        function initGl() {
+            if (!gl) {
+                console.error('[webgl] getContext(webgl) failed — falling back is not HW-accelerated');
+                return false;
+            }
+            const vs = compileShader(gl.VERTEX_SHADER, `
+                attribute vec2 a_pos;
+                attribute vec3 a_color;
+                uniform vec2 u_res;
+                varying vec3 v_color;
+                void main() {
+                    vec2 clip = (a_pos / u_res) * 2.0 - 1.0;
+                    gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+                    gl_PointSize = 3.0;
+                    v_color = a_color;
+                }
+            `);
+            const fs = compileShader(gl.FRAGMENT_SHADER, `
+                precision mediump float;
+                varying vec3 v_color;
+                void main() { gl_FragColor = vec4(v_color, 1.0); }
+            `);
+            program = gl.createProgram();
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            gl.linkProgram(program);
+            aPos = gl.getAttribLocation(program, 'a_pos');
+            aColor = gl.getAttribLocation(program, 'a_color');
+            uRes = gl.getUniformLocation(program, 'u_res');
+            lineBuf = gl.createBuffer();
+            pointBuf = gl.createBuffer();
+            // 2 pos + 3 color floats per vertex; 2 verts per line segment
+            lineVerts = new Float32Array(lineSegCount * 2 * 5);
+            pointVerts = new Float32Array(points.length * 5);
+            gl.clearColor(0.035, 0.035, 0.04, 1.0);
+            return true;
+        }
+
         function resizeCanvas() {
             const rect = canvas.getBoundingClientRect();
             width = rect.width;
             height = rect.height;
-            canvas.width = width * (window.devicePixelRatio || 1);
-            canvas.height = height * (window.devicePixelRatio || 1);
-            ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = Math.max(1, Math.floor(width * dpr));
+            canvas.height = Math.max(1, Math.floor(height * dpr));
+            if (gl) gl.viewport(0, 0, canvas.width, canvas.height);
+            initGridPoints();
         }
         window.addEventListener('resize', resizeCanvas);
         setTimeout(resizeCanvas, 50);
@@ -438,32 +508,13 @@
             cursorPosEl.textContent = 'CURSOR: OUTSIDE VIEWPORT';
         });
 
-        // 2D Physics Grid Points
-        const cols = 28;
-        const rows = 14;
-        const points = [];
-
-        for (let y = 0; y < rows; y++) {
-            for (let x = 0; x < cols; x++) {
-                points.push({
-                    baseX: 0,
-                    baseY: 0,
-                    x: 0,
-                    y: 0,
-                    vx: 0,
-                    vy: 0,
-                });
-            }
-        }
-
         function initGridPoints() {
             if (width === 0 || height === 0) return;
             const xStep = width / (cols - 1);
             const yStep = height / (rows - 1);
             for (let y = 0; y < rows; y++) {
                 for (let x = 0; x < cols; x++) {
-                    const idx = y * cols + x;
-                    const p = points[idx];
+                    const p = points[y * cols + x];
                     p.baseX = x * xStep;
                     p.baseY = y * yStep;
                     p.x = p.baseX;
@@ -472,11 +523,43 @@
             }
         }
 
-        function animate(now) {
+        function writeVert(arr, i, x, y, r, g, b) {
+            const o = i * 5;
+            arr[o] = x; arr[o + 1] = y;
+            arr[o + 2] = r; arr[o + 3] = g; arr[o + 4] = b;
+        }
+
+        // Basic app hygiene: don't keep a 60fps WebGL scene alive when the window
+        // isn't visible. Host broadcasts app.visibility because remote panes often
+        // never see document.hidden on Wayland blur/minimize.
+        let hostVisible = true;
+        let animScheduled = false;
+        let lastEpochUi = 0;
+
+        function demoShouldPaint() {
+            return hostVisible && document.visibilityState !== 'hidden';
+        }
+
+        function scheduleAnim() {
+            if (animScheduled || !demoShouldPaint()) return;
+            animScheduled = true;
             requestAnimationFrame(animate);
+        }
+
+        function animate(now) {
+            animScheduled = false;
+            if (!demoShouldPaint()) {
+                fpsLabel.textContent = '0.0 FPS (paused)';
+                return;
+            }
+            scheduleAnim();
 
             epochCounter += 1;
-            epochLabel.textContent = `MEMFD SEQLOCK EPOCH: #${epochCounter.toLocaleString()}`;
+            // Throttle DOM chrome — every frame text updates are needless work.
+            if (now - lastEpochUi >= 250) {
+                lastEpochUi = now;
+                epochLabel.textContent = `MEMFD SEQLOCK EPOCH: #${epochCounter.toLocaleString()}`;
+            }
 
             frameCount++;
             const delta = now - lastTime;
@@ -486,11 +569,9 @@
                 lastTime = now;
                 fpsLabel.textContent = `${fps.toFixed(1)} FPS`;
                 frametimeLabel.textContent = `${(1000 / Math.max(1, fps)).toFixed(1)}ms`;
-                
-                // Update miniature frametime chart
                 const bars = ftGraph.children;
                 for (let i = 0; i < bars.length - 1; i++) {
-                    bars[i].style.height = bars[i+1].style.height;
+                    bars[i].style.height = bars[i + 1].style.height;
                 }
                 const h = Math.min(10, Math.max(2, Math.round((fps / 60) * 8)));
                 bars[bars.length - 1].style.height = `${h}px`;
@@ -498,80 +579,97 @@
 
             if (points[0].baseX === 0 && width > 0) initGridPoints();
 
-            ctx.clearRect(0, 0, width, height);
-
-            // Background subtle grid
-            ctx.strokeStyle = '#101015';
-            ctx.lineWidth = 1;
-
-            // Physics update
             for (let i = 0; i < points.length; i++) {
                 const p = points[i];
                 if (mouseActive) {
                     const dx = mouseX - p.x;
                     const dy = mouseY - p.y;
                     const dist = Math.sqrt(dx * dx + dy * dy);
-                    if (dist < 90) {
+                    if (dist < 90 && dist > 0.001) {
                         const force = (1 - dist / 90) * 8;
                         p.vx -= (dx / dist) * force;
                         p.vy -= (dy / dist) * force;
                     }
                 }
-
-                // Spring back to base
-                const k = 0.08;
-                const damp = 0.82;
-                p.vx += (p.baseX - p.x) * k;
-                p.vy += (p.baseY - p.y) * k;
-                p.vx *= damp;
-                p.vy *= damp;
+                p.vx += (p.baseX - p.x) * 0.08;
+                p.vy += (p.baseY - p.y) * 0.08;
+                p.vx *= 0.82;
+                p.vy *= 0.82;
                 p.x += p.vx;
                 p.y += p.vy;
             }
 
-            // Draw grid lines
-            ctx.strokeStyle = '#181822';
+            if (!gl || !program) return;
+
+            let lv = 0;
+            const lr = 0.094, lg = 0.094, lb = 0.133;
             for (let y = 0; y < rows; y++) {
-                ctx.beginPath();
-                for (let x = 0; x < cols; x++) {
-                    const p = points[y * cols + x];
-                    if (x === 0) ctx.moveTo(p.x, p.y);
-                    else ctx.lineTo(p.x, p.y);
+                for (let x = 0; x < cols - 1; x++) {
+                    const a = points[y * cols + x];
+                    const b = points[y * cols + x + 1];
+                    writeVert(lineVerts, lv++, a.x, a.y, lr, lg, lb);
+                    writeVert(lineVerts, lv++, b.x, b.y, lr, lg, lb);
                 }
-                ctx.stroke();
             }
-
             for (let x = 0; x < cols; x++) {
-                ctx.beginPath();
-                for (let y = 0; y < rows; y++) {
-                    const p = points[y * cols + x];
-                    if (y === 0) ctx.moveTo(p.x, p.y);
-                    else ctx.lineTo(p.x, p.y);
+                for (let y = 0; y < rows - 1; y++) {
+                    const a = points[y * cols + x];
+                    const b = points[(y + 1) * cols + x];
+                    writeVert(lineVerts, lv++, a.x, a.y, lr, lg, lb);
+                    writeVert(lineVerts, lv++, b.x, b.y, lr, lg, lb);
                 }
-                ctx.stroke();
             }
 
-            // Draw nodes
+            let pv = 0;
             for (let i = 0; i < points.length; i++) {
                 const p = points[i];
                 const dx = p.x - p.baseX;
                 const dy = p.y - p.baseY;
                 const disp = Math.sqrt(dx * dx + dy * dy);
                 if (disp > 1) {
-                    ctx.fillStyle = disp > 8 ? '#f59e0b' : '#34d399';
-                    ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+                    if (disp > 8) writeVert(pointVerts, pv++, p.x, p.y, 0.961, 0.620, 0.043);
+                    else writeVert(pointVerts, pv++, p.x, p.y, 0.204, 0.827, 0.600);
                 }
             }
 
-            // Draw cursor ripple if active
-            if (mouseActive) {
-                ctx.strokeStyle = 'rgba(52, 211, 153, 0.4)';
-                ctx.beginPath();
-                ctx.arc(mouseX, mouseY, 14, 0, Math.PI * 2);
-                ctx.stroke();
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.useProgram(program);
+            gl.uniform2f(uRes, width, height);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
+            gl.bufferData(gl.ARRAY_BUFFER, lineVerts, gl.DYNAMIC_DRAW);
+            gl.enableVertexAttribArray(aPos);
+            gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 20, 0);
+            gl.enableVertexAttribArray(aColor);
+            gl.vertexAttribPointer(aColor, 3, gl.FLOAT, false, 20, 8);
+            gl.drawArrays(gl.LINES, 0, lv);
+
+            if (pv > 0) {
+                gl.bindBuffer(gl.ARRAY_BUFFER, pointBuf);
+                gl.bufferData(gl.ARRAY_BUFFER, pointVerts.subarray(0, pv * 5), gl.DYNAMIC_DRAW);
+                gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 20, 0);
+                gl.vertexAttribPointer(aColor, 3, gl.FLOAT, false, 20, 8);
+                gl.drawArrays(gl.POINTS, 0, pv);
             }
         }
-        requestAnimationFrame(animate);
+
+        document.addEventListener('visibilitychange', () => {
+            if (demoShouldPaint()) scheduleAnim();
+        });
+        const sandboxedEvents = window.lotus?.on ? window.lotus : (window.lotus?.ipc?.on ? window.lotus.ipc : null);
+        if (sandboxedEvents && typeof sandboxedEvents.on === 'function') {
+            sandboxedEvents.on('app.visibility', (payload) => {
+                hostVisible = payload?.visible !== false;
+                if (demoShouldPaint()) scheduleAnim();
+            });
+        }
+
+        if (initGl()) {
+            scheduleAnim();
+        } else {
+            epochLabel.textContent = 'WEBGL UNAVAILABLE — NO HOST GPU PATH';
+        }
 
         // ---------------------------------------------------------------------
         // 2. Sandbox Capability Boundary Tests

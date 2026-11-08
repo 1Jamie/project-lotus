@@ -28,16 +28,19 @@ pub static WS_PENDING: OnceCell<Arc<DashMap<String, std::collections::VecDeque<V
 
 pub const WS_PENDING_MAX_FRAMES: usize = 1024;
 
-pub fn dispatch_to_renderer(window_id: String, pane_id: Option<String>, data: axum::body::Bytes) {
-    let msg = if data.first() == Some(&b'{') || data.first() == Some(&b'[') {
-        if let Ok(text) = String::from_utf8(data.to_vec()) {
-            WsMessage::Text(text)
-        } else {
-            WsMessage::Binary(data.to_vec())
+fn ws_message_from_frame(data: Vec<u8>) -> WsMessage {
+    if data.first() == Some(&b'{') || data.first() == Some(&b'[') {
+        match String::from_utf8(data) {
+            Ok(text) => WsMessage::Text(text),
+            Err(err) => WsMessage::Binary(err.into_bytes()),
         }
     } else {
-        WsMessage::Binary(data.to_vec())
-    };
+        WsMessage::Binary(data)
+    }
+}
+
+pub fn dispatch_to_renderer(window_id: String, pane_id: Option<String>, data: axum::body::Bytes) {
+    let msg = ws_message_from_frame(data.to_vec());
     if let Some(senders) = WS_SENDERS.get() {
         match pane_id {
             Some(p) => {
@@ -383,7 +386,7 @@ async fn handle_ws_client(socket: WebSocket, client_id: String, state: ServerSta
     if let Some(pending) = WS_PENDING.get() {
         if let Some(mut entry) = pending.get_mut(&client_id) {
             while let Some(frame) = entry.pop_front() {
-                let _ = tx.send(WsMessage::Binary(frame.into()));
+                let _ = tx.send(ws_message_from_frame(frame));
             }
         }
 
@@ -391,7 +394,7 @@ async fn handle_ws_client(socket: WebSocket, client_id: String, state: ServerSta
         if parts.len() > 1 && (parts[1] == "main" || parts[1] == parts[0]) {
             if let Some(mut entry) = pending.get_mut(parts[0]) {
                 while let Some(frame) = entry.pop_front() {
-                    let _ = tx.send(WsMessage::Binary(frame.into()));
+                    let _ = tx.send(ws_message_from_frame(frame));
                 }
             }
         }

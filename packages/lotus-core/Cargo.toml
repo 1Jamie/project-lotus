@@ -14,7 +14,7 @@ napi = { version = "2", features = ["napi4"] }
 napi-derive = "2"
 winit = { version = "0.30" }
 euclid = "0.22"
-servo-url = "=0.7.0"
+servo-url = { path = "servo/components/url" }
 
 # Cross-platform dependencies
 aes-gcm = "0.10"
@@ -53,7 +53,13 @@ dark-light = "1.0"
 
 # Linux-only dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
-servo = { version = "=0.7.0", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
+servo = { path = "servo/components/servo", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgl", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
+webgl = { package = "servo-webgl", path = "servo/components/webgl" }
+servo_canvas_traits = { package = "servo-canvas-traits", path = "servo/components/shared/canvas" }
+servo_base = { package = "servo-base", path = "servo/components/shared/base" }
+paint_api = { package = "servo-paint-api", path = "servo/components/shared/paint" }
+parking_lot = "0.12"
+rustc-hash = "2"
 winit = { version = "0.30", features = ["x11", "wayland"] }
 glutin = "0.32"
 glutin-winit = "0.5"
@@ -61,12 +67,12 @@ raw-window-handle = "0.6"
 
 # Windows-only dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
-servo = { version = "=0.7.0", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "webcrypto", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
+servo = { path = "servo/components/servo", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "webcrypto", "webgl", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
 windows-sys = { version = "0.52", features = ["Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_Foundation"] }
 
 # For any other platform (like macOS)
 [target.'cfg(not(any(target_os = "linux", target_os = "windows")))'.dependencies]
-servo = { version = "=0.7.0", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
+servo = { path = "servo/components/servo", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgl", "webgpu", "bluetooth", "native-bluetooth", "gamepad", "media-gstreamer"] }
 
 [build-dependencies]
 napi-build = "2"
