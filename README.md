@@ -221,38 +221,43 @@ npx lotus build --target deb --encrypt
 
 ---
 
-## Documentation & Monorepo Structure
+## Documentation & Repository Structure
 
-Lotus is organized as an npm workspaces monorepo with two packages:
+Lotus is an **npm workspaces monorepo** for the published JS packages, plus **sibling Rust crates** for the Linux sandboxed engine path:
 
-| Document / Package | npm Package | Contents |
-|--------------------|-------------|----------|
-| [**Step-by-Step Tutorial**](./TUTORIAL.md) | None | Walkthrough building a frameless, transparent desktop monitor with IPC, multi-pane layouts, and packaging. |
-| [**`@lotus-gui/core` Docs**](./packages/lotus-core/README.md) | `@lotus-gui/core` | API reference for `ServoWindow`, `LayoutBuilder`, `Pane`, `ipcMain`, `app`, `<select>` theming, and overlay scrollbars. |
-| [**`@lotus-gui/dev` Docs**](./packages/lotus-dev/README.md) | `@lotus-gui/dev` | Reference for `lotus init`, `lotus dev`, `lotus build`, `lotus.config.json`, SEA bundling, and `--encrypt`. |
-| [**Contributor Guide**](./packages/lotus-core/CONTRIBUTING.md) | None | Instructions for building `@lotus-gui/core` locally, running showcase apps, and applying the Servo patch. |
+| Path / Document | Role | Contents |
+|-----------------|------|----------|
+| [**Step-by-Step Tutorial**](./TUTORIAL.md) | Docs | Walkthrough: frameless UI, IPC, multi-pane layouts, sandboxing, packaging. |
+| [**`@lotus-gui/core` Docs**](./packages/lotus-core/README.md) | npm: `@lotus-gui/core` | Host runtime: `ServoWindow`, `LayoutBuilder`, `Pane`, `ipcMain`, `app`, sandbox APIs. |
+| [**`@lotus-gui/dev` Docs**](./packages/lotus-dev/README.md) | npm: `@lotus-gui/dev` | CLI: `lotus init` / `dev` / `build`, `lotus.config.json`, SEA, `--encrypt`. |
+| [**Contributor Guide**](./packages/lotus-core/CONTRIBUTING.md) | Docs | Building core locally, showcase apps, Servo patch, sandbox WebGL broker flags. |
+| `packages/lotus-engine` | Rust bin (not on npm) | Sandboxed Servo process (`PID_secure_engine`); page SHM + WebGL broker client. |
+| `packages/lotus-supervisor` | Rust lib/bins (not on npm) | Stage A namespaces / Landlock / spawn; SHM + GPU frame helpers shared with core. |
 
 ```text
 lotus/
-├── TUTORIAL.md                         # Step-by-step beginner & intermediate tutorial
-├── packages/
-│   ├── lotus-core/                     # @lotus-gui/core -- Runtime engine (Servo + Node bindings)
-│   │   ├── src/lib.rs                  # Rust N-API bindings, Winit loop, GL compositor, IPC
-│   │   ├── src/window_state.rs         # Automatic window position/size persistence
-│   │   ├── src/platform.rs             # OS theme detection & cursor integration
-│   │   ├── lotus.js                    # High-level JS API (ServoWindow, LayoutBuilder, IpcMain)
-│   │   ├── index.js                    # Native .node binary loader
-│   │   ├── resources/                  # Injected IPC bridge, overlay scrollbars, and <select> popup UI
-│   │   ├── test_apps/                  # Showcase applications
-│   │   │   ├── test_app/               # Single-window showcase app (`npm run test-app`)
-│   │   │   ├── multi_pane_test_app/    # Multi-pane layout showcase (`npm run multipane-test-app`)
-│   │   │   └── sandbox_test_app/       # Process-isolated sandbox & Track 2 showcase (`npm run sandbox-test-app`)
-│   │
-│   └── lotus-dev/                      # @lotus-gui/dev -- CLI toolkit for dev & packaging
-│       ├── bin/lotus.js                # CLI entry point (init, dev, build, clean)
-│       └── lib/templates/              # Installer templates
-└── README.md                           # You are here
+├── README.md / TUTORIAL.md
+├── package.json                        # npm workspaces root (packages/*)
+├── scripts/
+│   ├── apply-servo-patch.sh            # Apply servo-v0.7.0-webgl-broker.patch
+│   └── gen-webgl-broker-wire.py        # Regenerates broker wire helpers
+└── packages/
+    ├── lotus-core/                     # @lotus-gui/core — host Node addon + in-process Servo
+    │   ├── src/                        # N-API, winit loop, layout tree, compositor (src/gl/)
+    │   ├── lotus.js / launcher.js      # JS API + sandboxed-engine spawn / GPU FD wiring
+    │   ├── secure_constellation.js     # Pooled vs isolated sandbox engine pool
+    │   ├── patches/                    # servo-v0.7.0-webgl-broker.patch
+    │   ├── servo/                      # Git submodule (Servo v0.7.0 + patch)
+    │   ├── resources/                  # IPC bridge, scrollbars, <select> overlay UI
+    │   └── test_apps/                  # test_app, multi_pane_test_app, sandbox_test_app
+    ├── lotus-dev/                      # @lotus-gui/dev — init / dev / build CLI
+    │   ├── bin/lotus.js
+    │   └── lib/templates/
+    ├── lotus-engine/                   # Sandboxed child Servo binary (Linux)
+    └── lotus-supervisor/               # Sandbox Stage A + shared SHM/GPU frame crates
 ```
+
+`npm install` / `npm run build` at the repo root drive the **workspaces** (`lotus-core`, `lotus-dev`). Building sandboxed panes also needs release (or debug) **`lotus-supervisor`** and **`lotus-engine`** binaries; core’s launcher resolves them via `LOTUS_NATIVE_PROFILE` (`release` preferred).
 
 ---
 
@@ -313,20 +318,21 @@ sudo dnf install rpm-build
 ### 2. Clone & Compile
 
 ```bash
-git clone https://github.com/1jamie/project-lotus.git
+git clone --recurse-submodules https://github.com/1jamie/project-lotus.git
 cd project-lotus
 npm install
 
+# Host addon (@lotus-gui/core): applies the Servo patch, then builds the N-API .node
 cd packages/lotus-core
+npm run build:debug    # faster incremental
+# npm run build        # release .node
 
-# Debug build (faster incremental builds while working on Rust code)
-npm run build:debug
-
-# Release build (full optimizations, smaller binary)
-npm run build
+# Linux sandboxed path (sibling crates; use release on low-RAM hosts with -j1)
+cd ../lotus-supervisor && cargo build --release -j1
+cd ../lotus-engine && cargo build --release -j1
 ```
 
-The first compile builds the Servo engine from crates.io and takes a long time. Subsequent incremental builds only recompile what changed.
+The first Servo/host compile takes a long time (submodule at `packages/lotus-core/servo` + `patches/servo-v0.7.0-webgl-broker.patch`). Incremental rebuilds only recompile what changed. Set `LOTUS_NATIVE_PROFILE=release` when running apps so the launcher prefers the release engine/supervisor binaries.
 
 ---
 
@@ -343,7 +349,7 @@ PRs, bug reports, and ideas are welcome. Please keep the `winit` 0.30 and `gluti
 
 ## Pieces of the Puzzle
 
-* **[Servo](https://servo.org/) ([GitHub](https://github.com/servo/servo)):** The memory-safe, parallel browser engine written in Rust, consumed as the published `servo` 0.7.0 crate. Multi-pane compositing is implemented by Lotus's `RenderingContext`.
+* **[Servo](https://servo.org/) ([GitHub](https://github.com/servo/servo)):** The memory-safe, parallel browser engine written in Rust, vendored as the `packages/lotus-core/servo` submodule (tag `v0.7.0`) plus Lotus’s WebGL-broker patch. Trusted panes paint through Lotus’s `RenderingContext`; sandboxed engines use SHM + the host WebGL broker.
 * **[Node.js](https://nodejs.org/) ([GitHub](https://github.com/nodejs/node)):** The JavaScript runtime that drives your application logic and OS integration.
 * **[Winit](https://winit.rs/) ([GitHub](https://github.com/rust-windowing/winit)):** Cross-platform window creation, input handling, and event loop management in Rust.
 * **[window-vibrancy](https://github.com/tauri-apps/window-vibrancy):** Native OS window transparency and vibrancy effects.

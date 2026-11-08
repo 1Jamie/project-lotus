@@ -472,19 +472,24 @@ For contributor build instructions and Linux/Windows system prerequisites, see [
 
 ## Package Structure
 
+`@lotus-gui/core` is the **host** package. On Linux, sandboxed panes also use sibling crates `packages/lotus-engine` and `packages/lotus-supervisor` (see the [root repository structure](https://github.com/1Jamie/project-lotus/blob/main/README.md#documentation--repository-structure)).
+
 ```text
 @lotus-gui/core
-├── src/lib.rs               # Rust N-API bindings, Servo compositor, winit loop & Axum IPC
-├── src/window_state.rs      # Automatic window position/size persistence
-├── src/platform.rs          # OS-specific theme & cursor integrations
-├── lotus.js                 # High-level JS API (ServoWindow, LayoutBuilder, Pane, IpcMain, app)
-├── lotus.d.ts               # TypeScript definitions
-├── index.js                 # Native .node binary loader
-├── resources/               # Injected IPC bridge, scrollbar, and <select> overlay UI
-├── test_apps/
-│   ├── test_app/            # Single-window showcase app
-│   ├── multi_pane_test_app/ # Multi-pane workspace & command palette showcase
-│   └── sandbox_test_app/    # Process-isolated sandbox & Track 2 showcase
+├── src/
+│   ├── lib.rs / app.rs / window.rs   # N-API, winit loop, trusted Servo panes
+│   ├── layout.rs                     # Dock + weighted split tree, gutters
+│   └── gl/                           # Compositor, SHM consumer, WebGL broker
+├── lotus.js / launcher.js            # JS API + sandboxed engine spawn
+├── secure_constellation.js           # Pooled / isolated engine manager
+├── lotus.d.ts                        # TypeScript definitions
+├── patches/servo-v0.7.0-webgl-broker.patch
+├── servo/                            # Servo v0.7.0 submodule (+ patch)
+├── resources/                        # IPC bridge, scrollbar, <select> overlay UI
+└── test_apps/
+    ├── test_app/
+    ├── multi_pane_test_app/
+    └── sandbox_test_app/             # Dual-track sandbox + WebGL broker showcase
 ```
 
 ## License

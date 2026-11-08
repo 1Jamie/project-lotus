@@ -1,6 +1,6 @@
 # Contributing to @lotus-gui/core
 
-Thanks for your interest in contributing to Lotus! Because Lotus is organized as an npm workspaces monorepo (`@lotus-gui/core` and `@lotus-gui/dev`), you can build and test the native runtime either from the root directory or inside `packages/lotus-core`.
+Thanks for your interest in contributing to Lotus! The repo is an **npm workspaces** monorepo for `@lotus-gui/core` and `@lotus-gui/dev`, plus sibling Rust crates `packages/lotus-engine` and `packages/lotus-supervisor` for Linux process-isolated sandboxes. You can build and test the host runtime from the repo root or inside `packages/lotus-core`; build the engine/supervisor crates when working on the sandboxed path.
 
 ---
 
