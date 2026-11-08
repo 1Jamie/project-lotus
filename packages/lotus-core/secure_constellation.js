@@ -266,7 +266,7 @@ class SecureConstellationManager extends EventEmitter {
         return prior;
     }
 
-    _spawnIsolatedEngineProcess() {
+    _spawnIsolatedEngineProcess(surfaceId) {
         const lotusCore = _hostBindings();
         const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
         return spawnSandboxedEngine({
@@ -277,7 +277,37 @@ class SecureConstellationManager extends EventEmitter {
             networkBroker: this.networkBroker,
             allowLocalhost: this.allowLocalhost,
             ipcPort,
+            surfaceId: surfaceId || '',
         });
+    }
+
+    /** Bind prewarmed GPU feeder to the first (or isolated) surface pane. */
+    _associateGpuPane(instance, surfaceId) {
+        if (!instance) {
+            console.warn('[SecureConstellation] associateGpuPane: no instance for', surfaceId);
+            return;
+        }
+        if (typeof instance.hostGpuFd !== 'number' || instance.hostGpuFd < 0) {
+            console.warn('[SecureConstellation] associateGpuPane: missing hostGpuFd for', surfaceId, 'got', instance.hostGpuFd);
+            return;
+        }
+        if (instance._gpuPaneAssociated) return;
+        const paneId = typeof surfaceId === 'string' && surfaceId.includes(':')
+            ? surfaceId.slice(surfaceId.indexOf(':') + 1)
+            : '';
+        if (!paneId) return;
+        try {
+            const native = require('./index.js');
+            if (typeof native.associateGpuWebglBrokerPane === 'function') {
+                native.associateGpuWebglBrokerPane(instance.hostGpuFd, paneId);
+                instance._gpuPaneAssociated = true;
+                console.log('[SecureConstellation] associated GPU fd', instance.hostGpuFd, '→ pane', paneId);
+            } else {
+                console.warn('[SecureConstellation] associateGpuWebglBrokerPane not exported');
+            }
+        } catch (e) {
+            console.warn('[SecureConstellation] associateGpuWebglBrokerPane failed:', e);
+        }
     }
 
     _ensureProvisionalNavigation(surfaceId, surfaceInfo) {
@@ -455,6 +485,7 @@ class SecureConstellationManager extends EventEmitter {
                 networkBroker: this.networkBroker,
                 allowLocalhost: this.allowLocalhost,
                 ipcPort,
+                surfaceId: '', // filled by first acquire via register; shared pool
             });
 
             this._activeInstance = instance;
@@ -498,7 +529,7 @@ class SecureConstellationManager extends EventEmitter {
             this._engineInstanceId++;
             const instanceId = this._engineInstanceId;
 
-            const instance = await this._spawnIsolatedEngineProcess();
+            const instance = await this._spawnIsolatedEngineProcess(surfaceId);
 
             this._isolatedInstances.set(surfaceId, {
                 instance,
@@ -550,6 +581,7 @@ class SecureConstellationManager extends EventEmitter {
             // Same provisional arm as isolated — keeps bridge documentId ↔ pending nav in sync
             // so LoadStatus complete can commit (otherwise Track-2 stays provisional forever).
             this._ensureProvisionalNavigation(surfaceId, surfaceInfo);
+            this._associateGpuPane(this._activeInstance, surfaceId);
             this._sendCreateSurface(this._activeInstance, surfaceId, surfaceInfo);
 
             return {
@@ -566,6 +598,7 @@ class SecureConstellationManager extends EventEmitter {
             this._refCount++;
             this._surfaces.set(surfaceId, surfaceInfo);
             this._ensureProvisionalNavigation(surfaceId, surfaceInfo);
+            this._associateGpuPane(this._activeInstance, surfaceId);
             this._sendCreateSurface(this._activeInstance, surfaceId, surfaceInfo);
             return {
                 ...res,
@@ -593,6 +626,7 @@ class SecureConstellationManager extends EventEmitter {
                 networkBroker: this.networkBroker,
                 allowLocalhost: this.allowLocalhost,
                 ipcPort,
+                surfaceId,
             });
 
             this._activeInstance = instance;
@@ -618,6 +652,7 @@ class SecureConstellationManager extends EventEmitter {
             this._refCount++;
             this._surfaces.set(surfaceId, surfaceInfo);
             this._ensureProvisionalNavigation(surfaceId, surfaceInfo);
+            this._associateGpuPane(this._activeInstance, surfaceId);
             this._sendCreateSurface(this._activeInstance, surfaceId, surfaceInfo);
             return res;
         } finally {

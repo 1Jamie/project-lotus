@@ -232,72 +232,31 @@
         let uptimeSec = 0;
         let hostVisible = !document.hidden;
 
+        // Canvas 2D on purpose — NOT WebGL. A WebGL heartbeat contended with Pool A
+        // on the shared host broker and blocked script/IPC (false watchdog kills).
         const hbCanvas = document.getElementById('heartbeat-canvas');
-        const hbGl = hbCanvas.getContext('webgl', { antialias: true, alpha: true });
+        const hbCtx = hbCanvas.getContext('2d', { alpha: true });
         let angle = 0;
-        let hbProgram = null;
-        let hbPos = -1;
-        let hbColor = -1;
-        let hbBuf = null;
         let hbRaf = 0;
-
-        function hbCompile(type, src) {
-            const sh = hbGl.createShader(type);
-            hbGl.shaderSource(sh, src);
-            hbGl.compileShader(sh);
-            return sh;
-        }
-
-        if (hbGl) {
-            const vs = hbCompile(hbGl.VERTEX_SHADER, `
-                attribute vec2 a_pos;
-                attribute vec3 a_color;
-                varying vec3 v_color;
-                void main() {
-                    vec2 clip = (a_pos / 70.0) - 1.0;
-                    gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
-                    gl_PointSize = 6.0;
-                    v_color = a_color;
-                }
-            `);
-            const fs = hbCompile(hbGl.FRAGMENT_SHADER, `
-                precision mediump float;
-                varying vec3 v_color;
-                void main() { gl_FragColor = vec4(v_color, 1.0); }
-            `);
-            hbProgram = hbGl.createProgram();
-            hbGl.attachShader(hbProgram, vs);
-            hbGl.attachShader(hbProgram, fs);
-            hbGl.linkProgram(hbProgram);
-            hbPos = hbGl.getAttribLocation(hbProgram, 'a_pos');
-            hbColor = hbGl.getAttribLocation(hbProgram, 'a_color');
-            hbBuf = hbGl.createBuffer();
-        }
 
         function demoShouldPaint() {
             return hostVisible && !document.hidden;
         }
 
         function drawHeartbeat() {
-            if (!hbGl || !hbProgram) return;
+            if (!hbCtx) return;
             angle += 0.04;
-            const verts = [];
+            const cx = hbCanvas.width / 2;
+            const cy = hbCanvas.height / 2;
+            hbCtx.clearRect(0, 0, hbCanvas.width, hbCanvas.height);
             for (let i = 0; i < 36; i++) {
                 const a = angle + (i / 36) * Math.PI * 2;
                 const r = 48 + Math.sin(a * 3.0 + angle) * 10;
-                verts.push(70 + Math.cos(a) * r, 70 + Math.sin(a) * r, 0.2, 0.85, 0.55);
+                hbCtx.beginPath();
+                hbCtx.arc(cx + Math.cos(a) * r, cy + Math.sin(a) * r, 3, 0, Math.PI * 2);
+                hbCtx.fillStyle = '#34d399';
+                hbCtx.fill();
             }
-            hbGl.viewport(0, 0, hbCanvas.width, hbCanvas.height);
-            hbGl.clearColor(0, 0, 0, 0);
-            hbGl.clear(hbGl.COLOR_BUFFER_BIT);
-            hbGl.useProgram(hbProgram);
-            hbGl.bindBuffer(hbGl.ARRAY_BUFFER, hbBuf);
-            hbGl.bufferData(hbGl.ARRAY_BUFFER, new Float32Array(verts), hbGl.DYNAMIC_DRAW);
-            hbGl.enableVertexAttribArray(hbPos);
-            hbGl.vertexAttribPointer(hbPos, 2, hbGl.FLOAT, false, 20, 0);
-            hbGl.enableVertexAttribArray(hbColor);
-            hbGl.vertexAttribPointer(hbColor, 3, hbGl.FLOAT, false, 20, 8);
-            hbGl.drawArrays(hbGl.POINTS, 0, 36);
         }
 
         function scheduleHeartbeat() {
@@ -329,13 +288,13 @@
         }
         setTimeout(fetchAuxPid, 80);
 
-        setInterval(async () => {
+        // Fire-and-forget: never await on the interval path so a slow IPC reply
+        // cannot stack callbacks behind a blocked promise.
+        setInterval(() => {
             if (window.lotus && typeof window.lotus.invoke === 'function') {
-                try {
-                    await window.lotus.invoke('sandboxTasks.heartbeat', {});
-                } catch (_) {}
+                window.lotus.invoke('sandboxTasks.heartbeat', {}).catch(() => {});
             }
-        }, 600);
+        }, 500);
 
         document.getElementById('btn-kill-seccomp').addEventListener('click', async () => {
             if (window.lotus && typeof window.lotus.invoke === 'function') {

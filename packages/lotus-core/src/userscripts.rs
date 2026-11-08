@@ -1,9 +1,10 @@
 //! Track-1 renderer userscripts (compile-time embedded).
 //!
 //! Scripts are `include_str!`-embedded so packaged SEA / arbitrary-cwd launches
-//! never fail path resolution. Injection is gated by [`PaneScriptRole`] so
-//! remote/sandbox panes, select overlays, and crash chrome never receive
-//! `window.lotus.token` or the full Track-1 IPC bootstrap.
+//! never fail path resolution. Injection is gated by [`PaneScriptRole`]:
+//! - remote/sandbox panes get nothing (no host token);
+//! - host recovery chrome (crash / select) get IPC only;
+//! - trusted app panes get the full Track-1 pipeline.
 
 use std::rc::Rc;
 
@@ -20,9 +21,9 @@ pub const SCROLLBAR: &str = include_str!("userscripts/scrollbar.js");
 pub enum PaneScriptRole {
     /// Trusted in-process app pane — full Track-1 pipeline.
     Track1AppPane,
-    /// `__lotus_select*` overlay — dedicated select UI only (injected elsewhere).
+    /// `__lotus_select*` overlay — host chrome; IPC only (no drag/scrollbar).
     SelectOverlay,
-    /// `__lotus_crash*` / other `__lotus_*` host recovery chrome.
+    /// `__lotus_crash*` / other `__lotus_*` host recovery chrome — IPC only.
     CrashChrome,
     /// Out-of-process / `sandbox: true` remote pane (SHM path).
     RemoteSandbox,
@@ -55,14 +56,7 @@ pub struct PaneScriptEnv<'a> {
     pub scrollbar: Option<&'a ScrollbarConfig>,
 }
 
-/// Populate a pane's `UserContentManager` with Track-1 scripts.
-///
-/// Returns immediately (adds nothing) unless `env.role == Track1AppPane`.
-pub fn populate_track1_ucm(ucm: &UserContentManager, env: &PaneScriptEnv<'_>) -> usize {
-    if env.role != PaneScriptRole::Track1AppPane {
-        return 0;
-    }
-
+fn inject_host_ipc(ucm: &UserContentManager, env: &PaneScriptEnv<'_>) -> usize {
     let mut added = 0usize;
 
     ucm.add_script(Rc::new(UserScript::from(env.msgpackr_source)));
@@ -70,6 +64,8 @@ pub fn populate_track1_ucm(ucm: &UserContentManager, env: &PaneScriptEnv<'_>) ->
     ucm.add_script(Rc::new(UserScript::from(IPC_BOOTSTRAP)));
     added += 1;
 
+    // Host chrome pages are always lotus-resource://; still gate on trusted origins
+    // so a mis-routed document cannot inherit the session token.
     let port_script = format!(
         r#"(function() {{
             const trusted = {};
@@ -88,34 +84,51 @@ pub fn populate_track1_ucm(ucm: &UserContentManager, env: &PaneScriptEnv<'_>) ->
     ucm.add_script(Rc::new(UserScript::from(port_script.as_str())));
     added += 1;
 
-    if let Some(theme) = env.theme {
-        let theme_script = format!(
-            r#"
+    added
+}
+
+/// Populate a pane's `UserContentManager` with Track-1 / host-chrome scripts.
+///
+/// Remote sandbox panes receive nothing. Host recovery chrome (crash + select)
+/// receive IPC bootstrap only — required for `crash-info` / Respawn and select
+/// populate handshakes. Trusted app panes get the full pipeline.
+pub fn populate_track1_ucm(ucm: &UserContentManager, env: &PaneScriptEnv<'_>) -> usize {
+    match env.role {
+        PaneScriptRole::RemoteSandbox => 0,
+        PaneScriptRole::SelectOverlay | PaneScriptRole::CrashChrome => inject_host_ipc(ucm, env),
+        PaneScriptRole::Track1AppPane => {
+            let mut added = inject_host_ipc(ucm, env);
+
+            if let Some(theme) = env.theme {
+                let theme_script = format!(
+                    r#"
             window.lotus.theme = '{}';
             try {{ document.documentElement.dataset.theme = window.lotus.theme; }} catch(e) {{}}
         "#,
-            theme
-        );
-        ucm.add_script(Rc::new(UserScript::from(theme_script.as_str())));
-        added += 1;
-    }
+                    theme
+                );
+                ucm.add_script(Rc::new(UserScript::from(theme_script.as_str())));
+                added += 1;
+            }
 
-    ucm.add_script(Rc::new(UserScript::from(DRAG_REGION)));
-    added += 1;
+            ucm.add_script(Rc::new(UserScript::from(DRAG_REGION)));
+            added += 1;
 
-    if let Some(cfg) = env.scrollbar {
-        if cfg.enabled {
-            let cfg_script = format!(
-                "window.__LOTUS_SCROLLBAR_CONFIG__ = {{ theme: '{}', autoHide: {}, width: {} }};",
-                cfg.theme, cfg.auto_hide, cfg.width
-            );
-            ucm.add_script(Rc::new(UserScript::from(cfg_script.as_str())));
-            ucm.add_script(Rc::new(UserScript::from(SCROLLBAR)));
-            added += 2;
+            if let Some(cfg) = env.scrollbar {
+                if cfg.enabled {
+                    let cfg_script = format!(
+                        "window.__LOTUS_SCROLLBAR_CONFIG__ = {{ theme: '{}', autoHide: {}, width: {} }};",
+                        cfg.theme, cfg.auto_hide, cfg.width
+                    );
+                    ucm.add_script(Rc::new(UserScript::from(cfg_script.as_str())));
+                    ucm.add_script(Rc::new(UserScript::from(SCROLLBAR)));
+                    added += 2;
+                }
+            }
+
+            added
         }
     }
-
-    added
 }
 
 #[cfg(test)]

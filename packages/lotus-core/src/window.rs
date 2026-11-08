@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use dpi::PhysicalSize as ServoPhysicalSize;
 use euclid::Point2D;
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
-use servo::{Code, Key, Modifiers, WindowRenderingContext};
+use servo::{Code, Key, Modifiers, RenderingContext, WindowRenderingContext};
 
 use crate::gl::LotusPaneContext;
 use winit::window::Window;
@@ -240,6 +243,13 @@ pub struct PaneInstance {
     pub pending_visible: bool,
     pub ghost_tex: Option<glow::NativeTexture>,
     pub ghost_tex_size: Option<winit::dpi::PhysicalSize<u32>>,
+    /// True only after a successful capture from a live-drawn FBO. Freeze/stretch
+    /// must not use the ghost until this is set (avoids black quads on startup resize).
+    pub ghost_valid: bool,
+    /// Bumped when this pane's pixels actually change (local paint / new remote SHM).
+    pub frame_seq: u64,
+    /// `frame_seq` at the last host present that included this pane.
+    pub last_presented_seq: u64,
     pub is_remote: bool,
     pub remote_consumer: Option<crate::gl::RemotePaneConsumer>,
     pub remote_input_fd: Option<std::os::unix::io::RawFd>,
@@ -353,6 +363,8 @@ pub struct WindowInstance {
     pub committed_layout: Option<StagedLayout>,
     pub active_window_size: winit::dpi::PhysicalSize<u32>,
     pub committed_window_size: Option<winit::dpi::PhysicalSize<u32>>,
+    /// Inner size at the last swapchain present (`None` until the first present).
+    pub last_presented_window_size: Option<winit::dpi::PhysicalSize<u32>>,
     pub active_select: Option<ActiveSelectPrompt>,
     pub scrollbar_config: ScrollbarConfig,
     pub trusted_origins: Vec<String>,
@@ -652,6 +664,26 @@ impl WindowInstance {
         }
         self.staged_layout = next_staged;
 
+        // Seed local ghosts once on the edge into resize *before* webview.resize()
+        // updates the offscreen FBO (after last live draw, before FB realloc/clear).
+        // Skip if ghost_valid — already seeded this freeze (cleared when is_resizing ends).
+        let local_seed_ids: Vec<String> = self
+            .panes
+            .iter()
+            .filter(|(_, p)| {
+                !p.is_remote
+                    && p.is_resizing
+                    && !p.ghost_valid
+                    && p.first_frame_painted
+                    && p.offscreen_ctx.size().width > 0
+                    && p.offscreen_ctx.size().height > 0
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in local_seed_ids {
+            crate::gl::compositor::capture_local_ghost(self, &id);
+        }
+
         // Evaluate if we are safe to update or establish a new layout transaction
         let can_commit = match &self.committed_layout {
             None => true,
@@ -709,19 +741,46 @@ impl WindowInstance {
                                 if target_size.width > 0 && target_size.height > 0 {
                                     pane.resize_generation += 1;
                                     let gen = pane.resize_generation;
-                                    if let Some(consumer) = &mut pane.remote_consumer {
-                                        consumer.update_active_resize_gen(gen);
-                                    }
                                     let surface_id = format!("{}:{}", self.window_id, pane.id);
-                                    let resize_msg = serde_json::json!({
-                                        "type": "Resize",
-                                        "surface_id": surface_id,
-                                        "generation": gen,
-                                        "width": target_size.width,
-                                        "height": target_size.height,
-                                        "scale_factor": scale_factor,
-                                    }).to_string();
-                                    crate::app::forward_remote_input(fd, &resize_msg);
+                                    let needs_realloc = pane
+                                        .remote_consumer
+                                        .as_ref()
+                                        .map(|c| {
+                                            target_size.width > c.max_width
+                                                || target_size.height > c.max_height
+                                        })
+                                        .unwrap_or(false);
+
+                                    if needs_realloc {
+                                        // Sealed memfd cannot grow — stepped realloc + dual-map handoff.
+                                        if let Err(e) = Self::realloc_remote_pixel_plane(
+                                            pane,
+                                            &surface_id,
+                                            fd,
+                                            gen,
+                                            target_size.width,
+                                            target_size.height,
+                                            scale_factor,
+                                        ) {
+                                            log::warn!(
+                                                "[shm] ReplacePixelPlane failed for {}: {}",
+                                                surface_id,
+                                                e
+                                            );
+                                        }
+                                    } else if let Some(consumer) = &mut pane.remote_consumer {
+                                        consumer.update_active_resize_gen(gen);
+                                        let resize_msg = serde_json::json!({
+                                            "type": "Resize",
+                                            "surface_id": surface_id,
+                                            "generation": gen,
+                                            "width": target_size.width,
+                                            "height": target_size.height,
+                                            "scale_factor": scale_factor,
+                                        })
+                                        .to_string();
+                                        crate::app::forward_remote_input(fd, &resize_msg);
+                                    }
                                     pane.requested_servo_size = target_size;
                                     pane.servo_busy = true;
                                     pane.pending_servo_size = None;
@@ -736,6 +795,13 @@ impl WindowInstance {
                             pane.servo_busy = true;
                             pane.pending_servo_size = None;
                             pane.is_resizing = true;
+                            // Match remotes: drop stale readiness so flip waits for a
+                            // frame at target_size. Re-arm the notify gate — a prior
+                            // notify may have left it false, which would drop the
+                            // Resize-driven notify_new_frame_ready and deadlock the
+                            // nuclear flip (frozen ghost + black dock slot).
+                            pane.ready_frame_size = None;
+                            pane.ready_to_repaint.store(true, Ordering::SeqCst);
                         }
                     }
                 }
@@ -745,6 +811,115 @@ impl WindowInstance {
         if self.committed_layout.is_some() {
             self.window.request_redraw();
         }
+    }
+
+    /// Grow a sealed remote pixel plane (never shrink during interactive resize).
+    /// Steps dimensions to 512px multiples after 1.5× headroom, dual-maps the
+    /// consumer, and sends `ReplacePixelPlane` + the new RW fd to the engine.
+    fn realloc_remote_pixel_plane(
+        pane: &mut PaneInstance,
+        surface_id: &str,
+        control_fd: i32,
+        generation: u64,
+        target_w: u32,
+        target_h: u32,
+        scale_factor: f32,
+    ) -> Result<(), String> {
+        fn step_plane_dim(phys: u32) -> u32 {
+            const STEP: u32 = 512;
+            const MAX: u32 = 4096;
+            let grown = phys.saturating_mul(3).div_ceil(2); // 1.5×
+            let stepped = grown.div_ceil(STEP).saturating_mul(STEP).max(STEP);
+            stepped.min(MAX)
+        }
+
+        let consumer = pane
+            .remote_consumer
+            .as_mut()
+            .ok_or_else(|| "no remote consumer".to_string())?;
+        let new_max_w = step_plane_dim(target_w).max(consumer.max_width);
+        let new_max_h = step_plane_dim(target_h).max(consumer.max_height);
+        if new_max_w <= consumer.max_width && new_max_h <= consumer.max_height {
+            consumer.update_active_resize_gen(generation);
+            let resize_msg = serde_json::json!({
+                "type": "Resize",
+                "surface_id": surface_id,
+                "generation": generation,
+                "width": target_w,
+                "height": target_h,
+                "scale_factor": scale_factor,
+            })
+            .to_string();
+            crate::app::forward_remote_input(control_fd, &resize_msg);
+            return Ok(());
+        }
+
+        let geom = lotus_supervisor::shm::calculate_shm_geometry(new_max_w, new_max_h)
+            .map_err(|e| format!("geometry: {e}"))?;
+        let total_size = 256 + geom.total_pixel_bytes;
+        let plane = lotus_supervisor::shm::SealedMemfdPlane::new(
+            &format!("{surface_id}_pixel_realloc"),
+            total_size,
+        )
+        .map_err(|e| format!("memfd: {e}"))?;
+
+        // Zero header on the new plane before the engine maps it.
+        unsafe {
+            let hdr =
+                &mut *(plane.rw_ptr as *mut lotus_supervisor::shm::ProducerControlHeader);
+            hdr.pub_seq
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            hdr.prod_resize_gen
+                .store(generation, std::sync::atomic::Ordering::Release);
+            hdr.active_slots = 3;
+            for slot in &hdr.slots {
+                slot.state.store(
+                    lotus_supervisor::shm::STATE_FREE,
+                    std::sync::atomic::Ordering::Release,
+                );
+                slot.pub_seq
+                    .store(0, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let pixel_rw = unsafe { libc::dup(plane.rw_fd) };
+        let pixel_ro = unsafe { libc::dup(plane.ro_fd) };
+        if pixel_rw < 0 || pixel_ro < 0 {
+            return Err("dup failed".into());
+        }
+        // SealedMemfdPlane Drop closes originals; dups survive.
+
+        consumer
+            .begin_plane_handoff(pixel_ro, total_size, new_max_w, new_max_h)
+            .map_err(|e| e.to_string())?;
+        consumer.update_active_resize_gen(generation);
+
+        let msg = serde_json::json!({
+            "type": "ReplacePixelPlane",
+            "surface_id": surface_id,
+            "generation": generation,
+            "width": target_w,
+            "height": target_h,
+            "max_width": new_max_w,
+            "max_height": new_max_h,
+            "scale_factor": scale_factor,
+        })
+        .to_string();
+        crate::send_fds_over_socket(control_fd, vec![pixel_rw], msg)
+            .map_err(|e| e.to_string())?;
+        // Engine owns the RW end after sendmsg; close our send copy.
+        unsafe {
+            libc::close(pixel_rw);
+        }
+        log::info!(
+            "[shm] ReplacePixelPlane {} -> {}x{} (target {}x{})",
+            surface_id,
+            new_max_w,
+            new_max_h,
+            target_w,
+            target_h
+        );
+        Ok(())
     }
 }
 

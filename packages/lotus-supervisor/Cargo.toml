@@ -14,3 +14,9 @@ path = "src/probe.rs"
 [dependencies]
 libc = "0.2"
 nix = { version = "0.29", default-features = false, features = ["user", "sched", "net", "signal", "fs", "process"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"

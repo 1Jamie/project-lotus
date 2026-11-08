@@ -1073,6 +1073,89 @@ fn main() {
                                             eprintln!("[lotus-engine] EvaluateScript surface not found: {}", surface_id);
                                         }
                                     }
+                                    ControlMessage::ReplacePixelPlane {
+                                        surface_id,
+                                        generation,
+                                        width: new_w,
+                                        height: new_h,
+                                        max_width,
+                                        max_height,
+                                        scale_factor,
+                                    } => {
+                                        let pixel_fd = if !pending_fds.is_empty() {
+                                            pending_fds.remove(0)
+                                        } else {
+                                            -1
+                                        };
+                                        if pixel_fd < 0 {
+                                            eprintln!("[lotus-engine] ReplacePixelPlane missing pixel fd for {}", surface_id);
+                                        } else if let Some(surf) = surfaces.get_mut(&surface_id) {
+                                            let geom_w = max_width.max(new_w).max(1);
+                                            let geom_h = max_height.max(new_h).max(1);
+                                            match calculate_shm_geometry(geom_w, geom_h) {
+                                                Ok(geom) => {
+                                                    let total = 256 + geom.total_pixel_bytes;
+                                                    let new_ptr = unsafe {
+                                                        libc::mmap(
+                                                            std::ptr::null_mut(),
+                                                            total,
+                                                            libc::PROT_READ | libc::PROT_WRITE,
+                                                            libc::MAP_SHARED,
+                                                            pixel_fd,
+                                                            0,
+                                                        ) as *mut u8
+                                                    };
+                                                    if new_ptr == libc::MAP_FAILED as *mut u8 {
+                                                        eprintln!("[lotus-engine] ReplacePixelPlane mmap failed for {}", surface_id);
+                                                        unsafe { libc::close(pixel_fd); }
+                                                    } else {
+                                                        let prod_hdr = unsafe { &mut *(new_ptr as *mut ProducerControlHeader) };
+                                                        prod_hdr.pub_seq.store(0, Ordering::Relaxed);
+                                                        prod_hdr.prod_resize_gen.store(generation, Ordering::Release);
+                                                        prod_hdr.active_slots = 3;
+                                                        for slot in &prod_hdr.slots {
+                                                            slot.state.store(STATE_FREE, Ordering::Release);
+                                                            slot.pub_seq.store(0, Ordering::Release);
+                                                        }
+                                                        let old_ptr = surf.rw_ptr;
+                                                        let old_size = surf.shm_size;
+                                                        surf.rw_ptr = new_ptr;
+                                                        surf.shm_size = total;
+                                                        surf.geom = geom;
+                                                        if scale_factor > 0.0 {
+                                                            surf.webview.set_hidpi_scale_factor(euclid::Scale::new(scale_factor));
+                                                        }
+                                                        if new_w > 0 && new_h > 0 {
+                                                            surf.width = new_w;
+                                                            surf.height = new_h;
+                                                            surf.webview.resize(PhysicalSize::new(new_w, new_h));
+                                                        }
+                                                        surf.paint_needed = true;
+                                                        surf.current_slot = 0;
+                                                        surf.last_pub_gen = [0; 3];
+                                                        surf.last_pub_seq = [0; 3];
+                                                        unsafe {
+                                                            if !old_ptr.is_null() && old_size > 0 {
+                                                                libc::munmap(old_ptr as *mut libc::c_void, old_size);
+                                                            }
+                                                            libc::close(pixel_fd);
+                                                        }
+                                                        log_debug!(
+                                                            "[lotus-engine] ReplacePixelPlane ok sid={} {}x{} max={}x{} gen={}",
+                                                            surface_id, new_w, new_h, geom_w, geom_h, generation
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[lotus-engine] ReplacePixelPlane bad geometry: {:?}", e);
+                                                    unsafe { libc::close(pixel_fd); }
+                                                }
+                                            }
+                                        } else {
+                                            unsafe { libc::close(pixel_fd); }
+                                            eprintln!("[lotus-engine] ReplacePixelPlane unknown surface {}", surface_id);
+                                        }
+                                    }
                                     ControlMessage::Resize { surface_id, generation, width: new_w, height: new_h, scale_factor } => {
                                         if let Some(surf) = surfaces.get_mut(&surface_id) {
                                             if new_w > 0 && new_h > 0 {

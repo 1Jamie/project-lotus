@@ -257,7 +257,12 @@ async function spawnSandboxedEngine(options = {}) {
                 typeof hostGpu !== 'number' || hostGpu < 0) {
                 throw new Error('registerGpuWebglBroker unavailable');
             }
-            native.registerGpuWebglBroker(hostGpu);
+            // Pane id scopes GPU feeder (and experimental hole-punch) to this remote.
+            const surfaceId = options.surfaceId || options.surface_id || '';
+            const paneId = typeof surfaceId === 'string' && surfaceId.includes(':')
+                ? surfaceId.slice(surfaceId.indexOf(':') + 1)
+                : (options.paneId || options.pane_id || '');
+            native.registerGpuWebglBroker(hostGpu, paneId || undefined);
             gpuRegistered = true;
             if (typeof gpuChild === 'number' && gpuChild >= 0 && !passFds.includes(GPU_CHILD_FD)) {
                 passFds.push(GPU_CHILD_FD);
@@ -554,6 +559,13 @@ async function spawnSandboxedEngine(options = {}) {
                         allocatedTempDir
                     );
                     instance.verificationReport = verificationReport;
+                    if (gpuRegistered && gpuSocketPair) {
+                        const hg = gpuSocketPair.hostFd ?? gpuSocketPair.host_fd;
+                        if (typeof hg === 'number' && hg >= 0) {
+                            instance.hostGpuFd = hg;
+                            console.log('[launcher] hostGpuFd=', hg, 'surfaceId=', options.surfaceId || '');
+                        }
+                    }
 
                     resolve(instance);
                 }

@@ -31,6 +31,18 @@ pub struct RemotePaneConsumer {
     pub max_width: u32,
     pub max_height: u32,
     local_ack_fallback: Option<Box<ConsumerAckHeader>>,
+    /// Dual-map handoff during sealed-memfd realloc (Phase 3.4). Active map stays
+    /// for stretch until the pending plane has published `pub_seq >= 1`.
+    pending: Option<PendingPlane>,
+}
+
+struct PendingPlane {
+    ro_fd: RawFd,
+    ro_ptr: *const u8,
+    mapped_size: usize,
+    max_width: u32,
+    max_height: u32,
+    last_rendered_seq: u64,
 }
 
 // Raw pointers across threads need unsafe impl Send
@@ -120,12 +132,97 @@ impl RemotePaneConsumer {
             max_width,
             max_height,
             local_ack_fallback,
+            pending: None,
         })
     }
 
     pub fn update_active_resize_gen(&mut self, gen: u64) {
         self.active_resize_gen = gen;
         self.staging_frames_since_resize = 0;
+    }
+
+    /// Begin dual-map handoff to a newly sealed pixel plane. Keeps the active map
+    /// (and last display texture) until [`try_promote_pending_plane`] succeeds.
+    pub fn begin_plane_handoff(
+        &mut self,
+        ro_fd: RawFd,
+        mapped_size: usize,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<(), &'static str> {
+        if ro_fd < 0 || mapped_size == 0 {
+            return Err("E_SHM_INVALID_FD");
+        }
+        // Retire any prior unfinished pending first.
+        if let Some(old) = self.pending.take() {
+            unsafe {
+                if !old.ro_ptr.is_null() && old.ro_ptr != libc::MAP_FAILED as *const u8 {
+                    libc::munmap(old.ro_ptr as *mut libc::c_void, old.mapped_size);
+                }
+                if old.ro_fd >= 0 {
+                    libc::close(old.ro_fd);
+                }
+            }
+        }
+        let ro_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mapped_size,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                ro_fd,
+                0,
+            ) as *const u8
+        };
+        if ro_ptr == libc::MAP_FAILED as *const u8 {
+            return Err("E_SHM_MMAP_FAILED");
+        }
+        self.pending = Some(PendingPlane {
+            ro_fd,
+            ro_ptr,
+            mapped_size,
+            max_width,
+            max_height,
+            last_rendered_seq: 0,
+        });
+        Ok(())
+    }
+
+    /// If the pending plane has published at least one frame, swap it in as active
+    /// and munmap+close the old active pixel mapping.
+    pub fn try_promote_pending_plane(&mut self) -> bool {
+        let Some(pending) = self.pending.as_ref() else {
+            return false;
+        };
+        let pub_seq = unsafe {
+            (*(pending.ro_ptr as *const ProducerControlHeader))
+                .pub_seq
+                .load(Ordering::Acquire)
+        };
+        if pub_seq < 1 {
+            return false;
+        }
+        let pending = self.pending.take().unwrap();
+        // Tear down old active pixel map (ack stays).
+        unsafe {
+            if !self.ro_ptr.is_null() && self.ro_ptr != libc::MAP_FAILED as *const u8 {
+                libc::munmap(self.ro_ptr as *mut libc::c_void, self.mapped_size);
+            }
+            if self.ro_fd >= 0 {
+                libc::close(self.ro_fd);
+            }
+        }
+        self.ro_fd = pending.ro_fd;
+        self.ro_ptr = pending.ro_ptr;
+        self.mapped_size = pending.mapped_size;
+        self.max_width = pending.max_width;
+        self.max_height = pending.max_height;
+        self.last_rendered_seq = pending.last_rendered_seq;
+        true
+    }
+
+    pub fn has_pending_plane(&self) -> bool {
+        self.pending.is_some()
     }
 
     pub fn staging_frames_since_resize(&self) -> u32 {
@@ -138,6 +235,16 @@ impl RemotePaneConsumer {
 
     /// True when the producer has published a frame newer than `last_rendered_seq`.
     pub fn has_unread_frame(&self) -> bool {
+        if let Some(pending) = self.pending.as_ref() {
+            let pub_seq = unsafe {
+                (*(pending.ro_ptr as *const ProducerControlHeader))
+                    .pub_seq
+                    .load(Ordering::Acquire)
+            };
+            if pub_seq >= 1 {
+                return true;
+            }
+        }
         let prod_hdr = unsafe { &*(self.ro_ptr as *const ProducerControlHeader) };
         prod_hdr.pub_seq.load(Ordering::Acquire) > self.last_rendered_seq
     }
@@ -165,6 +272,9 @@ impl RemotePaneConsumer {
         gl: &glow::Context,
         preserve_display: bool,
     ) -> Result<bool, &'static str> {
+        // Promote pending realloc plane once it has published a frame.
+        let _ = self.try_promote_pending_plane();
+
         let prod_hdr = unsafe { &*(self.ro_ptr as *const ProducerControlHeader) };
         let latest_pub_seq = prod_hdr.pub_seq.load(Ordering::Acquire);
 
@@ -441,6 +551,16 @@ impl RemotePaneConsumer {
 
 impl Drop for RemotePaneConsumer {
     fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            unsafe {
+                if !pending.ro_ptr.is_null() && pending.ro_ptr != libc::MAP_FAILED as *const u8 {
+                    libc::munmap(pending.ro_ptr as *mut libc::c_void, pending.mapped_size);
+                }
+                if pending.ro_fd >= 0 {
+                    libc::close(pending.ro_fd);
+                }
+            }
+        }
         if !self.ro_ptr.is_null() && self.ro_ptr != libc::MAP_FAILED as *const u8 {
             unsafe {
                 libc::munmap(self.ro_ptr as *mut libc::c_void, self.mapped_size);

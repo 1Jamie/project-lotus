@@ -42,6 +42,18 @@ pub enum ControlMessage {
         height: u32,
         scale_factor: f32,
     },
+    /// Replace the sealed pixel memfd (SCM_RIGHTS: one RW fd). Ack plane unchanged.
+    /// Engine remaps, sets prod_resize_gen, resizes the webview; host keeps the old
+    /// consumer map until pub_seq >= 1 on the new plane.
+    ReplacePixelPlane {
+        surface_id: String,
+        generation: u64,
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+        scale_factor: f32,
+    },
     Destroy {
         surface_id: String,
     },

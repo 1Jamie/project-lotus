@@ -55,16 +55,31 @@ pub fn ensure_webgl_broker() -> napi::Result<()> {
 }
 
 /// Register the host end of the GPU `socketpair` (from [`create_gpu_socket_pair`]) and start the feeder thread.
+/// Optional `pane_id` scopes the GPU feeder (and experimental hole-punch) to that host pane.
 #[cfg(target_os = "linux")]
 #[napi(js_name = "registerGpuWebglBroker")]
-pub fn register_gpu_webgl_broker(fd: i32) -> napi::Result<()> {
-    crate::gl::webgl_broker::register_gpu_fd(fd)
+pub fn register_gpu_webgl_broker(fd: i32, pane_id: Option<String>) -> napi::Result<()> {
+    crate::gl::webgl_broker::register_gpu_fd(fd, pane_id)
         .map_err(|e| napi::Error::from_reason(e))
 }
 
 #[cfg(not(target_os = "linux"))]
 #[napi(js_name = "registerGpuWebglBroker")]
-pub fn register_gpu_webgl_broker(_fd: i32) -> napi::Result<()> {
+pub fn register_gpu_webgl_broker(_fd: i32, _pane_id: Option<String>) -> napi::Result<()> {
+    Err(napi::Error::from_reason("WebGL broker is only supported on Linux"))
+}
+
+/// Bind a previously registered GPU feeder to a host pane (prewarm → first surface).
+#[cfg(target_os = "linux")]
+#[napi(js_name = "associateGpuWebglBrokerPane")]
+pub fn associate_gpu_webgl_broker_pane(fd: i32, pane_id: String) -> napi::Result<()> {
+    crate::gl::webgl_broker::associate_feeder_pane(fd, &pane_id);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[napi(js_name = "associateGpuWebglBrokerPane")]
+pub fn associate_gpu_webgl_broker_pane(_fd: i32, _pane_id: String) -> napi::Result<()> {
     Err(napi::Error::from_reason("WebGL broker is only supported on Linux"))
 }
 

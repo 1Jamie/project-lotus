@@ -90,7 +90,8 @@
             color: #93c5fd;
         }
 
-        /* Top 60%: Interactive 60fps Canvas */
+        /* Top 60%: canvas + chrome. Chrome outside <canvas> so experimental
+           hole-punch (on-top of canvas rect) cannot cover FPS labels. */
         .canvas-section {
             position: relative;
             flex: 6;
@@ -98,41 +99,42 @@
             background: #030305;
             border-bottom: 1px solid var(--border-hairline);
             overflow: hidden;
+            display: flex;
+            flex-direction: column;
         }
 
         canvas {
             display: block;
             width: 100%;
-            height: 100%;
+            flex: 1 1 auto;
+            min-height: 0;
+            height: auto;
         }
 
         .canvas-overlay-top {
-            position: absolute;
-            top: 6px;
-            left: 8px;
-            right: 8px;
+            flex: 0 0 auto;
             display: flex;
             justify-content: space-between;
             align-items: center;
             pointer-events: none;
             font-size: 9.5px;
             color: var(--text-muted);
-            background: rgba(9, 9, 11, 0.85);
-            padding: 2px 6px;
-            border: 1px solid #1c1c22;
+            background: rgba(9, 9, 11, 0.95);
+            padding: 4px 8px;
+            border-bottom: 1px solid #1c1c22;
         }
 
         .canvas-overlay-bottom {
-            position: absolute;
-            bottom: 6px;
-            left: 8px;
-            right: 8px;
+            flex: 0 0 auto;
             display: flex;
             justify-content: space-between;
             align-items: center;
             pointer-events: none;
             font-size: 9.5px;
             color: var(--text-muted);
+            background: rgba(9, 9, 11, 0.95);
+            padding: 4px 8px;
+            border-top: 1px solid #1c1c22;
         }
 
         .frametime-bar-container {
@@ -314,13 +316,13 @@
 
     <!-- Top 60%: Interactive 60fps Frame-Pacing Canvas -->
     <div class="canvas-section" id="canvas-container">
-        <canvas id="physics-canvas"></canvas>
-        
         <div class="canvas-overlay-top">
             <span>INPUT: <strong id="cursor-pos" style="color: #6ee7b7;">CURSOR: HOVER CANVAS</strong></span>
             <span id="seqlock-epoch-label" style="color: #fcd34d;">MEMFD SEQLOCK EPOCH: #0</span>
             <span style="color: #93c5fd;">TRIPLE-BUFFER SCANOUT (0.04ms)</span>
         </div>
+
+        <canvas id="physics-canvas"></canvas>
 
         <div class="canvas-overlay-bottom">
             <span style="background: rgba(9,9,11,0.85); padding: 2px 6px; border: 1px solid #1c1c22;">
@@ -569,6 +571,18 @@
                 lastTime = now;
                 fpsLabel.textContent = `${fps.toFixed(1)} FPS`;
                 frametimeLabel.textContent = `${(1000 / Math.max(1, fps)).toFixed(1)}ms`;
+                // Report to host (console may not reach node stderr in sandboxed engine).
+                try {
+                    if (window.lotus && typeof window.lotus.invoke === 'function') {
+                        window.lotus.invoke('sandboxTasks.reportFps', { fps, pane: 'sandboxed' }).catch((err) => {
+                            console.warn('[lotus-fps] invoke failed', err && err.message ? err.message : err);
+                        });
+                    } else {
+                        console.warn('[lotus-fps] window.lotus.invoke unavailable');
+                    }
+                } catch (err) {
+                    console.warn('[lotus-fps] report threw', err && err.message ? err.message : err);
+                }
                 const bars = ftGraph.children;
                 for (let i = 0; i < bars.length - 1; i++) {
                     bars[i].style.height = bars[i + 1].style.height;

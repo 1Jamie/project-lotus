@@ -118,7 +118,14 @@ pub unsafe fn try_copy_frame(ptr: *const u8, out: &mut Vec<u8>) -> Option<(u32, 
             continue;
         }
         std::sync::atomic::fence(Ordering::Acquire);
-        out.resize(need, 0);
+        // Grow without zero-fill — copy overwrites every byte on success.
+        if out.capacity() < need {
+            out.reserve(need - out.capacity());
+        }
+        // SAFETY: capacity >= need; contents overwritten by copy_nonoverlapping.
+        unsafe {
+            out.set_len(need);
+        }
         let base = ptr.add(CANVAS_HEADER_BYTES + slot * need);
         // Volatile-ish copy via ptr::copy — writer uses release fences; we re-check seq.
         std::ptr::copy_nonoverlapping(base, out.as_mut_ptr(), need);

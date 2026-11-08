@@ -563,8 +563,9 @@ function ensureCrashChromePane(win, pane) {
     const layout = pane._layout || {};
     // Absolute high-z overlay — never participates in dock layout. The remote keeps its
     // dock slot (and vsync) underneath while chrome covers the slot visually.
+    // paneId in the query lets Respawn arm even if the first crash-info push races load.
     crash = win.createPane(crashId, {
-        url: 'lotus-resource://localhost/surface-crash.html',
+        url: `lotus-resource://localhost/surface-crash.html?paneId=${encodeURIComponent(pane.id)}`,
         x: layout.x || 0,
         y: layout.y || 0,
         width: layout.width || 0,
@@ -577,6 +578,28 @@ function ensureCrashChromePane(win, pane) {
         secure: false,
     });
     return crash;
+}
+
+function buildCrashInfoPayload(pane, surfaceId) {
+    const crashed = pane?._crashed || {};
+    return {
+        paneId: pane.id,
+        surfaceId: surfaceId || pane.surfaceId || null,
+        code: crashed.code ?? null,
+        sig: crashed.sig || null,
+        reason: crashed.reason || null,
+        isolated: crashed.isolated === true,
+        autoRespawnFailures: crashed.autoRespawnFailures || 0,
+    };
+}
+
+function pushCrashInfoToChrome(win, crash, pane, surfaceId) {
+    if (!win || !crash || !pane?._crashed) return;
+    const info = buildCrashInfoPayload(pane, surfaceId);
+    // Latch like select-overlay `_pendingSelectPayload`: crash-info sent before the
+    // chrome page's WS is up is recovered on `__lotus_crash_ready`.
+    crash._pendingCrashInfo = info;
+    win.sendToPaneRenderer(crash.id, 'crash-info', info, true);
 }
 
 function coverRemoteWithCrashChrome(win, pane, crash) {
@@ -621,8 +644,42 @@ function armAutoRespawnHealthyReset(pane) {
     }
 }
 
+function stepPlaneDim(physPx) {
+    const STEP = 512;
+    const MAX = 4096;
+    const grown = Math.ceil(physPx * 1.5);
+    return Math.min(MAX, Math.max(STEP, Math.ceil(grown / STEP) * STEP));
+}
+
 function sanitizePaneShm(pane) {
     if (!pane?._shm || typeof resetRemotePaneShm !== 'function') return;
+    // If layout grew past the sealed plane (e.g. after native realloc or HiDPI
+    // maximize), mint a fresh stepped plane so CreateSurface on respawn fits.
+    try {
+        const layoutW = Math.max(1, Math.round(pane._layout?.width || pane._shm.width || 800));
+        const layoutH = Math.max(1, Math.round(pane._layout?.height || pane._shm.height || 600));
+        // Prefer physical ceiling already stored on the plane; else step from CSS layout.
+        const needW = stepPlaneDim(layoutW);
+        const needH = stepPlaneDim(layoutH);
+        const curW = pane._shm.maxWidth || pane._shm.width || 0;
+        const curH = pane._shm.maxHeight || pane._shm.height || 0;
+        if (
+            (needW > curW || needH > curH) &&
+            typeof allocateRemotePaneShm === 'function'
+        ) {
+            const fresh = allocateRemotePaneShm(
+                `respawn_${pane.id}_${Date.now()}`,
+                Math.max(needW, curW),
+                Math.max(needH, curH)
+            );
+            fresh.width = layoutW;
+            fresh.height = layoutH;
+            fresh.maxWidth = Math.max(needW, curW);
+            fresh.maxHeight = Math.max(needH, curH);
+            pane._shm = fresh;
+            return;
+        }
+    } catch (_) {}
     const pixelRwFd = pane._shm.pixelRwFd ?? pane._shm.rwFd ?? -1;
     const ackRwFd = pane._shm.ackRwFd ?? -1;
     try {
@@ -667,15 +724,24 @@ function showHostCrashChrome(surfaceId, crashInfo = {}) {
     // Keep the remote docked+visible under opaque host chrome so a later respawn already
     // has a compositor slot / vsync path — never swap to a frozen SHM flash.
     coverRemoteWithCrashChrome(win, pane, crash);
-    win.sendToPaneRenderer(crash.id, 'crash-info', {
-        paneId: pane.id,
-        surfaceId,
-        code: pane._crashed.code,
-        sig: pane._crashed.sig,
-        reason: pane._crashed.reason,
-        isolated: pane._crashed.isolated,
-        autoRespawnFailures: pane._crashed.autoRespawnFailures,
-    }, true);
+    pushCrashInfoToChrome(win, crash, pane, surfaceId);
+    // Retry while the chrome page brings up its WS — first paint often races this push.
+    if (crash._crashInfoRetryTimer) {
+        clearInterval(crash._crashInfoRetryTimer);
+    }
+    let tries = 0;
+    crash._crashInfoRetryTimer = setInterval(() => {
+        if (!pane._crashed || !crash._pendingCrashInfo) {
+            clearInterval(crash._crashInfoRetryTimer);
+            crash._crashInfoRetryTimer = null;
+            return;
+        }
+        win.sendToPaneRenderer(crash.id, 'crash-info', crash._pendingCrashInfo, true);
+        if (++tries >= 15) {
+            clearInterval(crash._crashInfoRetryTimer);
+            crash._crashInfoRetryTimer = null;
+        }
+    }, 100);
 }
 
 const _respawnInFlight = new Map();
@@ -779,6 +845,11 @@ function revealRemoteAfterRespawn(win, pane, crash) {
     pane._respawning = false;
     // Remote was already visible under chrome (vsync path). Only lift the cover.
     if (crash) {
+        if (crash._crashInfoRetryTimer) {
+            clearInterval(crash._crashInfoRetryTimer);
+            crash._crashInfoRetryTimer = null;
+        }
+        crash._pendingCrashInfo = null;
         crash.visible = false;
         win.handle.setPaneVisible(crash.id, false);
     }
@@ -1030,16 +1101,12 @@ ipcMain.on('__lotus_crash_ready', (_payload, clientId) => {
     const paneId = crashPaneId.slice('__lotus_crash_'.length);
     const win = windows.get(windowId);
     const pane = win?.panes.get(paneId);
-    if (!win || !pane?._crashed) return;
-    win.sendToPaneRenderer(crashPaneId, 'crash-info', {
-        paneId,
-        surfaceId: pane.surfaceId,
-        code: pane._crashed.code,
-        sig: pane._crashed.sig,
-        reason: pane._crashed.reason,
-        isolated: pane._crashed.isolated,
-        autoRespawnFailures: pane._crashed.autoRespawnFailures,
-    }, true);
+    const crash = win?.panes.get(crashPaneId);
+    if (!win || !pane?._crashed || !crash) return;
+    // Prefer the latched payload (mirrors `__lotus_select_ready` + `_pendingSelectPayload`).
+    const info = crash._pendingCrashInfo || buildCrashInfoPayload(pane, pane.surfaceId);
+    crash._pendingCrashInfo = info;
+    win.sendToPaneRenderer(crashPaneId, 'crash-info', info, true);
 });
 
 function ensureApp() {
@@ -2435,8 +2502,18 @@ class ServoWindow extends EventEmitter {
             }
             const shmWidth = Math.max(1, targetWidth || this._logicalWidth || 800);
             const shmHeight = Math.max(1, targetHeight || this._logicalHeight || 600);
-            const maxShmWidth = Math.max(shmWidth, 3840);
-            const maxShmHeight = Math.max(shmHeight, 2160);
+            // Physical-pixel SHM ceiling with stepped headroom (Phase 3.4).
+            // Sealed memfds cannot grow — size for device pixels + step so common
+            // dock/maximize growth fits without a 4K×3 (~95 MiB) floor. Never use
+            // the old Math.max(..., 3840/2160) CSS-pixel floor.
+            const scale = Math.max(
+                1,
+                Number(this._scaleFactor) ||
+                    (typeof this.handle?.scaleFactor === 'number' ? this.handle.scaleFactor : 1) ||
+                    1
+            );
+            const maxShmWidth = stepPlaneDim(Math.ceil(shmWidth * scale));
+            const maxShmHeight = stepPlaneDim(Math.ceil(shmHeight * scale));
             const shm = allocateRemotePaneShm(surfaceId, maxShmWidth, maxShmHeight);
             shm.width = shmWidth;
             shm.height = shmHeight;

@@ -498,6 +498,18 @@ async function startShowcase() {
     // a crash, the next cold-spawn inherits a multi-second stale "elapsed" and the
     // watchdog SIGKILLs the brand-new engine before its first heartbeat can land —
     // which is exactly the "Respawn needs 2–3 clicks" failure mode.
+    ipcMain.register('sandboxTasks.reportFps', async (payload) => {
+        const fps = typeof payload?.fps === 'number' ? payload.fps : Number(payload?.fps);
+        const pane = payload?.pane || 'unknown';
+        if (Number.isFinite(fps)) {
+            console.log(`[lotus-fps] pane=${pane} fps=${fps.toFixed(1)}`);
+        }
+        return { ok: true };
+    }, {
+        channel: 'sandboxTasks',
+        schema: { ok: 'boolean' },
+    });
+
     ipcMain.register('sandboxTasks.heartbeat', async () => {
         lastPoolBHeartbeat = Date.now();
         poolBHeartbeatArmed = true;
@@ -511,9 +523,10 @@ async function startShowcase() {
         },
     });
 
-    // Hang detection: 2s without heartbeat → SIGKILL. Recovery is pane policy
-    // (autoRespawn / host crash chrome), not showcase auto-respawn.
-    const POOL_B_HANG_MS = 2000;
+    // Hang detection: no heartbeat → SIGKILL. EXPERIMENTAL LOTUS_WEBGL_HOLE_PUNCH
+    // shares one host GL thread and can delay Pool B IPC — widen only then.
+    // Default (reliable readback path) keeps the strict 2s timeout.
+    const POOL_B_HANG_MS = process.env.LOTUS_WEBGL_HOLE_PUNCH ? 5000 : 2000;
     const watchdogInterval = setInterval(() => {
         if (!activeWindow) return;
         if (!showcaseWindowFocused) return;
@@ -634,6 +647,17 @@ async function startShowcase() {
     win.once('ready-to-show', () => {
         console.log('[Lotus Sandbox Showcase] First frame painted - showing window.');
         win.show();
+        if (process.env.LOTUS_FPS_BENCH === '1') {
+            try { win.focus(); } catch (_) {}
+            broadcastAllPanes('app.visibility', { visible: true });
+            // Re-assert visibility while panes bring up IPC (blur can race show).
+            const keepVisible = setInterval(() => {
+                broadcastAllPanes('app.visibility', { visible: true });
+                try { win.focus(); } catch (_) {}
+            }, 1000);
+            if (typeof keepVisible.unref === 'function') keepVisible.unref();
+            setTimeout(() => clearInterval(keepVisible), 25000);
+        }
 
         if (process.env.LOTUS_TEST_CRASH_RECOVERY === '1') {
             (async () => {
@@ -745,17 +769,30 @@ async function startShowcase() {
         }
     });
 
+    const fpsBench = process.env.LOTUS_FPS_BENCH === '1';
+
     win.on('focus', () => {
         showcaseWindowFocused = true;
-        // Give Pool B a grace window after refocus before hang detection.
+        // Do not judge hang until a post-focus heartbeat lands — blur often pauses
+        // remote rAF/WebGL mid-call; a stale clock would false-trigger the watchdog.
         if (poolBHeartbeatArmed) {
             lastPoolBHeartbeat = Date.now();
         }
-        // Let sandboxed demos resume rAF (Page Visibility alone is unreliable in remotes).
         broadcastAllPanes('app.visibility', { visible: true });
     });
     win.on('blur', () => {
+        // FPS A/B must keep rAF + host refresh alive even when the OS steals focus.
+        if (fpsBench) {
+            showcaseWindowFocused = true;
+            broadcastAllPanes('app.visibility', { visible: true });
+            try { win.focus(); } catch (_) {}
+            return;
+        }
         showcaseWindowFocused = false;
+        // Disarm hang detection while unfocused: remotes may stop heartbeating when
+        // Wayland stops RedrawRequested / WebGL blocks. Crash chrome still works if
+        // the engine actually dies; we only skip false "hung" kills.
+        disarmPoolBWatchdog();
         broadcastAllPanes('app.visibility', { visible: false });
     });
 

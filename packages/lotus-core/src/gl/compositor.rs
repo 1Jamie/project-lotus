@@ -49,6 +49,54 @@ pub struct CompositeRemoteResult {
     pub cover_ready_panes: Vec<String>,
 }
 
+/// True when the host must rebuild the scene FBO and issue a swapchain present.
+/// Idle parking: skip clear/bind/present when pane pixels and layout are unchanged
+/// so we do not re-arm Wayland frame callbacks at display rate with no damage.
+pub fn scene_needs_present(
+    instance: &WindowInstance,
+    window_size: winit::dpi::PhysicalSize<u32>,
+    flip_occurred: bool,
+    pending_hides: &HashSet<String>,
+) -> bool {
+    if flip_occurred || instance.committed_layout.is_some() {
+        return true;
+    }
+    if instance.last_presented_window_size != Some(window_size) {
+        return true;
+    }
+    if !pending_hides.is_empty() {
+        return true;
+    }
+    for pane in instance.panes.values() {
+        if !pane.is_visible && !pane.pending_visible {
+            continue;
+        }
+        if pane.is_resizing {
+            return true;
+        }
+        // Visible (or becoming visible) panes with newer content must present.
+        if pane.is_visible || pane.pending_visible {
+            if pane.frame_seq != pane.last_presented_seq {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// After a successful present, latch pane + window damage state.
+pub fn ack_presented_scene(
+    instance: &mut WindowInstance,
+    window_size: winit::dpi::PhysicalSize<u32>,
+) {
+    instance.last_presented_window_size = Some(window_size);
+    for pane in instance.panes.values_mut() {
+        if pane.is_visible {
+            pane.last_presented_seq = pane.frame_seq;
+        }
+    }
+}
+
 fn draw_pane_texture(
     instance: &WindowInstance,
     tex: glow::NativeTexture,
@@ -87,10 +135,15 @@ fn draw_pane_texture(
 }
 
 /// Capture pane-sized last-good pixels into `ghost_tex` for stretch-interim during resize.
-fn capture_local_ghost(instance: &mut WindowInstance, pane_id: &str) {
+/// Call **after** the last live draw into the offscreen FBO and **before** that FBO is
+/// resized or cleared. Sets `ghost_valid` on success.
+pub(crate) fn capture_local_ghost(instance: &mut WindowInstance, pane_id: &str) {
     let Some(pane) = instance.panes.get_mut(pane_id) else {
         return;
     };
+    if pane.is_remote {
+        return;
+    }
     let size = pane.offscreen_ctx.size();
     if size.width == 0 || size.height == 0 {
         return;
@@ -135,7 +188,22 @@ fn capture_local_ghost(instance: &mut WindowInstance, pane_id: &str) {
         );
         instance.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
         instance.gl.bind_texture(glow::TEXTURE_2D, None);
+        pane.ghost_valid = true;
     }
+}
+
+/// Delete the local ghost texture (call before removing a pane from the map).
+pub(crate) fn destroy_local_ghost(instance: &mut WindowInstance, pane_id: &str) {
+    let Some(pane) = instance.panes.get_mut(pane_id) else {
+        return;
+    };
+    if let Some(tex) = pane.ghost_tex.take() {
+        unsafe {
+            instance.gl.delete_texture(tex);
+        }
+    }
+    pane.ghost_tex_size = None;
+    pane.ghost_valid = false;
 }
 
 /// Returns pane ids of remote surfaces that consumed a new SHM frame this pass
@@ -151,6 +219,13 @@ pub fn composite_panes_to_scene(
 ) -> CompositeRemoteResult {
     let remotes_with_new_frames = Vec::new();
     let cover_ready_panes = Vec::new();
+
+    // Experimental hole-punch only — never run punch bookkeeping on the reliable path.
+    #[cfg(target_os = "linux")]
+    let hole_punch = crate::gl::webgl_broker::experimental_hole_punch_enabled();
+    #[cfg(target_os = "linux")]
+    let mut hole_punch_panes: Vec<(String, i32, i32, i32, i32, u64)> = Vec::new();
+
     unsafe {
         // Defensive: never let a prior remote upload leave UNPACK_* set for Servo/WebRender.
         instance.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
@@ -233,15 +308,14 @@ pub fn composite_panes_to_scene(
                 } else {
                     let is_locked = is_transaction_pending && !transaction_complete;
                     let is_hiding = pending_hides.contains(&pane.id);
-                    let freeze = (is_locked || pane.is_resizing || is_hiding)
-                        && pane.ghost_tex_size.is_some();
+                    let want_freeze = is_locked || pane.is_resizing || is_hiding;
                     let tex_size = pane.offscreen_ctx.size();
                     let live_ok = tex_size.width > 0 && tex_size.height > 0;
-                    if freeze {
+                    if want_freeze && pane.ghost_valid {
                         if let Some(tex) = pane.ghost_tex {
                             DrawPlan::LocalFreeze { tex }
                         } else if live_ok {
-                            // No ghost yet — still fill the slot (avoid black hole).
+                            // ghost_valid without tex should not happen; fill live + seed.
                             DrawPlan::LocalLive {
                                 tex: pane.offscreen_ctx.color_texture(),
                                 capture: true,
@@ -249,10 +323,18 @@ pub fn composite_panes_to_scene(
                         } else {
                             DrawPlan::Skip
                         }
-                    } else if live_ok {
+                    } else if want_freeze && live_ok {
+                        // Freeze requested but no valid ghost yet (e.g. hide/transaction
+                        // without a prior resize seed) — draw live and capture once.
                         DrawPlan::LocalLive {
                             tex: pane.offscreen_ctx.color_texture(),
                             capture: true,
+                        }
+                    } else if live_ok {
+                        // Steady-state: no per-frame ghost copy.
+                        DrawPlan::LocalLive {
+                            tex: pane.offscreen_ctx.color_texture(),
+                            capture: false,
                         }
                     } else {
                         DrawPlan::Skip
@@ -274,6 +356,24 @@ pub fn composite_panes_to_scene(
                         scale_factor,
                         1,
                     );
+                    #[cfg(target_os = "linux")]
+                    if hole_punch {
+                        let shm_seq = instance
+                            .panes
+                            .get(&id)
+                            .and_then(|p| p.remote_consumer.as_ref())
+                            .map(|c| c.last_rendered_seq)
+                            .unwrap_or(0);
+                        crate::gl::webgl_broker::note_pane_shm_seq(&id, shm_seq);
+                        hole_punch_panes.push((
+                            id.clone(),
+                            layout_px,
+                            layout_py,
+                            layout_pw,
+                            layout_ph,
+                            shm_seq,
+                        ));
+                    }
                 }
                 DrawPlan::LocalFreeze { tex } => {
                     draw_pane_texture(
@@ -309,6 +409,50 @@ pub fn composite_panes_to_scene(
         instance.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
         instance.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
     }
+
+    // EXPERIMENTAL: SurfaceTexture quads on top of remote SHM (opt-in env only).
+    #[cfg(target_os = "linux")]
+    if hole_punch {
+        for (pane_id, px, py, pw, ph, shm_seq) in hole_punch_panes {
+            let _ = crate::gl::webgl_broker::draw_hole_punch_quads_for_pane(
+                instance.rendering_context.as_ref(),
+                &pane_id,
+                shm_seq,
+                |gl_tex, _tw, _th, rx, ry, rw, rh| {
+                    let Some(nz) = std::num::NonZeroU32::new(gl_tex) else {
+                        return;
+                    };
+                    let (qx, qy, qw, qh) = if rw > 0 && rh > 0 {
+                        let qx = px + rx;
+                        let qy = py + (ph - ry - rh);
+                        let left = qx.max(px);
+                        let right = (qx + rw).min(px + pw);
+                        let bottom = qy.max(py);
+                        let top = (qy + rh).min(py + ph);
+                        let cw = right - left;
+                        let ch = top - bottom;
+                        if cw <= 0 || ch <= 0 {
+                            return;
+                        }
+                        (left, bottom, cw, ch)
+                    } else {
+                        (px, py, pw, ph)
+                    };
+                    draw_pane_texture(
+                        instance,
+                        glow::NativeTexture(nz),
+                        qx,
+                        qy,
+                        qw,
+                        qh,
+                        scale_factor,
+                        0,
+                    );
+                },
+            );
+        }
+    }
+
     CompositeRemoteResult {
         remotes_with_new_frames,
         cover_ready_panes,

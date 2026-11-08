@@ -54,3 +54,5 @@ incremental = true
 [profile.release]
 lto = "thin"
 codegen-units = 16
+strip = true
+panic = "abort"

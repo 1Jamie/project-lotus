@@ -34,6 +34,8 @@ pub const KIND_REPLY: u32 = 4;
 pub const KIND_CONTEXT_ABANDONED: u32 = 5;
 /// Host → engine: canvas memfd slot advanced for `context_id` (body empty or tiny).
 pub const KIND_CANVAS_PRESENT: u32 = 6;
+/// Engine → host: canvas device-pixel bounds for hole-punch (body = 4×i32 x,y,w,h).
+pub const KIND_CANVAS_BOUNDS: u32 = 7;
 
 /// Parsed header fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

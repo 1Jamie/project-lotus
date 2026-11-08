@@ -396,14 +396,32 @@ pub(crate) fn forward_remote_input(fd: std::os::unix::io::RawFd, json: &str) {
     }
 }
 
+/// Whether a pane should receive mouse hit-testing.
+/// Crash-covered remotes never get input (chrome overlay owns the slot). Host recovery
+/// chrome (`__lotus_crash_*`) is hittable as soon as `pending_visible` is set — do not
+/// wait for a layout-commit flip of `is_visible` or clicks fall through to the dead remote.
+fn pane_accepts_pointer_input(pane: &PaneInstance) -> bool {
+    if pane.under_crash_cover {
+        return false;
+    }
+    if pane.is_visible {
+        return true;
+    }
+    // Overlays / crash chrome: pending_visible is enough to interact on the first frames.
+    pane.pending_visible
+        && (pane.id.starts_with("__lotus_crash_")
+            || pane.id.starts_with("__lotus_select_overlay")
+            || pane.anchor == PaneAnchor::None)
+}
+
 /// True floating overlays beat gutters. Tree-backed leaves (including sandboxed
 /// remotes with `Anchor::None`) must **not** — they are layout participants, not modals.
 fn is_gutter_blocking_overlay(instance: &WindowInstance, pane: &PaneInstance) -> bool {
-    if !pane.is_visible || pane.anchor != PaneAnchor::None {
+    if !pane_accepts_pointer_input(pane) || pane.anchor != PaneAnchor::None {
         return false;
     }
     if pane.id.starts_with("__lotus_crash_") {
-        return false;
+        return true; // crash chrome must beat gutters for Respawn clicks
     }
     // Participating layout-tree leaf (dock or split) → allow gutters through.
     if instance.layout_root.child_participating(&pane.id) {
@@ -645,7 +663,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             }
         }
 
-        // When remotes may publish soon, wake at display period to poll SHM; otherwise sleep.
+        // Event-driven parking: never ControlFlow::Poll. Local animation is driven by
+        // NewFrameReady → request_redraw; remotes with unread SHM use WaitUntil(refresh).
+        // Idle sockets → Wait (block until winit/user/Servo event).
         if pending_remote_work {
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + remote_period));
         } else {
@@ -771,6 +791,28 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         return;
                     }
                 };
+
+                // GPU broker must share the window surfman Connection so
+                // swap-chain Surfaces can become UI-thread SurfaceTextures.
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(connection) = RenderingContext::connection(rendering_context.as_ref()) {
+                        match connection.create_adapter() {
+                            Ok(adapter) => {
+                                if let Err(e) =
+                                    crate::gl::webgl_broker::bind_window_surfman(connection, adapter)
+                                {
+                                    error!("[webgl-broker] bind_window_surfman failed: {e}");
+                                }
+                            },
+                            Err(e) => {
+                                error!("[webgl-broker] create_adapter for bind failed: {e:?}");
+                            },
+                        }
+                    } else {
+                        error!("[webgl-broker] window rendering context has no Connection");
+                    }
+                }
                 
                 let _ = rendering_context.make_current();
 
@@ -950,6 +992,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         pending_visible: pane_opt.visible,
                         ghost_tex: None,
                         ghost_tex_size: None,
+                        ghost_valid: false,
+                        frame_seq: 0,
+                        last_presented_seq: 0,
                         is_remote: false,
                         remote_consumer: None,
                         remote_input_fd: None,
@@ -1050,6 +1095,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     committed_layout: None,
                     active_window_size: winit::dpi::PhysicalSize::new(size.width, size.height),
                     committed_window_size: None,
+                    last_presented_window_size: None,
                     active_select: None,
                     scrollbar_config,
                     trusted_origins: effective_trusted_origins,
@@ -1318,6 +1364,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     if let Some(pane) = instance.panes.get_mut(&pane_id) {
                         pane.animating = animating;
                         trace!("Rust: Window {} Pane {} animating={}", window_id, pane_id, animating);
+                        // Servo notes that animation ticks are driven by repaint; if we
+                        // miss a notify after resize the loop stalls until an external wake.
+                        if animating && window_is_viewable(instance) {
+                            instance.window.request_redraw();
+                        }
                     }
                 }
             },
@@ -1501,6 +1552,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         pending_visible: visible,
                         ghost_tex: None,
                         ghost_tex_size: None,
+                        ghost_valid: false,
+                        frame_seq: 0,
+                        last_presented_seq: 0,
                         is_remote: false,
                         remote_consumer: None,
                         remote_input_fd: None,
@@ -1591,6 +1645,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         pending_visible: visible,
                         ghost_tex: None,
                         ghost_tex_size: None,
+                        ghost_valid: false,
+                        frame_seq: 0,
+                        last_presented_seq: 0,
                         is_remote: true,
                         remote_consumer: consumer,
                         remote_input_fd: None,
@@ -1619,6 +1676,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             EngineCommand::RemovePane(window_id, pane_id) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
+                    crate::gl::compositor::destroy_local_ghost(instance, &pane_id);
                     let _ = instance.panes.remove(&pane_id);
                     // Focus fallback: If the removed pane was active, move focus to primary.
                     if instance.active_pane_id == pane_id {
@@ -1665,6 +1723,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         } else {
                             // No change needed, but ensure we don't leave it in resizing state
                             pane.is_resizing = false;
+                            pane.ghost_valid = false;
                             pane.pending_physical_rect = None;
                         }
                     }
@@ -1851,10 +1910,14 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         if let Some(crash) = instance.panes.get_mut(&crash_pane_id) {
                             crash.rect = logical;
                             crash.last_notified_rect = Some(logical);
+                            crash.last_physical_rect = phys;
                             crash.anchor = PaneAnchor::None;
                             // Below select overlay (i32::MAX) but above normal content.
                             crash.z_index = 2_000_000;
+                            // Eager visibility: hit-testing uses is_visible; waiting for a
+                            // layout flip left crash chrome painted (staged) but unclickable.
                             crash.pending_visible = true;
+                            crash.is_visible = true;
                             crash.is_dirty = true;
                             crash.pending_physical_rect = Some(phys);
                         }
@@ -1862,6 +1925,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         crash.anchor = PaneAnchor::None;
                         crash.z_index = 2_000_000;
                         crash.pending_visible = true;
+                        crash.is_visible = true;
                         crash.is_dirty = true;
                     }
 
@@ -2333,6 +2397,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         // in webrender (src_size <= len) / leaves inside_frame.
                                         if p.requested_servo_size != safe_size {
                                             p.needs_repaint = false;
+                                            // Re-arm so Servo can notify for the post-resize frame.
+                                            p.ready_to_repaint.store(true, Ordering::SeqCst);
                                             continue;
                                         }
                                         if p.offscreen_ctx.size() != safe_size {
@@ -2347,6 +2413,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                             let safe_size = ServoPhysicalSize::new(target_size.width.max(1), target_size.height.max(1));
                                             if current_size != safe_size {
                                                 p.needs_repaint = false;
+                                                p.ready_to_repaint.store(true, Ordering::SeqCst);
                                                 continue;
                                             }
                                         }
@@ -2375,6 +2442,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                             );
                                         } else {
                                             p.first_frame_painted = true;
+                                            p.frame_seq = p.frame_seq.wrapping_add(1);
                                         }
                                     }
                                     p.needs_repaint = false;
@@ -2397,6 +2465,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 let preserve_display = p.servo_busy && p.first_frame_painted;
                                 match consumer.consume_latest_frame(&instance.gl, preserve_display) {
                                     Ok(true) => {
+                                        p.frame_seq = p.frame_seq.wrapping_add(1);
                                         preflight_remote_frames.push(p.id.clone());
                                         let (tw, th) = consumer.latest_upload_size();
                                         let want = p.requested_servo_size;
@@ -2535,6 +2604,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                             } else {
                                                 p.pending_physical_rect = None;
                                                 p.is_resizing = false;
+                                                // Next resize edge must re-seed from a live FBO.
+                                                p.ghost_valid = false;
                                             }
                                         }
                                     }
@@ -2553,94 +2624,113 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                             }
 
-                            let mut sorted_panes: Vec<_> = instance.panes.values_mut().collect();
-                            sorted_panes.sort_by_key(|p| p.z_index);
-
-                            let active_w = instance.active_window_size.width.max(1);
-                            let active_h = instance.active_window_size.height.max(1);
-
-                            gl::ensure_textures(instance, active_w, active_h);
-                            let composite_remotes = gl::composite_panes_to_scene(
+                            // Idle parking: skip scene clear/bind + swapchain present when
+                            // pane pixels and layout are unchanged. Skipping present is
+                            // intentional — presenting would re-arm the Wayland frame
+                            // callback and pin the host at display rate with no damage.
+                            // (Hidden windows still present-only above to release callbacks.)
+                            let needs_present = gl::scene_needs_present(
                                 instance,
-                                active_w,
-                                active_h,
-                                scale_factor,
-                                is_transaction_pending,
-                                transaction_complete,
+                                window_size,
+                                _flip_occurred,
                                 &pending_hides,
                             );
-                            let mut remotes_updated = composite_remotes.remotes_with_new_frames;
-                            for id in preflight_remote_frames {
-                                if !remotes_updated.contains(&id) {
-                                    remotes_updated.push(id);
-                                }
-                            }
-                            let mut cover_ready: Vec<(String, u64)> = composite_remotes
-                                .cover_ready_panes
-                                .into_iter()
-                                .map(|id| (id, 0u64))
-                                .collect();
-                            for (id, seq) in preflight_cover_ready {
-                                if !cover_ready.iter().any(|(existing, _)| existing == &id) {
-                                    cover_ready.push((id, seq));
-                                }
-                            }
 
-                            let live_w = window_size.width.max(1) as i32;
-                            let live_h = window_size.height.max(1) as i32;
-                            gl::blit_scene_to_window(instance, live_w, live_h, scale_factor);
+                            if needs_present {
+                                let active_w = instance.active_window_size.width.max(1);
+                                let active_h = instance.active_window_size.height.max(1);
 
-                            // Timing already applied at RedrawRequested entry; keep Vsync
-                            // pull-model while focused + viewable, or while awaiting respawn frame.
-                            if window_is_viewable(instance) {
-                                let presentation_time_ns = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_nanos() as u64)
-                                    .unwrap_or(0);
-                                for pane_id in &remotes_updated {
-                                    if let Some(pane) = instance.panes.get(pane_id) {
-                                        if instance.os_focused || pane.await_host_composited_frame {
-                                            if let Some(fd) = pane.remote_input_fd {
-                                                let surface_id = format!("{}:{}", uuid, pane_id);
-                                                send_remote_vsync(
-                                                    fd,
-                                                    &surface_id,
-                                                    presentation_time_ns,
-                                                );
+                                gl::ensure_textures(instance, active_w, active_h);
+                                let composite_remotes = gl::composite_panes_to_scene(
+                                    instance,
+                                    active_w,
+                                    active_h,
+                                    scale_factor,
+                                    is_transaction_pending,
+                                    transaction_complete,
+                                    &pending_hides,
+                                );
+                                let mut remotes_updated = composite_remotes.remotes_with_new_frames;
+                                for id in preflight_remote_frames {
+                                    if !remotes_updated.contains(&id) {
+                                        remotes_updated.push(id);
+                                    }
+                                }
+                                let mut cover_ready: Vec<(String, u64)> = composite_remotes
+                                    .cover_ready_panes
+                                    .into_iter()
+                                    .map(|id| (id, 0u64))
+                                    .collect();
+                                for (id, seq) in preflight_cover_ready {
+                                    if !cover_ready.iter().any(|(existing, _)| existing == &id) {
+                                        cover_ready.push((id, seq));
+                                    }
+                                }
+
+                                let live_w = window_size.width.max(1) as i32;
+                                let live_h = window_size.height.max(1) as i32;
+                                gl::blit_scene_to_window(instance, live_w, live_h, scale_factor);
+                                gl::ack_presented_scene(instance, window_size);
+
+                                // Timing already applied at RedrawRequested entry; keep Vsync
+                                // pull-model while focused + viewable, or while awaiting respawn.
+                                if window_is_viewable(instance) {
+                                    let presentation_time_ns = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_nanos() as u64)
+                                        .unwrap_or(0);
+                                    for pane_id in &remotes_updated {
+                                        if let Some(pane) = instance.panes.get(pane_id) {
+                                            if instance.os_focused || pane.await_host_composited_frame {
+                                                if let Some(fd) = pane.remote_input_fd {
+                                                    let surface_id = format!("{}:{}", uuid, pane_id);
+                                                    send_remote_vsync(
+                                                        fd,
+                                                        &surface_id,
+                                                        presentation_time_ns,
+                                                    );
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
 
-                            // Notify JS only after the host has the fresh pixels in GL —
-                            // FramePublished alone still leaves the prior life's texture up.
-                            for (pane_id, pub_seq) in &cover_ready {
-                                if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
-                                    "event": "remote-frame-composited",
-                                    "window_id": uuid,
-                                    "pane_id": pane_id,
-                                    "pub_seq": pub_seq,
-                                })) {
-                                    let mut wrapped = Vec::with_capacity(msg.len() + 1);
-                                    wrapped.push(MSG_TYPE_DATA);
-                                    wrapped.extend(msg);
-                                    self.callback.call(
-                                        (uuid.clone(), vec![wrapped.into()]),
-                                        ThreadsafeFunctionCallMode::NonBlocking,
-                                    );
+                                // Notify JS only after the host has the fresh pixels in GL —
+                                // FramePublished alone still leaves the prior life's texture up.
+                                for (pane_id, pub_seq) in &cover_ready {
+                                    if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
+                                        "event": "remote-frame-composited",
+                                        "window_id": uuid,
+                                        "pane_id": pane_id,
+                                        "pub_seq": pub_seq,
+                                    })) {
+                                        let mut wrapped = Vec::with_capacity(msg.len() + 1);
+                                        wrapped.push(MSG_TYPE_DATA);
+                                        wrapped.extend(msg);
+                                        self.callback.call(
+                                            (uuid.clone(), vec![wrapped.into()]),
+                                            ThreadsafeFunctionCallMode::NonBlocking,
+                                        );
+                                    }
                                 }
+                            } else {
+                                trace!("Rust: [Lifecycle] RedrawRequested skip present (no damage)");
                             }
 
-                            // LOCK STEP: The current frame is now fully presented to the GPU and screen.
+                            // LOCK STEP: clear busy only after the nuclear flip lands.
+                            // Always re-run layout dispatch afterward: paint may have just
+                            // cleared `needs_repaint`, which was blocking `webview.resize()`
+                            // when the transaction opened. Without this, dock toggles against
+                            // a continuously animating WebGL pane freeze on a stretched ghost
+                            // until some other IPC (e.g. palette) calls recalculate_layout.
                             if instance.committed_layout.is_none() {
                                 for pane in instance.panes.values_mut() {
                                     pane.servo_busy = false;
                                 }
-                                let window_size = instance.window.inner_size();
-                                let scale_factor = instance.window.scale_factor() as f32;
-                                instance.recalculate_layout(window_size, scale_factor);
                             }
+                            let window_size = instance.window.inner_size();
+                            let scale_factor = instance.window.scale_factor() as f32;
+                            instance.recalculate_layout(window_size, scale_factor);
 
                             trace!("Rust: [Lifecycle] RedrawRequested DONE");
                         }
@@ -2833,7 +2923,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             sorted_panes.sort_by_key(|p| -p.z_index); // Reverse Z for hit-testing
 
                             for pane in sorted_panes {
-                                if !pane.is_visible { continue; }
+                                if !pane_accepts_pointer_input(pane) { continue; }
                                 let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
                                 let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
 
@@ -2943,7 +3033,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             let mut sorted_panes: Vec<_> = instance.panes.values().collect();
                             sorted_panes.sort_by_key(|p| -p.z_index);
                             for pane in sorted_panes {
-                                if !pane.is_visible { continue; }
+                                if !pane_accepts_pointer_input(pane) { continue; }
                                 let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
                                 let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
 
@@ -3070,7 +3160,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             if let Some(_) = &instance.active_select {
                                 let overlay_pane = instance.panes.get("__lotus_select_overlay");
                                 let is_inside_overlay = overlay_pane.map(|p| {
-                                    if !p.is_visible { return false; }
+                                    if !pane_accepts_pointer_input(p) { return false; }
                                     let (px, py, pw, ph) = p.input_physical_rect(scale_factor);
                                     let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
                                     rect.contains(instance.last_mouse_pos)
@@ -3126,7 +3216,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             
                             let mut found_id = None;
                             for pane in sorted_panes {
-                                if !pane.is_visible { continue; }
+                                if !pane_accepts_pointer_input(pane) { continue; }
                                 let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
                                 let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
 
@@ -3293,7 +3383,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         if let Some(_) = &instance.active_select {
                             let overlay_pane = instance.panes.get("__lotus_select_overlay");
                             let is_inside_overlay = overlay_pane.map(|p| {
-                                if !p.is_visible { return false; }
+                                if !pane_accepts_pointer_input(p) { return false; }
                                 let (px, py, pw, ph) = p.input_physical_rect(scale_factor);
                                 let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
                                 rect.contains(instance.last_mouse_pos)
@@ -3329,7 +3419,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         let mut sorted_panes: Vec<_> = instance.panes.values_mut().collect();
                         sorted_panes.sort_by_key(|p| -p.z_index);
                         for pane in sorted_panes {
-                            if !pane.is_visible { continue; }
+                            if !pane_accepts_pointer_input(pane) { continue; }
                             let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
                             let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
 

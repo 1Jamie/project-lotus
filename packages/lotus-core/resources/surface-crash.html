@@ -87,9 +87,21 @@
     <div id="status"></div>
     <script>
         let paneId = null;
+        let detailsReady = false;
+        let readyPoll = null;
         const btn = document.getElementById('btn-respawn');
         const meta = document.getElementById('meta');
         const status = document.getElementById('status');
+
+        try {
+            const q = new URLSearchParams(location.search || '');
+            const fromQuery = q.get('paneId');
+            if (fromQuery) {
+                paneId = fromQuery;
+                btn.disabled = false;
+                meta.textContent = 'pane ' + paneId + ' · waiting for crash details…';
+            }
+        } catch (_) {}
 
         function setStatus(text, isError) {
             status.textContent = text || '';
@@ -104,10 +116,20 @@
             if (info && info.reason) parts.push(String(info.reason));
             if (info && (info.code !== null && info.code !== undefined)) parts.push('code ' + info.code);
             if (info && info.isolated) parts.push('isolated');
+            detailsReady = parts.length > 0 && !!(info && (info.sig || info.reason || info.paneId));
             meta.textContent = parts.length ? parts.join(' · ') : 'Surface offline';
             btn.disabled = !paneId;
             btn.textContent = 'Respawn surface';
             setStatus('');
+            if (detailsReady && readyPoll) {
+                clearInterval(readyPoll);
+                readyPoll = null;
+            }
+        }
+
+        function requestCrashInfo() {
+            if (!window.lotus || typeof window.lotus.send !== 'function') return;
+            window.lotus.send('__lotus_crash_ready', {}, { urgent: true });
         }
 
         function wireLotus() {
@@ -118,13 +140,29 @@
                     setStatus(result.newPid ? ('Restored (PID ' + result.newPid + ')') : 'Restored');
                     btn.disabled = true;
                     btn.textContent = 'Online';
+                    detailsReady = true;
+                    if (readyPoll) {
+                        clearInterval(readyPoll);
+                        readyPoll = null;
+                    }
                     return;
                 }
                 setStatus((result && result.error) || 'Respawn failed', true);
                 btn.disabled = !paneId;
                 btn.textContent = 'Respawn surface';
             });
-            window.lotus.send('__lotus_crash_ready', {}, { urgent: true });
+            requestCrashInfo();
+            // Keep asking until host flushes latched crash-info (WS may connect late).
+            if (!readyPoll) {
+                readyPoll = setInterval(() => {
+                    if (detailsReady) {
+                        clearInterval(readyPoll);
+                        readyPoll = null;
+                        return;
+                    }
+                    requestCrashInfo();
+                }, 200);
+            }
             return true;
         }
 

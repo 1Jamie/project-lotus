@@ -28,3 +28,6 @@ packages/lotus-core/index.d.ts
 dist/
 installers/
 .flatpak-builder
+
+# Local scratch (never commit)
+tmp/
