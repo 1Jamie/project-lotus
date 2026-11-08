@@ -7,6 +7,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+use log::{debug, warn};
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use servo::resources::{self, Resource};
@@ -59,7 +60,7 @@ impl AutonomousKeyDeriver {
         let shard3 = Self::read_shard_from_binary("LOTUS_APP_S2")?;
 
         if shard2.len() != 32 || shard3.len() != 32 {
-            eprintln!("[DEBUG] Invalid shard length: s2={}, s3={}", shard2.len(), shard3.len());
+            debug!("Invalid VFS shard length: s2={}, s3={}", shard2.len(), shard3.len());
             return None;
         }
 
@@ -67,7 +68,7 @@ impl AutonomousKeyDeriver {
         for i in 0..32 {
             key[i] = shard2[i] ^ shard3[i] ^ shard1[i % shard1.len()];
         }
-        eprintln!("[DEBUG] Key derivation successful.");
+        debug!("VFS key derivation successful");
         Some(key)
     }
 
@@ -78,7 +79,7 @@ impl AutonomousKeyDeriver {
     }
 
     pub(crate) fn read_shard_from_binary(name: &str) -> Option<Vec<u8>> {
-        eprintln!("[DEBUG] Reading shard: {}", name);
+        debug!("Reading VFS shard: {}", name);
         #[cfg(target_os = "windows")]
         {
             use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, FindResourceW, LoadResource, LockResource, SizeofResource};
@@ -117,7 +118,7 @@ impl AutonomousKeyDeriver {
             let file = match File::open("/proc/self/exe") {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("[DEBUG] Failed to open /proc/self/exe: {}", e);
+                    debug!("Failed to open /proc/self/exe: {}", e);
                     return None;
                 }
             };
@@ -125,7 +126,7 @@ impl AutonomousKeyDeriver {
                 match memmap2::Mmap::map(&file) {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("[DEBUG] Failed to map /proc/self/exe: {}", e);
+                        debug!("Failed to map /proc/self/exe: {}", e);
                         return None;
                     }
                 }
@@ -133,18 +134,18 @@ impl AutonomousKeyDeriver {
             let obj_file = match object::File::parse(&*mmap) {
                 Ok(o) => o,
                 Err(e) => {
-                    eprintln!("[DEBUG] Failed to parse ELF: {}", e);
+                    debug!("Failed to parse ELF: {}", e);
                     return None;
                 }
             };
             let section = match obj_file.section_by_name(name) {
                 Some(s) => s,
                 None => {
-                    eprintln!("[DEBUG] Section not found: {}", name);
+                    debug!("VFS section not found: {}", name);
                     return None;
                 }
             };
-            eprintln!("[DEBUG] Found section {}, size: {}", name, section.size());
+            debug!("Found VFS section {}, size: {}", name, section.size());
             section.data().ok().map(|d| d.to_vec())
         }
 
@@ -168,7 +169,7 @@ impl EncryptedVfs {
             return Ok(None);
         }
 
-        eprintln!("[DEBUG] Initializing EncryptedVfs (detected encrypted sections)...");
+        debug!("Initializing EncryptedVfs (detected encrypted sections)");
         let key = match AutonomousKeyDeriver::derive_key() {
             Some(k) => k,
             None => {
@@ -193,7 +194,7 @@ impl EncryptedVfs {
             return Err("Corrupted VFS payload: index size exceeds binary data length".to_string());
         }
 
-        eprintln!("[DEBUG] VFS Index size: {}", index_size);
+        debug!("VFS index size: {}", index_size);
         let index_json = &vfs_data[12..12+index_size];
         let index: HashMap<String, (usize, usize)> = match serde_json::from_slice(index_json) {
             Ok(idx) => idx,
@@ -203,7 +204,7 @@ impl EncryptedVfs {
         };
 
         let data_offset = 12 + index_size;
-        eprintln!("[DEBUG] VFS initialized with {} entries.", index.len());
+        debug!("VFS initialized with {} entries", index.len());
 
         Ok(Some(Self {
             data: vfs_data,
@@ -235,7 +236,7 @@ impl resources::ResourceReaderMethods for ResourceReader {
         match fs::read(&path) {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("Rust Warning: Missing resource: {:?} ({})", path, e);
+                warn!("Missing resource: {:?} ({})", path, e);
                 Vec::new()
             }
         }

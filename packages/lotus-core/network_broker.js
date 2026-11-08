@@ -93,16 +93,14 @@ function isAllowedPublicIp(ipString, allowLocalhost = false) {
 /**
  * Normalizes an origin string according to WHATWG rules.
  */
+const {
+    normalizeOriginBroker,
+    isTrustedOrigin,
+} = require('./origin_normalize.js');
+
+/** BrokerHttp-only normalizer (http/https). See origin_normalize.js / origin.rs. */
 function normalizeOrigin(urlStr) {
-    try {
-        const u = new URL(urlStr);
-        if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-            return null;
-        }
-        return u.origin.toLowerCase();
-    } catch {
-        return null;
-    }
+    return normalizeOriginBroker(urlStr);
 }
 
 /**
@@ -292,6 +290,8 @@ class NetworkBroker {
         this.requestTimeoutMs = options.requestTimeoutMs || REQUEST_TIMEOUT_MS;
         this.maxConcurrentRequests = options.maxConcurrentRequests || MAX_CONCURRENT_REQUESTS;
         this.maxRedirectHops = options.maxRedirectHops !== undefined ? options.maxRedirectHops : MAX_REDIRECT_HOPS;
+        // Explicit options.ipcPort always wins over the host registry (unit tests).
+        this.ipcPort = options.ipcPort || 0;
 
         this._httpAgent = new http.Agent({ keepAlive: true, maxSockets: this.maxConcurrentRequests });
         this._httpsAgent = new https.Agent({ keepAlive: true, maxSockets: this.maxConcurrentRequests });
@@ -699,7 +699,7 @@ class NetworkBroker {
 
             // Destination origin validation against surface policy
             const destOrigin = normalizeOrigin(url);
-            if (surface.trustedOrigins && !surface.trustedOrigins.has(destOrigin) && surface.trustedOrigins.size > 0) {
+            if (surface.trustedOrigins && surface.trustedOrigins.size > 0 && !isTrustedOrigin(destOrigin, surface.trustedOrigins)) {
                 return reject(Object.assign(new Error(`Destination origin ${destOrigin} denied by surface policy`), { code: 'E_BROKER_ORIGIN_DENIED' }));
             }
 
@@ -858,14 +858,13 @@ class NetworkBroker {
         }
 
         const getEffectiveIpcPort = () => {
+            // Precedence: call options → instance field → host registry (never lotus.js).
             if (options.ipcPort) return options.ipcPort;
             if (this.ipcPort) return this.ipcPort;
             try {
-                const lotusCore = require('./lotus.js');
-                if (typeof lotusCore.getIpcPort === 'function') {
-                    const p = lotusCore.getIpcPort();
-                    if (p) return p;
-                }
+                const { getIpcPort } = require('./lotus-host-registry.js');
+                const p = getIpcPort();
+                if (p) return p;
             } catch {}
             return 0;
         };
@@ -1155,6 +1154,7 @@ module.exports = {
     HostCookieStore,
     isAllowedPublicIp,
     normalizeOrigin,
+    isTrustedOrigin,
     parseCookieString,
     measureAttributesBytes,
     MAX_COOKIE_SEQ_GAP,

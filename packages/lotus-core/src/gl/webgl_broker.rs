@@ -27,28 +27,42 @@ use webgl::broker_wire::rehydrate_webgl_command;
 use webgl::webgl_presented_frames::WebGLPresentedBufferMap;
 use webgl::webgl_thread::{WebGLContextBusyMap, WebGLThread, WebGLThreadInit};
 
-static BROKER_STARTED: AtomicBool = AtomicBool::new(false);
-static BROKER_THREAD: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+static BROKER_THREADS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
 
 static GL_READY: AtomicBool = AtomicBool::new(false);
 static GL_SENDER: Mutex<Option<GenericSender<WebGLMsg>>> = Mutex::new(None);
 
-/// Host end of the current engine GPU socket (for GL-thread present notifies).
-static GPU_OUT_FD: Mutex<Option<RawFd>> = Mutex::new(None);
-/// Serialize all writes on the GPU socket (feeder replies + GL-thread presents).
+/// Per-context host GPU socket (CreateContext feeder fd → present notifies).
+static CONTEXT_GPU_FD: LazyLock<Mutex<HashMap<u64, RawFd>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Serialize all writes on GPU sockets (feeder replies + GL-thread presents).
 static GPU_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static CANVAS_PLANES: LazyLock<Mutex<HashMap<u64, SealedMemfdPlane>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-struct BrokerThreadExitGuard;
+/// Clears only state owned by one engine feeder when that socket EOF's.
+struct BrokerThreadExitGuard {
+    fd: RawFd,
+}
 
 impl Drop for BrokerThreadExitGuard {
     fn drop(&mut self) {
-        BROKER_STARTED.store(false, Ordering::SeqCst);
-        *GPU_OUT_FD.lock().expect("poisoned") = None;
-        CANVAS_PLANES.lock().expect("poisoned").clear();
-        if let Ok(mut slot) = BROKER_THREAD.lock() {
-            *slot = None;
+        let fd = self.fd;
+        let removed: Vec<u64> = {
+            let mut map = CONTEXT_GPU_FD.lock().expect("poisoned");
+            let ids: Vec<u64> = map
+                .iter()
+                .filter(|(_, &mapped)| mapped == fd)
+                .map(|(&id, _)| id)
+                .collect();
+            for id in &ids {
+                map.remove(id);
+            }
+            ids
+        };
+        let mut planes = CANVAS_PLANES.lock().expect("poisoned");
+        for id in removed {
+            planes.remove(&id);
         }
     }
 }
@@ -72,7 +86,7 @@ pub fn ensure_webgl_broker() -> Result<(), String> {
 }
 
 fn notify_canvas_present(context_id: WebGLContextId, canvas_epoch: Option<servo_base::Epoch>) {
-    let fd = match *GPU_OUT_FD.lock().expect("poisoned") {
+    let fd = match CONTEXT_GPU_FD.lock().expect("poisoned").get(&context_id.0).copied() {
         Some(fd) => fd,
         None => return,
     };
@@ -182,30 +196,18 @@ fn clone_gl_sender() -> Result<GenericSender<WebGLMsg>, String> {
 pub fn register_gpu_fd(host_fd: RawFd) -> Result<(), String> {
     ensure_webgl_broker()?;
 
-    if BROKER_STARTED
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Err("WebGL GPU broker already registered for this process".to_string());
-    }
-
-    *GPU_OUT_FD.lock().expect("poisoned") = Some(host_fd);
-
+    // One feeder per sandboxed engine socket. Presents route via CONTEXT_GPU_FD.
     let jh = std::thread::Builder::new()
         .name("lotus-gpu-broker".into())
         .spawn(move || run_gpu_feeder(host_fd))
-        .map_err(|e| {
-            BROKER_STARTED.store(false, Ordering::SeqCst);
-            *GPU_OUT_FD.lock().expect("poisoned") = None;
-            e.to_string()
-        })?;
+        .map_err(|e| e.to_string())?;
 
-    *BROKER_THREAD.lock().expect("poisoned") = Some(jh);
+    BROKER_THREADS.lock().expect("poisoned").push(jh);
     Ok(())
 }
 
 fn run_gpu_feeder(fd: RawFd) {
-    let _exit = BrokerThreadExitGuard;
+    let _exit = BrokerThreadExitGuard { fd };
     let _closer = FdCloser(fd);
 
     loop {
@@ -383,6 +385,10 @@ fn handle_command(
                 }) => {
                     let context_id = msg_sender.context_id();
                     let _ = msg_sender;
+                    CONTEXT_GPU_FD
+                        .lock()
+                        .expect("poisoned")
+                        .insert(context_id.0, fd);
                     let reply = WireReply::CreateContext(Ok(WireCreateContextOk {
                         context_id,
                         limits,
@@ -397,6 +403,7 @@ fn handle_command(
                         r
                     } else {
                         // Refuse context without a sealed plane (plan: no silent degrade).
+                        CONTEXT_GPU_FD.lock().expect("poisoned").remove(&context_id.0);
                         let fail = WireReply::CreateContext(Err(
                             "canvas memfd seal/alloc failed".into(),
                         ));
@@ -423,7 +430,7 @@ fn handle_command(
             let result = rx.recv().unwrap_or(Err("resize recv failed".into()));
             match result {
                 Ok(()) => {
-                    // Replace plane generation.
+                    // Replace plane generation; keep CONTEXT_GPU_FD mapping (same feeder).
                     CANVAS_PLANES.lock().expect("poisoned").remove(&context_id.0);
                     let reply = WireReply::ResizeContext(Ok(()));
                     if let Some(ro) = install_canvas_plane(context_id, size.width, size.height) {
@@ -444,6 +451,7 @@ fn handle_command(
             }
         },
         WireWebGLMsg::RemoveContext(id) => {
+            CONTEXT_GPU_FD.lock().expect("poisoned").remove(&id.0);
             CANVAS_PLANES.lock().expect("poisoned").remove(&id.0);
             let _ = sender.send(WebGLMsg::RemoveContext(id));
             Ok(())
@@ -477,7 +485,8 @@ fn handle_command(
             write_reply(fd, corr, &WireReply::ClearPainterResources)
         },
         WireWebGLMsg::Exit => {
-            let _ = sender.send(WebGLMsg::Exit);
+            // Shared host GL thread must outlive other engine feeders — only
+            // tear down this feeder's socket loop, not the process-wide WebGLThread.
             Err(())
         },
     }

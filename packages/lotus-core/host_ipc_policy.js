@@ -14,7 +14,10 @@
 
 const util = require('node:util');
 const crypto = require('node:crypto');
-const { normalizeOrigin } = require('./network_broker.js');
+const {
+    normalizeOriginIpc: normalizeOrigin,
+    isTrustedOrigin,
+} = require('./origin_normalize.js');
 const { deriveOriginForUrl } = require('./origin_derivation.js');
 
 let track1GenerationCounter = 0;
@@ -220,15 +223,17 @@ function validateAndProjectOutput(schema, value) {
 /**
  * Surface state tracking manager.
  */
-function syncSurfacePolicyToNative(surface) {
+function syncSurfacePolicyToNative(surface, options = {}) {
     let allowedMethods = Array.from(surface.allowedMethods || []);
     if (allowedMethods.length === 0) {
-        try {
-            const lotusCore = require('./lotus.js');
-            if (lotusCore.hostIpcRouter && lotusCore.hostIpcRouter.track2Methods) {
-                allowedMethods = Array.from(lotusCore.hostIpcRouter.track2Methods.keys());
-            }
-        } catch (_) {}
+        // Explicit options.policyRouter beats the host registry (unit tests / cold require).
+        const router = options.policyRouter
+            || (() => {
+                try { return require('./lotus-host-registry.js').getHostIpcRouter(); } catch (_) { return null; }
+            })();
+        if (router && router.track2Methods) {
+            allowedMethods = Array.from(router.track2Methods.keys());
+        }
     }
 
     if (typeof globalThis.__lotusCoreRegisterSurfacePolicy === 'function') {
@@ -243,8 +248,8 @@ function syncSurfacePolicyToNative(surface) {
         );
     } else {
         try {
-            const lotusCore = require('./lotus.js');
-            const fn = lotusCore.registerSurfacePolicy || lotusCore.register_surface_policy;
+            const native = require('./index.js');
+            const fn = native.registerSurfacePolicy || native.register_surface_policy;
             if (typeof fn === 'function') {
                 fn(
                     surface.surfaceId,
@@ -409,7 +414,9 @@ class HostSurfaceTracker {
     setTrustedOrigins(surfaceId, origins) {
         const surface = this.surfaces.get(surfaceId);
         if (surface) {
-            surface.trustedOrigins = new Set(origins.map(normalizeOrigin));
+            surface.trustedOrigins = new Set(
+                origins.map(normalizeOrigin).filter((o) => o && o !== 'null')
+            );
         }
     }
 }
@@ -482,7 +489,7 @@ class HostIpcPolicyRouter {
             err.code = 'E_DOCUMENT_MISMATCH';
             throw err;
         }
-        if (surface.trustedOrigins.size > 0 && !surface.trustedOrigins.has(surface.currentOrigin)) {
+        if (surface.trustedOrigins.size > 0 && !isTrustedOrigin(surface.currentOrigin, surface.trustedOrigins)) {
             const err = new Error(`E_ORIGIN_NOT_TRUSTED: Origin ${surface.currentOrigin} is not in trusted set`);
             err.code = 'E_ORIGIN_NOT_TRUSTED';
             throw err;

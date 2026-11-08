@@ -12,6 +12,7 @@ use log::{info, error, debug};
 
 pub(crate) mod window_state;
 pub(crate) mod platform;
+pub mod origin;
 pub mod ipc_security;
 pub mod vfs;
 pub mod layout;
@@ -19,10 +20,15 @@ pub mod window;
 pub mod server;
 pub mod delegate;
 pub mod gl;
+pub mod userscripts;
 pub mod app;
 
 use crate::window_state::WindowStateManager;
 pub use app::*;
+pub use origin::{
+    is_trusted_origin, normalize_origin_broker, normalize_origin_ipc, origin_grants_trust,
+    NormalizeMode,
+};
 pub(crate) use vfs::*;
 pub use layout::{PaneAnchor, StagedPaneLayout, StagedLayout};
 pub use server::{dispatch_to_renderer, start_ipc_server, WS_SENDERS, WS_PENDING};

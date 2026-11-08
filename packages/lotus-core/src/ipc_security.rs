@@ -47,44 +47,8 @@ pub fn constant_time_eq_str(a: &str, b: &str) -> bool {
     constant_time_eq(a.as_bytes(), b.as_bytes())
 }
 
-/// Normalizes an origin string according to WHATWG standard serialization.
-///
-/// Converts host to lowercase, standardizes default ports (omits :80 for http, :443 for https),
-/// and preserves special schemes like `lotus-resource://` and `null`.
-pub fn normalize_origin(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed == "null" {
-        return Some("null".to_string());
-    }
-
-    if let Ok(parsed) = url::Url::parse(trimmed) {
-        let scheme = parsed.scheme().to_lowercase();
-        if scheme == "data" || scheme == "javascript" {
-            return Some("null".to_string());
-        }
-        if scheme == "lotus-resource" {
-            let host = parsed.host_str().unwrap_or("localhost").to_lowercase();
-            return Some(format!("lotus-resource://{}", host));
-        }
-        let host = parsed.host_str()?.to_lowercase();
-        let port_part = match parsed.port() {
-            Some(p) => {
-                if (scheme == "http" && p == 80) || (scheme == "https" && p == 443) {
-                    String::new()
-                } else {
-                    format!(":{}", p)
-                }
-            }
-            None => String::new(),
-        };
-        Some(format!("{}://{}{}", scheme, host, port_part))
-    } else {
-        None
-    }
-}
+/// Re-export shared IpcTrust normalizer (see [`crate::origin`]).
+pub use crate::origin::normalize_origin_ipc as normalize_origin;
 
 /// Continuous Token Bucket rate limiter for per-surface request throttling.
 #[derive(Debug, Clone)]

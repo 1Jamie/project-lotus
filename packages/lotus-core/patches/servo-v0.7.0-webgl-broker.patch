@@ -4216,7 +4216,7 @@ index 00000000000..f955f1c7f90
 +    dst
 +}
 diff --git a/components/webgl/webgl_thread.rs b/components/webgl/webgl_thread.rs
-index 19c29104eec..bdf7d3771ac 100644
+index 19c29104eec..9957d8300cf 100644
 --- a/components/webgl/webgl_thread.rs
 +++ b/components/webgl/webgl_thread.rs
 @@ -26,7 +26,7 @@ use paint_api::{
@@ -4358,7 +4358,34 @@ index 19c29104eec..bdf7d3771ac 100644
              return Err(format!("No PainterSurfmanDetails found for {painter_id:?}"));
          };
  
-@@ -805,6 +845,8 @@ impl WebGLThread {
+@@ -545,9 +585,23 @@ impl WebGLThread {
+         // Clear it to ensure that  make_current() is called in subsequent commands.
+         self.bound_context_id = None;
+ 
+-        // This can happen if the Webview was dropped while one of its ScriptThreads
+-        // is still issuing asynchronous commands to the WebGL thread.
+-        let Some(painter_surfman_details) = self.painter_surfman_details_map.get(painter_id) else {
++        // Sandboxed engines broker WebGL onto the host GL thread, which only
++        // registers TEST_PAINTER_ID (via default_painter_id_slot). Fall back the
++        // same way get_or_create_device_for_painter does so CreateContext works
++        // for arbitrary jail PainterIds.
++        let painter_surfman_details = if let Some(d) = self.painter_surfman_details_map.get(painter_id)
++        {
++            d
++        } else if let Some(default_id) = *self.default_painter_id_slot.lock() {
++            match self.painter_surfman_details_map.get(default_id) {
++                Some(d) => d,
++                None => {
++                    return Err(format!(
++                        "PainterSurfmanDetails not found for {painter_id:?} (default {default_id:?} missing)"
++                    ));
++                },
++            }
++        } else {
+             return Err(format!(
+                 "PainterSurfmanDetails not found for {painter_id:?}"
+             ));
+@@ -805,6 +859,8 @@ impl WebGLThread {
              self.paint_api.delete_image(image_key);
          }
  
@@ -4367,7 +4394,7 @@ index 19c29104eec..bdf7d3771ac 100644
          if !self.contexts.contains_key(&context_id) {
              return;
          };
-@@ -852,81 +894,166 @@ impl WebGLThread {
+@@ -852,81 +908,166 @@ impl WebGLThread {
              self.make_current_if_needed(context_id)
                  .expect("Where's the GL data?");
  
@@ -4385,7 +4412,9 @@ index 19c29104eec..bdf7d3771ac 100644
 +                    .get_mut(&context_id)
 +                    .expect("Missing WebGL context");
 +                debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
-+
+ 
+-            // Ensure there are no pending GL errors from other parts of the pipeline.
+-            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 +                let SurfaceInfo { size, .. } = data
 +                    .device
 +                    .context_surface_info(&data.ctx)
@@ -4404,7 +4433,10 @@ index 19c29104eec..bdf7d3771ac 100644
 +                )
 +            };
  
--            // Ensure there are no pending GL errors from other parts of the pipeline.
+-            // Check to see if any of the current framebuffer bindings are the surface we're about
+-            // to swap out. If so, we'll have to reset them after destroying the surface.
+-            let framebuffer_rebinding_info =
+-                FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
 -            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
 +            self.readback_present_default_framebuffer(
 +                context_id,
@@ -4415,25 +4447,16 @@ index 19c29104eec..bdf7d3771ac 100644
 +                canvas_epoch,
 +            );
  
--            // Check to see if any of the current framebuffer bindings are the surface we're about
--            // to swap out. If so, we'll have to reset them after destroying the surface.
--            let framebuffer_rebinding_info =
--                FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
--            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
-+            {
-+                let data = self
-+                    .contexts
-+                    .get_mut(&context_id)
-+                    .expect("Missing WebGL context");
- 
 -            debug!("Getting swap chain for {:?}", context_id);
 -            let swap_chain = self
 -                .webrender_swap_chains
 -                .get(context_id)
 -                .expect("Where's the swap chain?");
-+                let framebuffer_rebinding_info =
-+                    FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
-+                debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
++            {
++                let data = self
++                    .contexts
++                    .get_mut(&context_id)
++                    .expect("Missing WebGL context");
  
 -            debug!("Swapping {:?}", context_id);
 -            swap_chain
@@ -4448,11 +4471,9 @@ index 19c29104eec..bdf7d3771ac 100644
 -                )
 -                .unwrap();
 -            debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
-+                debug!("Getting swap chain for {:?}", context_id);
-+                let swap_chain = self
-+                    .webrender_swap_chains
-+                    .get(context_id)
-+                    .expect("Where's the swap chain?");
++                let framebuffer_rebinding_info =
++                    FramebufferRebindingInfo::detect(&data.device, &data.ctx, &data.gl);
++                debug_assert_eq!(unsafe { data.gl.get_error() }, gl::NO_ERROR);
  
 -            if !data.attributes.preserve_drawing_buffer {
 -                debug!("Clearing {:?}", context_id);
@@ -4461,6 +4482,12 @@ index 19c29104eec..bdf7d3771ac 100644
 -                    .requested_flags
 -                    .contains(ContextAttributeFlags::ALPHA);
 -                let clear_color = [0.0, 0.0, 0.0, !alpha as i32 as f32];
++                debug!("Getting swap chain for {:?}", context_id);
++                let swap_chain = self
++                    .webrender_swap_chains
++                    .get(context_id)
++                    .expect("Where's the swap chain?");
++
 +                debug!("Swapping {:?}", context_id);
                  swap_chain
 -                    .clear_surface(&data.device, &mut data.ctx, &data.gl, clear_color)
@@ -4594,7 +4621,7 @@ index 19c29104eec..bdf7d3771ac 100644
      /// Which access mode to use
      fn surface_access(&self) -> SurfaceAccess {
          SurfaceAccess::GPUOnly
-@@ -991,17 +1118,10 @@ impl WebGLThread {
+@@ -991,17 +1132,10 @@ impl WebGLThread {
  
      /// Helper function to create a `ImageData::External` instance.
      fn external_image_data(&self, context_id: WebGLContextId) -> SerializableImageData {
@@ -4613,7 +4640,7 @@ index 19c29104eec..bdf7d3771ac 100644
              normalized_uvs: false,
          };
          SerializableImageData::External(data)
-@@ -3224,6 +3344,22 @@ fn flip_pixels_y(
+@@ -3224,6 +3358,22 @@ fn flip_pixels_y(
      flipped
  }
  

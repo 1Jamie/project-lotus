@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use winit::event_loop::EventLoopProxy;
 
-use crate::{get_trusted_origins, normalize_origin, APP_STATE, EngineCommand};
+use crate::{get_trusted_origins, normalize_origin, origin_grants_trust, APP_STATE, EngineCommand};
 
 pub static WS_SENDERS: OnceCell<Arc<DashMap<String, mpsc::UnboundedSender<WsMessage>>>> = OnceCell::new();
 pub static WS_PENDING: OnceCell<Arc<DashMap<String, std::collections::VecDeque<Vec<u8>>>>> = OnceCell::new();
@@ -214,10 +214,11 @@ async fn handle_batch(
 
     if let Some(origin_val) = headers.get("origin").and_then(|v| v.to_str().ok()) {
         let trusted_set = get_trusted_origins();
+        // Origin: null is an explicit lotus-resource opaque bridge, NOT membership of "null".
         let is_trusted = if origin_val == "null" {
             trusted_set.contains("lotus-resource://localhost")
         } else if let Some(norm) = normalize_origin(origin_val) {
-            trusted_set.contains(&norm)
+            origin_grants_trust(&norm) && trusted_set.contains(&norm)
         } else {
             false
         };
@@ -249,10 +250,11 @@ async fn handle_ipc(
 
     if let Some(origin_val) = headers.get("origin").and_then(|v| v.to_str().ok()) {
         let trusted_set = get_trusted_origins();
+        // Origin: null is an explicit lotus-resource opaque bridge, NOT membership of "null".
         let is_trusted = if origin_val == "null" {
             trusted_set.contains("lotus-resource://localhost")
         } else if let Some(norm) = normalize_origin(origin_val) {
-            trusted_set.contains(&norm)
+            origin_grants_trust(&norm) && trusted_set.contains(&norm)
         } else {
             false
         };
@@ -283,10 +285,11 @@ async fn handle_resource(
 ) -> impl IntoResponse {
     if let Some(origin_val) = headers.get("origin").and_then(|v| v.to_str().ok()) {
         let trusted_set = get_trusted_origins();
+        // Origin: null is an explicit lotus-resource opaque bridge, NOT membership of "null".
         let is_trusted = if origin_val == "null" {
             trusted_set.contains("lotus-resource://localhost")
         } else if let Some(norm) = normalize_origin(origin_val) {
-            trusted_set.contains(&norm)
+            origin_grants_trust(&norm) && trusted_set.contains(&norm)
         } else {
             false
         };
@@ -354,10 +357,11 @@ async fn handle_ws_upgrade(
 
     if let Some(origin_val) = headers.get("origin").and_then(|v| v.to_str().ok()) {
         let trusted_set = get_trusted_origins();
+        // Origin: null is an explicit lotus-resource opaque bridge, NOT membership of "null".
         let is_trusted = if origin_val == "null" {
             trusted_set.contains("lotus-resource://localhost")
         } else if let Some(norm) = normalize_origin(origin_val) {
-            trusted_set.contains(&norm)
+            origin_grants_trust(&norm) && trusted_set.contains(&norm)
         } else {
             false
         };

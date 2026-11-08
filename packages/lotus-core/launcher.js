@@ -175,8 +175,12 @@ class SandboxedEngineProcess {
  * Spawns lotus-supervisor with the engine binary and performs the STAGE_B_LOCKED /proc audit.
  */
 async function spawnSandboxedEngine(options = {}) {
-    const supervisorBin = options.supervisorBin || path.resolve(__dirname, '../lotus-supervisor/target/debug/lotus-supervisor');
-    const engineBin = options.engineBin || path.resolve(__dirname, '../lotus-supervisor/target/debug/lotus-sandbox-probe');
+    // Match lotus.js: LOTUS_NATIVE_PROFILE=release → target/release, else debug.
+    // Default engine is lotus-engine (production path). Tests that need the probe
+    // must pass engineBin explicitly (see sandbox-launcher / audit9 tests).
+    const nativeProfile = process.env.LOTUS_NATIVE_PROFILE === 'release' ? 'release' : 'debug';
+    const supervisorBin = options.supervisorBin || path.resolve(__dirname, `../lotus-supervisor/target/${nativeProfile}/lotus-supervisor`);
+    const engineBin = options.engineBin || path.resolve(__dirname, `../lotus-engine/target/${nativeProfile}/lotus-engine`);
     const engineArgs = [...(options.engineArgs || [])];
     const cacheDir = options.cacheDir;
     
@@ -213,6 +217,63 @@ async function spawnSandboxedEngine(options = {}) {
     }
 
     const passFds = [...(options.passFds || [])];
+
+    let controlSocketPair = null;
+    let controlSocket = null;
+    let childControlFd = 'pipe';
+    let gpuSocketPair = null;
+    let gpuRegistered = false;
+    const GPU_CHILD_FD = 5;
+    // Native FD/GPU helpers live on the NAPI loader (index.js), not lotus.js —
+    // avoid the launcher ↔ lotus circular require and silent no-ops when lotus
+    // does not re-export these symbols.
+    try {
+        const native = require('./index.js');
+        if (typeof native.createControlSocketPair === 'function') {
+            controlSocketPair = native.createControlSocketPair();
+            const hostFd = controlSocketPair.hostFd ?? controlSocketPair.host_fd;
+            const childFd = controlSocketPair.childFd ?? controlSocketPair.child_fd;
+            childControlFd = childFd;
+            const net = require('net');
+            controlSocket = new net.Socket({ fd: hostFd, readable: true, writable: true });
+        }
+        if (typeof native.createGpuSocketPair === 'function' && process.env.LOTUS_DISABLE_GPU_BROKER !== '1') {
+            gpuSocketPair = native.createGpuSocketPair();
+        }
+    } catch {}
+
+    // Register the host feeder *before* spawn so the engine's initial ping
+    // cannot race an unregistered socket. Only pass LOTUS_GPU_FD when this
+    // succeeds — otherwise the child would WebGL-panic on Disconnected.
+    if (gpuSocketPair) {
+        const hostGpu = gpuSocketPair.hostFd ?? gpuSocketPair.host_fd;
+        const gpuChild = gpuSocketPair.childFd ?? gpuSocketPair.child_fd;
+        try {
+            const native = require('./index.js');
+            if (typeof native.ensureWebglBroker === 'function') {
+                native.ensureWebglBroker();
+            }
+            if (typeof native.registerGpuWebglBroker !== 'function' ||
+                typeof hostGpu !== 'number' || hostGpu < 0) {
+                throw new Error('registerGpuWebglBroker unavailable');
+            }
+            native.registerGpuWebglBroker(hostGpu);
+            gpuRegistered = true;
+            if (typeof gpuChild === 'number' && gpuChild >= 0 && !passFds.includes(GPU_CHILD_FD)) {
+                passFds.push(GPU_CHILD_FD);
+            }
+        } catch (e) {
+            console.warn('[launcher] registerGpuWebglBroker failed; engine will use software WebGL:', e);
+            if (typeof hostGpu === 'number' && hostGpu >= 0) {
+                try { fs.closeSync(hostGpu); } catch {}
+            }
+            if (typeof gpuChild === 'number' && gpuChild >= 0) {
+                try { fs.closeSync(gpuChild); } catch {}
+            }
+            gpuSocketPair = null;
+        }
+    }
+
     const supArgs = [
         '--supervisor-fd', '3',
         '--control-fd', '4',
@@ -231,40 +292,14 @@ async function spawnSandboxedEngine(options = {}) {
         supArgs.push('--', ...engineArgs);
     }
 
-    let controlSocketPair = null;
-    let controlSocket = null;
-    let childControlFd = 'pipe';
-    let gpuSocketPair = null;
-    const GPU_CHILD_FD = 5;
-    try {
-        const lotusCore = require('./lotus.js');
-        if (typeof lotusCore.createControlSocketPair === 'function') {
-            controlSocketPair = lotusCore.createControlSocketPair();
-            const hostFd = controlSocketPair.hostFd ?? controlSocketPair.host_fd;
-            const childFd = controlSocketPair.childFd ?? controlSocketPair.child_fd;
-            childControlFd = childFd;
-            const net = require('net');
-            controlSocket = new net.Socket({ fd: hostFd, readable: true, writable: true });
-        }
-        if (typeof lotusCore.createGpuSocketPair === 'function') {
-            gpuSocketPair = lotusCore.createGpuSocketPair();
-            const gpuChild = gpuSocketPair.childFd ?? gpuSocketPair.child_fd;
-            if (typeof gpuChild === 'number' && gpuChild >= 0 && !passFds.includes(GPU_CHILD_FD)) {
-                passFds.push(GPU_CHILD_FD);
-            }
-        }
-    } catch {}
-
     const stdio = ['inherit', 'inherit', 'inherit', 'pipe', childControlFd];
-    if (gpuSocketPair) {
-        const gpuChild = gpuSocketPair.childFd ?? gpuSocketPair.child_fd;
-        if (typeof gpuChild === 'number' && gpuChild >= 0) {
-            stdio[GPU_CHILD_FD] = gpuChild;
-        }
-    }
     if (passFds.length > 0) {
         for (const fd of passFds) {
-            if (typeof fd === 'number' && fd >= 0) {
+            // GPU_CHILD_FD is a *target* slot in the child; the real socket lives on a
+            // different parent fd and must be mapped via stdio[5] = gpuChild below.
+            // Writing stdio[5] = 5 here would overwrite that mapping and close the only
+            // child end of the GPU socketpair → host feeder E_EOF → WebGL Disconnected.
+            if (typeof fd === 'number' && fd >= 0 && fd !== GPU_CHILD_FD) {
                 stdio[fd] = fd;
             }
         }
@@ -272,6 +307,12 @@ async function spawnSandboxedEngine(options = {}) {
             if (stdio[i] === undefined) {
                 stdio[i] = 'ignore';
             }
+        }
+    }
+    if (gpuRegistered && gpuSocketPair) {
+        const gpuChild = gpuSocketPair.childFd ?? gpuSocketPair.child_fd;
+        if (typeof gpuChild === 'number' && gpuChild >= 0) {
+            stdio[GPU_CHILD_FD] = gpuChild;
         }
     }
 
@@ -285,7 +326,7 @@ async function spawnSandboxedEngine(options = {}) {
     supervisorEnv.GST_REGISTRY_DISABLE = 'yes';
     supervisorEnv.PULSE_SERVER = '';
     supervisorEnv.PULSE_AUTOSPAWN = '0';
-    if (gpuSocketPair && passFds.includes(GPU_CHILD_FD)) {
+    if (gpuRegistered && passFds.includes(GPU_CHILD_FD)) {
         supervisorEnv.LOTUS_GPU_FD = String(GPU_CHILD_FD);
     }
 
@@ -300,24 +341,10 @@ async function spawnSandboxedEngine(options = {}) {
             try { fs.closeSync(childFd); } catch {}
         }
     }
-    if (gpuSocketPair) {
+    if (gpuRegistered && gpuSocketPair) {
         const gChildDup = gpuSocketPair.childFd ?? gpuSocketPair.child_fd;
         if (typeof gChildDup === 'number' && gChildDup >= 0) {
             try { fs.closeSync(gChildDup); } catch {}
-        }
-        // Start host GPU broker before ENGINE_READY so the engine's post-ready ping/pong
-        // handshake does not block on a feeder that is only registered later.
-        try {
-            const lotusCore = require('./lotus.js');
-            if (typeof lotusCore.ensureWebglBroker === 'function') {
-                lotusCore.ensureWebglBroker();
-            }
-            const hostGpu = gpuSocketPair.hostFd ?? gpuSocketPair.host_fd;
-            if (typeof lotusCore.registerGpuWebglBroker === 'function' && typeof hostGpu === 'number' && hostGpu >= 0) {
-                lotusCore.registerGpuWebglBroker(hostGpu);
-            }
-        } catch (e) {
-            console.warn('[launcher] registerGpuWebglBroker (early) failed:', e);
         }
     }
 

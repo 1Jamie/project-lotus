@@ -58,6 +58,9 @@ const {
     allocateRemotePaneShm,
     resetRemotePaneShm,
     createControlSocketPair,
+    createGpuSocketPair,
+    ensureWebglBroker,
+    registerGpuWebglBroker,
     sendFdsOverSocket,
     registerSurfacePolicy,
     dispatchToSurface
@@ -82,7 +85,15 @@ try {
 
 const hostIpcPolicy = require('./host_ipc_policy.js');
 const hostIpcRouter = new hostIpcPolicy.HostIpcPolicyRouter();
-const { normalizeOrigin } = require('./network_broker.js');
+const { normalizeOriginIpc: normalizeOrigin } = require('./origin_normalize.js');
+const { registerHostRegistry, resetHostRegistry } = require('./lotus-host-registry.js');
+
+// Publish host IPC handles for sandbox/policy modules (avoids require cycles).
+registerHostRegistry({
+    hostIpcRouter,
+    hostIpcPolicy,
+    getIpcPort: () => ipcServerPort,
+});
 
 class IpcMain extends EventEmitter {
     constructor() {
@@ -378,6 +389,10 @@ if (isProfiling) {
 const ipcMain = new IpcMain();
 let globalApp = null;
 let ipcServerPort = 0;
+// Refresh registry getIpcPort now that the binding exists (idempotent).
+registerHostRegistry({
+    getIpcPort: () => ipcServerPort,
+});
 let systemTheme = 'light';
 let vfsInitialized = false;
 const windows = new Map();
@@ -747,7 +762,7 @@ function restoreSurfaceGrants(pane) {
         } catch (_) {
             return o;
         }
-    }));
+    }).filter((o) => o && o !== 'null')); // opaque "null" never grants trust
     // Dying-generation failNavigation leaves navigationState=failed and empty grants.
     // Re-arm so CreateSurface can bake a coherent bridge for the successor.
     if (surface.navigationState === 'failed') {
@@ -3116,6 +3131,9 @@ module.exports = {
         allocateRemotePaneShm,
         resetRemotePaneShm,
         createControlSocketPair,
+        createGpuSocketPair,
+        ensureWebglBroker,
+        registerGpuWebglBroker,
         sendFdsOverSocket,
         registerSurfacePolicy,
         register_surface_policy: registerSurfacePolicy,
@@ -3135,12 +3153,17 @@ module.exports = {
     originDerivation: require('./origin_derivation.js'),
     hostIpcPolicy,
     hostIpcRouter,
+    registerHostRegistry,
+    resetHostRegistry,
     defaultSecureConstellation,
     respawnCrashedSurface,
     showHostCrashChrome,
     allocateRemotePaneShm,
     resetRemotePaneShm,
     createControlSocketPair,
+    createGpuSocketPair,
+    ensureWebglBroker,
+    registerGpuWebglBroker,
     sendFdsOverSocket,
     registerSurfacePolicy,
     register_surface_policy: registerSurfacePolicy,

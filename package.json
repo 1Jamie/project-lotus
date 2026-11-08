@@ -13,8 +13,5 @@
         "multipane-test-app": "npm run multipane-test-app --workspace=@lotus-gui/core",
         "secure-test-app": "npm run secure-test-app --workspace=@lotus-gui/core",
         "benchmark": "npm run benchmark --workspace=@lotus-gui/core"
-    },
-    "devDependencies": {
-        "lerna": "^8.0.0"
     }
 }

@@ -1,0 +1,122 @@
+{
+  "ipc_trust": [
+    {
+      "input": "http://[2001:DB8::1]:8080/path",
+      "output": "http://[2001:db8::1]:8080"
+    },
+    {
+      "input": "http://example.com",
+      "output": "http://example.com"
+    },
+    {
+      "input": "http://example.com:80",
+      "output": "http://example.com"
+    },
+    {
+      "input": "https://example.com",
+      "output": "https://example.com"
+    },
+    {
+      "input": "https://example.com:443",
+      "output": "https://example.com"
+    },
+    {
+      "input": "http://example.com:443",
+      "output": "http://example.com:443"
+    },
+    {
+      "input": "https://example.com:80",
+      "output": "https://example.com:80"
+    },
+    {
+      "input": "ws://example.com:80",
+      "output": "ws://example.com"
+    },
+    {
+      "input": "wss://example.com:443",
+      "output": "wss://example.com"
+    },
+    {
+      "input": "blob:https://EXAMPLE.com:443/uuid",
+      "output": "https://example.com"
+    },
+    {
+      "input": "blob:lotus-resource://localhost/uuid",
+      "output": "null"
+    },
+    {
+      "input": "file:///tmp/x",
+      "output": "null"
+    },
+    {
+      "input": "data:text/html,hi",
+      "output": "null"
+    },
+    {
+      "input": "javascript:void(0)",
+      "output": "null"
+    },
+    {
+      "input": "about:blank",
+      "output": "null"
+    },
+    {
+      "input": "null",
+      "output": "null"
+    },
+    {
+      "input": "lotus-resource://CUSTOM-HOST/x",
+      "output": "lotus-resource://custom-host"
+    },
+    {
+      "input": "lotus-resource:",
+      "output": "lotus-resource://localhost"
+    },
+    {
+      "input": "lotus-resource://localhost",
+      "output": "lotus-resource://localhost"
+    },
+    {
+      "input": "http://127.0.0.1:80",
+      "output": "http://127.0.0.1"
+    },
+    {
+      "input": "https://EXAMPLE.com:443",
+      "output": "https://example.com"
+    },
+    {
+      "input": "  ",
+      "output": null
+    },
+    {
+      "input": "",
+      "output": null
+    }
+  ],
+  "broker_http": [
+    {
+      "input": "https://EXAMPLE.com:443/x",
+      "output": "https://example.com"
+    },
+    {
+      "input": "http://127.0.0.1:3000",
+      "output": "http://127.0.0.1:3000"
+    },
+    {
+      "input": "ws://example.com",
+      "output": null
+    },
+    {
+      "input": "lotus-resource://localhost",
+      "output": null
+    },
+    {
+      "input": "data:text/html,hi",
+      "output": null
+    }
+  ],
+  "notes": {
+    "lotus-resource": "IpcTrust uses Lotus custom serialization (not WHATWG null) so Track-1 trustedOrigins keep working.",
+    "null_trust": "Normalized origin 'null' must never grant trust via set membership. Origin header 'null' may still map to lotus-resource://localhost check explicitly."
+  }
+}

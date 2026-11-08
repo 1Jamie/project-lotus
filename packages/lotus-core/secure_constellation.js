@@ -7,6 +7,21 @@
 
 const EventEmitter = require('node:events');
 const { spawnSandboxedEngine } = require('./launcher.js');
+const hostRegistry = require('./lotus-host-registry.js');
+
+/** Resolve host IPC / native helpers without requiring lotus.js (breaks cycles). */
+function _hostBindings() {
+    let sendFdsOverSocket = null;
+    try {
+        sendFdsOverSocket = require('./index.js').sendFdsOverSocket;
+    } catch (_) {}
+    return {
+        sendFdsOverSocket,
+        getIpcPort: () => hostRegistry.getIpcPort(),
+        hostIpcRouter: hostRegistry.getHostIpcRouter(),
+        hostIpcPolicy: hostRegistry.getHostIpcPolicy() || require('./host_ipc_policy.js'),
+    };
+}
 
 class SecureConstellationManager extends EventEmitter {
     constructor(options = {}) {
@@ -62,7 +77,7 @@ class SecureConstellationManager extends EventEmitter {
         if (!surfaceInfo?.shm || !instance?.controlFd) return;
         const pixelRwFd = surfaceInfo.shm.pixelRwFd ?? surfaceInfo.shm.rwFd;
         const ackRoFd = surfaceInfo.shm.ackRoFd;
-        const lotusCore = require('./lotus.js');
+        const lotusCore = _hostBindings();
         if (typeof lotusCore.sendFdsOverSocket === 'function' && typeof pixelRwFd === 'number' && typeof ackRoFd === 'number') {
             const surface = lotusCore.hostIpcRouter?.surfaceTracker?.getSurface(surfaceId);
             let bridgeScript = surfaceInfo.bridgeScript || null;
@@ -143,7 +158,7 @@ class SecureConstellationManager extends EventEmitter {
      */
     _reinjectSecureBridge(surfaceId, surface, pane) {
         if (!surface?.secure || !surface.ipcEligible) return;
-        const lotusCore = require('./lotus.js');
+        const lotusCore = _hostBindings();
         const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
         if (!(ipcPort > 0)) return;
 
@@ -252,7 +267,7 @@ class SecureConstellationManager extends EventEmitter {
     }
 
     _spawnIsolatedEngineProcess() {
-        const lotusCore = require('./lotus.js');
+        const lotusCore = _hostBindings();
         const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
         return spawnSandboxedEngine({
             supervisorBin: this.supervisorBin,
@@ -269,7 +284,7 @@ class SecureConstellationManager extends EventEmitter {
         const pane = surfaceInfo?.pane;
         const url = surfaceInfo?.url || pane?._pendingUrl || pane?._url || 'about:blank';
         if (!pane) return;
-        const lotusCore = require('./lotus.js');
+        const lotusCore = _hostBindings();
         const tracker = lotusCore.hostIpcRouter?.surfaceTracker;
         if (!tracker) return;
 
@@ -296,7 +311,7 @@ class SecureConstellationManager extends EventEmitter {
      * (also used as a FramePublished heal if complete raced before the pane was mapped).
      */
     _commitSecureNavigation(surfaceId, pane, finalUrl) {
-        const lotusCore = require('./lotus.js');
+        const lotusCore = _hostBindings();
         const tracker = lotusCore.hostIpcRouter?.surfaceTracker;
         if (!tracker || !pane) return null;
         const surface = tracker.getSurface(surfaceId);
@@ -354,10 +369,10 @@ class SecureConstellationManager extends EventEmitter {
                 Array.isArray(pane._trustedOrigins) &&
                 pane._trustedOrigins.length > 0
             ) {
-                const { normalizeOrigin } = require('./network_broker.js');
+                const { normalizeOriginIpc } = require('./origin_normalize.js');
                 surface.trustedOrigins = new Set(pane._trustedOrigins.map((o) => {
-                    try { return normalizeOrigin(o); } catch (_) { return o; }
-                }));
+                    try { return normalizeOriginIpc(o); } catch (_) { return o; }
+                }).filter((o) => o && o !== 'null'));
             }
 
             const committed = tracker.commitNavigation(surfaceId, navId, commitUrl);
@@ -371,10 +386,14 @@ class SecureConstellationManager extends EventEmitter {
                     for (const ch of pane._allowedChannels) committed.allowedChannels.add(ch);
                 }
                 if (Array.isArray(pane._trustedOrigins) && pane._trustedOrigins.length > 0) {
-                    const { normalizeOrigin } = require('./network_broker.js');
+                    const { normalizeOriginIpc } = require('./origin_normalize.js');
                     for (const o of pane._trustedOrigins) {
-                        try { committed.trustedOrigins.add(normalizeOrigin(o)); }
-                        catch (_) { committed.trustedOrigins.add(o); }
+                        try {
+                            const n = normalizeOriginIpc(o);
+                            if (n && n !== 'null') committed.trustedOrigins.add(n);
+                        } catch (_) {
+                            if (o && o !== 'null') committed.trustedOrigins.add(o);
+                        }
                     }
                 }
                 const hip = lotusCore.hostIpcPolicy || require('./host_ipc_policy.js');
@@ -425,7 +444,7 @@ class SecureConstellationManager extends EventEmitter {
             const instanceId = this._engineInstanceId;
             this._sharedEngineInstanceId = instanceId;
 
-            const lotusCore = require('./lotus.js');
+            const lotusCore = _hostBindings();
             const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
 
             const instance = await spawnSandboxedEngine({
@@ -563,7 +582,7 @@ class SecureConstellationManager extends EventEmitter {
             const passFds = [];
             const engineArgs = [];
 
-            const lotusCore = require('./lotus.js');
+            const lotusCore = _hostBindings();
             const ipcPort = typeof lotusCore.getIpcPort === 'function' ? lotusCore.getIpcPort() : 0;
 
             const instance = await spawnSandboxedEngine({
@@ -688,7 +707,7 @@ class SecureConstellationManager extends EventEmitter {
         if (evt.type === 'LoadStatus') {
             const finalUrl = evt.url;
             const surfaceId = evt.surface_id;
-            const lotusCore = require('./lotus.js');
+            const lotusCore = _hostBindings();
 
             if (evt.status === 'complete') {
                 if (pane) {
@@ -744,7 +763,7 @@ class SecureConstellationManager extends EventEmitter {
             if (pane) {
                 // Heal Track-2 if LoadStatus complete raced / missed commit (page is painting
                 // but host still thinks navigation is provisional → E_NAVIGATION_NOT_COMMITTED).
-                const lotusCore = require('./lotus.js');
+                const lotusCore = _hostBindings();
                 const surface = lotusCore.hostIpcRouter?.surfaceTracker?.getSurface(evt.surface_id);
                 if (
                     surface?.secure &&

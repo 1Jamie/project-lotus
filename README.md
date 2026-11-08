@@ -249,7 +249,7 @@ lotus/
 │   │   ├── test_apps/                  # Showcase applications
 │   │   │   ├── test_app/               # Single-window showcase app (`npm run test-app`)
 │   │   │   ├── multi_pane_test_app/    # Multi-pane layout showcase (`npm run multipane-test-app`)
-│   │   │   └── secure_test_app/        # Process-isolated sandbox & Track 2 showcase (`npm run secure-test-app`)
+│   │   │   └── sandbox_test_app/       # Process-isolated sandbox & Track 2 showcase (`npm run sandbox-test-app`)
 │   │
 │   └── lotus-dev/                      # @lotus-gui/dev -- CLI toolkit for dev & packaging
 │       ├── bin/lotus.js                # CLI entry point (init, dev, build, clean)

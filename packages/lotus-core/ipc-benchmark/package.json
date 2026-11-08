@@ -1,7 +1,7 @@
 {
-    "name": "lotus-test-app",
+    "name": "lotus-ipc-benchmark",
     "version": "1.0.0",
-    "description": "Test Application for Lotus",
+    "description": "IPC throughput / latency benchmark for Lotus",
     "main": "main.js",
     "license": "ISC",
     "dependencies": {

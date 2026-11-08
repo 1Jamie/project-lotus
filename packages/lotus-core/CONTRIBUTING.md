@@ -6,7 +6,7 @@ Thanks for your interest in contributing to Lotus! Because Lotus is organized as
 
 ## Building Locally
 
-> **Note:** By default, `npm install` downloads pre-built `.node` binaries for end-users. When working on the Rust code (`src/*.rs`), run the build scripts below to compile your local changes. Servo is the git submodule at `servo/` (tag `v0.7.0`) plus `patches/servo-v0.7.0-webgl-broker.patch`, applied automatically by `npm run build` / `scripts/apply-servo-patch.sh`.
+> **Note:** By default, `npm install` downloads pre-built `.node` binaries for end-users. When working on the Rust code (`src/*.rs`), run the build scripts below to compile your local changes. Servo is the git submodule at `packages/lotus-core/servo` (tag `v0.7.0`) plus `patches/servo-v0.7.0-webgl-broker.patch`, applied automatically by `npm run build` / `scripts/apply-servo-patch.sh`.
 
 ### From the Monorepo Root
 ```bash

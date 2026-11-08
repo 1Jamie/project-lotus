@@ -12,9 +12,9 @@ pub fn set_always_on_top(window: &Window, always_on_top: bool) {
 
 #[cfg(target_os = "windows")]
 pub fn set_always_on_top(_window: &Window, _always_on_top: bool) {
-    // Windows doesn't support this via winit directly in 0.29
-    // Would need raw Win32 API calls with SetWindowPos
-    eprintln!("Warning: set_always_on_top not fully supported on Windows via winit 0.29");
+    // Windows doesn't support this via winit 0.30 WindowLevel yet.
+    // Would need raw Win32 API calls with SetWindowPos.
+    log::warn!("set_always_on_top not fully supported on Windows via winit 0.30");
 }
 
 #[cfg(target_os = "macos")]
