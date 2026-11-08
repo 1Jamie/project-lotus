@@ -5,7 +5,7 @@ The runtime engine for Lotus desktop applications.
 `@lotus-gui/core` embeds the **Servo** rendering engine, native OS window management (`winit` + OpenGL/ANGLE), and a binary-packed WebSocket IPC bridge into Node.js as a native addon. Node.js runs your application logic and OS integrations directly, while Servo renders your HTML, CSS, and browser JavaScript.
 
 * [**Step-by-Step Tutorial (Building Your First Lotus App)**](https://github.com/1Jamie/project-lotus/blob/main/TUTORIAL.md)
-* [**What's New in v0.4.0 & Architecture Overview**](https://github.com/1Jamie/project-lotus/blob/main/README.md#whats-new-in-v040)
+* [**What's New in v0.5.0-devel & Architecture Overview**](https://github.com/1Jamie/project-lotus/blob/main/README.md#whats-new-in-v050-devel)
 * [**`@lotus-gui/dev` CLI & Packager Docs**](https://github.com/1Jamie/project-lotus/blob/main/packages/lotus-dev/README.md)
 
 ---
@@ -228,6 +228,8 @@ win.batchLayout(() => {
 
 `win.setSplitWeights(splitId, mapOrArray)` and `win.setSplitSizes(splitId, mapOrArray)` adjust a split at runtime. `win.batchLayout(fn)` applies dock + split changes in one reflow. Tree-backed `pane.setWeight(n)` updates a single leaf’s weight.
 
+**Split gutters:** Weighted `.row()` / `.col()` children default to `resizable: true`, which exposes a draggable seam between panes. Drag updates weights live; **Escape** cancels an in-progress drag. During window or gutter reflow, the compositor may **stretch** the last good frame (local panes: ghost texture; sandboxed panes: last SHM frame) until the new size is ready, reducing flash on resize.
+
 #### Managing Individual `Pane` Instances
 
 Every pane created via `LayoutBuilder` or `win.createPane(id, options)` is stored in `win.panes` and accessible via `win.getPane(id)`.
@@ -252,7 +254,7 @@ When you call `pane.setVisible(false)` or `pane.toggleVisible()` on a docked pan
 
 ### 4. Process-Isolated Sandboxed Panes (`sandbox: true` — Experimental, Linux Only)
 
-> **Platform & Fail-Closed Requirements:** Process-isolated sandboxing (`sandbox: true`) is **experimental** in `v0.4.0` and supported on **Linux (`x86_64`) only**. It requires a Landlock-capable Linux kernel (5.13+) and unprivileged user namespaces, and will not work inside Flatpak. If `sandbox: true` is passed on an unsupported platform, inside Flatpak, or when unprivileged user namespaces are disabled, Lotus **throws `E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM`** immediately rather than silently loading content unsandboxed.
+> **Platform & Fail-Closed Requirements:** Process-isolated sandboxing (`sandbox: true`) is **experimental** in `v0.5.x` and supported on **Linux (`x86_64`) only**. It requires a Landlock-capable Linux kernel (5.13+) and unprivileged user namespaces, and will not work inside Flatpak. If `sandbox: true` is passed on an unsupported platform, inside Flatpak, or when unprivileged user namespaces are disabled, Lotus **throws `E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM`** immediately rather than silently loading content unsandboxed.
 
 Lotus mitigates the risk of hosting external documentation, third-party widgets, or untrusted web pages alongside your local UI by running `sandbox: true` panes inside an unprivileged child engine process (`PID_secure_engine`) managed by `lotus-supervisor`. (`secure: true` is also supported as a backwards-compatible alias).
 
@@ -331,11 +333,12 @@ if (window.lotus) {
 
 #### Multi-Layer Sandboxing Architecture
 
-When `sandbox: true` is enabled, five coordinated defense layers mitigate renderer compromise:
+When `sandbox: true` is enabled, coordinated defense layers mitigate renderer compromise:
 
 ```text
 [ Node.js Host Process (PID_main) ]
-  ├── OpenGL / ANGLE Compositor (Window Blit via Read-Only SHM)
+  ├── OpenGL / ANGLE Compositor (trusted pane FBOs + sandbox pane SHM; optional WebGL hole-punch)
+  ├── Host WebGL broker (process-wide GL thread; LOTUS_GPU_FD socket per sandboxed engine)
   ├── HostIpcPolicyRouter (Track 2 Verification & Origin Derivation)
   ├── Axum IPC Gateway (127.0.0.1:<port> - Token Auth & Rate Limiting)
   └── NetworkBroker (Strict Anti-SSRF Proxy & Cookie Store)
@@ -349,7 +352,8 @@ When `sandbox: true` is enabled, five coordinated defense layers mitigate render
 [ lotus-engine (PID_secure_engine) ]
   ├── Landlock ABI v1-v5 (Denies host writes; writes only to private 0o700 scratch dir)
   ├── Stage B Seccomp BPF (SECCOMP_FILTER_FLAG_TSYNC across engine threads; kills chmod/mount/ptrace)
-  ├── Dual-Plane Sealed SHM (CPU SoftwareRenderingContext -> pixel_rw / ack_ro sealed memfd)
+  ├── Dual-Plane Sealed SHM (SoftwareRenderingContext page paint -> pixel_rw / ack_ro sealed memfd)
+  ├── WebGL broker bridge (when LOTUS_GPU_FD set) -> host GL thread (no in-jail GPU adapter)
   ├── lotus-net-proxy (Forwards all network traffic over broker_socket to host NetworkBroker)
   └── UserContentManager (Injected client bridge with origin & calling-realm stack inspection)
 ```
@@ -360,9 +364,11 @@ When `sandbox: true` is enabled, five coordinated defense layers mitigate render
    The supervisor applies Landlock rules denying write, create, or delete access to host directories (`/`, `/home`, `/etc`, `/var`) and writes only to a private `0o700` scratch directory (`/tmp/lotus-sandbox-XXXXXX`) that is recursively deleted when the engine exits.
 3. **Stage B Seccomp BPF Syscall Lockdown:**
    Before parsing untrusted HTML or executing JavaScript, `lotus-engine` synchronizes a strict seccomp BPF filter across all engine threads (`SECCOMP_FILTER_FLAG_TSYNC`). Dangerous syscalls—including `SYS_fchmod`, `SYS_fchmodat`, `SYS_ptrace`, `SYS_mount`, `SYS_execve`, `SYS_unshare`, and `SYS_setns`—are denied with immediate `SIGSYS` termination.
-4. **CPU Software Rendering & Double-Mapped Shared Memory (SHM):**
-   Sandboxed panes use CPU software rasterization (`SoftwareRenderingContext`) with **no GPU device nodes (`/dev/dri`) and no WebGL**. Rendered pixels stream back to the host window compositor via double-mapped POSIX `memfd` buffers (`0o400` read-only on the host, synchronized via lock-free atomic Seqlocks) without network hops.
-5. **Anti-SSRF NetworkBroker Egress Proxying:**
+4. **Software page paint & sealed SHM:**
+   Sandboxed panes rasterize the main document with `SoftwareRenderingContext` and **no in-jail GPU adapter** (`/dev/dri` is not opened for paint). Finished pane pixels stream to the host window compositor via double-mapped POSIX `memfd` buffers (`0o400` read-only on the host, synchronized via lock-free atomic Seqlocks).
+5. **Host WebGL GPU broker (default on Linux):**
+   `<canvas>` WebGL is **not** executed on a GPU inside the jail. The host registers a WebGL broker socket at spawn (`LOTUS_GPU_FD`); the engine forwards `WebGLMsg` to the host GL thread on the same surfman connection as the window. By default, WebGL pixels are read back on the host, published into canvas planes, composited in the jail, then still delivered as **pane SHM** (reliable path). Set `LOTUS_DISABLE_GPU_BROKER=1` before spawn to skip the broker. Set `LOTUS_WEBGL_HOLE_PUNCH` to enable an **experimental** opaque-canvas fast path that samples host GL surfaces in the compositor (readback skipped; off by default / not for production).
+6. **Anti-SSRF NetworkBroker Egress Proxying:**
    Because the sandboxed engine has no direct network access inside `CLONE_NEWNET`, all HTTP/HTTPS traffic goes through the host's `NetworkBroker`:
    - **Loopback & Private Range Blocking:** Rejects private networks (RFC 1918), link-local, and loopback (`127.0.0.1` / `localhost`) by default. Consequently, **sandboxed panes cannot load a local dev server or intranet URL** unless you explicitly opt in via `app.defaultSecureConstellation.allowLocalhost = true`.
    - **Synchronous DNS Socket Pinning:** Resolves all `A` and `AAAA` records and pins the verified IP address directly at socket creation, defeating DNS rebinding and TOCTOU attacks.

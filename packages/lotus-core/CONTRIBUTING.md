@@ -45,10 +45,23 @@ npm run multipane-test-app
 
 # 3. High-frequency IPC stress benchmark
 npm run benchmark
+
+# 4. Process-isolated sandbox + Track 2 + WebGL broker showcase
+npm run sandbox-test-app
 ```
+
+### Sandbox / WebGL broker debug flags
+
+| Variable | Effect |
+|----------|--------|
+| `LOTUS_DISABLE_GPU_BROKER=1` | Skip host GPU socket registration at sandbox spawn (no `LOTUS_GPU_FD` on the child). |
+| `LOTUS_WEBGL_HOLE_PUNCH` | Experimental opaque WebGL hole-punch on the host compositor (off by default). |
+| `LOTUS_GPU_FD` | Internal FD set by the launcher for the engine—do not set this in apps. |
 
 ---
 
 ## Servo
 
 Lotus depends on the published `servo` crate at version 0.7.0. Trusted panes use `LotusPaneContext`, a `RenderingContext` in this crate, so each pane paints into its own framebuffer on the window GL context. The compositor blits those framebuffers into the scene.
+
+Sandboxed `lotus-engine` uses `SoftwareRenderingContext` + sealed SHM for page pixels. Canvas WebGL is brokered to the host via `patches/servo-v0.7.0-webgl-broker.patch` and `src/gl/webgl_broker.rs` when `LOTUS_GPU_FD` is present. Use the env flags above only when debugging those paths.

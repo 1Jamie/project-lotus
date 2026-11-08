@@ -397,7 +397,7 @@ ipcMain.on('file-selected', (file) => {
 
 ## Step 6: Sandboxing External or Untrusted Content (`sandbox: true`) *(Experimental — Linux Only)*
 
-> **Status & Platform Requirements:** Process-isolated sandboxing (`sandbox: true`) is **experimental** in `v0.4.0` and currently supported on **Linux (`x86_64`) only**. It requires a Landlock-capable Linux kernel (5.13+) with unprivileged user namespaces enabled, and **will not work inside Flatpak** (which blocks nested user and network namespaces).
+> **Status & Platform Requirements:** Process-isolated sandboxing (`sandbox: true`) is **experimental** in `v0.5.x` and currently supported on **Linux (`x86_64`) only**. It requires a Landlock-capable Linux kernel (5.13+) with unprivileged user namespaces enabled, and **will not work inside Flatpak** (which blocks nested user and network namespaces).
 >
 > **Fail-Closed Guarantee:** If `sandbox: true` is requested on an unsupported OS (Windows/macOS), inside Flatpak, or on a host where unprivileged user namespaces are disabled (`kernel.unprivileged_userns_clone=0` or `kernel.apparmor_restrict_unprivileged_userns=1`), Lotus **throws `E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM` immediately**—it never silently downgrades or loads the page unsandboxed.
 
@@ -410,7 +410,8 @@ By setting `sandbox: true` on a pane, Lotus runs that web view in an unprivilege
 * **Landlock Filesystem Jailing:** Denies write access to host directories (`/`, `/home`, `/etc`, `/var`) and writes only to a private, mode-`0700` scratch directory (`/tmp/lotus-sandbox-XXXXXX`) that is recursively deleted when the engine exits.
 * **Seccomp Stage B BPF Lockdown:** Synchronizes a strict syscall filter (`SECCOMP_FILTER_FLAG_TSYNC`) across all engine threads before any untrusted content is parsed, denying dangerous syscalls with `SIGSYS`.
 * **Anti-SSRF Network Broker:** Outbound HTTP/HTTPS requests are proxied through the host's `NetworkBroker` with synchronous DNS socket pinning, blocking loopback (`127.0.0.1`, `::1`) and private IP ranges (RFC 1918) by default.
-* **CPU Rendering & Shared Memory (SHM):** Sandboxed panes use CPU software rasterization (`SoftwareRenderingContext`) with **no GPU device nodes (`/dev/dri`) and no WebGL**. Frame pixels stream to the host OpenGL compositor over read-only sealed `memfd` buffers (`0o400`) without network hops.
+* **Software page paint & sealed SHM:** Sandboxed panes rasterize the main document with `SoftwareRenderingContext` (no in-jail GPU adapter). Finished pane frames stream to the host OpenGL compositor over read-only sealed `memfd` buffers (`0o400`).
+* **Host WebGL GPU broker (default on Linux):** `<canvas>` WebGL runs on a **host** GL thread via `LOTUS_GPU_FD`—the jail never opens `/dev/dri` for WebGL. The default path still delivers the full pane over SHM. Opt out with `LOTUS_DISABLE_GPU_BROKER=1`; `LOTUS_WEBGL_HOLE_PUNCH` is an experimental compositor shortcut (off by default).
 
 ### Adding a Sandboxed Web Pane
 
@@ -495,7 +496,7 @@ app.defaultSecureConstellation.allowLocalhost = true;
 ### Threat Model, Pooling & Crash Behavior
 
 1. **What `sandbox: true` Mitigates vs. What Remains:**
-   Process isolation and OS sandboxing mitigate renderer memory-corruption or logic bugs by preventing direct filesystem writes, arbitrary syscall execution, GPU driver exploits (since rendering is CPU-only), and local network scanning. They **do not** protect against Linux kernel vulnerabilities (privilege escalation in user namespaces, Landlock, or netfilter), side-channel attacks, or logic bugs in `ipcMain.register()` handlers that you explicitly expose via `allowedChannels`.
+   Process isolation and OS sandboxing mitigate renderer memory-corruption or logic bugs by preventing direct filesystem writes, arbitrary syscall execution, **in-sandbox** GPU/driver access (WebGL GL work runs on the **host** broker; the jail still does not own `/dev/dri`), and local network scanning. They **do not** protect against Linux kernel vulnerabilities (privilege escalation in user namespaces, Landlock, or netfilter), side-channel attacks, bugs in the host WebGL broker / compositor path, or logic bugs in `ipcMain.register()` handlers that you explicitly expose via `allowedChannels`.
 2. **Pooled Engine Default vs. `isolated: true`:**
    By default, multiple `sandbox: true` panes share a single pooled `lotus-engine` process (`PID_secure_engine`) to keep memory overhead low. While cookies and Track 2 IPC policies are partitioned per surface on the host, **pooled panes share the same renderer process memory and failure domain**. If you are loading mutually untrusted pages that must be isolated from *each other* as well as from the host, pass `isolated: true` to spawn a dedicated `lotus-supervisor` + `lotus-engine` process pair for that pane:
    ```javascript

@@ -50,21 +50,17 @@ For a full walkthrough, follow [**TUTORIAL.md: Building Your First Lotus App**](
 
 ---
 
-## What's New in v0.4.0
+## What's New in v0.5.0-devel
 
-* **Process-Isolated Sandboxed Panes (`sandbox: true`, Experimental on Linux):** Mitigate the risk of untrusted or third-party web content by running panes in an OS-level, multi-process sandbox (`PID_secure_engine`) managed by `lotus-supervisor`. Hardened with Landlock FS jailing (writes only to a private `0700` scratch directory), Seccomp Stage B BPF filters (`SECCOMP_FILTER_FLAG_TSYNC`), network namespaces (`CLONE_NEWNET` with all traffic routed through the host `NetworkBroker`), CPU software rendering over read-only sealed shared memory (`memfd`), and capability-based Track 2 IPC.
-* **Multi-Pane OpenGL Compositor:** Split a single window into multiple docked or floating web views (`Pane`s) on one shared OpenGL surface using `LayoutBuilder` (`Left`, `Right`, `Top`, `Bottom`, `Fill`, `Absolute`). Hiding or showing a docked pane automatically reflows the rest of the layout in Rust on the next frame.
-* **Servo v0.7.0 (submodule + patch):** The renderer lives in the git submodule `packages/lotus-core/servo` at tag `v0.7.0`, with `packages/lotus-core/patches/servo-v0.7.0-webgl-broker.patch` applied before builds (see `scripts/apply-servo-patch.sh`). Trusted panes paint through Lotus's own `RenderingContext` into per-pane framebuffers, which the window compositor blits into one scene.
-* **Native `<select>` Overlays:** HTML `<select>` dropdowns render in a pre-warmed, high-z-index overlay pane above split panes so they never clip. Supports single-select, multi-select, `<optgroup>`, and runtime theming (`'auto'`, `'dark'`, `'light'`, or custom CSS/tokens).
-* **Injected Overlay Scrollbars:** Auto-fading, GPU-positioned (`translate3d`) overlay scrollbars that expand on hover while staying decoupled from frameless window resize borders.
-* **Encrypted VFS (`--encrypt`):** Package your `ui/` directory into an AEAD-encrypted (AES-256-GCM) virtual file system with native key sharding across ELF/PE binary sections and a 128MB byte-limited LRU cache.
+* **Host WebGL GPU broker for sandboxed panes:** Sandboxed engines still composite the main document with CPU `SoftwareRenderingContext` and deliver finished pane pixels over sealed SHM. `<canvas>` WebGL commands are forwarded to a **host** GL thread over `LOTUS_GPU_FD` (no in-jail `/dev/dri` adapter). The default reliable path readbacks WebGL into canvas planes inside the jail, then still ships the full pane via SHM. Set `LOTUS_DISABLE_GPU_BROKER=1` to opt out at spawn; set `LOTUS_WEBGL_HOLE_PUNCH` only for an **experimental** opaque-canvas compositor fast path (off by default).
+* **Layout-tree split gutters & stretch-interim resize:** Weighted `.row()` / `.col()` splits expose draggable seams when `resizable: true` (default). During window or gutter reflow, the compositor can stretch the last good frame (local ghost textures; sandbox last SHM frame) until the new size is ready.
+* **Carried from v0.4.0:** Process-isolated sandboxed panes (`sandbox: true`, Linux experimental), multi-pane OpenGL compositor + `LayoutBuilder`, Servo v0.7.0 submodule + `servo-v0.7.0-webgl-broker.patch`, native `<select>` overlays, injected overlay scrollbars, and encrypted VFS (`--encrypt`).
 
-### Upgrading from v0.3.x to v0.4.0
+### Upgrading from v0.4.x to v0.5.0-devel
 
-* **Single-window apps work without changes:** A standard `new ServoWindow({ root, index })` automatically creates a single `'main'` pane anchored to `Anchor.Fill` (`autoResizeMain: true` by default).
-* **Multi-pane layouts require `autoResizeMain: false`:** When passing custom `panes` (or `...layout.config()`), set `autoResizeMain: false` on `ServoWindow` so the Rust compositor calculates docked pane boundaries rather than forcing a single `'main'` pane to fill the window.
-* **New `Pane` and `<select>` APIs:** You can now manage split views dynamically via `win.createPane(id, opts)`, `win.getPane(id)`, `pane.toggleVisible()`, and `win.sendToPaneRenderer(paneId, ch, data)`, and customize dropdowns or scrollbars via `selectMenu` and `scrollbars` in `WindowOptions`.
-* **Event & Option Aliases:** `ready-to-show` is the primary first-frame event (`frame-ready` remains supported as an alias), and `frameless: true` also accepts `frame: false` for Electron familiarity.
+* **No sandboxed-pane API break:** `sandbox: true` / `isolated` / Track 2 IPC are unchanged. Sandboxed WebGL now uses the host GPU broker by default when spawn succeeds—apps do not set `LOTUS_GPU_FD` themselves.
+* **Threat-model docs:** Do not assume “CPU-only, no WebGL.” The jail still has no GPU device nodes; GL work for WebGL runs on the **host** broker. Page paint remains software + SHM.
+* **v0.3 → v0.4 notes still apply** for multi-pane (`autoResizeMain: false`, `createPane`, `ready-to-show` / `frameless` aliases).
 
 ---
 
@@ -106,7 +102,8 @@ const webPane = win.createPane('docs-viewer', {
 ```
 * **Platform & Fail-Closed Gating:** Requires Linux (`x86_64`) with a Landlock-capable kernel (5.13+) and unprivileged user namespaces; unsupported inside Flatpak. If `sandbox: true` is used where unavailable, Lotus throws `E_SECURITY_ISOLATION_UNSUPPORTED_PLATFORM` rather than silently loading content unsandboxed.
 * **OS-Level Sandbox:** Runs inside `CLONE_NEWUSER`, `CLONE_NEWNET`, and `CLONE_NEWPID` namespaces with zero capabilities, Landlock filesystem jailing (denies writes to host directories; writes only to a private `0o700` scratch directory purged on exit), and Stage B Seccomp BPF filters (`SECCOMP_FILTER_FLAG_TSYNC`) applied before untrusted content is parsed.
-* **CPU Rendering & Shared Memory (SHM):** Sandboxed panes use CPU software rasterization (`SoftwareRenderingContext`) with no GPU device nodes (`/dev/dri`) or WebGL. Frame pixels stream to the host OpenGL compositor through read-only sealed `memfd` buffers (`0o400` + `SYS_fchmod` lockout) without network hops.
+* **Software page paint + sealed SHM:** Sandboxed panes rasterize the main document with `SoftwareRenderingContext` (no in-jail GPU adapter / `/dev/dri`). Finished pane frames stream to the host OpenGL compositor through read-only sealed `memfd` buffers (`0o400` + `SYS_fchmod` lockout).
+* **Host WebGL GPU broker (default on Linux):** `<canvas>` WebGL is forwarded to a host GL thread over `LOTUS_GPU_FD` (`servo-v0.7.0-webgl-broker.patch` + `webgl_broker.rs`). The default path readbacks into the jail and still delivers the pane via SHM. Opt out with `LOTUS_DISABLE_GPU_BROKER=1`; `LOTUS_WEBGL_HOLE_PUNCH` enables an experimental opaque hole-punch compositor path (off by default).
 * **Anti-SSRF NetworkBroker:** The engine has no direct network access; all HTTP/HTTPS traffic goes through `NetworkBroker` on the host, enforcing DNS socket pinning, blocking loopback (`localhost` / `127.0.0.1`) and private IP ranges (RFC 1918) by default (configurable via `app.defaultSecureConstellation.allowLocalhost = true`), and enforcing a 64 MiB payload cap.
 * **Capability Gating & Single-Use Tickets:** Trusted origins receive `window.lotus` (`invoke`, `on`, `off`) and authenticate via `/ipc/handshake` with a constant-time bootstrap secret to obtain a single-use 256-bit WebSocket ticket (`/ipc/secure-ws`). Untrusted origins and subframes see `window.lotus === undefined`.
 * **Crash Isolation & Pooling:** By default, `sandbox: true` panes share a pooled child engine (or pass `isolated: true` for a dedicated process per pane). If a sandboxed engine crashes, the host process and local UI panes stay up, the crashed pane stops updating, and `app.defaultSecureConstellation` emits a `'crashed'` event.
@@ -115,7 +112,7 @@ const webPane = win.createPane('docs-viewer', {
 
 ## Current Limitations & Pre-1.0 Status
 
-Lotus is currently at **`v0.4.0` (pre-1.0)**. While the core architecture is stable and used to build real Linux and Windows packages, you should evaluate these trade-offs before choosing it over Electron or Tauri:
+Lotus is currently at **`v0.5.0-devel` (pre-1.0)**. While the core architecture is stable and used to build real Linux and Windows packages, you should evaluate these trade-offs before choosing it over Electron or Tauri:
 
 * **Pre-1.0 API:** Minor versions (`0.x`) may introduce breaking API adjustments as upstream Servo evolves.
 * **Servo Web Platform Coverage:** Servo v0.7.0 has strong support for modern HTML5, CSS Flexbox, CSS Grid, Canvas/WebGL, and ES6+, and Lotus polyfills Servo's missing `<select>` menus and overlay scrollbars. However, Servo is not Chromium: niche browser APIs (such as WebRTC, DRM/Widevine media, complex SVG filters, or Chromium-specific CSS extensions) are either unimplemented or experimental upstream. Lotus works best when you control your own frontend UI rather than embedding arbitrary third-party web apps.
