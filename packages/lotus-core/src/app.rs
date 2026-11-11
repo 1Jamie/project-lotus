@@ -5096,7 +5096,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         .unwrap_or_else(|| pane.input_physical_rect(scale_factor));
                                     #[cfg(not(target_os = "linux"))]
                                     let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
-                                    let mut translated_point = Point2D::new(point.x - px, point.y - py);
+                                    let mut translated_point: Point2D<f32, DevicePixel> =
+                                        Point2D::new(point.x - px, point.y - py);
                                     if pane.is_remote {
                                         if let Some(ref consumer) = pane.remote_consumer {
                                             if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
@@ -5193,7 +5194,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 instance.hover_pane_id = Some(pane.id.clone());
                                 // Unified physical coordinate translation
                                 let (px, py, _pw, _ph) = pane.input_physical_rect(scale_factor);
-                                let translated_point = Point2D::new(point.x - px, point.y - py);
+                                let translated_point: Point2D<f32, DevicePixel> =
+                                    Point2D::new(point.x - px, point.y - py);
 
                                  // SHADOWING: Check no-drag regions first.
                                  let mut hit_no_drag = false;
@@ -5627,7 +5629,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         .unwrap_or_else(|| pane.input_physical_rect(scale_factor));
                                     #[cfg(not(target_os = "linux"))]
                                     let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
-                                    let mut translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+                                    let mut translated_point: Point2D<f32, DevicePixel> =
+                                        Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
                                     if pane.is_remote {
                                         if let Some(ref consumer) = pane.remote_consumer {
                                             if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
@@ -5665,7 +5668,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         }
                                         
                                         if let Some(dir) = resize_dir {
-                                            let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+                                            let translated_point: Point2D<f32, DevicePixel> =
+                                                Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
                                             pane.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                                                 MouseButtonAction::Up,
                                                 servo_button,
@@ -5697,7 +5701,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         
                                         if hit_drag {
                                             info!("Rust: Hit Drag Region at {:?} in pane '{}'", translated_point, pane.id);
-                                            let translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+                                            let translated_point: Point2D<f32, DevicePixel> =
+                                                Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
                                             pane.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                                                 MouseButtonAction::Up,
                                                 servo_button,
@@ -5763,6 +5768,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         servo_button,
                                         servo::WebViewPoint::Device(translated_point)
                                     )));
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    pane.webview.notify_input_event(InputEvent::MouseButton(
+                                        MouseButtonEvent::new(
+                                            action,
+                                            servo_button,
+                                            servo::WebViewPoint::Device(translated_point),
+                                        ),
+                                    ));
                                 }
                             }
                         }
@@ -5932,7 +5947,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     .unwrap_or_else(|| pane.input_physical_rect(scale_factor));
                                 #[cfg(not(target_os = "linux"))]
                                 let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
-                                let mut translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+                                let mut translated_point: Point2D<f32, DevicePixel> =
+                                    Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
                                 #[cfg(target_os = "linux")]
                                 if let Some((ws, mx, my)) =
                                     wheel_layout.as_ref().and_then(|(_, ext)| ext.clone())
@@ -5973,6 +5989,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     pane.webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
                                         wheel_delta,
                                         servo::WebViewPoint::Device(translated_point)
+                                    )));
+                                    pane.needs_repaint = true;
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let _ = (pw, ph);
+                                    pane.webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
+                                        wheel_delta,
+                                        servo::WebViewPoint::Device(translated_point),
                                     )));
                                     pane.needs_repaint = true;
                                 }
