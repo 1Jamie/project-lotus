@@ -869,9 +869,38 @@ fn nest_in_overlay_input_mode(instance: &WindowInstance) -> bool {
     instance.nested_compositor.is_some() && !instance.game_mode
 }
 
+/// Nested atrium/gamescope host: outer window chrome resize is wrong (and fights
+/// Discord/Chromium CSD). Use host frameless edge resize only for plain lotus windows.
+fn nest_owns_host_window(instance: &WindowInstance) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        instance.nested_compositor.is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = instance;
+        false
+    }
+}
+
+/// Window-edge resize shapes from nested Electron CSD must not paint onto the host.
+fn nest_is_window_chrome_resize_cursor(icon: CursorIcon) -> bool {
+    matches!(
+        icon,
+        CursorIcon::NwResize
+            | CursorIcon::NeResize
+            | CursorIcon::SwResize
+            | CursorIcon::SeResize
+            | CursorIcon::NResize
+            | CursorIcon::SResize
+            | CursorIcon::EResize
+            | CursorIcon::WResize
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn nest_named_cursor_icon(name: &str) -> CursorIcon {
-    name.parse::<CursorIcon>().unwrap_or_else(|_| match name {
+    let icon = name.parse::<CursorIcon>().unwrap_or_else(|_| match name {
         "dnd-ask" => CursorIcon::Copy,
         "all-resize" => CursorIcon::Move,
         // Xcursor legacy aliases commonly used by Wine/Proton themes.
@@ -884,8 +913,18 @@ fn nest_named_cursor_icon(name: &str) -> CursorIcon {
         "sb_v_double_arrow" | "v_double_arrow" => CursorIcon::RowResize,
         "fleur" | "size_all" => CursorIcon::Move,
         "pirate" | "crossed_circle" => CursorIcon::NotAllowed,
+        // Chromium CSD grip names that may not parse as CursorIcon.
+        "nw-resize" | "ne-resize" | "sw-resize" | "se-resize" | "n-resize" | "s-resize"
+        | "e-resize" | "w-resize" | "nwse-resize" | "nesw-resize"
+        | "top_left_corner" | "top_right_corner" | "bottom_left_corner" | "bottom_right_corner"
+        | "left_side" | "right_side" | "top_side" | "bottom_side" => CursorIcon::Default,
         _ => CursorIcon::Default,
-    })
+    });
+    if nest_is_window_chrome_resize_cursor(icon) {
+        CursorIcon::Default
+    } else {
+        icon
+    }
 }
 
 /// Paint a nested cursor onto the host window (visual only — no game-shoe updates).
@@ -5216,15 +5255,18 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                      }
                                  }
                                 
-                                // 1. In frameless windows, check window resize borders first
-                                let resize_cursor = if instance.frameless {
+                                // Frameless host edge-resize — never when nest owns the window
+                                // (gamescope/atrium); that path is what resurfaced the corner cursor.
+                                let resize_cursor = if instance.frameless
+                                    && !nest_owns_host_window(instance)
+                                {
                                     let size = instance.window.inner_size();
                                     let x = position.x;
                                     let y = position.y;
                                     let w = size.width as f64;
                                     let h = size.height as f64;
                                     let border = (6.0_f64 * f64::from(scale_factor)).round().max(4.0);
-                                    
+
                                     if x < border && y < border {
                                         Some(CursorIcon::NwResize)
                                     } else if x > w - border && y < border {
@@ -5605,6 +5647,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         };
 
                         if let Some(pane_id) = target_pane_id {
+                            let nest_owns = nest_owns_host_window(instance);
                             #[cfg(target_os = "linux")]
                             let pointer_layout = instance.panes.get(&pane_id).map(|p| {
                                 (
@@ -5640,14 +5683,18 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         }
                                     }
 
-                                    if is_pressed && button == winit::event::MouseButton::Left && instance.frameless {
+                                    if is_pressed
+                                        && button == winit::event::MouseButton::Left
+                                        && instance.frameless
+                                        && !nest_owns
+                                    {
                                         let size = instance.window.inner_size();
                                         let x = instance.last_mouse_pos.x as f64;
                                         let y = instance.last_mouse_pos.y as f64;
                                         let w = size.width as f64;
                                         let h = size.height as f64;
                                         let border = (6.0_f64 * f64::from(scale_factor)).round().max(4.0);
-                                        
+
                                         let mut resize_dir = None;
                                         if x < border && y < border {
                                             resize_dir = Some(winit::window::ResizeDirection::NorthWest);
