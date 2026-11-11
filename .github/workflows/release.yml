@@ -3,6 +3,9 @@ env:
   DEBUG: napi:*
   APP_NAME: lotus
   MACOSX_DEPLOYMENT_TARGET: '10.13'
+  # Devel cuts iterate often; skip release LTO and ship debug napi binaries instead.
+  # Stable tags (no "devel" in the ref) still use optimized `npm run build`.
+  LOTUS_NAPI_BUILD: ${{ contains(github.ref_name, 'devel') && 'build:debug' || 'build' }}
 permissions:
   contents: write
   id-token: write
@@ -27,7 +30,8 @@ jobs:
               echo "PYTHON=python" >> $GITHUB_ENV
               echo "AWS_LC_SYS_PREBUILT_NASM=1" >> $GITHUB_ENV
             build: |
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc && npm run extract-angle --workspace=@lotus-gui/core
+              echo "Using napi script: $LOTUS_NAPI_BUILD"
+              npm run "$LOTUS_NAPI_BUILD" --workspace=@lotus-gui/core -- --target x86_64-pc-windows-msvc && npm run extract-angle --workspace=@lotus-gui/core
             target: x86_64-pc-windows-msvc
             build_id: x86_64-pc-windows-msvc
           - host: ubuntu-24.04
@@ -56,7 +60,8 @@ jobs:
                 || sudo apt-get install -y libgstreamer-plugins-extra1.0-dev \
                 || true
             build: |
-              npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
+              echo "Using napi script: $LOTUS_NAPI_BUILD"
+              npm run "$LOTUS_NAPI_BUILD" --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
           - host: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             build_id: x86_64-unknown-linux-suse
@@ -84,7 +89,8 @@ jobs:
                 'fi' \
                 > /tmp/cc-glslopt-shim
               chmod +x /tmp/cc-glslopt-shim
-              docker run --rm -v $GITHUB_WORKSPACE:/workspace \
+              docker run --rm -e LOTUS_NAPI_BUILD \
+                -v $GITHUB_WORKSPACE:/workspace \
                 -v /tmp/glslopt_compat.h:/tmp/glslopt_compat.h \
                 -v /tmp/cc-glslopt-shim:/tmp/cc-glslopt-shim \
                 -w /workspace opensuse/tumbleweed /bin/sh -c "
@@ -98,7 +104,8 @@ jobs:
                 git config --global gitoxide.objects.allocLimitIfReducedTrust 0
                 bash scripts/apply-servo-patch.sh
                 npm install
-                npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
+                echo \"Using napi script: \$LOTUS_NAPI_BUILD\"
+                npm run \"\$LOTUS_NAPI_BUILD\" --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
                 mv packages/lotus-core/lotus.linux-x64-gnu.node packages/lotus-core/lotus.linux-x64-suse.node
                 mv packages/lotus-core/bindings-x86_64-unknown-linux-gnu packages/lotus-core/bindings-x86_64-unknown-linux-suse 2>/dev/null || true
               "
