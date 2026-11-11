@@ -211,10 +211,10 @@ impl Drop for LotusWaylandServer {
             });
             let _ = rx.recv_timeout(Duration::from_secs(2));
         }
-        // Host-runtime symlink created for Proton (wayland-atrium-<session>).
+        // Host-runtime symlink created for Proton (wayland-nest-<session>).
         if let Ok(host_runtime) = std::env::var("XDG_RUNTIME_DIR") {
             if let Some(name) = self.runtime_dir.file_name().and_then(|s| s.to_str()) {
-                let link = PathBuf::from(host_runtime).join(format!("wayland-atrium-{}", name));
+                let link = PathBuf::from(host_runtime).join(format!("wayland-nest-{}", name));
                 let _ = std::fs::remove_file(&link);
             }
         }

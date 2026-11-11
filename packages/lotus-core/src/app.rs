@@ -3357,7 +3357,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         } else if let Ok(host_runtime) = std::env::var("XDG_RUNTIME_DIR") {
                             let host_dir = std::path::PathBuf::from(&host_runtime);
                             let child_wl_name = format!(
-                                "wayland-atrium-{}",
+                                "wayland-nest-{}",
                                 isolated_runtime
                                     .file_name()
                                     .and_then(|s| s.to_str())
