@@ -49,7 +49,7 @@ async function startShowcase() {
     const sandboxedPort = sandboxedServer.address().port;
     const sandboxedOrigin = `http://127.0.0.1:${sandboxedPort}`;
     const sandboxedUrl = `${sandboxedOrigin}/sandboxed.html`;
-    const auxUrl = `${sandboxedOrigin}/aux.html`;
+    const auxUrl = `${sandboxedOrigin}/aux_pane.html`;
 
     console.log(`[Lotus Showcase] Sandboxed HTTP asset server listening on ${sandboxedUrl}`);
 
