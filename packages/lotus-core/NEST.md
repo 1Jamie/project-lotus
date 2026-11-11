@@ -54,9 +54,10 @@ Product apps (e.g. atrium) forward these to Node and own UX. Atrium lives under 
 
 ## Atrium (reference consumer)
 
+Product shell lives in the sibling [`atrium`](../../../atrium) repo (depends on this package via `file:` until `@lotus-gui/core@0.5.0` is published).
+
 ```bash
-./bin/atrium -- %command%
-# or: npm run atrium --workspace=@lotus-gui/core
+cd ../atrium && npm install && ./bin/atrium -- %command%
 ```
 
 Profile keybinds: `~/.config/lotus-atrium/overlay-profile.json` → `keybinds`.
