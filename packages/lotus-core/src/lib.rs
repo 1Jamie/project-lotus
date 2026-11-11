@@ -363,8 +363,44 @@ impl WindowHandle {
     #[cfg(target_os = "linux")]
     #[napi]
     pub fn set_game_mode(&self, enabled: bool) {
+        // Do not guard nest readiness here — CreateExternalAppPane and SetGameMode
+        // share the winit FIFO queue (EC4). Guard lives in the event handler.
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::SetGameMode(self.id.clone(), enabled));
+        }
+    }
+
+    /// Register a window-scoped host hotkey (PhysicalKey / KeyboardEvent.code).
+    /// Works with or without a nested compositor when the table is non-empty (EC3).
+    #[cfg(target_os = "linux")]
+    #[napi]
+    pub fn register_host_hotkey(&self, id: String, key: String, modifiers: Option<u32>) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::RegisterHostHotkey {
+                window_id: self.id.clone(),
+                id,
+                key,
+                modifiers: modifiers.unwrap_or(0),
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[napi]
+    pub fn unregister_host_hotkey(&self, id: String) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::UnregisterHostHotkey {
+                window_id: self.id.clone(),
+                id,
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[napi]
+    pub fn clear_host_hotkeys(&self) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::ClearHostHotkeys(self.id.clone()));
         }
     }
 

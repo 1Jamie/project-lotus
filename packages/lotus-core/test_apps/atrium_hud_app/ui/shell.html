@@ -108,7 +108,11 @@
         const ipc = lotusIpc();
         if (ipc?.send) ipc.send('atrium-notify-action', payload || {});
       });
-      eventSource.on('atrium-game-mode-changed', (data) => {
+      eventSource.on('nest:hotkey', (data) => {
+        const ipc = lotusIpc();
+        if (ipc?.send) ipc.send('nest-hotkey', data || {});
+      });
+      eventSource.on('nest:game-mode', (data) => {
         const ipc = lotusIpc();
         if (ipc?.send) ipc.send('atrium-forward-mode', data);
         if (data && data.game_mode !== undefined) {
@@ -116,9 +120,13 @@
           render();
         }
       });
-      eventSource.on('atrium-toggle-discord', (data) => {
+      eventSource.on('atrium-game-mode-changed', (data) => {
         const ipc = lotusIpc();
-        if (ipc?.send) ipc.send('discord-ui-sync', !!(data && data.visible));
+        if (ipc?.send) ipc.send('atrium-forward-mode', data);
+        if (data && data.game_mode !== undefined) {
+          mode = data.game_mode ? 'game' : 'overlay';
+          render();
+        }
       });
       eventSource.on('atrium-fullscreen-changed', (data) => {
         const ipc = lotusIpc();

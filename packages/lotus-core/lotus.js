@@ -2653,11 +2653,50 @@ class ServoWindow extends EventEmitter {
 
     /**
      * Set input mode: true = Game mode (pass-through to Wayland/X11 app), false = HUD mode (interact with webview).
-     * @param {boolean} enabled 
+     * Nest-ready check runs on the winit loop so it is safe to call immediately after createExternalAppPane.
+     * @param {boolean} enabled
      */
     setGameMode(enabled) {
         if (this.handle && typeof this.handle.setGameMode === 'function') {
             this.handle.setGameMode(!!enabled);
+        }
+    }
+
+    /**
+     * Register a window-level host hotkey (beats game/pane focus).
+     * @param {object} opts
+     * @param {string} opts.id Stable action id (emitted as nest:hotkey)
+     * @param {string} opts.key W3C KeyboardEvent.code (e.g. "F12", "KeyD")
+     * @param {object} [opts.modifiers] { ctrl?, alt?, shift?, super? }
+     */
+    registerHostHotkey(opts = {}) {
+        if (!this.handle || typeof this.handle.registerHostHotkey !== 'function') {
+            return;
+        }
+        const id = opts.id;
+        const key = opts.key;
+        if (!id || !key) {
+            console.warn('[lotus] registerHostHotkey requires { id, key }');
+            return;
+        }
+        const m = opts.modifiers || {};
+        let mask = 0;
+        if (m.ctrl || m.control) mask |= 1;
+        if (m.alt) mask |= 2;
+        if (m.shift) mask |= 4;
+        if (m.super || m.meta) mask |= 8;
+        this.handle.registerHostHotkey(String(id), String(key), mask);
+    }
+
+    unregisterHostHotkey(id) {
+        if (this.handle && typeof this.handle.unregisterHostHotkey === 'function') {
+            this.handle.unregisterHostHotkey(String(id));
+        }
+    }
+
+    clearHostHotkeys() {
+        if (this.handle && typeof this.handle.clearHostHotkeys === 'function') {
+            this.handle.clearHostHotkeys();
         }
     }
 

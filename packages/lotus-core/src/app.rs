@@ -268,6 +268,22 @@ pub enum EngineCommand {
     },
     #[cfg(target_os = "linux")]
     SetGameMode(String, bool),
+    #[cfg(target_os = "linux")]
+    RegisterHostHotkey {
+        window_id: String,
+        id: String,
+        /// W3C KeyboardEvent.code (e.g. "F12", "KeyD").
+        key: String,
+        /// Bitmask: Ctrl=1 Alt=2 Shift=4 Super=8 (lock keys ignored at match).
+        modifiers: u32,
+    },
+    #[cfg(target_os = "linux")]
+    UnregisterHostHotkey {
+        window_id: String,
+        id: String,
+    },
+    #[cfg(target_os = "linux")]
+    ClearHostHotkeys(String),
     /// Borderless fullscreen for the lotus host window itself.
     SetFullscreen(String, bool),
     SetPaneZIndex(String, String, i32),
@@ -609,11 +625,25 @@ fn atrium_apply_game_mode(
     mode: bool,
     event_loop: Option<&ActiveEventLoop>,
 ) {
+    let leaving_game = instance.game_mode && !mode;
+    let entering_game = !instance.game_mode && mode;
     instance.game_mode = mode;
+    if entering_game {
+        // Fresh enter — no stale host-consumed press set.
+        instance.host_hotkey_pressed.clear();
+    }
     if let Some(ref ws) = instance.nested_compositor {
         // Nested compositor tracks host game-mode so new Discord toplevels never
         // grab Activated (which would silence session-bus Notify).
         ws.lock().set_host_game_mode(mode);
+    }
+    // Leaving game: wl_keyboard::leave (via clear focus) so clients release held keys
+    // that may have been forwarded before a host hotkey flipped mode (EC1).
+    if leaving_game {
+        if let Some(ref ws) = instance.nested_compositor {
+            ws.lock().clear_keyboard_focus();
+        }
+        instance.host_hotkey_pressed.clear();
     }
     if mode {
         // Overlay externals (Discord, …) must look unfocused so they emit desktop
@@ -668,9 +698,6 @@ fn atrium_apply_game_mode(
             .collect();
         if atrium_is_primary_game(instance, &instance.active_pane_id) {
             instance.active_pane_id.clear();
-            if let Some(ref ws) = instance.nested_compositor {
-                ws.lock().clear_keyboard_focus();
-            }
         }
         // Leave the game surface so it stops highlighting under the overlay cursor.
         // Activate *visible* overlays so Chromium resumes painting (game mode keeps
@@ -2480,7 +2507,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     pending_gutter_delta: None,
                     gutter_hover: None,
                     hover_pane_id: None,
-                    game_mode: true,
+                    game_mode: false,
+                    #[cfg(target_os = "linux")]
+                    host_hotkeys: std::collections::HashMap::new(),
+                    #[cfg(target_os = "linux")]
+                    host_hotkey_pressed: std::collections::HashSet::new(),
                     #[cfg(target_os = "linux")]
                     host_pointer_grabbed: false,
                     #[cfg(target_os = "linux")]
@@ -3500,14 +3531,73 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             #[cfg(target_os = "linux")]
             EngineCommand::SetGameMode(window_id, mode) => {
+                // Nest-ready guard lives here (winit loop), not on the N-API thread,
+                // so FIFO CreateExternalAppPane → SetGameMode(true) works (EC4).
                 if let Some(instance) = self.windows.get_mut(&window_id) {
-                    atrium_apply_game_mode(instance, mode, Some(event_loop));
-                    info!("[lotus-atrium] game mode set: {}", mode);
-                    push_renderer_ipc(
-                        &window_id,
-                        "atrium-game-mode-changed",
-                        serde_json::json!({ "game_mode": mode }),
-                    );
+                    if mode && instance.nested_compositor.is_none() {
+                        warn!(
+                            "[lotus-nest] setGameMode(true) ignored: nested compositor not started yet"
+                        );
+                    } else {
+                        atrium_apply_game_mode(instance, mode, Some(event_loop));
+                        info!("[lotus-nest] game mode set: {}", mode);
+                        push_renderer_ipc(
+                            &window_id,
+                            "nest:game-mode",
+                            serde_json::json!({ "game_mode": mode }),
+                        );
+                        // Compat for atrium shell chrome until listeners migrate.
+                        push_renderer_ipc(
+                            &window_id,
+                            "atrium-game-mode-changed",
+                            serde_json::json!({ "game_mode": mode }),
+                        );
+                    }
+                }
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::RegisterHostHotkey {
+                window_id,
+                id,
+                key,
+                modifiers,
+            } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    match crate::window::parse_keyboard_event_code(&key) {
+                        Some(keycode) => {
+                            instance.host_hotkeys.insert(
+                                id.clone(),
+                                crate::window::HostHotkeyBinding {
+                                    id: id.clone(),
+                                    key: keycode,
+                                    modifiers,
+                                },
+                            );
+                            info!(
+                                "[lotus-nest] host hotkey registered id={} key={} mods={:#x}",
+                                id, key, modifiers
+                            );
+                        }
+                        None => {
+                            warn!(
+                                "[lotus-nest] registerHostHotkey: unknown KeyboardEvent.code '{}'",
+                                key
+                            );
+                        }
+                    }
+                }
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::UnregisterHostHotkey { window_id, id } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    instance.host_hotkeys.remove(&id);
+                }
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::ClearHostHotkeys(window_id) => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    instance.host_hotkeys.clear();
+                    instance.host_hotkey_pressed.clear();
                 }
             },
             EngineCommand::SetFullscreen(window_id, enabled) => {
@@ -6046,87 +6136,41 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
 
                         #[cfg(target_os = "linux")]
-                        // Ignore key-repeat: holding F9/F12 was flipping open↔closed every
-                        // repeat tick (felt like a stuck double-toggle loop).
-                        if event.state == winit::event::ElementState::Pressed && !event.repeat {
-                            match &event.logical_key {
-                                winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) => {
-                                    let next = !instance.game_mode;
-                                    atrium_apply_game_mode(instance, next, Some(event_loop));
-                                    info!("[lotus-atrium] F12 pressed -> toggled game mode: {}", next);
-                                    push_renderer_ipc(
-                                        &uuid,
-                                        "atrium-game-mode-changed",
-                                        serde_json::json!({ "game_mode": next }),
-                                    );
-                                    return;
+                        {
+                            // EC1: Released for keys whose Pressed was host-consumed — never forward.
+                            if event.state == winit::event::ElementState::Released
+                                && instance.host_hotkey_pressed.remove(&event.physical_key)
+                            {
+                                return;
+                            }
+
+                            // EC3: any window with a non-empty host hotkey table.
+                            // Match PhysicalKey::Code + Ctrl|Alt|Shift|Super (ignore lock keys).
+                            if !instance.host_hotkeys.is_empty()
+                                && event.state == winit::event::ElementState::Pressed
+                                && !event.repeat
+                            {
+                                if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key
+                                {
+                                    let pressed_mods =
+                                        crate::window::host_hotkey_mod_mask(instance.modifiers);
+                                    let matched_id = instance
+                                        .host_hotkeys
+                                        .values()
+                                        .find(|b| {
+                                            b.key == code && b.modifiers == pressed_mods
+                                        })
+                                        .map(|b| b.id.clone());
+                                    if let Some(id) = matched_id {
+                                        instance.host_hotkey_pressed.insert(event.physical_key);
+                                        push_renderer_ipc(
+                                            &uuid,
+                                            "nest:hotkey",
+                                            serde_json::json!({ "id": id }),
+                                        );
+                                        return;
+                                    }
                                 }
-                                winit::keyboard::Key::Named(winit::keyboard::NamedKey::F9) => {
-                                    info!("[lotus-atrium] F9 pressed -> toggle discord overlay");
-                                    let next_visible = instance
-                                        .panes
-                                        .get("discord")
-                                        .map(|p| !p.pending_visible)
-                                        .unwrap_or(false);
-                                    if next_visible {
-                                        // Leave game mode *before* showing Discord so the
-                                        // visible configure grants Activated (not throttled).
-                                        if instance.game_mode {
-                                            atrium_apply_game_mode(
-                                                instance,
-                                                false,
-                                                Some(event_loop),
-                                            );
-                                            push_renderer_ipc(
-                                                &uuid,
-                                                "atrium-game-mode-changed",
-                                                serde_json::json!({ "game_mode": false }),
-                                            );
-                                        }
-                                        atrium_set_pane_visible(instance, "discord", true);
-                                        atrium_set_keyboard_focus(instance, "discord");
-                                    } else {
-                                        atrium_set_pane_visible(instance, "discord", false);
-                                    }
-                                    if !next_visible && instance.active_pane_id == "discord" {
-                                        instance.active_pane_id.clear();
-                                    }
-                                    let physical_size = instance.window.inner_size();
-                                    let scale_factor = instance.window.scale_factor() as f32;
-                                    instance.recalculate_layout(physical_size, scale_factor);
-                                    instance.window.request_redraw();
-                                    push_renderer_ipc(
-                                        &uuid,
-                                        "atrium-toggle-discord",
-                                        serde_json::json!({ "visible": next_visible }),
-                                    );
-                                    return;
-                                }
-                                winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
-                                    let next = instance.window.fullscreen().is_none();
-                                    info!("[lotus-atrium] F11 pressed -> lotus fullscreen={}", next);
-                                    if next {
-                                        instance.window.set_fullscreen(Some(
-                                            winit::window::Fullscreen::Borderless(None),
-                                        ));
-                                    } else {
-                                        instance.window.set_fullscreen(None);
-                                    }
-                                    #[cfg(target_os = "linux")]
-                                    tag_window_for_gamescope(&instance.window);
-                                    push_renderer_ipc(
-                                        &uuid,
-                                        "atrium-fullscreen-changed",
-                                        serde_json::json!({ "fullscreen": next }),
-                                    );
-                                    apply_refresh_policy(instance);
-                                    #[cfg(target_os = "linux")]
-                                    if let Some(ref ws) = instance.nested_compositor {
-                                        ws.lock().set_output_refresh(instance.refresh_rate_millihertz);
-                                    }
-                                    return;
-                                }
-                                _ => {}
                             }
                         }
 

@@ -20,14 +20,40 @@ function pluginsDir() {
   return path.join(configDir(), 'plugins');
 }
 
+/** Default host hotkeys (W3C KeyboardEvent.code). Overridable via profile.keybinds. */
+function defaultKeybinds() {
+  return {
+    'toggle-mode': { key: 'F12' },
+    'toggle-fullscreen': { key: 'F11' },
+    'discord-sidecar:toggle': { key: 'F9' },
+    'perf-hud:toggle': { key: 'F10' },
+  };
+}
+
 function defaultProfile() {
   return {
-    version: 1,
+    version: 2,
     mode: 'game',
     plugins: {},
-    keybinds: {},
+    keybinds: defaultKeybinds(),
     panes: {},
   };
+}
+
+/** Merge saved keybinds over defaults (missing ids keep defaults). */
+function resolveKeybinds(profile) {
+  const defaults = defaultKeybinds();
+  const saved = profile && typeof profile.keybinds === 'object' ? profile.keybinds : {};
+  const out = { ...defaults };
+  for (const [id, spec] of Object.entries(saved)) {
+    if (!spec || typeof spec !== 'object') continue;
+    if (typeof spec.key !== 'string' || !spec.key) continue;
+    out[id] = {
+      key: spec.key,
+      modifiers: spec.modifiers && typeof spec.modifiers === 'object' ? spec.modifiers : {},
+    };
+  }
+  return out;
 }
 
 function ensureConfigLayout(bundledPluginsDir) {
@@ -125,4 +151,6 @@ module.exports = {
   getPaneRect,
   setPaneRect,
   paneKey,
+  defaultKeybinds,
+  resolveKeybinds,
 };

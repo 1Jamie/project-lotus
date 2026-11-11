@@ -140,6 +140,139 @@ pub fn map_winit_modifiers(winit_mods: winit::event::Modifiers) -> Modifiers {
     s_mods
 }
 
+/// Host hotkey modifier bitmask (lock keys ignored at match time).
+#[cfg(target_os = "linux")]
+pub const HOST_HOTKEY_CTRL: u32 = 1;
+#[cfg(target_os = "linux")]
+pub const HOST_HOTKEY_ALT: u32 = 2;
+#[cfg(target_os = "linux")]
+pub const HOST_HOTKEY_SHIFT: u32 = 4;
+#[cfg(target_os = "linux")]
+pub const HOST_HOTKEY_SUPER: u32 = 8;
+
+/// One registered host hotkey: W3C `KeyboardEvent.code` → physical KeyCode + mod mask.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct HostHotkeyBinding {
+    pub id: String,
+    pub key: winit::keyboard::KeyCode,
+    pub modifiers: u32,
+}
+
+/// Parse a W3C `KeyboardEvent.code` string into a winit `KeyCode`.
+#[cfg(target_os = "linux")]
+pub fn parse_keyboard_event_code(code: &str) -> Option<winit::keyboard::KeyCode> {
+    use winit::keyboard::KeyCode;
+    Some(match code {
+        "F1" => KeyCode::F1,
+        "F2" => KeyCode::F2,
+        "F3" => KeyCode::F3,
+        "F4" => KeyCode::F4,
+        "F5" => KeyCode::F5,
+        "F6" => KeyCode::F6,
+        "F7" => KeyCode::F7,
+        "F8" => KeyCode::F8,
+        "F9" => KeyCode::F9,
+        "F10" => KeyCode::F10,
+        "F11" => KeyCode::F11,
+        "F12" => KeyCode::F12,
+        "F13" => KeyCode::F13,
+        "F14" => KeyCode::F14,
+        "F15" => KeyCode::F15,
+        "F16" => KeyCode::F16,
+        "F17" => KeyCode::F17,
+        "F18" => KeyCode::F18,
+        "F19" => KeyCode::F19,
+        "F20" => KeyCode::F20,
+        "F21" => KeyCode::F21,
+        "F22" => KeyCode::F22,
+        "F23" => KeyCode::F23,
+        "F24" => KeyCode::F24,
+        "Escape" => KeyCode::Escape,
+        "Backquote" => KeyCode::Backquote,
+        "Digit0" => KeyCode::Digit0,
+        "Digit1" => KeyCode::Digit1,
+        "Digit2" => KeyCode::Digit2,
+        "Digit3" => KeyCode::Digit3,
+        "Digit4" => KeyCode::Digit4,
+        "Digit5" => KeyCode::Digit5,
+        "Digit6" => KeyCode::Digit6,
+        "Digit7" => KeyCode::Digit7,
+        "Digit8" => KeyCode::Digit8,
+        "Digit9" => KeyCode::Digit9,
+        "KeyA" => KeyCode::KeyA,
+        "KeyB" => KeyCode::KeyB,
+        "KeyC" => KeyCode::KeyC,
+        "KeyD" => KeyCode::KeyD,
+        "KeyE" => KeyCode::KeyE,
+        "KeyF" => KeyCode::KeyF,
+        "KeyG" => KeyCode::KeyG,
+        "KeyH" => KeyCode::KeyH,
+        "KeyI" => KeyCode::KeyI,
+        "KeyJ" => KeyCode::KeyJ,
+        "KeyK" => KeyCode::KeyK,
+        "KeyL" => KeyCode::KeyL,
+        "KeyM" => KeyCode::KeyM,
+        "KeyN" => KeyCode::KeyN,
+        "KeyO" => KeyCode::KeyO,
+        "KeyP" => KeyCode::KeyP,
+        "KeyQ" => KeyCode::KeyQ,
+        "KeyR" => KeyCode::KeyR,
+        "KeyS" => KeyCode::KeyS,
+        "KeyT" => KeyCode::KeyT,
+        "KeyU" => KeyCode::KeyU,
+        "KeyV" => KeyCode::KeyV,
+        "KeyW" => KeyCode::KeyW,
+        "KeyX" => KeyCode::KeyX,
+        "KeyY" => KeyCode::KeyY,
+        "KeyZ" => KeyCode::KeyZ,
+        "Tab" => KeyCode::Tab,
+        "Space" => KeyCode::Space,
+        "Enter" => KeyCode::Enter,
+        "Backspace" => KeyCode::Backspace,
+        "Delete" => KeyCode::Delete,
+        "Insert" => KeyCode::Insert,
+        "Home" => KeyCode::Home,
+        "End" => KeyCode::End,
+        "PageUp" => KeyCode::PageUp,
+        "PageDown" => KeyCode::PageDown,
+        "ArrowLeft" => KeyCode::ArrowLeft,
+        "ArrowRight" => KeyCode::ArrowRight,
+        "ArrowUp" => KeyCode::ArrowUp,
+        "ArrowDown" => KeyCode::ArrowDown,
+        "Minus" => KeyCode::Minus,
+        "Equal" => KeyCode::Equal,
+        "BracketLeft" => KeyCode::BracketLeft,
+        "BracketRight" => KeyCode::BracketRight,
+        "Backslash" => KeyCode::Backslash,
+        "Semicolon" => KeyCode::Semicolon,
+        "Quote" => KeyCode::Quote,
+        "Comma" => KeyCode::Comma,
+        "Period" => KeyCode::Period,
+        "Slash" => KeyCode::Slash,
+        _ => return None,
+    })
+}
+
+/// Active Ctrl/Alt/Shift/Super only — CapsLock/NumLock/ScrollLock ignored.
+#[cfg(target_os = "linux")]
+pub fn host_hotkey_mod_mask(mods: Modifiers) -> u32 {
+    let mut m = 0u32;
+    if mods.contains(Modifiers::CONTROL) {
+        m |= HOST_HOTKEY_CTRL;
+    }
+    if mods.contains(Modifiers::ALT) {
+        m |= HOST_HOTKEY_ALT;
+    }
+    if mods.contains(Modifiers::SHIFT) {
+        m |= HOST_HOTKEY_SHIFT;
+    }
+    if mods.contains(Modifiers::META) {
+        m |= HOST_HOTKEY_SUPER;
+    }
+    m
+}
+
 pub fn map_winit_key(winit_key: &winit::keyboard::Key) -> Key {
     use winit::keyboard::Key as WKey;
     use winit::keyboard::NamedKey as WNamed;
@@ -482,6 +615,12 @@ pub struct WindowInstance {
     pub hover_pane_id: Option<String>,
     /// When true, input goes directly to the embedded Wayland/X11 game pane.
     pub game_mode: bool,
+    /// Window-scoped host hotkeys (PhysicalKey + mod mask). Empty = no consume.
+    #[cfg(target_os = "linux")]
+    pub host_hotkeys: std::collections::HashMap<String, HostHotkeyBinding>,
+    /// Keys whose Pressed was consumed by a host hotkey — matching Released is also consumed.
+    #[cfg(target_os = "linux")]
+    pub host_hotkey_pressed: std::collections::HashSet<winit::keyboard::PhysicalKey>,
     /// Host winit cursor grab currently applied (derived from game shoes + game_mode).
     #[cfg(target_os = "linux")]
     pub host_pointer_grabbed: bool,

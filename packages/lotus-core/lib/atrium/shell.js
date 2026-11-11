@@ -9,6 +9,7 @@ const {
   loadProfile,
   saveProfile,
   pluginsDir,
+  resolveKeybinds,
 } = require('./profile');
 const { loadPlugins } = require('./plugin_manager');
 const { zIndexForLayer } = require('./layers');
@@ -186,30 +187,78 @@ async function startShell(cfg) {
     } catch (_) {}
   }
 
-  // Built-in shell buttons
+  function toggleFullscreen() {
+    cfg._fullscreenOn = !cfg._fullscreenOn;
+    try {
+      win.setFullscreen(!!cfg._fullscreenOn);
+    } catch (e) {
+      console.warn('[atrium] fullscreen toggle failed:', e.message);
+    }
+    pushShellChrome();
+  }
+
+  function handleHostHotkey(id) {
+    if (id === 'toggle-mode') {
+      shellApi.setMode(shellApi.mode === 'game' ? 'overlay' : 'game');
+      return;
+    }
+    if (id === 'toggle-fullscreen') {
+      toggleFullscreen();
+      return;
+    }
+    if (id === 'discord-sidecar:toggle') {
+      shellApi._togglePluginPane('discord-sidecar', 'app');
+      return;
+    }
+    if (id === 'perf-hud:toggle') {
+      shellApi._togglePluginPane('perf-hud', 'main');
+      return;
+    }
+    // Generic plugin action: "<pluginId>:toggle" → toggle-pane:app/main if present
+    if (typeof id === 'string' && id.endsWith(':toggle')) {
+      const pluginId = id.slice(0, -':toggle'.length);
+      const entry = shellApi._plugins.get(pluginId);
+      if (entry) {
+        const local =
+          entry.ctx.getPane('app') ? 'app' : entry.ctx.getPane('main') ? 'main' : null;
+        if (local) shellApi._togglePluginPane(pluginId, local);
+      }
+    }
+  }
+
+  function installHostHotkeys() {
+    const binds = resolveKeybinds(profile);
+    try {
+      win.clearHostHotkeys();
+    } catch (_) {}
+    for (const [id, spec] of Object.entries(binds)) {
+      if (!spec || !spec.key) continue;
+      try {
+        win.registerHostHotkey({
+          id,
+          key: spec.key,
+          modifiers: spec.modifiers || {},
+        });
+      } catch (e) {
+        console.warn(`[atrium] registerHostHotkey ${id} failed:`, e.message);
+      }
+    }
+  }
+
+  // Built-in shell buttons (same handlers as host hotkeys)
   shellApi.registerButton({
     id: 'mode',
     label: 'Game · F12',
     shortcut: 'F12',
     pluginId: 'shell',
-    onClick: () => {
-      shellApi.setMode(shellApi.mode === 'game' ? 'overlay' : 'game');
-    },
+    onClick: () => handleHostHotkey('toggle-mode'),
   });
   shellApi.registerButton({
     id: 'fullscreen',
     label: 'Full · F11',
     shortcut: 'F11',
     pluginId: 'shell',
-    onClick: () => {
-      cfg._fullscreenOn = !cfg._fullscreenOn;
-      try {
-        win.setFullscreen(!!cfg._fullscreenOn);
-      } catch (e) {
-        console.warn('[atrium] fullscreen toggle failed:', e.message);
-      }
-      pushShellChrome();
-    },
+    onClick: () => handleHostHotkey('toggle-fullscreen'),
   });
 
   // Deduplicate Discord pills — manifest registers one; ignore extras without action.
@@ -248,7 +297,11 @@ async function startShell(cfg) {
       }
     }
 
+    // Host hotkeys may register before nest is ready (EC3).
+    installHostHotkeys();
+
     // Shell owns the game pane — must be first external pane (primary).
+    // createExternalAppPane + setGameMode share the winit FIFO (EC4).
     win.createExternalAppPane('game_surface', {
       command: cfg.command,
       args: cfg.args,
@@ -275,8 +328,12 @@ async function startShell(cfg) {
     });
     pinShellBar();
 
-    // Fan-out atrium-game-stats once at window level (+ surface-size refits).
-    wireWindowIpc(win, shellApi, { refitOverlays, cfg });
+    // Fan-out nest:hotkey + telemetry (+ surface-size refits).
+    wireWindowIpc(win, shellApi, {
+      refitOverlays,
+      cfg,
+      onHostHotkey: handleHostHotkey,
+    });
 
     // Smoke the toast bus once plugins are up (surfaces can also AtriumPlugin.notify).
     setTimeout(() => {
@@ -356,32 +413,18 @@ async function startShell(cfg) {
   ipcMain.on('atrium-notify-action', (payload) => {
     shellApi.emit('notify-action', payload || {});
   });
-  // F9 bridge: Rust owns the keybind + pane toggle (id "discord"), then emits
-  // atrium-toggle-discord. JS must ONLY mirror state — calling setVisible here
-  // re-enters SetPaneVisible and open↔closes on one press.
-  ipcMain.on('discord-ui-sync', (visible) => {
-    const entry = shellApi._plugins.get('discord-sidecar');
-    if (!entry) return;
-    const handle = entry.ctx.getPane('app');
-    if (handle) {
-      handle.syncHostVisible(!!visible);
-      // Enter overlay so Discord is interactive; applyModeFlags skips no-op setVisible.
-      if (visible && shellApi.mode === 'game') {
-        shellApi.setMode('overlay');
-      }
-    }
-    pushShellChrome();
-  });
-
   return { win, shell: shellApi, profile };
 }
 
 function wireWindowIpc(win, shellApi, opts = {}) {
   const refitOverlays = opts.refitOverlays || (() => {});
   const cfg = opts.cfg || {};
-  // Renderer events arrive on the window; subscribe via executeScript bridge is awkward.
-  // Instead, listen on Node by patching through the existing lotus event path:
-  // atrium pushes to all renderer sockets — shell.html forwards stats to Node once.
+  const onHostHotkey = opts.onHostHotkey || (() => {});
+  // Renderer events arrive on the window; shell.html forwards nest:hotkey / stats to Node.
+  ipcMain.on('nest-hotkey', (payload) => {
+    const id = payload && payload.id;
+    if (id) onHostHotkey(id);
+  });
   ipcMain.on('atrium-forward-stats', (stats) => {
     if (!stats || typeof stats !== 'object') return;
     for (const cb of shellApi._telemetrySubs) {

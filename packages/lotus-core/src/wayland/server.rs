@@ -362,7 +362,7 @@ impl LotusWaylandState {
             known_surfaces: HashMap::new(),
             refresh_rate_millihertz,
             // Atrium windows start in game mode.
-            host_game_mode: true,
+            host_game_mode: false,
             last_emitted_pointer_lock: false,
         }
     }
