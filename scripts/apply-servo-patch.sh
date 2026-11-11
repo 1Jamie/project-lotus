@@ -15,39 +15,35 @@ SERVO_PATH_PATCH_END='# <<< lotus-servo-path-patch'
 
 inject_servo_path_patch() {
   local cargo_toml="$1"
-  if rg -q 'lotus-servo-path-patch' "$cargo_toml"; then
+  if grep -q 'lotus-servo-path-patch' "$cargo_toml"; then
     echo "[apply-servo-patch] Cargo.toml already redirects crates.io servo → submodule path."
     return 0
   fi
-  if ! rg -q '^\[patch\.crates-io\]' "$cargo_toml"; then
-    printf '\n[patch.crates-io]\n%s\nservo = { path = "servo/components/servo" }\n%s\n' \
-      "$SERVO_PATH_PATCH_BEGIN" "$SERVO_PATH_PATCH_END" >> "$cargo_toml"
-  else
-    local tmp
-    tmp="$(mktemp)"
-    awk -v begin="$SERVO_PATH_PATCH_BEGIN" -v end="$SERVO_PATH_PATCH_END" '
-      BEGIN { done = 0 }
-      /^\[patch\.crates-io\]$/ && !done {
-        print
+
+  local tmp
+  tmp="$(mktemp)"
+  awk -v begin="$SERVO_PATH_PATCH_BEGIN" -v end="$SERVO_PATH_PATCH_END" '
+    BEGIN { done = 0 }
+    /^\[patch\.crates-io\]$/ && !done {
+      print
+      print begin
+      print "servo = { path = \"servo/components/servo\" }"
+      print end
+      done = 1
+      next
+    }
+    { print }
+    END {
+      if (!done) {
+        print ""
+        print "[patch.crates-io]"
         print begin
         print "servo = { path = \"servo/components/servo\" }"
         print end
-        done = 1
-        next
       }
-      { print }
-      END {
-        if (!done) {
-          print ""
-          print "[patch.crates-io]"
-          print begin
-          print "servo = { path = \"servo/components/servo\" }"
-          print end
-        }
-      }
-    ' "$cargo_toml" > "$tmp"
-    mv "$tmp" "$cargo_toml"
-  fi
+    }
+  ' "$cargo_toml" > "$tmp"
+  mv "$tmp" "$cargo_toml"
   echo "[apply-servo-patch] Injected crates.io → path redirect for servo into Cargo.toml."
 }
 

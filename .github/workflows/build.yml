@@ -128,8 +128,10 @@ jobs:
         shell: powershell
       - uses: actions/checkout@v4
         with:
-          # Windows/BSD use crates.io Servo; Linux needs the patched submodule.
-          submodules: ${{ runner.os == 'Linux' }}
+          # Submodule is required on all hosts: Cargo validates linux-only path deps
+          # even when building for Windows. Windows still uses crates.io Servo (no
+          # apply-servo-patch injection); Linux redirects via [patch.crates-io].
+          submodules: true
       # MSVC/mozangle still hit legacy MAX_PATH under deep GitHub workspaces (e.g. packages/lotus-core/target/...).
       - name: Short Cargo and temp dirs (Windows)
         if: runner.os == 'Windows'
