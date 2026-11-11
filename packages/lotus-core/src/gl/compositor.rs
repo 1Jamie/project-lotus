@@ -347,6 +347,8 @@ pub fn composite_panes_to_scene(
 
         instance.gl.color_mask(true, true, true, true);
         // Game mode + primary covering the viewport: skip clear (opaque blit replaces all).
+        // Nest external surfaces exist only on Linux; keep Windows compiling as a noop.
+        #[cfg(target_os = "linux")]
         let skip_clear = instance.game_mode
             && instance.primary_game_pane.as_ref().is_some_and(|pid| {
                 instance
@@ -355,6 +357,8 @@ pub fn composite_panes_to_scene(
                     .and_then(|p| p.external_surface_slot.as_ref())
                     .is_some_and(|s| s.lock().current_texture.is_some())
             });
+        #[cfg(not(target_os = "linux"))]
+        let skip_clear = false;
         if !skip_clear {
             if instance.transparent {
                 instance.gl.clear_color(0.0, 0.0, 0.0, 0.0);

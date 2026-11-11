@@ -1,6 +1,6 @@
 {
   "name": "@lotus-gui/core",
-  "version": "0.4.0",
+  "version": "0.5.0-devel.0",
   "main": "lotus.js",
   "types": "lotus.d.ts",
   "repository": {

@@ -226,14 +226,33 @@ jobs:
           ls -la packages/lotus-core/
       - name: Publish to npm
         run: |
+          set -euo pipefail
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
-          npm publish --workspace=@lotus-gui/core --access public
-          npm publish --workspace=@lotus-gui/dev --access public
+          CORE_VER=$(node -p "require('./packages/lotus-core/package.json').version")
+          DEV_VER=$(node -p "require('./packages/lotus-dev/package.json').version")
+          if [[ "$CORE_VER" == *"-devel"* ]]; then
+            TAG=devel
+            echo "Devel release detected (@lotus-gui/core@$CORE_VER) — publishing with --tag devel"
+            npm publish --workspace=@lotus-gui/core --access public --tag "$TAG"
+            # Skip @lotus-gui/dev unless this exact version is not on the registry yet
+            # (devel cuts often only bump core).
+            if npm view "@lotus-gui/dev@${DEV_VER}" version >/dev/null 2>&1; then
+              echo "@lotus-gui/dev@${DEV_VER} already published — skipping"
+            else
+              echo "Publishing @lotus-gui/dev@${DEV_VER} with --tag devel"
+              npm publish --workspace=@lotus-gui/dev --access public --tag "$TAG"
+            fi
+          else
+            echo "Stable release (@lotus-gui/core@$CORE_VER) — publishing with default latest tag"
+            npm publish --workspace=@lotus-gui/core --access public
+            npm publish --workspace=@lotus-gui/dev --access public
+          fi
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: packages/lotus-core/*.node
+          prerelease: ${{ contains(github.ref_name, 'devel') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -92,6 +92,8 @@ void main() {
 
 /// Desktop GL compose for Proton/Xwayland DMA-BUFs imported as GL_TEXTURE_EXTERNAL_OES.
 /// Mesa RadeonSI/Zink need GL_OES_EGL_image_external_essl3 for samplerExternalOES in #version 330.
+/// Linux-only: nest DMA-BUF import does not exist on Windows.
+#[cfg(target_os = "linux")]
 pub const COMP_FS_OES: &str = r#"
 #version 330 core
 #extension GL_OES_EGL_image_external_essl3 : enable
@@ -766,50 +768,62 @@ impl WindowInstance {
             self.u_comp_flip_loc = self.gl.get_uniform_location(program, "u_flip_y");
             self.comp_program = Some(program);
 
-            // Optional OES external program — soft-fail if the extension is missing.
-            let oes_program = self.gl.create_program().expect("Cannot create OES program");
-            let fs_oes = self.gl.create_shader(glow::FRAGMENT_SHADER).expect("Cannot create OES FS");
-            self.gl.shader_source(fs_oes, COMP_FS_OES);
-            self.gl.compile_shader(fs_oes);
-            if !self.gl.get_shader_compile_status(fs_oes) {
-                log::warn!(
-                    "[lotus-nest] COMP_FS_OES compile failed (external dmabufs may stay black): {}",
-                    self.gl.get_shader_info_log(fs_oes)
-                );
-                self.gl.delete_shader(fs_oes);
-                self.gl.delete_program(oes_program);
-                self.comp_program_oes = None;
-            } else {
-                self.gl.attach_shader(oes_program, vs);
-                self.gl.attach_shader(oes_program, fs_oes);
-                self.gl.link_program(oes_program);
-                if !self.gl.get_program_link_status(oes_program) {
+            // Optional OES external program — Linux nest DMA-BUF path only.
+            #[cfg(target_os = "linux")]
+            {
+                let oes_program = self.gl.create_program().expect("Cannot create OES program");
+                let fs_oes = self
+                    .gl
+                    .create_shader(glow::FRAGMENT_SHADER)
+                    .expect("Cannot create OES FS");
+                self.gl.shader_source(fs_oes, COMP_FS_OES);
+                self.gl.compile_shader(fs_oes);
+                if !self.gl.get_shader_compile_status(fs_oes) {
                     log::warn!(
-                        "[lotus-nest] COMP_FS_OES link failed: {}",
-                        self.gl.get_program_info_log(oes_program)
+                        "[lotus-nest] COMP_FS_OES compile failed (external dmabufs may stay black): {}",
+                        self.gl.get_shader_info_log(fs_oes)
                     );
-                    self.gl.detach_shader(oes_program, vs);
-                    self.gl.detach_shader(oes_program, fs_oes);
                     self.gl.delete_shader(fs_oes);
                     self.gl.delete_program(oes_program);
                     self.comp_program_oes = None;
                 } else {
-                    self.gl.detach_shader(oes_program, vs);
-                    self.gl.detach_shader(oes_program, fs_oes);
-                    self.gl.delete_shader(fs_oes);
-                    self.u_comp_oes_size_loc = self.gl.get_uniform_location(oes_program, "u_size");
-                    self.u_comp_oes_radius_loc =
-                        self.gl.get_uniform_location(oes_program, "u_radius");
-                    self.u_comp_oes_flip_loc =
-                        self.gl.get_uniform_location(oes_program, "u_flip_y");
-                    if let Some(u_tex) = self.gl.get_uniform_location(oes_program, "u_texture") {
-                        self.gl.use_program(Some(oes_program));
-                        self.gl.uniform_1_i32(Some(&u_tex), 0);
-                        self.gl.use_program(None);
+                    self.gl.attach_shader(oes_program, vs);
+                    self.gl.attach_shader(oes_program, fs_oes);
+                    self.gl.link_program(oes_program);
+                    if !self.gl.get_program_link_status(oes_program) {
+                        log::warn!(
+                            "[lotus-nest] COMP_FS_OES link failed: {}",
+                            self.gl.get_program_info_log(oes_program)
+                        );
+                        self.gl.detach_shader(oes_program, vs);
+                        self.gl.detach_shader(oes_program, fs_oes);
+                        self.gl.delete_shader(fs_oes);
+                        self.gl.delete_program(oes_program);
+                        self.comp_program_oes = None;
+                    } else {
+                        self.gl.detach_shader(oes_program, vs);
+                        self.gl.detach_shader(oes_program, fs_oes);
+                        self.gl.delete_shader(fs_oes);
+                        self.u_comp_oes_size_loc =
+                            self.gl.get_uniform_location(oes_program, "u_size");
+                        self.u_comp_oes_radius_loc =
+                            self.gl.get_uniform_location(oes_program, "u_radius");
+                        self.u_comp_oes_flip_loc =
+                            self.gl.get_uniform_location(oes_program, "u_flip_y");
+                        if let Some(u_tex) = self.gl.get_uniform_location(oes_program, "u_texture")
+                        {
+                            self.gl.use_program(Some(oes_program));
+                            self.gl.uniform_1_i32(Some(&u_tex), 0);
+                            self.gl.use_program(None);
+                        }
+                        self.comp_program_oes = Some(oes_program);
+                        log::info!("[lotus-nest] COMP_FS_OES ready (samplerExternalOES)");
                     }
-                    self.comp_program_oes = Some(oes_program);
-                    log::info!("[lotus-nest] COMP_FS_OES ready (samplerExternalOES)");
                 }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                self.comp_program_oes = None;
             }
 
             self.gl.delete_shader(vs);
