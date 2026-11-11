@@ -201,10 +201,17 @@ jobs:
           ) -Wait -PassThru -NoNewWindow
           if ($proc.ExitCode -ne 0) { throw "msiexec failed with exit code $($proc.ExitCode)" }
           Write-Host "GStreamer devel installed successfully."
-          $pkgConfigPath = "$gstRoot\lib\pkgconfig" -replace '\\', '/'
+          $glibPc = Join-Path $gstRoot "lib\pkgconfig\glib-2.0.pc"
+          if (-not (Test-Path -LiteralPath $glibPc)) {
+            throw "GStreamer devel install missing $glibPc"
+          }
+          # pkg-config treats ':' as a path separator, so "D:/..." becomes ["D","/..."].
+          # Use an MSYS-style /D/... path that has no drive colon.
+          $pkgConfigPath = (($gstRoot + "\lib\pkgconfig") -replace '\\', '/') -replace '^([A-Za-z]):', '/$1'
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" >> $env:GITHUB_ENV
           echo "GSTREAMER_1_0_ROOT_X86_64=$gstRoot" >> $env:GITHUB_ENV
           echo "PKG_CONFIG_PATH=$pkgConfigPath" >> $env:GITHUB_ENV
+          echo "$gstRoot\bin" >> $env:GITHUB_PATH
           Write-Host "PKG_CONFIG_PATH set to: $pkgConfigPath"
       - name: Setup toolchain
         run: ${{ matrix.settings.setup }}
