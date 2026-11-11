@@ -5261,7 +5261,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                                 // Route MouseMove to the hovered pane with translated physical coordinates
                                 let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
-                                let mut translated_point = Point2D::new(point.x - px, point.y - py);
+                                let mut translated_point: Point2D<f32, DevicePixel> =
+                                    Point2D::new(point.x - px, point.y - py);
 
                                 #[cfg(target_os = "linux")]
                                 if let Some(ref ws) = pane.external_wayland_server {
@@ -5290,6 +5291,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     pane.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
                                         servo::WebViewPoint::Device(translated_point)
                                     )));
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let _ = (pw, ph);
+                                    pane.webview.notify_input_event(InputEvent::MouseMove(
+                                        MouseMoveEvent::new(servo::WebViewPoint::Device(
+                                            translated_point,
+                                        )),
+                                    ));
                                 }
                             }
                         } else {
