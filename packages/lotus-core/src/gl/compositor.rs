@@ -58,8 +58,15 @@ pub fn scene_needs_present(
     flip_occurred: bool,
     pending_hides: &HashSet<String>,
 ) -> bool {
-    if flip_occurred || instance.committed_layout.is_some() {
+    if flip_occurred || instance.committed_layout.is_some() || instance.force_scene_repaint {
         return true;
+    }
+    for (id, staged) in &instance.staged_layout.panes {
+        if let Some(active) = instance.active_layout.panes.get(id) {
+            if staged.visible != active.visible {
+                return true;
+            }
+        }
     }
     if instance.last_presented_window_size != Some(window_size) {
         return true;
@@ -89,6 +96,7 @@ pub fn ack_presented_scene(
     instance: &mut WindowInstance,
     window_size: winit::dpi::PhysicalSize<u32>,
 ) {
+    instance.force_scene_repaint = false;
     instance.last_presented_window_size = Some(window_size);
     for pane in instance.panes.values_mut() {
         if pane.is_visible {
@@ -107,26 +115,129 @@ fn draw_pane_texture(
     scale_factor: f32,
     flip_y: i32,
 ) {
+    draw_pane_texture_ext(
+        instance,
+        tex,
+        glow::TEXTURE_2D,
+        layout_px,
+        layout_py,
+        layout_pw,
+        layout_ph,
+        scale_factor,
+        flip_y,
+        false,
+    );
+}
+
+/// GL_TEXTURE_EXTERNAL_OES — must bind with this target, not TEXTURE_2D.
+const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
+
+fn draw_pane_texture_ext(
+    instance: &WindowInstance,
+    tex: glow::NativeTexture,
+    target: u32,
+    layout_px: i32,
+    layout_py: i32,
+    layout_pw: i32,
+    layout_ph: i32,
+    scale_factor: f32,
+    flip_y: i32,
+    opaque: bool,
+) {
+    draw_pane_texture_ext_clipped(
+        instance,
+        tex,
+        target,
+        layout_px,
+        layout_py,
+        layout_pw,
+        layout_ph,
+        layout_px,
+        layout_py,
+        layout_pw,
+        layout_ph,
+        scale_factor,
+        flip_y,
+        opaque,
+    );
+}
+
+/// Like [`draw_pane_texture_ext`], but viewport (draw dest) may differ from scissor
+/// (clip). Used for cover-fit overlays: draw a larger quad, clip to the dock pane.
+/// `opaque`: primary/game fullscreen blit — skip blending for a pure 1:1 copy.
+fn draw_pane_texture_ext_clipped(
+    instance: &WindowInstance,
+    tex: glow::NativeTexture,
+    target: u32,
+    viewport_px: i32,
+    viewport_py: i32,
+    viewport_pw: i32,
+    viewport_ph: i32,
+    clip_px: i32,
+    clip_py: i32,
+    clip_pw: i32,
+    clip_ph: i32,
+    scale_factor: f32,
+    flip_y: i32,
+    opaque: bool,
+) {
     unsafe {
         instance.gl.bind_framebuffer(glow::FRAMEBUFFER, instance.scene_fbo);
-        instance.gl.viewport(layout_px, layout_py, layout_pw, layout_ph);
+        instance
+            .gl
+            .viewport(viewport_px, viewport_py, viewport_pw, viewport_ph);
         instance.gl.enable(glow::SCISSOR_TEST);
-        instance.gl.scissor(layout_px, layout_py, layout_pw, layout_ph);
-        instance.gl.enable(glow::BLEND);
-        instance.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+        instance.gl.scissor(clip_px, clip_py, clip_pw, clip_ph);
+        if opaque {
+            instance.gl.disable(glow::BLEND);
+        } else {
+            instance.gl.enable(glow::BLEND);
+            instance.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+        }
 
-        if let Some(program) = instance.comp_program {
+        let use_oes = target == GL_TEXTURE_EXTERNAL_OES;
+        let (program, size_loc, radius_loc, flip_loc) = if use_oes {
+            (
+                instance.comp_program_oes.or(instance.comp_program),
+                instance
+                    .u_comp_oes_size_loc
+                    .as_ref()
+                    .or(instance.u_comp_size_loc.as_ref()),
+                instance
+                    .u_comp_oes_radius_loc
+                    .as_ref()
+                    .or(instance.u_comp_radius_loc.as_ref()),
+                instance
+                    .u_comp_oes_flip_loc
+                    .as_ref()
+                    .or(instance.u_comp_flip_loc.as_ref()),
+            )
+        } else {
+            (
+                instance.comp_program,
+                instance.u_comp_size_loc.as_ref(),
+                instance.u_comp_radius_loc.as_ref(),
+                instance.u_comp_flip_loc.as_ref(),
+            )
+        };
+
+        if let Some(program) = program {
             instance.gl.use_program(Some(program));
             instance.gl.bind_vertex_array(instance.comp_vao);
             instance.gl.active_texture(glow::TEXTURE0);
-            instance.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            // External OES textures must be bound to TEXTURE_EXTERNAL_OES, not TEXTURE_2D.
+            instance.gl.bind_texture(target, Some(tex));
 
-            instance.gl.uniform_2_f32(instance.u_comp_size_loc.as_ref(), layout_pw as f32, layout_ph as f32);
+            instance
+                .gl
+                .uniform_2_f32(size_loc, viewport_pw as f32, viewport_ph as f32);
+            // Corner radius follows the visible clip (dock), not the oversized cover quad.
             let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
-            instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), radius);
-            instance.gl.uniform_1_i32(instance.u_comp_flip_loc.as_ref(), flip_y);
+            instance.gl.uniform_1_f32(radius_loc, radius);
+            instance.gl.uniform_1_i32(flip_loc, flip_y);
 
             instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            instance.gl.bind_texture(target, None);
             instance.gl.bind_vertex_array(None);
             instance.gl.use_program(None);
         }
@@ -235,12 +346,26 @@ pub fn composite_panes_to_scene(
         instance.gl.viewport(0, 0, active_w as i32, active_h as i32);
 
         instance.gl.color_mask(true, true, true, true);
-        if instance.transparent {
-            instance.gl.clear_color(0.0, 0.0, 0.0, 0.0);
-        } else {
-            instance.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        // Game mode + primary covering the viewport: skip clear (opaque blit replaces all).
+        let skip_clear = instance.game_mode
+            && instance.primary_game_pane.as_ref().is_some_and(|pid| {
+                instance
+                    .panes
+                    .get(pid)
+                    .and_then(|p| p.external_surface_slot.as_ref())
+                    .is_some_and(|s| s.lock().current_texture.is_some())
+            });
+        if !skip_clear {
+            if instance.transparent {
+                instance.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            } else {
+                // Match normal gamescope/Steam black splash (no diagnostic navy flash).
+                instance.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            }
+            instance
+                .gl
+                .clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
         }
-        instance.gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
 
         // Prefer pending rect for same-window reflows (weights/dock/gutter) so the
         // slot snaps while the old texture stretches until nuclear flip.
@@ -250,7 +375,15 @@ pub fn composite_panes_to_scene(
             && instance.staged_layout.height == active_h;
 
         let mut sorted_ids: Vec<_> = instance.panes.keys().cloned().collect();
-        sorted_ids.sort_by_key(|id| instance.panes.get(id).map(|p| p.z_index).unwrap_or(0));
+        sorted_ids.sort_by_key(|id| {
+            instance.panes.get(id).map(|p| {
+                #[cfg(target_os = "linux")]
+                let is_overlay = if p.external_wayland_server.is_some() { 0 } else { 1 };
+                #[cfg(not(target_os = "linux"))]
+                let is_overlay = 0;
+                (p.z_index, is_overlay, p.dock_order)
+            }).unwrap_or((0, 0, 0))
+        });
 
         for id in sorted_ids {
             enum DrawPlan {
@@ -258,18 +391,35 @@ pub fn composite_panes_to_scene(
                 Remote { tex: glow::NativeTexture },
                 LocalFreeze { tex: glow::NativeTexture },
                 LocalLive { tex: glow::NativeTexture, capture: bool },
+                #[cfg(target_os = "linux")]
+                ExternalSurface {
+                    tex: glow::NativeTexture,
+                    target: u32,
+                    flip_y: i32,
+                    buf_w: u32,
+                    buf_h: u32,
+                    opaque: bool,
+                },
             }
 
             let (layout_px, layout_py, layout_pw, layout_ph, plan) = {
                 let Some(pane) = instance.panes.get(&id) else {
                     continue;
                 };
-                if !pane.is_visible {
+                let composite_visible = instance
+                    .staged_layout
+                    .panes
+                    .get(&id)
+                    .map(|s| s.visible)
+                    .unwrap_or(pane.is_visible);
+                if !composite_visible {
                     continue;
                 }
                 // Same-window interim: always use staged_layout for EVERY pane so
                 // neighbors cannot diverge (pending armed on one, last_physical on
                 // another → black seam). Textures stretch into these slots.
+                // Window-size interim (!pending_fits_active): prefer active_layout so
+                // an eager last_physical writer cannot place into the old scene FBO.
                 let rect = if pending_fits_active {
                     instance
                         .staged_layout
@@ -283,7 +433,13 @@ pub fn composite_panes_to_scene(
                         })
                         .unwrap_or(pane.last_physical_rect)
                 } else {
-                    pane.last_physical_rect
+                    instance
+                        .active_layout
+                        .panes
+                        .get(&id)
+                        .map(|s| s.rect)
+                        .filter(|r| r.size.width > 0 && r.size.height > 0)
+                        .unwrap_or(pane.last_physical_rect)
                 };
                 if rect.size.width <= 0 || rect.size.height <= 0 {
                     continue;
@@ -293,7 +449,30 @@ pub fn composite_panes_to_scene(
                 let layout_px = rect.origin.x;
                 let layout_py = active_h as i32 - (rect.origin.y + layout_ph);
 
-                let plan = if pane.is_remote {
+                #[cfg(target_os = "linux")]
+                let plan = if let Some(ref slot) = pane.external_surface_slot {
+                    let guard = slot.lock();
+                    if let Some(tex) = guard.current_texture {
+                        // Game and overlay panes scan out Wayland DMA-BUFs/SHM directly.
+                        // Standard Wayland buffers are top-down (row 0 at top), so we flip V
+                        // unless the buffer was explicitly flagged as bottom-up (y_inverted).
+                        let is_primary = instance
+                            .primary_game_pane
+                            .as_ref()
+                            .is_some_and(|pid| pid == &pane.id);
+                        DrawPlan::ExternalSurface {
+                            tex: glow::NativeTexture(tex.0),
+                            target: guard.target,
+                            flip_y: if guard.y_inverted { 0 } else { 1 },
+                            buf_w: guard.width.max(1),
+                            buf_h: guard.height.max(1),
+                            // Opaque primary blit in game mode — no blend tax.
+                            opaque: instance.game_mode && is_primary,
+                        }
+                    } else {
+                        DrawPlan::Skip
+                    }
+                } else if pane.is_remote {
                     if pane.under_crash_cover {
                         DrawPlan::Skip
                     } else if let Some(tex) = pane
@@ -308,7 +487,11 @@ pub fn composite_panes_to_scene(
                 } else {
                     let is_locked = is_transaction_pending && !transaction_complete;
                     let is_hiding = pending_hides.contains(&pane.id);
-                    let want_freeze = is_locked || pane.is_resizing || is_hiding;
+                    // Hide→show must sample the live FBO, not a freeze ghost — otherwise
+                    // HUD/telemetry panes stick on the last pre-hide frame until reflow.
+                    let becoming_visible = pane.pending_visible && !pane.is_visible;
+                    let want_freeze =
+                        (is_locked || pane.is_resizing || is_hiding) && !becoming_visible;
                     let tex_size = pane.offscreen_ctx.size();
                     let live_ok = tex_size.width > 0 && tex_size.height > 0;
                     if want_freeze && pane.ghost_valid {
@@ -332,6 +515,53 @@ pub fn composite_panes_to_scene(
                         }
                     } else if live_ok {
                         // Steady-state: no per-frame ghost copy.
+                        DrawPlan::LocalLive {
+                            tex: pane.offscreen_ctx.color_texture(),
+                            capture: false,
+                        }
+                    } else {
+                        DrawPlan::Skip
+                    }
+                };
+
+                #[cfg(not(target_os = "linux"))]
+                let plan = if pane.is_remote {
+                    if pane.under_crash_cover {
+                        DrawPlan::Skip
+                    } else if let Some(tex) = pane
+                        .remote_consumer
+                        .as_ref()
+                        .and_then(|c| c.get_texture())
+                    {
+                        DrawPlan::Remote { tex }
+                    } else {
+                        DrawPlan::Skip
+                    }
+                } else {
+                    let is_locked = is_transaction_pending && !transaction_complete;
+                    let is_hiding = pending_hides.contains(&pane.id);
+                    let becoming_visible = pane.pending_visible && !pane.is_visible;
+                    let want_freeze =
+                        (is_locked || pane.is_resizing || is_hiding) && !becoming_visible;
+                    let tex_size = pane.offscreen_ctx.size();
+                    let live_ok = tex_size.width > 0 && tex_size.height > 0;
+                    if want_freeze && pane.ghost_valid {
+                        if let Some(tex) = pane.ghost_tex {
+                            DrawPlan::LocalFreeze { tex }
+                        } else if live_ok {
+                            DrawPlan::LocalLive {
+                                tex: pane.offscreen_ctx.color_texture(),
+                                capture: true,
+                            }
+                        } else {
+                            DrawPlan::Skip
+                        }
+                    } else if want_freeze && live_ok {
+                        DrawPlan::LocalLive {
+                            tex: pane.offscreen_ctx.color_texture(),
+                            capture: true,
+                        }
+                    } else if live_ok {
                         DrawPlan::LocalLive {
                             tex: pane.offscreen_ctx.color_texture(),
                             capture: false,
@@ -402,12 +632,56 @@ pub fn composite_panes_to_scene(
                         capture_local_ghost(instance, &id);
                     }
                 }
+                #[cfg(target_os = "linux")]
+                DrawPlan::ExternalSurface {
+                    tex,
+                    target,
+                    flip_y,
+                    buf_w,
+                    buf_h,
+                    opaque,
+                } => {
+                    // Contain-fit: scale the client buffer down to fully fit the pane
+                    // (game letterbox + Discord drawer). Never crop / spill past bounds.
+                    let pw = layout_pw.max(1) as f32;
+                    let ph = layout_ph.max(1) as f32;
+                    let bw = buf_w as f32;
+                    let bh = buf_h as f32;
+                    let pane_ar = pw / ph;
+                    let buf_ar = bw / bh;
+                    let (dx, dy, dw, dh) = if (pane_ar - buf_ar).abs() < 0.02 {
+                        (layout_px, layout_py, layout_pw, layout_ph)
+                    } else if buf_ar > pane_ar {
+                        let dh = (pw / buf_ar).round().max(1.0) as i32;
+                        let dy = layout_py + (layout_ph - dh) / 2;
+                        (layout_px, dy, layout_pw, dh)
+                    } else {
+                        let dw = (ph * buf_ar).round().max(1.0) as i32;
+                        let dx = layout_px + (layout_pw - dw) / 2;
+                        (dx, layout_py, dw, layout_ph)
+                    };
+                    draw_pane_texture_ext(
+                        instance,
+                        tex,
+                        target,
+                        dx,
+                        dy,
+                        dw,
+                        dh,
+                        scale_factor,
+                        flip_y,
+                        opaque,
+                    );
+                }
             }
         }
 
         instance.gl.color_mask(true, true, true, true);
         instance.gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
         instance.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        // Push the primary blit to the GPU before swap so we can release the game's
+        // wl_buffer immediately after present without waiting another frame.
+        instance.gl.flush();
     }
 
     // EXPERIMENTAL: SurfaceTexture quads on top of remote SHM (opt-in env only).
@@ -459,12 +733,84 @@ pub fn composite_panes_to_scene(
     }
 }
 
+/// Host swap choke point. Returns `true` if `eglSwapBuffers` ran.
+///
+/// Game-driven VRR passthrough (nested atrium):
+/// - gamescope / game-driven: eglSwapInterval(0), no software phase sleep — outer
+///   adaptive-sync pageflip is the clock; FrameDone follows this swap.
+/// - otherwise: eglSwapInterval(1) — host compositor FIFO.
+pub fn atrium_host_present(instance: &WindowInstance) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Instant;
+
+        static SWAP_COUNT: AtomicU64 = AtomicU64::new(0);
+        static LAST_PRESENT_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+        let gamescope = crate::app::is_gamescope_session_pub();
+        let game_driven = crate::app::atrium_game_driven_present(instance);
+        let mhz = instance.refresh_rate_millihertz.max(1);
+        let min_period_ms = 1_000_000.0f32 / mhz as f32;
+        let pacing_diag = std::env::var_os("ATRIUM_PACING_DIAG").is_some();
+
+        // Never phase-sleep here — that imposes a fixed timer and kills VRR.
+        // gamescope FIFO deadlocks with interval 1; game-driven needs interval 0 too.
+        if gamescope || game_driven {
+            crate::app::atrium_set_egl_swap_interval_pub(0);
+        } else {
+            crate::app::atrium_set_egl_swap_interval_pub(1);
+        }
+
+        let n = SWAP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if pacing_diag && (n <= 8 || n % 120 == 0) {
+            crate::app::atrium_host_diag_pub(&format!(
+                "pre-swap #{n} gamescope={gamescope} game_driven={game_driven} focused={} min_period_ms={:.2}",
+                instance.os_focused, min_period_ms
+            ));
+        }
+        let t0 = Instant::now();
+        instance.rendering_context.present();
+        let now = Instant::now();
+        let swap_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let present_dt_ms = {
+            let mut prev = LAST_PRESENT_AT.lock().unwrap_or_else(|e| e.into_inner());
+            let dt = prev.map(|p| now.duration_since(p).as_secs_f32() * 1000.0);
+            *prev = Some(now);
+            dt
+        };
+        if pacing_diag
+            && (n <= 8
+                || n % 120 == 0
+                || swap_ms > 50.0
+                || present_dt_ms.map(|d| d > 50.0).unwrap_or(false))
+        {
+            crate::app::atrium_host_diag_pub(&format!(
+                "post-swap #{n} swap={swap_ms:.2}ms present_dt={} focused={} occluded={}",
+                present_dt_ms
+                    .map(|d| format!("{d:.2}ms"))
+                    .unwrap_or_else(|| "n/a".into()),
+                instance.os_focused,
+                instance.os_occluded
+            ));
+        }
+        return true;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        instance.rendering_context.present();
+        true
+    }
+}
+
+/// Blit scene FBO to the window and present. Returns whether the swapchain flipped.
 pub fn blit_scene_to_window(
     instance: &mut WindowInstance,
     live_w: i32,
     live_h: i32,
     scale_factor: f32,
-) {
+) -> bool {
     unsafe {
         let _ = instance.rendering_context.make_current();
         instance.rendering_context.prepare_for_rendering();
@@ -492,6 +838,6 @@ pub fn blit_scene_to_window(
             }
         }
 
-        instance.rendering_context.present();
+        atrium_host_present(instance)
     }
 }

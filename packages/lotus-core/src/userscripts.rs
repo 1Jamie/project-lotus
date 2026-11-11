@@ -77,6 +77,13 @@ fn inject_host_ipc(ucm: &UserContentManager, env: &PaneScriptEnv<'_>) -> usize {
                 window.lotus.token = '{}';
                 window.lotus.id = '{}';
                 window.lotus.paneId = '{}';
+                // Open IPC immediately so host→renderer pushes (stats, mode) are received
+                // without waiting for the page to call lotus.send() first.
+                try {{
+                    if (typeof window.lotus._connectWs === 'function') {{
+                        window.lotus._connectWs();
+                    }}
+                }} catch (e) {{}}
             }}
         }})();"#,
         env.origins_json, env.port, env.token, env.window_id, env.pane_id

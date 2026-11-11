@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Atrium</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+        body {
+            background: transparent !important;
+            font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+            overflow: hidden;
+            width: 100vw;
+            height: 100vh;
+            color: #e2e8f0;
+            pointer-events: none;
+        }
+
+        .hud {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            min-width: 220px;
+            max-width: 280px;
+            padding: 10px 12px;
+            background: rgba(8, 12, 20, 0.72);
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            border-radius: 8px;
+            pointer-events: auto;
+            transition: opacity 0.15s ease;
+        }
+        .hud.hidden { opacity: 0; pointer-events: none; }
+
+        .row {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 12px;
+            line-height: 1.25;
+        }
+        .label { color: #94a3b8; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+        .value { color: #f8fafc; font-size: 12px; font-weight: 600; }
+        .fps {
+            font-size: 36px;
+            font-weight: 800;
+            color: #4ade80;
+            line-height: 1;
+            text-shadow: 0 0 12px rgba(74, 222, 128, 0.35);
+        }
+        .fps.waiting { color: #64748b; font-size: 18px; font-weight: 600; }
+        .game-name {
+            margin-top: 6px;
+            font-size: 11px;
+            color: #cbd5e1;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 250px;
+        }
+        .meta { margin-top: 8px; display: grid; gap: 4px; }
+        .graph {
+            margin-top: 8px;
+            height: 40px;
+            background: rgba(15, 23, 42, 0.8);
+            border-radius: 4px;
+            overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+        canvas { width: 100%; height: 100%; display: block; }
+
+        .actions {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            display: flex;
+            gap: 6px;
+            pointer-events: auto;
+        }
+        .btn {
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid rgba(148, 163, 184, 0.3);
+            color: #f1f5f9;
+            border-radius: 6px;
+            padding: 7px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        .btn:hover { border-color: #38bdf8; background: rgba(56, 189, 248, 0.18); }
+        .btn.active { border-color: #4ade80; color: #4ade80; }
+    </style>
+</head>
+<body>
+    <div class="hud" id="hud">
+        <div class="row">
+            <div class="fps waiting" id="fps">—</div>
+            <div class="label">FPS</div>
+        </div>
+        <div class="game-name" id="game-name">waiting for game…</div>
+        <div class="meta">
+            <div class="row"><span class="label">Frametime</span><span class="value" id="ft">—</span></div>
+            <div class="row"><span class="label">1% Low</span><span class="value" id="low1">—</span></div>
+            <div class="row"><span class="label">0.1% Low</span><span class="value" id="low01">—</span></div>
+            <div class="row"><span class="label">Surface</span><span class="value" id="res">—</span></div>
+        </div>
+        <div class="graph"><canvas id="ft-canvas"></canvas></div>
+    </div>
+
+    <div class="actions" id="actions">
+        <button class="btn" id="mode-btn" type="button">Game · F12</button>
+        <button class="btn" id="discord-btn" type="button">Discord · F9</button>
+        <button class="btn" id="fs-btn" type="button">Full · F11</button>
+        <button class="btn" id="hud-btn" type="button">HUD</button>
+    </div>
+
+    <script>
+        const fpsEl = document.getElementById('fps');
+        const ftEl = document.getElementById('ft');
+        const low1El = document.getElementById('low1');
+        const low01El = document.getElementById('low01');
+        const resEl = document.getElementById('res');
+        const gameNameEl = document.getElementById('game-name');
+        const modeBtn = document.getElementById('mode-btn');
+        const discordBtn = document.getElementById('discord-btn');
+        const fsBtn = document.getElementById('fs-btn');
+        const hudBtn = document.getElementById('hud-btn');
+        const hud = document.getElementById('hud');
+        const canvas = document.getElementById('ft-canvas');
+        const ctx = canvas.getContext('2d');
+
+        const HISTORY = 90;
+        const frameHistory = new Array(HISTORY).fill(0);
+        let isGameMode = true;
+        let discordOn = false;
+        let fullscreenOn = false;
+        let hudVisible = true;
+        let hasFrames = false;
+
+        function lotusIpc() {
+            return window.lotus?.ipc || window.lotus || null;
+        }
+
+        function resizeCanvas() {
+            canvas.width = Math.max(1, canvas.clientWidth * devicePixelRatio);
+            canvas.height = Math.max(1, canvas.clientHeight * devicePixelRatio);
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        function setUiInputMode(gameMode) {
+            isGameMode = !!gameMode;
+            document.body.style.pointerEvents = isGameMode ? 'none' : 'auto';
+            modeBtn.textContent = isGameMode ? 'Game · F12' : 'Overlay · F12';
+            modeBtn.classList.toggle('active', !isGameMode);
+        }
+
+        function toggleInputMode() {
+            setUiInputMode(!isGameMode);
+            const ipc = lotusIpc();
+            if (ipc?.send) ipc.send('set-game-mode', isGameMode);
+        }
+
+        function toggleDiscord() {
+            discordOn = !discordOn;
+            discordBtn.classList.toggle('active', discordOn);
+            const ipc = lotusIpc();
+            // Absolute visibility — stays in sync with host F9 toggles.
+            if (ipc?.send) ipc.send('set-discord-visible', discordOn);
+        }
+
+        function toggleHud() {
+            hudVisible = !hudVisible;
+            hud.classList.toggle('hidden', !hudVisible);
+            hudBtn.classList.toggle('active', hudVisible);
+        }
+
+        function setFullscreenUi(on) {
+            fullscreenOn = !!on;
+            fsBtn.classList.toggle('active', fullscreenOn);
+            fsBtn.textContent = fullscreenOn ? 'Window · F11' : 'Full · F11';
+        }
+
+        function toggleFullscreen() {
+            setFullscreenUi(!fullscreenOn);
+            const ipc = lotusIpc();
+            if (ipc?.send) ipc.send('set-fullscreen', fullscreenOn);
+        }
+
+        function updateLiveStats(stats) {
+            if (!stats) return;
+            if (stats.fps != null && Number(stats.fps) > 0) {
+                hasFrames = true;
+                fpsEl.classList.remove('waiting');
+                fpsEl.textContent = Math.round(Number(stats.fps));
+            } else if (stats.total_frames != null && Number(stats.total_frames) > 0) {
+                fpsEl.classList.remove('waiting');
+                fpsEl.textContent = '…';
+            }
+            if (stats.frametime_ms != null && Number(stats.frametime_ms) > 0) {
+                const ft = Number(stats.frametime_ms);
+                ftEl.textContent = ft.toFixed(2) + ' ms';
+                frameHistory.push(ft);
+                if (frameHistory.length > HISTORY) frameHistory.shift();
+                hasFrames = true;
+            }
+            if (stats.fps_1_low != null) low1El.textContent = Math.round(Number(stats.fps_1_low));
+            if (stats.fps_01_low != null) low01El.textContent = Math.round(Number(stats.fps_01_low));
+            if (stats.width && stats.height) {
+                resEl.textContent = stats.width + '×' + stats.height;
+            }
+        }
+
+        function renderGraph() {
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.clearRect(0, 0, w, h);
+            if (!hasFrames) {
+                requestAnimationFrame(renderGraph);
+                return;
+            }
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 1.5 * devicePixelRatio;
+            ctx.beginPath();
+            const step = w / (HISTORY - 1);
+            for (let i = 0; i < frameHistory.length; i++) {
+                const ft = frameHistory[i] || 0;
+                const y = h - Math.min(h, (ft / 33.3) * h);
+                const x = i * step;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            // 16.6ms / 33.3ms guides
+            ctx.strokeStyle = 'rgba(148,163,184,0.25)';
+            ctx.lineWidth = 1;
+            for (const ms of [16.6, 33.3]) {
+                const y = h - Math.min(h, (ms / 33.3) * h);
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(w, y);
+                ctx.stroke();
+            }
+            requestAnimationFrame(renderGraph);
+        }
+        requestAnimationFrame(renderGraph);
+
+        modeBtn.addEventListener('click', toggleInputMode);
+        discordBtn.addEventListener('click', toggleDiscord);
+        fsBtn.addEventListener('click', toggleFullscreen);
+        hudBtn.addEventListener('click', toggleHud);
+
+        window.addEventListener('atrium-bootstrap', (e) => {
+            const d = e.detail || {};
+            if (d.game) gameNameEl.textContent = d.game;
+            if (d.gameMode !== undefined) setUiInputMode(d.gameMode);
+            if (d.discord === false) {
+                discordBtn.style.display = 'none';
+            }
+        });
+
+        const eventSource = window.lotus?.on ? window.lotus
+            : (window.lotus?.ipc?.on ? window.lotus.ipc : null);
+        if (eventSource) {
+            eventSource.on('atrium-game-stats', updateLiveStats);
+            eventSource.on('atrium-game-mode-changed', (data) => {
+                if (data && data.game_mode !== undefined) setUiInputMode(data.game_mode);
+            });
+            eventSource.on('atrium-toggle-discord', (data) => {
+                // Host F9 already toggled the pane in Rust. Only mirror the button —
+                // do NOT call set-discord-visible here (that re-entered setVisible/setRect
+                // and caused open↔close loops + a delayed resize over the HUD buttons).
+                if (data && data.visible !== undefined) {
+                    discordOn = !!data.visible;
+                } else {
+                    discordOn = !discordOn;
+                }
+                discordBtn.classList.toggle('active', discordOn);
+                const ipc = lotusIpc();
+                if (ipc?.send) ipc.send('discord-ui-sync', discordOn);
+            });
+            eventSource.on('atrium-fullscreen-changed', (data) => {
+                if (data && data.fullscreen !== undefined) setFullscreenUi(!!data.fullscreen);
+            });
+        }
+
+        // Ensure IPC websocket is up even if userscript connect raced before port was set.
+        try {
+            const ipc = lotusIpc();
+            if (ipc && typeof ipc._connectWs === 'function') ipc._connectWs();
+            else if (ipc && typeof ipc.send === 'function') ipc.send('atrium-hud-ready', {});
+        } catch (e) {}
+
+        setUiInputMode(true);
+    </script>
+</body>
+</html>

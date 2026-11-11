@@ -956,7 +956,8 @@ fn solve_dock(
             }
             PaneAnchor::Fill => {
                 child_rect = available;
-                available.size = euclid::default::Size2D::new(0, 0);
+                // Do not zero out available: allow multiple layered Fill panes (e.g. game surface + HUD overlay)
+                // to share the viewport and layer strictly according to z_index.
             }
             PaneAnchor::None => continue,
         }

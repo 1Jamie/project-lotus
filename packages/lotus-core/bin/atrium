@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# atrium — gamescope-style Steam launch wrapper for Lotus Atrium
+#
+# Steam launch options:
+#   atrium -- %command%
+#   atrium -W 1920 -H 1080 -f -- %command%
+#
+# Game Mode (embedded gamescope): atrium is a *nested compositor* (game+HUD
+# panes inside one host window), not a mangoapp-style overlay. The host must
+# look like the Steam game on STEAM_GAME_DISPLAY_0 (STEAM_GAME + baselayer).
+# Inner Proton talks to atrium's own Xwayland — never outer :1 directly.
+set -euo pipefail
+
+# Resolve through symlinks (e.g. ~/.local/bin/atrium → this file).
+_atrium_src="${BASH_SOURCE[0]}"
+while [[ -L "$_atrium_src" ]]; do
+  _atrium_dir="$(cd "$(dirname "$_atrium_src")" && pwd)"
+  _atrium_src="$(readlink "$_atrium_src")"
+  [[ "$_atrium_src" != /* ]] && _atrium_src="${_atrium_dir}/${_atrium_src}"
+done
+ATRIUM_ROOT="$(cd "$(dirname "$_atrium_src")/.." && pwd)"
+ATRIUM_MAIN="${ATRIUM_ROOT}/test_apps/atrium_hud_app/main.js"
+
+if [[ ! -f "$ATRIUM_MAIN" ]]; then
+  echo "atrium: missing launcher at $ATRIUM_MAIN" >&2
+  exit 1
+fi
+
+_atrium_path_prefix="${HOME}/.local/bin:/home/linuxbrew/.linuxbrew/bin:${HOME}/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="${_atrium_path_prefix}${PATH:+:$PATH}"
+
+NODE_BIN="$(command -v node || true)"
+if [[ -z "$NODE_BIN" ]]; then
+  echo "atrium: node not found (need node on the host for Steam launch)" >&2
+  exit 1
+fi
+
+export NODE_PATH="${ATRIUM_ROOT}${NODE_PATH:+:$NODE_PATH}"
+
+ATRIUM_HOST_LOG="${ATRIUM_HOST_LOG:-/tmp/lotus-atrium-host.log}"
+
+# --- helpers (bash is top-to-bottom; declare before use) -----------------------
+atrium_log() {
+  printf '[atrium] %s\n' "$*" | tee -a "$ATRIUM_HOST_LOG" >&2
+}
+
+atrium_detect_gamemode() {
+  local desk="${XDG_CURRENT_DESKTOP:-}"
+  if [[ -n "${GAMESCOPE_WAYLAND_DISPLAY:-}" ]] \
+    || [[ "${desk,,}" == *gamescope* ]] \
+    || [[ "${ATRIUM_GAMEMODE:-}" == "1" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Prefer Steam's game Xwayland (:1 typical). Fall back to live sockets.
+atrium_pick_game_display() {
+  if [[ -n "${STEAM_GAME_DISPLAY_0:-}" ]]; then
+    printf '%s\n' "$STEAM_GAME_DISPLAY_0"
+    return
+  fi
+  # Game Mode with --xwayland-count 2: :0 = Steam UI, :1 = games.
+  if [[ -S /tmp/.X11-unix/X1 ]]; then
+    printf ':1\n'
+    return
+  fi
+  if [[ -n "${DISPLAY:-}" ]]; then
+    printf '%s\n' "$DISPLAY"
+    return
+  fi
+  if [[ -S /tmp/.X11-unix/X0 ]]; then
+    printf ':0\n'
+    return
+  fi
+  printf ':0\n'
+}
+
+# Tag every plausible Atrium host window the way gamescope-fg does.
+atrium_tag_windows() {
+  local app_id="$1"
+  local d win original baselayer dec
+  local -A tried_display=()
+
+  for d in "${DISPLAY:-}" ":1" ":0"; do
+    [[ -z "$d" ]] && continue
+    [[ -n "${tried_display[$d]:-}" ]] && continue
+    tried_display[$d]=1
+
+    while read -r win; do
+      [[ -z "$win" || "$win" != 0x* ]] && continue
+      xprop -display "$d" -id "$win" -f STEAM_GAME 32c -set STEAM_GAME "$app_id" 2>/dev/null || true
+      xprop -display "$d" -id "$win" -f _NET_WM_WINDOW_OPACITY 32c -set _NET_WM_WINDOW_OPACITY 4294967295 2>/dev/null || true
+      # Force mapped + fullscreen-ish size so steamcompmgr has a real surface to sample.
+      if command -v xdotool >/dev/null 2>&1; then
+        root_geom="$(xwininfo -display "$d" -root 2>/dev/null | awk '/Width:/{w=$2} /Height:/{h=$2} END{print w" "h}')"
+        rw="${root_geom%% *}"; rh="${root_geom##* }"
+        if [[ -n "$rw" && -n "$rh" && "$rw" -gt 1 && "$rh" -gt 1 ]]; then
+          DISPLAY="$d" xdotool windowsize --sync "$win" "$rw" "$rh" 2>/dev/null || true
+          DISPLAY="$d" xdotool windowmove --sync "$win" 0 0 2>/dev/null || true
+          DISPLAY="$d" xdotool windowmap "$win" 2>/dev/null || true
+          DISPLAY="$d" xdotool windowactivate "$win" 2>/dev/null || true
+        fi
+      fi
+      if [[ -z "${ATRIUM_DUMPED_WIN:-}" ]]; then
+        ATRIUM_DUMPED_WIN=1
+        atrium_log "window dump $(xwininfo -display "$d" -id "$win" 2>/dev/null | tr '\n' ' ' | head -c 500)"
+        atrium_log "atoms $(xprop -display "$d" -id "$win" STEAM_GAME WM_CLASS _NET_WM_STATE _NET_WM_WINDOW_OPACITY 2>/dev/null | tr '\n' ' ')"
+        atrium_log "focus :0 $(xprop -display :0 -root GAMESCOPECTRL_BASELAYER_APPID GAMESCOPE_FOCUSED_APP GAMESCOPE_FOCUSABLE_APPS 2>/dev/null | tr '\n' ' ')"
+      fi
+      atrium_log "tagged STEAM_GAME=$app_id on $win (display $d)"
+
+      # APPID-only, just us — Steam keeps rewriting the list with 413091/769 first.
+      baselayer="$app_id"
+      xprop -display "$d" -root -format GAMESCOPECTRL_BASELAYER_APPID 32co -set GAMESCOPECTRL_BASELAYER_APPID "$baselayer" 2>/dev/null || true
+      xprop -display :0 -root -format GAMESCOPECTRL_BASELAYER_APPID 32co -set GAMESCOPECTRL_BASELAYER_APPID "$baselayer" 2>/dev/null || true
+      xprop -display "$d" -root -remove GAMESCOPECTRL_BASELAYER_WINDOW 2>/dev/null || true
+      xprop -display :0 -root -remove GAMESCOPECTRL_BASELAYER_WINDOW 2>/dev/null || true
+    done < <(
+      xwininfo -display "$d" -root -tree 2>/dev/null \
+        | grep -E '^[[:space:]]*0x' \
+        | grep -iE 'Atrium|lotus-atrium|atrium-hud' \
+        | awk '{print $1}' \
+        | sort -u
+    )
+  done
+}
+
+atrium_gamescope_fg_watch() {
+  local app_id="$1"
+  local atrium_pid="$2"
+  local i focus mapstate
+  atrium_log "gamescope-fg watcher start appid=$app_id pid=$atrium_pid"
+  for i in $(seq 1 120); do
+    atrium_tag_windows "$app_id"
+    # steamcompmgr: FOCUSED_APP only switches once the window has commits.
+    # Log every ~1s so we can see if we ever leave Steam UI (769).
+    if (( i % 4 == 0 )); then
+      focus="$(xprop -display :0 -root GAMESCOPE_FOCUSED_APP GAMESCOPE_FOCUSED_WINDOW GAMESCOPECTRL_BASELAYER_APPID GAMESCOPECTRL_BASELAYER_WINDOW GAMESCOPE_FOCUSABLE_APPS 2>/dev/null | tr '\n' ' ')"
+      atrium_log "focus-poll $focus"
+      while read -r win; do
+        [[ -z "$win" || "$win" != 0x* ]] && continue
+        mapstate="$(xwininfo -display "${DISPLAY:-:1}" -id "$win" 2>/dev/null | awk '/Map State:/{print $3}')"
+        atrium_log "win $win map=$mapstate geom=$(xwininfo -display "${DISPLAY:-:1}" -id "$win" 2>/dev/null | awk '/geometry/{print $2}')"
+      done < <(
+        xwininfo -display "${DISPLAY:-:1}" -root -tree 2>/dev/null \
+          | grep -E '^[[:space:]]*0x' \
+          | grep -iE 'Atrium|lotus-atrium|atrium-hud' \
+          | awk '{print $1}' | sort -u
+      )
+    fi
+    if ! kill -0 "$atrium_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  atrium_log "gamescope-fg watcher done"
+}
+
+# Save Steam's full preload, then strip only gameoverlayrenderer* from the host.
+# Proton child restores ATRIUM_SAVED_LD_PRELOAD in Rust; Discord/Xwayland must not.
+atrium_strip_host_overlay_preload() {
+  export ATRIUM_SAVED_LD_PRELOAD="${LD_PRELOAD:-}"
+  local cleaned="" part
+  local IFS=':'
+  for part in ${LD_PRELOAD:-}; do
+    [[ -z "$part" ]] && continue
+    case "${part,,}" in
+      *gameoverlayrenderer*) continue ;;
+    esac
+    if [[ -z "$cleaned" ]]; then
+      cleaned="$part"
+    else
+      cleaned="${cleaned}:${part}"
+    fi
+  done
+  if [[ -n "$cleaned" ]]; then
+    export LD_PRELOAD="$cleaned"
+  else
+    unset LD_PRELOAD || true
+  fi
+  atrium_log "LD_PRELOAD host='${LD_PRELOAD:-}' saved='${ATRIUM_SAVED_LD_PRELOAD:-}'"
+}
+
+# --- Game Mode / desktop bootstrap -------------------------------------------
+: >"$ATRIUM_HOST_LOG"
+atrium_log "start argv: $*"
+atrium_log "env DISPLAY=${DISPLAY:-} STEAM_GAME_DISPLAY_0=${STEAM_GAME_DISPLAY_0:-} GAMESCOPE_WAYLAND_DISPLAY=${GAMESCOPE_WAYLAND_DISPLAY:-} XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-} SteamAppId=${SteamAppId:-}"
+
+if atrium_detect_gamemode; then
+  export ATRIUM_GAMEMODE=1
+  GAME_DISPLAY="$(atrium_pick_game_display)"
+  export STEAM_GAME_DISPLAY_0="$GAME_DISPLAY"
+  export DISPLAY="$GAME_DISPLAY"
+  export WINIT_UNIX_BACKEND="${WINIT_UNIX_BACKEND:-x11}"
+  export XDG_SESSION_TYPE=x11
+  export ATRIUM_FULLSCREEN="${ATRIUM_FULLSCREEN:-1}"
+  # Host is EGL/GL (surfman), not Vulkan Gamescope WSI. Bazzite exports WSI=1
+  # globally — that split-brains X11 :1 with gamescope-0. Kill it for host+child.
+  export ENABLE_GAMESCOPE_WSI=0
+  export DISABLE_GAMESCOPE_WSI=1
+  # Mesa DRI3: async backbuffer init before first resize recreates the swapchain.
+  export vblank_mode=0
+  atrium_strip_host_overlay_preload
+  # Force X11 for winit STEAM_GAME tagging; keep GAMESCOPE_WAYLAND_DISPLAY for session id.
+  unset WAYLAND_DISPLAY || true
+  export RUST_LOG="${RUST_LOG:-lotus=info,lotus_atrium=info}"
+  atrium_log "Game Mode: host DISPLAY=$DISPLAY STEAM_GAME_DISPLAY_0=${STEAM_GAME_DISPLAY_0:-} GAMESCOPE_WAYLAND_DISPLAY=${GAMESCOPE_WAYLAND_DISPLAY:-} ENABLE_GAMESCOPE_WSI=$ENABLE_GAMESCOPE_WSI DISABLE_GAMESCOPE_WSI=$DISABLE_GAMESCOPE_WSI vblank_mode=$vblank_mode WINIT_UNIX_BACKEND=$WINIT_UNIX_BACKEND"
+
+  APP_ID="${SteamAppId:-${SteamGameId:-${STEAM_COMPAT_APP_ID:-1}}}"
+
+  # Run node in background so we can gamescope-fg-tag its X11 window.
+  set +e
+  "$NODE_BIN" "$ATRIUM_MAIN" "$@" >>"$ATRIUM_HOST_LOG" 2>&1 &
+  ATRIUM_PID=$!
+  atrium_gamescope_fg_watch "$APP_ID" "$ATRIUM_PID" &
+  WATCH_PID=$!
+  wait "$ATRIUM_PID"
+  STATUS=$?
+  kill "$WATCH_PID" 2>/dev/null || true
+  wait "$WATCH_PID" 2>/dev/null || true
+  atrium_log "exit status=$STATUS"
+  exit "$STATUS"
+fi
+
+# Desktop path — still strip overlay from host if Steam injected it.
+atrium_strip_host_overlay_preload
+exec "$NODE_BIN" "$ATRIUM_MAIN" "$@"

@@ -1,0 +1,16 @@
+{
+  "id": "notifications",
+  "name": "Notifications",
+  "version": "0.1.0",
+  "host": "host.js",
+  "panes": {
+    "toasts": {
+      "type": "surface",
+      "entry": "ui/index.html",
+      "defaultRect": { "x": 880, "y": 64, "width": 380, "height": 320 },
+      "layer": "shell",
+      "visibility": "always",
+      "interactive": "never"
+    }
+  }
+}

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+    html, body {
+      width: 100%; height: 100%;
+      background: transparent !important;
+      font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+      color: #e2e8f0;
+      overflow: hidden;
+    }
+    .hud {
+      margin: 0;
+      min-width: 220px;
+      padding: 10px 12px;
+      background: rgba(8, 12, 20, 0.72);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 8px;
+    }
+    .row { display: flex; justify-content: space-between; gap: 12px; line-height: 1.25; }
+    .label { color: #94a3b8; font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .value { color: #f8fafc; font-size: 12px; font-weight: 600; }
+    .fps {
+      font-size: 36px; font-weight: 800; color: #4ade80; line-height: 1;
+      text-shadow: 0 0 12px rgba(74, 222, 128, 0.35);
+    }
+    .fps.waiting { color: #64748b; font-size: 18px; font-weight: 600; }
+    .meta { margin-top: 8px; display: grid; gap: 4px; }
+    .graph {
+      margin-top: 8px; height: 40px;
+      background: rgba(15, 23, 42, 0.8); border-radius: 4px;
+      overflow: hidden; border: 1px solid rgba(255,255,255,0.06);
+    }
+    canvas { width: 100%; height: 100%; display: block; }
+  </style>
+</head>
+<body>
+  <div class="hud">
+    <div class="row">
+      <div class="fps waiting" id="fps">—</div>
+      <div class="label">FPS</div>
+    </div>
+    <div class="meta">
+      <div class="row"><span class="label">Frametime</span><span class="value" id="ft">—</span></div>
+      <div class="row"><span class="label">1% Low</span><span class="value" id="low1">—</span></div>
+      <div class="row"><span class="label">0.1% Low</span><span class="value" id="low01">—</span></div>
+      <div class="row"><span class="label">Surface</span><span class="value" id="res">—</span></div>
+    </div>
+    <div class="graph"><canvas id="ft-canvas"></canvas></div>
+  </div>
+  <script>
+    const fpsEl = document.getElementById('fps');
+    const ftEl = document.getElementById('ft');
+    const low1El = document.getElementById('low1');
+    const low01El = document.getElementById('low01');
+    const resEl = document.getElementById('res');
+    const canvas = document.getElementById('ft-canvas');
+    const g = canvas.getContext('2d');
+    const HISTORY = 90;
+    const frameHistory = new Array(HISTORY).fill(0);
+    let hasFrames = false;
+
+    function resizeCanvas() {
+      canvas.width = Math.max(1, canvas.clientWidth * devicePixelRatio);
+      canvas.height = Math.max(1, canvas.clientHeight * devicePixelRatio);
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    function updateLiveStats(stats) {
+      if (!stats) return;
+      if (stats.fps != null && Number(stats.fps) > 0) {
+        hasFrames = true;
+        fpsEl.classList.remove('waiting');
+        fpsEl.textContent = Math.round(Number(stats.fps));
+      }
+      if (stats.frametime_ms != null && Number(stats.frametime_ms) > 0) {
+        const ft = Number(stats.frametime_ms);
+        ftEl.textContent = ft.toFixed(2) + ' ms';
+        frameHistory.push(ft);
+        if (frameHistory.length > HISTORY) frameHistory.shift();
+        hasFrames = true;
+      }
+      if (stats.fps_1_low != null) low1El.textContent = Math.round(Number(stats.fps_1_low));
+      if (stats.fps_01_low != null) low01El.textContent = Math.round(Number(stats.fps_01_low));
+      if (stats.width && stats.height) resEl.textContent = stats.width + '×' + stats.height;
+    }
+
+    let rafPending = false;
+    function renderGraph() {
+      rafPending = false;
+      const w = canvas.width, h = canvas.height;
+      g.clearRect(0, 0, w, h);
+      if (hasFrames) {
+        g.strokeStyle = '#38bdf8';
+        g.lineWidth = 1.5 * devicePixelRatio;
+        g.beginPath();
+        const step = w / (HISTORY - 1);
+        for (let i = 0; i < frameHistory.length; i++) {
+          const ft = frameHistory[i] || 0;
+          const y = h - Math.min(h, (ft / 33.3) * h);
+          const x = i * step;
+          if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+        }
+        g.stroke();
+      }
+      scheduleGraph();
+    }
+    function scheduleGraph() {
+      if (rafPending) return;
+      rafPending = true;
+      requestAnimationFrame(renderGraph);
+    }
+    scheduleGraph();
+
+    window.addEventListener('plugin:perf-hud:stats', (e) => updateLiveStats(e.detail));
+    // Host kicks this after hide→show so rAF + stats resume.
+    window.addEventListener('atrium-pane-shown', () => {
+      scheduleGraph();
+    });
+    // Also listen via AtriumPlugin when injected
+    const waitPlugin = setInterval(() => {
+      if (window.AtriumPlugin) {
+        clearInterval(waitPlugin);
+        window.AtriumPlugin.on('stats', updateLiveStats);
+      }
+    }, 100);
+  </script>
+</body>
+</html>

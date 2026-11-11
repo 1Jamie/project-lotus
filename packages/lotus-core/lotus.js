@@ -2037,6 +2037,20 @@ class Pane extends EventEmitter {
         this.window.handle.setPaneRect(this.id, x, y, width, height);
     }
 
+    get zIndex() {
+        return this._layout ? this._layout.zIndex : 0;
+    }
+
+    set zIndex(val) {
+        const z = Number(val) || 0;
+        if (this._layout) {
+            this._layout.zIndex = z;
+        }
+        if (this.window && this.window.handle && typeof this.window.handle.setPaneZIndex === 'function') {
+            this.window.handle.setPaneZIndex(this.id, z);
+        }
+    }
+
     /**
      * Update dock thickness without clearing the pane's anchor.
      * Left/Right use width; Top/Bottom use height; Fill/None are no-ops.
@@ -2106,6 +2120,14 @@ class Pane extends EventEmitter {
             return;
         }
         this.window.handle.setPaneVisible(this.id, this.visible);
+    }
+
+    /** Skip hit-testing so clicks fall through (atrium crosshair / game-mode overlay-only). */
+    setPassthrough(passthrough) {
+        this.pointerPassthrough = !!passthrough;
+        if (this.window?.handle && typeof this.window.handle.setPanePassthrough === 'function') {
+            this.window.handle.setPanePassthrough(this.id, this.pointerPassthrough);
+        }
     }
 
     isVisible() {
@@ -2318,6 +2340,20 @@ class ServoWindow extends EventEmitter {
             });
         }
 
+        if (!this.panes.has('main')) {
+            const mainPane = new Pane(this, 'main', true);
+            mainPane._layout = {
+                anchor: Anchor.Fill,
+                x: 0,
+                y: 0,
+                width: finalOptions.width || 0,
+                height: finalOptions.height || 0,
+                zIndex: 0,
+                dockOrder: 0,
+            };
+            this.panes.set('main', mainPane);
+        }
+
         this._logicalWidth = finalOptions.width;
         this._logicalHeight = finalOptions.height;
         this.maximized = Boolean(finalOptions.maximized);
@@ -2436,7 +2472,7 @@ class ServoWindow extends EventEmitter {
         if (this.panes.has(id)) {
             throw new Error(`Pane with id '${id}' already exists`);
         }
-        const { url = 'about:blank', x = 0, y = 0, width = 0, height = 0, zIndex = 0, anchor = 0, dockOrder = 0, visible = true } = options;
+        const { url = 'about:blank', x = 0, y = 0, width = 0, height = 0, zIndex = 0, anchor = 0, dockOrder = 0, visible = true, pointerPassthrough = false } = options;
         const isInternalPane = id.startsWith('__lotus_');
         const isSecure = !isInternalPane && (options.sandbox === true || options.secure === true || (options.sandbox !== false && options.secure !== false && this._finalOptions && (this._finalOptions.sandbox === true || this._finalOptions.secure === true)));
         const isIsolated = isSecure && (options.isolated === true || (options.isolated !== false && this._finalOptions && this._finalOptions.isolated === true));
@@ -2547,8 +2583,99 @@ class ServoWindow extends EventEmitter {
         }
 
         this.panes.set(id, pane);
+        if (pointerPassthrough) {
+            pane.setPassthrough(true);
+        }
 
         return pane;
+    }
+
+    /**
+     * Create an external app pane (nested zero-copy Wayland + Xwayland game surface).
+     * @param {string} id Unique pane identifier
+     * @param {object} options External app options: command, args, anchor, zIndex, width, height, etc.
+     */
+    createExternalAppPane(id, options = {}) {
+        if (!this.handle) throw new Error("Window not created yet");
+        if (this.panes.has(id)) {
+            throw new Error(`Pane '${id}' already exists on window '${this.id}'`);
+        }
+
+        const visible = options.visible !== undefined ? options.visible : true;
+        const pane = new Pane(this, id, visible);
+        pane.anchor = options.anchor !== undefined ? options.anchor : Anchor.Fill;
+        pane.zIndex = options.zIndex !== undefined ? options.zIndex : 0;
+        pane.dockOrder = options.dockOrder !== undefined ? options.dockOrder : 0;
+        pane.isExternal = true;
+
+        const command = options.command || 'vkcube';
+        const args = Array.isArray(options.args) ? options.args : [];
+        const x = options.x || 0;
+        const y = options.y || 0;
+        const width = options.width || this._logicalWidth || 800;
+        const height = options.height || this._logicalHeight || 600;
+
+        const dbus = options.dbus || {};
+        const dbusNotifications =
+            options.dbusNotifications || dbus.notifications || 'off';
+        const dbusNotificationApps = Array.isArray(options.dbusNotificationApps)
+            ? options.dbusNotificationApps
+            : Array.isArray(dbus.notificationApps)
+              ? dbus.notificationApps
+              : [];
+
+        if (typeof this.handle.createExternalAppPane === 'function') {
+            this.handle.createExternalAppPane(
+                id,
+                command,
+                args,
+                x,
+                y,
+                width,
+                height,
+                pane.zIndex,
+                pane.anchor,
+                pane.dockOrder,
+                visible,
+                dbusNotifications,
+                dbusNotificationApps
+            );
+        } else {
+            console.warn('[lotus-atrium] createExternalAppPane not supported on this platform');
+        }
+
+        this.panes.set(id, pane);
+        if (options.pointerPassthrough) {
+            pane.setPassthrough(true);
+        }
+        return pane;
+    }
+
+    /**
+     * Set input mode: true = Game mode (pass-through to Wayland/X11 app), false = HUD mode (interact with webview).
+     * @param {boolean} enabled 
+     */
+    setGameMode(enabled) {
+        if (this.handle && typeof this.handle.setGameMode === 'function') {
+            this.handle.setGameMode(!!enabled);
+        }
+    }
+
+    /**
+     * Borderless fullscreen for the lotus host window itself.
+     * @param {boolean} enabled
+     */
+    setFullscreen(enabled) {
+        if (this.handle && typeof this.handle.setFullscreen === 'function') {
+            this.handle.setFullscreen(!!enabled);
+        }
+    }
+
+    /**
+     * Convenience alias for accessing the primary 'main' pane.
+     */
+    get pane() {
+        return this.panes.get('main');
     }
 
     addPane(id, options = {}) {

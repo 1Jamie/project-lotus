@@ -22,6 +22,10 @@ pub mod delegate;
 pub mod gl;
 pub mod userscripts;
 pub mod app;
+#[cfg(target_os = "linux")]
+pub mod wayland;
+#[cfg(target_os = "linux")]
+pub mod dbus_notify;
 
 use crate::window_state::WindowStateManager;
 pub use app::*;
@@ -317,6 +321,68 @@ impl WindowHandle {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[napi]
+    pub fn create_external_app_pane(
+        &self,
+        pane_id: String,
+        command: String,
+        args: Vec<String>,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        z_index: i32,
+        anchor: Option<u32>,
+        dock_order: Option<u32>,
+        visible: Option<bool>,
+        dbus_notifications: Option<String>,
+        dbus_notification_apps: Option<Vec<String>>,
+    ) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let rect: euclid::Rect<f32, servo::DeviceIndependentPixel> = euclid::Rect::new(
+                euclid::Point2D::new(x as f32, y as f32),
+                euclid::Size2D::new(width as f32, height as f32),
+            );
+            let _ = proxy.send_event(EngineCommand::CreateExternalAppPane {
+                window_id: self.id.clone(),
+                pane_id,
+                command,
+                args,
+                rect,
+                z_index,
+                anchor: PaneAnchor::from(anchor.unwrap_or(0)),
+                dock_order: dock_order.unwrap_or(0),
+                visible: visible.unwrap_or(true),
+                dbus_notifications: dbus_notifications.unwrap_or_else(|| "off".into()),
+                dbus_notification_apps: dbus_notification_apps.unwrap_or_default(),
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[napi]
+    pub fn set_game_mode(&self, enabled: bool) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetGameMode(self.id.clone(), enabled));
+        }
+    }
+
+    /// Borderless fullscreen for the lotus host window (not the nested game).
+    #[napi]
+    pub fn set_fullscreen(&self, enabled: bool) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetFullscreen(self.id.clone(), enabled));
+        }
+    }
+
+    #[napi]
+    pub fn set_pane_z_index(&self, pane_id: String, z_index: i32) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetPaneZIndex(self.id.clone(), pane_id, z_index));
+        }
+    }
+
     #[napi]
     pub fn attach_remote_pane_input(&self, pane_id: String, input_fd: i32) -> napi::Result<()> {
         let dup_fd = unsafe { libc::dup(input_fd) };
@@ -444,6 +510,17 @@ impl WindowHandle {
     pub fn set_pane_visible(&self, pane_id: String, visible: bool) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::SetPaneVisible(self.id.clone(), pane_id, visible));
+        }
+    }
+
+    #[napi]
+    pub fn set_pane_passthrough(&self, pane_id: String, passthrough: bool) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetPanePassthrough(
+                self.id.clone(),
+                pane_id,
+                passthrough,
+            ));
         }
     }
 

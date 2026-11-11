@@ -64,6 +64,10 @@ winit = { version = "0.30", features = ["x11", "wayland"] }
 glutin = "0.32"
 glutin-winit = "0.5"
 raw-window-handle = "0.6"
+smithay = { version = "0.7.0", default-features = false, features = ["wayland_frontend", "desktop", "backend_egl", "xwayland"] }
+drm-fourcc = "2.2"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zvariant = "5"
 
 # Windows-only dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -87,4 +91,9 @@ strip = true
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Game Mode: smithay's SHM drop-thread LazyLock unwrap()'d on EAGAIN and killed
+# the nested compositor (navy host, dead Discord/game). Patched to retry.
+[patch.crates-io]
+smithay = { path = "vendor/smithay" }
 

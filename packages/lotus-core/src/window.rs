@@ -90,6 +90,40 @@ void main() {
 }
 "#;
 
+/// Desktop GL compose for Proton/Xwayland DMA-BUFs imported as GL_TEXTURE_EXTERNAL_OES.
+/// Mesa RadeonSI/Zink need GL_OES_EGL_image_external_essl3 for samplerExternalOES in #version 330.
+pub const COMP_FS_OES: &str = r#"
+#version 330 core
+#extension GL_OES_EGL_image_external_essl3 : enable
+#extension GL_OES_EGL_image_external : require
+in vec2 v_pos;
+in vec2 v_uv;
+out vec4 f_color;
+
+uniform samplerExternalOES u_texture;
+uniform vec2 u_size;
+uniform float u_radius;
+uniform int u_flip_y;
+
+float sdRoundedBox(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+void main() {
+    vec2 p = v_pos * u_size * 0.5;
+    vec2 b = u_size * 0.5;
+
+    float distance = sdRoundedBox(p, b, u_radius);
+    float smoothing = fwidth(distance);
+    float alpha_mask = 1.0 - smoothstep(-smoothing, smoothing, distance);
+
+    vec2 uv = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+    vec4 tex_color = texture(u_texture, uv);
+    f_color = tex_color * alpha_mask;
+}
+"#;
+
 #[derive(Debug, Clone)]
 pub struct WindowMetadata {
     pub root_path: Option<PathBuf>,
@@ -227,6 +261,9 @@ pub struct PaneInstance {
     pub is_dirty: bool,
     pub needs_repaint: bool,
     pub is_visible: bool,
+    /// When true, hit-testing skips this pane so clicks fall through (crosshair, etc.).
+    /// In atrium game_mode input already bypasses the stack; this matters in overlay/edit.
+    pub pointer_passthrough: bool,
     pub drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
     pub no_drag_regions: Vec<euclid::Rect<f32, servo::DevicePixel>>,
     pub offscreen_ctx: Rc<LotusPaneContext>,
@@ -260,6 +297,46 @@ pub struct PaneInstance {
     /// After a respawn, emit `remote-frame-composited` once a fresh SHM frame is
     /// uploaded so JS can lift crash chrome without flashing the prior life.
     pub await_host_composited_frame: bool,
+    #[cfg(target_os = "linux")]
+    pub external_surface_slot: Option<Arc<parking_lot::Mutex<crate::wayland::ExternalSurfaceSlot>>>,
+    #[cfg(target_os = "linux")]
+    pub external_wayland_server: Option<Arc<parking_lot::Mutex<crate::wayland::LotusWaylandServer>>>,
+    #[cfg(target_os = "linux")]
+    pub external_child_pid: Option<u32>,
+}
+
+/// Terminate an atrium external child (Proton/flatpak) and its process group.
+/// SIGTERM the group first, then SIGKILL after a short grace if still alive.
+#[cfg(target_os = "linux")]
+pub fn terminate_external_child(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let pid_i = pid as i32;
+    unsafe {
+        // Process group (spawned with setpgid) — covers wineserver helpers.
+        let _ = libc::kill(-pid_i, libc::SIGTERM);
+        let _ = libc::kill(pid_i, libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        let alive = unsafe { libc::kill(pid_i, 0) == 0 };
+        if !alive {
+            // Reap if we are parent; ignore ECHILD.
+            let mut status = 0;
+            unsafe {
+                let _ = libc::waitpid(pid_i, &mut status, libc::WNOHANG);
+            }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    unsafe {
+        let _ = libc::kill(-pid_i, libc::SIGKILL);
+        let _ = libc::kill(pid_i, libc::SIGKILL);
+        let mut status = 0;
+        let _ = libc::waitpid(pid_i, &mut status, libc::WNOHANG);
+    }
+    log::info!("[lotus-atrium] terminated external child pid {}", pid);
 }
 
 impl Drop for PaneInstance {
@@ -268,6 +345,10 @@ impl Drop for PaneInstance {
             if fd >= 0 {
                 unsafe { libc::close(fd) };
             }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = self.external_child_pid.take() {
+            terminate_external_child(pid);
         }
     }
 }
@@ -349,6 +430,8 @@ pub struct WindowInstance {
     pub u_stencil_size_loc: Option<glow::UniformLocation>,
     pub u_stencil_radius_loc: Option<glow::UniformLocation>,
     pub comp_program: Option<glow::Program>,
+    /// Compose program for GL_TEXTURE_EXTERNAL_OES (Proton modifier dmabufs).
+    pub comp_program_oes: Option<glow::Program>,
     pub comp_fbo: Option<glow::NativeFramebuffer>,
     pub comp_tex: Option<glow::NativeTexture>,
     pub comp_vao: Option<glow::VertexArray>,
@@ -356,6 +439,9 @@ pub struct WindowInstance {
     pub u_comp_size_loc: Option<glow::UniformLocation>,
     pub u_comp_radius_loc: Option<glow::UniformLocation>,
     pub u_comp_flip_loc: Option<glow::UniformLocation>,
+    pub u_comp_oes_size_loc: Option<glow::UniformLocation>,
+    pub u_comp_oes_radius_loc: Option<glow::UniformLocation>,
+    pub u_comp_oes_flip_loc: Option<glow::UniformLocation>,
     pub comp_tex_size: Option<winit::dpi::PhysicalSize<u32>>,
     pub scene_fbo: Option<glow::NativeFramebuffer>,
     pub scene_tex: Option<glow::NativeTexture>,
@@ -394,6 +480,35 @@ pub struct WindowInstance {
     pub gutter_hover: Option<(String, String)>,
     /// Last pane that received a routed MouseMove (for synthetic leave on gutter entry).
     pub hover_pane_id: Option<String>,
+    /// When true, input goes directly to the embedded Wayland/X11 game pane.
+    pub game_mode: bool,
+    /// Host winit cursor grab currently applied (derived from game shoes + game_mode).
+    #[cfg(target_os = "linux")]
+    pub host_pointer_grabbed: bool,
+    /// Game-owned shoes: pointer-constraints lock/confine last requested by the primary.
+    /// Survives overlay mode so returning to game just re-applies.
+    #[cfg(target_os = "linux")]
+    pub game_pointer_constraint_active: bool,
+    /// Game-owned shoes: last primary cursor was Hidden (Wine/X11 trap).
+    #[cfg(target_os = "linux")]
+    pub game_cursor_hidden: bool,
+    /// Game-owned shoes: last cursor image from the primary game client.
+    #[cfg(target_os = "linux")]
+    pub game_cursor: Option<crate::wayland::NestedCursor>,
+    /// Designates the primary base game pane ID.
+    pub primary_game_pane: Option<String>,
+    /// Last instant telemetry stats were sent to the HUD webview.
+    pub last_stats_send: Option<std::time::Instant>,
+    /// Host must recomposite on the next tick (e.g. nested pane show/hide).
+    pub force_scene_repaint: bool,
+    /// Latest nested cursor shown on the host (Discord overlay visual, etc.).
+    #[cfg(target_os = "linux")]
+    pub nested_cursor: Option<crate::wayland::NestedCursor>,
+    /// True while the host cursor is showing a nested visual (vs Servo/HUD default).
+    #[cfg(target_os = "linux")]
+    pub nested_cursor_applied: bool,
+    #[cfg(target_os = "linux")]
+    pub nested_compositor: Option<Arc<parking_lot::Mutex<crate::wayland::LotusWaylandServer>>>,
 }
 
 impl WindowInstance {
@@ -503,7 +618,7 @@ impl WindowInstance {
             }
 
             self.gl.detach_shader(program, vs);
-            self.gl.delete_shader(vs);
+            // Keep VS for OES program link below; delete after both programs link.
             self.gl.detach_shader(program, fs);
             self.gl.delete_shader(fs);
 
@@ -511,6 +626,54 @@ impl WindowInstance {
             self.u_comp_radius_loc = self.gl.get_uniform_location(program, "u_radius");
             self.u_comp_flip_loc = self.gl.get_uniform_location(program, "u_flip_y");
             self.comp_program = Some(program);
+
+            // Optional OES external program — soft-fail if the extension is missing.
+            let oes_program = self.gl.create_program().expect("Cannot create OES program");
+            let fs_oes = self.gl.create_shader(glow::FRAGMENT_SHADER).expect("Cannot create OES FS");
+            self.gl.shader_source(fs_oes, COMP_FS_OES);
+            self.gl.compile_shader(fs_oes);
+            if !self.gl.get_shader_compile_status(fs_oes) {
+                log::warn!(
+                    "[lotus-atrium] COMP_FS_OES compile failed (external dmabufs may stay black): {}",
+                    self.gl.get_shader_info_log(fs_oes)
+                );
+                self.gl.delete_shader(fs_oes);
+                self.gl.delete_program(oes_program);
+                self.comp_program_oes = None;
+            } else {
+                self.gl.attach_shader(oes_program, vs);
+                self.gl.attach_shader(oes_program, fs_oes);
+                self.gl.link_program(oes_program);
+                if !self.gl.get_program_link_status(oes_program) {
+                    log::warn!(
+                        "[lotus-atrium] COMP_FS_OES link failed: {}",
+                        self.gl.get_program_info_log(oes_program)
+                    );
+                    self.gl.detach_shader(oes_program, vs);
+                    self.gl.detach_shader(oes_program, fs_oes);
+                    self.gl.delete_shader(fs_oes);
+                    self.gl.delete_program(oes_program);
+                    self.comp_program_oes = None;
+                } else {
+                    self.gl.detach_shader(oes_program, vs);
+                    self.gl.detach_shader(oes_program, fs_oes);
+                    self.gl.delete_shader(fs_oes);
+                    self.u_comp_oes_size_loc = self.gl.get_uniform_location(oes_program, "u_size");
+                    self.u_comp_oes_radius_loc =
+                        self.gl.get_uniform_location(oes_program, "u_radius");
+                    self.u_comp_oes_flip_loc =
+                        self.gl.get_uniform_location(oes_program, "u_flip_y");
+                    if let Some(u_tex) = self.gl.get_uniform_location(oes_program, "u_texture") {
+                        self.gl.use_program(Some(oes_program));
+                        self.gl.uniform_1_i32(Some(&u_tex), 0);
+                        self.gl.use_program(None);
+                    }
+                    self.comp_program_oes = Some(oes_program);
+                    log::info!("[lotus-atrium] COMP_FS_OES ready (samplerExternalOES)");
+                }
+            }
+
+            self.gl.delete_shader(vs);
 
             let vao = self.gl.create_vertex_array().expect("Cannot create VAO");
             self.gl.bind_vertex_array(Some(vao));
@@ -596,13 +759,20 @@ impl WindowInstance {
         for id in sorted_ids {
             let pane = self.panes.get_mut(&id).unwrap();
 
+            #[cfg(target_os = "linux")]
+            let keep_hidden_external = pane.external_wayland_server.is_some();
+            #[cfg(not(target_os = "linux"))]
+            let keep_hidden_external = false;
+
             let pane_phys = if let Some(rect) = solved.get(&id) {
-                if !pane.pending_visible {
+                if !pane.pending_visible && !keep_hidden_external {
                     continue;
                 }
                 *rect
             } else if pane.anchor == PaneAnchor::None {
-                if !pane.pending_visible {
+                // Nested Wayland overlays still need geometry + xdg configures while
+                // hidden so Discord/Electron adopt the dock size before first show.
+                if !pane.pending_visible && !keep_hidden_external {
                     continue;
                 }
                 // Absolute / overlay (incl. crash chrome before mirror apply)
@@ -622,6 +792,28 @@ impl WindowInstance {
                 // Docked pane not in tree solve output (hidden/detached) — skip
                 continue;
             };
+
+            #[cfg(target_os = "linux")]
+            if pane.external_wayland_server.is_some() {
+                // Same-window: snap last_physical so composite matches staged immediately.
+                // Window-size change: leave last_physical for nuclear flip — scene FBO is
+                // still active_window_size; writing new rects here draws them into the old
+                // FBO and stretch-blits wrong until a later resize unsticks the flip
+                // (maximize → image stuck until drag-resize).
+                if size == self.active_window_size {
+                    pane.last_physical_rect = pane_phys;
+                }
+                if let Some(staged) = next_staged.panes.get_mut(&id) {
+                    staged.rect = pane_phys;
+                    staged.visible = pane.pending_visible;
+                }
+                let target_w = (pane_phys.size.width as u32).max(1);
+                let target_h = (pane_phys.size.height as u32).max(1);
+                if let Some(ref ws) = self.nested_compositor {
+                    ws.lock().send_resize_pane(&id, target_w, target_h);
+                }
+                continue;
+            }
 
             if let Some(staged) = next_staged.panes.get_mut(&id) {
                 staged.rect = pane_phys;
@@ -651,9 +843,14 @@ impl WindowInstance {
             }
 
             if pane.last_notified_rect != Some(logical_rect) || pane.is_dirty {
-                let size_changed = servo_size != pane.current_servo_size || !pane.first_frame_painted;
-                pane.is_resizing = true;
+                let size_changed =
+                    servo_size != pane.current_servo_size || !pane.first_frame_painted;
+                // Only real geometry changes enter resize-freeze. Visibility toggles
+                // set is_dirty without a size change — treating that as resize left
+                // is_resizing stuck true and the compositor sampling a freeze ghost
+                // until the next window resize (HUD telemetry freeze on hide/show).
                 if size_changed {
+                    pane.is_resizing = true;
                     pane.pending_servo_size = Some(servo_size);
                 }
                 pane.last_notified_rect = Some(logical_rect);
@@ -690,20 +887,27 @@ impl WindowInstance {
             Some(_) => {
                 // If Servo is not actively busy rendering any pane for the current lock,
                 // it is safe to absorb rapid sequential IPC commands into the same transaction.
-                !self.panes.values().any(|p| p.servo_busy)
+                !self.panes.values().filter(|p| {
+                    #[cfg(target_os = "linux")]
+                    if p.external_wayland_server.is_some() {
+                        return false;
+                    }
+                    true
+                }).any(|p| p.servo_busy)
             }
         };
 
         if can_commit {
-            let needs_transaction = self.active_window_size != size || self.panes.values().any(|p| {
-                if let Some(staged) = self.staged_layout.panes.get(&p.id) {
-                    if let Some(active) = self.active_layout.panes.get(&p.id) {
-                        return staged.rect != active.rect || staged.visible != active.visible;
+            let needs_transaction = self.active_window_size != size
+                || self.panes.values().any(|p| {
+                    if let Some(staged) = self.staged_layout.panes.get(&p.id) {
+                        if let Some(active) = self.active_layout.panes.get(&p.id) {
+                            return staged.rect != active.rect || staged.visible != active.visible;
+                        }
+                        return true;
                     }
-                    return true;
-                }
-                false
-            });
+                    false
+                });
 
             if needs_transaction {
                 self.committed_layout = Some(self.staged_layout.clone());
@@ -721,6 +925,10 @@ impl WindowInstance {
         // Locals: never webview.resize() while a frame is waiting to paint — resize()
         // updates the Webrender document view + FB immediately.
         for pane in self.panes.values_mut() {
+            #[cfg(target_os = "linux")]
+            if pane.external_wayland_server.is_some() {
+                continue;
+            }
             let can_dispatch = if pane.is_remote {
                 !pane.servo_busy
             } else {

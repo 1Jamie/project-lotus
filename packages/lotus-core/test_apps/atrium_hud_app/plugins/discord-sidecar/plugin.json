@@ -1,0 +1,14 @@
+{
+  "id": "discord-sidecar",
+  "name": "Discord Sidecar",
+  "version": "0.1.0",
+  "host": "host.js",
+  "shellButtons": [
+    {
+      "id": "toggle",
+      "label": "Discord · F9",
+      "shortcut": "F9",
+      "action": "toggle-pane:app"
+    }
+  ]
+}

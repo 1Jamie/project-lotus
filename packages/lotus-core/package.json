@@ -3,6 +3,9 @@
   "version": "0.4.0",
   "main": "lotus.js",
   "types": "lotus.d.ts",
+  "bin": {
+    "atrium": "./bin/atrium"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/1Jamie/project-lotus.git"
@@ -63,6 +66,8 @@
     "test": "npm run test-app",
     "test-app": "RUST_LOG=info LOTUS_DEV_REQ=../../ node test_apps/test_app/main.js",
     "multipane-test-app": "RUST_LOG=info LOTUS_DEV_REQ=../../ node test_apps/multi_pane_test_app/main.js",
+    "atrium-hud-app": "RUST_LOG=info ./bin/atrium",
+    "atrium": "RUST_LOG=info ./bin/atrium",
     "sandbox-test-app": "RUST_LOG=info LOTUS_DEV_REQ=../../ node test_apps/sandbox_test_app/main.js",
     "secure-test-app": "npm run sandbox-test-app",
     "test-app:multi": "npm run multipane-test-app",

@@ -1,0 +1,13 @@
+{
+  "id": "static-crosshair",
+  "name": "Static Crosshair",
+  "version": "0.1.0",
+  "host": "host.js",
+  "shellButtons": [
+    {
+      "id": "toggle",
+      "label": "Crosshair",
+      "action": "toggle-pane:main"
+    }
+  ]
+}

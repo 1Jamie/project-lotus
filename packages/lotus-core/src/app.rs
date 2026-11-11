@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::path::PathBuf;
 
@@ -12,7 +12,11 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize as WinitPhysicalSize;
 use dpi::PhysicalSize as ServoPhysicalSize;
 use winit::event::{WindowEvent, MouseScrollDelta};
+#[cfg(target_os = "linux")]
+use winit::event::{DeviceEvent, DeviceId};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy, ControlFlow};
+#[cfg(target_os = "linux")]
+use winit::event_loop::DeviceEvents;
 use winit::window::{Window, WindowId, CursorIcon};
 use winit::raw_window_handle::{HasWindowHandle, HasDisplayHandle};
 
@@ -155,6 +159,20 @@ pub enum EngineCommand {
     AnimatingChanged(String, String, bool), // window_id, pane_id, animating
     NewFrameReady(String, String), // window_id, pane_id
     RedrawWindow(String), // window_id
+    /// Nested Wayland/X11 client cursor (shape or bitmap) → host winit cursor.
+    #[cfg(target_os = "linux")]
+    NestedCursor {
+        window_id: String,
+        cursor: crate::wayland::NestedCursor,
+        /// True when the seat cursor came from the primary/game pane.
+        from_primary: bool,
+    },
+    /// Primary game activated/released zwp_pointer_constraints lock/confine.
+    #[cfg(target_os = "linux")]
+    NestedPointerLock {
+        window_id: String,
+        active: bool,
+    },
     SetMinInnerSize(String, Option<winit::dpi::PhysicalSize<u32>>), // window_id, size (None = remove constraint)
     SetMaxInnerSize(String, Option<winit::dpi::PhysicalSize<u32>>), // window_id, size (None = remove constraint)
 
@@ -185,6 +203,7 @@ pub enum EngineCommand {
     BeginLayoutBatch(String), // window_id
     EndLayoutBatch(String), // window_id — flush one recalculate_layout
     SetPaneVisible(String, String, bool), // window_id, pane_id, visible
+    SetPanePassthrough(String, String, bool), // window_id, pane_id, pointer_passthrough
     FocusPane(String, String), // window_id, pane_id
     AttachRemotePaneInput(String, String, std::os::unix::io::RawFd), // window_id, pane_id, fd
     /// Keep a remote pane docked+visible (so it receives compositor vsync) while a host
@@ -231,6 +250,27 @@ pub enum EngineCommand {
         window_id: String,
         control_id: String,
     },
+    #[cfg(target_os = "linux")]
+    CreateExternalAppPane {
+        window_id: String,
+        pane_id: String,
+        command: String,
+        args: Vec<String>,
+        rect: euclid::Rect<f32, servo::DeviceIndependentPixel>,
+        z_index: i32,
+        anchor: PaneAnchor,
+        dock_order: u32,
+        visible: bool,
+        /// `off` | `mirror` | `capture` — host-bus Notify → atrium toast bridge.
+        dbus_notifications: String,
+        /// App names / desktop-ids to match (case-insensitive), e.g. Discord.
+        dbus_notification_apps: Vec<String>,
+    },
+    #[cfg(target_os = "linux")]
+    SetGameMode(String, bool),
+    /// Borderless fullscreen for the lotus host window itself.
+    SetFullscreen(String, bool),
+    SetPaneZIndex(String, String, i32),
 }
 
 fn intercept_drag_regions(raw_bytes: &[u8], window_id: String) {
@@ -396,6 +436,704 @@ pub(crate) fn forward_remote_input(fd: std::os::unix::io::RawFd, json: &str) {
     }
 }
 
+/// Push a Track-1 IPC batch to renderer WebSockets. Renderer `_processRaw` requires the
+/// leading `MSG_TYPE_DATA` (0x02) byte — bare msgpack is silently dropped.
+fn push_renderer_ipc(window_id: &str, channel: &str, payload: serde_json::Value) {
+    let Some(senders) = WS_SENDERS.get() else {
+        return;
+    };
+    let Ok(packed) = rmp_serde::encode::to_vec_named(&vec![(channel, payload)]) else {
+        return;
+    };
+    let mut wrapped = Vec::with_capacity(packed.len() + 1);
+    wrapped.push(MSG_TYPE_DATA);
+    wrapped.extend(packed);
+    let msg = axum::extract::ws::Message::Binary(wrapped.into());
+    for entry in senders.iter() {
+        if entry.key().starts_with(&format!("{}:", window_id)) || entry.key() == window_id {
+            let _ = entry.value().send(msg.clone());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn winit_mouse_button_evdev(button: winit::event::MouseButton) -> u32 {
+    match button {
+        winit::event::MouseButton::Left => 0x110,
+        winit::event::MouseButton::Right => 0x111,
+        winit::event::MouseButton::Middle => 0x112,
+        winit::event::MouseButton::Back => 0x115,
+        winit::event::MouseButton::Forward => 0x116,
+        winit::event::MouseButton::Other(v) => v as u32,
+    }
+}
+
+/// Kill nested Proton/Discord children, then tear down the nested compositor.
+#[cfg(target_os = "linux")]
+fn atrium_teardown_window(instance: &mut WindowInstance) {
+    // Children first while the nested display is still alive.
+    for pane in instance.panes.values_mut() {
+        if let Some(pid) = pane.external_child_pid.take() {
+            crate::window::terminate_external_child(pid);
+        }
+        pane.external_wayland_server = None;
+        pane.external_surface_slot = None;
+    }
+    if instance.nested_compositor.take().is_some() {
+        info!("[lotus-atrium] nested compositor dropped");
+    }
+}
+
+fn atrium_set_pane_visible(instance: &mut WindowInstance, pane_id: &str, visible: bool) {
+    instance.layout_root.set_leaf_visible(pane_id, visible);
+    #[cfg(target_os = "linux")]
+    crate::dbus_notify::set_source_pane_visible(pane_id, visible);
+    if let Some(pane) = instance.panes.get_mut(pane_id) {
+        pane.pending_visible = visible;
+        pane.is_dirty = true;
+        pane.frame_seq = pane.frame_seq.wrapping_add(1);
+
+        // Keep Servo painting while the host just stops compositing this pane.
+        // webview.hide()/show() throttles the document and clears rAF; unthrottle
+        // does not re-schedule callbacks, so reveal stayed blank until a resize
+        // forced a Webrender frame. Overlay toggles need the paint loop left alone.
+        //
+        // Also exit compositor freeze: visibility dirty used to set is_resizing
+        // without a size change, which locked LocalFreeze on a ghost forever.
+        pane.ghost_valid = false;
+        pane.is_resizing = false;
+
+        #[cfg(target_os = "linux")]
+        if pane.external_wayland_server.is_some() {
+            // Nested panes have no Servo resize transaction — commit visibility now so
+            // composite + hit-testing match pending_visible without a window resize.
+            // Client buffer size stays fixed (game output / overlay client size);
+            // dock geometry is composite-only (cover/contain scale).
+            pane.is_visible = visible;
+        }
+    }
+    if let Some(active) = instance.active_layout.panes.get_mut(pane_id) {
+        active.visible = visible;
+    }
+    if let Some(staged) = instance.staged_layout.panes.get_mut(pane_id) {
+        staged.visible = visible;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ref ws) = instance.nested_compositor {
+        ws.lock().send_pane_visible(pane_id, visible);
+    }
+    instance.force_scene_repaint = true;
+    instance.window.request_redraw();
+}
+
+/// Physical rect for pointer hit-testing; matches staged compositor placement in atrium.
+#[cfg(target_os = "linux")]
+fn atrium_pane_hit_rect(
+    instance: &WindowInstance,
+    pane: &PaneInstance,
+    scale_factor: f32,
+) -> (f32, f32, f32, f32) {
+    if instance.nested_compositor.is_some() {
+        if let Some(staged) = instance.staged_layout.panes.get(&pane.id) {
+            if staged.rect.size.width > 0 && staged.rect.size.height > 0 {
+                let r = staged.rect;
+                return (
+                    r.origin.x as f32,
+                    r.origin.y as f32,
+                    r.size.width as f32,
+                    r.size.height as f32,
+                );
+            }
+        }
+    }
+    pane.input_physical_rect(scale_factor)
+}
+
+/// Topmost pane under the cursor (z-order), same as standard lotus overlay routing.
+///
+/// When `exclude_primary_game` is set (overlay input mode), the base game surface is
+/// wallpaper-only: it never wins hit-test, so hover/click cannot steal focus back to it.
+#[cfg(target_os = "linux")]
+fn hit_test_pointer_pane<'a>(
+    instance: &'a WindowInstance,
+    point: Point2D<f32, servo::DevicePixel>,
+    scale_factor: f32,
+    exclude_primary_game: bool,
+) -> Option<&'a PaneInstance> {
+    let mut sorted: Vec<_> = instance.panes.values().collect();
+    sorted.sort_by_key(|p| -p.z_index);
+    for pane in sorted {
+        if exclude_primary_game
+            && instance.primary_game_pane.as_deref() == Some(pane.id.as_str())
+        {
+            continue;
+        }
+        if !pane_accepts_pointer_input(pane) {
+            continue;
+        }
+        let (px, py, pw, ph) = atrium_pane_hit_rect(instance, pane, scale_factor);
+        let rect = euclid::Rect::new(
+            euclid::Point2D::new(px, py),
+            euclid::Size2D::new(pw, ph),
+        );
+        if rect.contains(point) {
+            return Some(pane);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_is_primary_game(instance: &WindowInstance, pane_id: &str) -> bool {
+    instance.primary_game_pane.as_deref() == Some(pane_id)
+}
+
+/// Sticky keyboard/click focus for overlay surfaces. Does not follow the mouse.
+#[cfg(target_os = "linux")]
+fn atrium_set_keyboard_focus(instance: &mut WindowInstance, pane_id: &str) {
+    instance.active_pane_id = pane_id.to_string();
+    if let Some(pane) = instance.panes.get(pane_id) {
+        if let Some(ref ws) = pane.external_wayland_server {
+            ws.lock().focus_pane(pane_id);
+        }
+    }
+}
+
+/// Enter/leave game-only input. Overlay uses click-to-focus; game mode always focuses the game.
+///
+/// Game cursor/lock "shoes" keep updating while overlay is up — switching modes only
+/// puts those shoes on/off the host. Overlay never wipes game state.
+#[cfg(target_os = "linux")]
+fn atrium_apply_game_mode(
+    instance: &mut WindowInstance,
+    mode: bool,
+    event_loop: Option<&ActiveEventLoop>,
+) {
+    instance.game_mode = mode;
+    if let Some(ref ws) = instance.nested_compositor {
+        // Nested compositor tracks host game-mode so new Discord toplevels never
+        // grab Activated (which would silence session-bus Notify).
+        ws.lock().set_host_game_mode(mode);
+    }
+    if mode {
+        // Overlay externals (Discord, …) must look unfocused so they emit desktop
+        // Notify calls — we mirror those into atrium toasts via the dbus bridge.
+        let game_id = instance.primary_game_pane.clone();
+        let overlay_ids: Vec<String> = instance
+            .panes
+            .iter()
+            .filter(|(id, p)| {
+                p.external_wayland_server.is_some()
+                    && game_id.as_deref() != Some(id.as_str())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let Some(ref ws) = instance.nested_compositor {
+            let server = ws.lock();
+            for id in &overlay_ids {
+                server.set_pane_activated(id, false);
+            }
+            // Keyboard off overlays; restore pointer to the game so its cursor/lock
+            // channel stays live (do not wipe game shoes).
+            server.clear_keyboard_focus();
+        }
+        if let Some(ref gid) = game_id {
+            if instance.active_pane_id != *gid
+                && overlay_ids.iter().any(|id| id == &instance.active_pane_id)
+            {
+                instance.active_pane_id.clear();
+            }
+            atrium_set_keyboard_focus(instance, gid);
+            if let Some(ref ws) = instance.nested_compositor {
+                // Re-seat pointer on the game so constraints/cursor keep flowing.
+                ws.lock().focus_pane(gid);
+            }
+        }
+        instance.hover_pane_id = None;
+        for id in &overlay_ids {
+            crate::dbus_notify::set_source_pane_visible(id, false);
+        }
+        // Put the game's shoes back on the host.
+        atrium_wear_game_pointer_shoes(instance, event_loop);
+    } else {
+        let game_id = instance.primary_game_pane.clone();
+        let overlay_ids: Vec<String> = instance
+            .panes
+            .iter()
+            .filter(|(id, p)| {
+                p.external_wayland_server.is_some()
+                    && game_id.as_deref() != Some(id.as_str())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if atrium_is_primary_game(instance, &instance.active_pane_id) {
+            instance.active_pane_id.clear();
+            if let Some(ref ws) = instance.nested_compositor {
+                ws.lock().clear_keyboard_focus();
+            }
+        }
+        // Leave the game surface so it stops highlighting under the overlay cursor.
+        // Activate *visible* overlays so Chromium resumes painting (game mode keeps
+        // them deactivated for Notify — that left Discord frozen after a match).
+        if let Some(ref ws) = instance.nested_compositor {
+            let server = ws.lock();
+            server.clear_pointer_focus();
+            for id in &overlay_ids {
+                let visible = instance
+                    .panes
+                    .get(id)
+                    .map(|p| p.is_visible || p.pending_visible)
+                    .unwrap_or(false);
+                server.set_pane_activated(id, visible);
+            }
+        }
+        // Take host shoes off for Discord/HUD — game_* state stays as-is.
+        atrium_release_host_pointer_grab(instance);
+        atrium_clear_nested_cursor(instance);
+        instance.window.set_cursor_visible(true);
+        instance.window.set_cursor(CursorIcon::Default);
+        // Kick a present so any pending Discord wl_callbacks are released.
+        instance.force_scene_repaint = true;
+        instance.window.request_redraw();
+        // Immediate enter+motion on whatever is under the cursor — otherwise the first
+        // Discord click hits a stale (0,0) enter and Chromium starts a CSD resize.
+        if let Some(el) = event_loop {
+            let scale = instance.window.scale_factor() as f32;
+            let point = instance.last_mouse_pos;
+            let wid = instance.window_id.clone();
+            atrium_route_cursor_moved(instance, el, &wid, point, scale);
+        }
+    }
+}
+
+/// Host grab only in game mode, driven by the game's sticky shoes.
+#[cfg(target_os = "linux")]
+fn atrium_want_host_pointer_grab(instance: &WindowInstance) -> bool {
+    instance.game_mode
+        && instance.nested_compositor.is_some()
+        && (instance.game_pointer_constraint_active || instance.game_cursor_hidden)
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_release_host_pointer_grab(instance: &mut WindowInstance) {
+    use winit::window::CursorGrabMode;
+    if instance.host_pointer_grabbed {
+        let _ = instance.window.set_cursor_grab(CursorGrabMode::None);
+        instance.host_pointer_grabbed = false;
+        info!("[lotus-atrium] host pointer grab off (overlay / unlocked)");
+    }
+}
+
+/// Match host CursorGrab to game shoes while in game mode.
+#[cfg(target_os = "linux")]
+fn atrium_sync_pointer_grab(instance: &mut WindowInstance) {
+    use winit::window::CursorGrabMode;
+    let want = atrium_want_host_pointer_grab(instance);
+    if want == instance.host_pointer_grabbed {
+        if want {
+            instance.window.set_cursor_visible(false);
+        }
+        return;
+    }
+    if want {
+        let grabbed = instance
+            .window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| instance.window.set_cursor_grab(CursorGrabMode::Confined));
+        match grabbed {
+            Ok(()) => {
+                instance.window.set_cursor_visible(false);
+                instance.host_pointer_grabbed = true;
+                info!(
+                    "[lotus-atrium] host pointer grab on (constraint={} cursor_hidden={})",
+                    instance.game_pointer_constraint_active, instance.game_cursor_hidden
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "[lotus-atrium] host pointer grab failed (relative aim may be soft): {:?}",
+                    err
+                );
+                instance.host_pointer_grabbed = false;
+            }
+        }
+    } else {
+        atrium_release_host_pointer_grab(instance);
+    }
+}
+
+/// Record primary-game cursor into sticky shoes (never touches overlay Discord state).
+#[cfg(target_os = "linux")]
+fn atrium_record_game_cursor(instance: &mut WindowInstance, cursor: &crate::wayland::NestedCursor) {
+    instance.game_cursor = Some(cursor.clone());
+    instance.game_cursor_hidden = matches!(cursor, crate::wayland::NestedCursor::Hidden);
+}
+
+/// Apply the game's sticky shoes to the host (grab + cursor visual).
+#[cfg(target_os = "linux")]
+fn atrium_wear_game_pointer_shoes(
+    instance: &mut WindowInstance,
+    event_loop: Option<&ActiveEventLoop>,
+) {
+    atrium_sync_pointer_grab(instance);
+    if instance.host_pointer_grabbed {
+        instance.window.set_cursor_visible(false);
+        instance.nested_cursor_applied = true;
+        return;
+    }
+    if let (Some(el), Some(cursor)) = (event_loop, instance.game_cursor.clone()) {
+        atrium_paint_host_cursor(instance, el, &cursor);
+    } else if instance.game_cursor_hidden {
+        instance.window.set_cursor_visible(false);
+        instance.nested_cursor_applied = true;
+    } else {
+        atrium_clear_nested_cursor(instance);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_pointer_coords(
+    instance: &WindowInstance,
+    pane: &PaneInstance,
+    point: Point2D<f32, servo::DevicePixel>,
+    scale_factor: f32,
+) -> (f64, f64) {
+    let (px, py, pw, ph) = atrium_pane_hit_rect(instance, pane, scale_factor);
+    let lx = (point.x - px) as f64;
+    let ly = (point.y - py) as f64;
+    // Map host pane pixels → client buffer using the same contain-fit as composite.
+    if let Some(ref slot) = pane.external_surface_slot {
+        let guard = slot.lock();
+        let bw = guard.width.max(1) as f64;
+        let bh = guard.height.max(1) as f64;
+        if pw > 1.0 && ph > 1.0 {
+            let pane_ar = pw as f64 / ph as f64;
+            let buf_ar = bw / bh;
+            if (pane_ar - buf_ar).abs() < 0.02 {
+                return (lx * bw / pw as f64, ly * bh / ph as f64);
+            }
+            if buf_ar > pane_ar {
+                let content_h = pw as f64 / buf_ar;
+                let y0 = (ph as f64 - content_h) * 0.5;
+                return (lx * bw / pw as f64, (ly - y0) * bh / content_h);
+            }
+            let content_w = ph as f64 * buf_ar;
+            let x0 = (pw as f64 - content_w) * 0.5;
+            return ((lx - x0) * bw / content_w, ly * bh / ph as f64);
+        }
+    }
+    (lx, ly)
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_in_overlay_input_mode(instance: &WindowInstance) -> bool {
+    instance.nested_compositor.is_some() && !instance.game_mode
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_named_cursor_icon(name: &str) -> CursorIcon {
+    name.parse::<CursorIcon>().unwrap_or_else(|_| match name {
+        "dnd-ask" => CursorIcon::Copy,
+        "all-resize" => CursorIcon::Move,
+        // Xcursor legacy aliases commonly used by Wine/Proton themes.
+        "left_ptr" | "arrow" | "top_left_arrow" => CursorIcon::Default,
+        "hand2" | "hand1" | "hand" | "pointing_hand" => CursorIcon::Pointer,
+        "xterm" | "ibeam" => CursorIcon::Text,
+        "watch" => CursorIcon::Wait,
+        "left_ptr_watch" | "half-busy" => CursorIcon::Progress,
+        "sb_h_double_arrow" | "h_double_arrow" => CursorIcon::ColResize,
+        "sb_v_double_arrow" | "v_double_arrow" => CursorIcon::RowResize,
+        "fleur" | "size_all" => CursorIcon::Move,
+        "pirate" | "crossed_circle" => CursorIcon::NotAllowed,
+        _ => CursorIcon::Default,
+    })
+}
+
+/// Paint a nested cursor onto the host window (visual only — no game-shoe updates).
+#[cfg(target_os = "linux")]
+fn atrium_paint_host_cursor(
+    instance: &mut WindowInstance,
+    event_loop: &ActiveEventLoop,
+    cursor: &crate::wayland::NestedCursor,
+) {
+    use winit::window::{Cursor, CustomCursor};
+    instance.nested_cursor = Some(cursor.clone());
+    match cursor {
+        crate::wayland::NestedCursor::Hidden => {
+            instance.window.set_cursor_visible(false);
+            instance.nested_cursor_applied = true;
+        }
+        crate::wayland::NestedCursor::Named(name) => {
+            instance.window.set_cursor_visible(true);
+            instance.window.set_cursor(atrium_named_cursor_icon(name));
+            instance.nested_cursor_applied = true;
+        }
+        crate::wayland::NestedCursor::Custom {
+            rgba,
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+        } => {
+            match CustomCursor::from_rgba(
+                rgba.clone(),
+                *width,
+                *height,
+                *hotspot_x,
+                *hotspot_y,
+            ) {
+                Ok(source) => {
+                    let custom = event_loop.create_custom_cursor(source);
+                    instance.window.set_cursor_visible(true);
+                    instance.window.set_cursor(Cursor::Custom(custom));
+                    instance.nested_cursor_applied = true;
+                }
+                Err(err) => {
+                    warn!("[lotus-atrium] nested custom cursor rejected: {:?}", err);
+                    instance.window.set_cursor_visible(true);
+                    instance.window.set_cursor(CursorIcon::Default);
+                    instance.nested_cursor_applied = true;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_clear_nested_cursor(instance: &mut WindowInstance) {
+    if instance.nested_cursor_applied {
+        instance.window.set_cursor_visible(true);
+        instance.window.set_cursor(CursorIcon::Default);
+        instance.nested_cursor_applied = false;
+    }
+}
+
+/// Re-apply the last nested host visual when the pointer is over an external pane.
+#[cfg(target_os = "linux")]
+fn atrium_sync_nested_cursor_for_hover(
+    instance: &mut WindowInstance,
+    event_loop: Option<&ActiveEventLoop>,
+    over_external: bool,
+) {
+    if over_external {
+        if instance.nested_cursor_applied {
+            return;
+        }
+        if let (Some(el), Some(cursor)) = (event_loop, instance.nested_cursor.clone()) {
+            atrium_paint_host_cursor(instance, el, &cursor);
+        }
+    } else {
+        atrium_clear_nested_cursor(instance);
+    }
+}
+
+/// Route cursor movement in atrium HUD/overlay mode (z-ordered hit test).
+/// Updates hover + pointer only — never steals sticky keyboard focus (`active_pane_id`).
+#[cfg(target_os = "linux")]
+fn atrium_route_cursor_moved(
+    instance: &mut WindowInstance,
+    event_loop: &ActiveEventLoop,
+    uuid: &str,
+    point: Point2D<f32, servo::DevicePixel>,
+    scale_factor: f32,
+) {
+    let Some(hover_id) =
+        hit_test_pointer_pane(instance, point, scale_factor, true).map(|p| p.id.clone())
+    else {
+        instance.hover_pane_id = None;
+        atrium_clear_nested_cursor(instance);
+        // Not over Discord — reseat pointer on the game so lock/cursor shoes keep flowing.
+        if let Some(ref gid) = instance.primary_game_pane {
+            if let Some(ref ws) = instance.nested_compositor {
+                ws.lock().focus_pane(gid);
+            }
+        }
+        return;
+    };
+    instance.hover_pane_id = Some(hover_id.clone());
+    let hovering_primary = instance.primary_game_pane.as_deref() == Some(hover_id.as_str());
+    let external_motion = instance.panes.get(&hover_id).and_then(|pane| {
+        if pane.external_wayland_server.is_none() {
+            return None;
+        }
+        let ws = pane.external_wayland_server.clone()?;
+        let (tx, ty) = atrium_pointer_coords(instance, pane, point, scale_factor);
+        Some((ws, tx, ty))
+    });
+    if let Some((ws, tx, ty)) = external_motion {
+        ws.lock().send_pointer_motion_to_pane(&hover_id, tx, ty);
+        if !hovering_primary {
+            atrium_sync_nested_cursor_for_hover(instance, Some(event_loop), true);
+        }
+        return;
+    }
+    // Left nested overlay surface → Servo/HUD owns the cursor; reseat game for shoes.
+    atrium_clear_nested_cursor(instance);
+    if let Some(ref gid) = instance.primary_game_pane {
+        if let Some(ref ws) = instance.nested_compositor {
+            ws.lock().focus_pane(gid);
+        }
+    }
+    let (px, py, pw, ph, is_external, wayland, translated) =
+        if let Some(pane) = instance.panes.get(&hover_id) {
+            let (px, py, pw, ph) = atrium_pane_hit_rect(instance, pane, scale_factor);
+            let mut translated = Point2D::new(point.x - px, point.y - py);
+            let is_external = pane.external_wayland_server.is_some();
+            let wayland = pane.external_wayland_server.clone();
+            if pane.is_remote {
+                if let Some(ref consumer) = pane.remote_consumer {
+                    if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
+                        translated.x *= consumer.tex_width as f32 / pw;
+                        translated.y *= consumer.tex_height as f32 / ph;
+                    }
+                }
+            }
+            (px, py, pw, ph, is_external, wayland, translated)
+        } else {
+            return;
+        };
+    let _ = (px, py, pw, ph, is_external, wayland);
+    if let Some(pane) = instance.panes.get(&hover_id) {
+        if pane.is_remote {
+            if let Some(fd) = pane.remote_input_fd {
+                let surface_id = format!("{}:{}", uuid, pane.id);
+                let msg = serde_json::json!({
+                    "type": "Input",
+                    "event": {
+                        "kind": "MouseMove",
+                        "surface_id": surface_id,
+                        "generation": 1,
+                        "x": translated.x,
+                        "y": translated.y,
+                        "modifiers": instance.modifiers.bits(),
+                    }
+                })
+                .to_string();
+                forward_remote_input(fd, &msg);
+            }
+        } else {
+            pane.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
+                servo::WebViewPoint::Device(translated),
+            )));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_resolve_button_target(
+    instance: &WindowInstance,
+    is_pressed: bool,
+    scale_factor: f32,
+) -> Option<String> {
+    if is_pressed {
+        hit_test_pointer_pane(instance, instance.last_mouse_pos, scale_factor, true)
+            .map(|p| p.id.clone())
+    } else {
+        instance.last_mouse_down_pane_id.clone()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_route_mouse_button(
+    instance: &mut WindowInstance,
+    uuid: &str,
+    button: winit::event::MouseButton,
+    is_pressed: bool,
+    scale_factor: f32,
+) {
+    let Some(target_id) = atrium_resolve_button_target(instance, is_pressed, scale_factor) else {
+        return;
+    };
+    if is_pressed {
+        instance.last_mouse_down_pane_id = Some(target_id.clone());
+        // Click-to-focus: sticky until the next overlay click (or return to game mode).
+        atrium_set_keyboard_focus(instance, &target_id);
+    } else {
+        instance.last_mouse_down_pane_id = None;
+    }
+    let pointer_plan = instance.panes.get(&target_id).map(|pane| {
+        let (px, py, pw, ph) = atrium_pane_hit_rect(instance, pane, scale_factor);
+        let translated = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
+        let evdev = winit_mouse_button_evdev(button);
+        let (wx, wy) = atrium_pointer_coords(instance, pane, instance.last_mouse_pos, scale_factor);
+        (
+            pane.external_wayland_server.clone(),
+            pane.is_remote,
+            pane.remote_input_fd,
+            pane.id.clone(),
+            translated,
+            pw,
+            ph,
+            evdev,
+            wx,
+            wy,
+        )
+    });
+    let Some((wayland, is_remote, remote_fd, pane_id, mut translated, pw, ph, evdev, wx, wy)) =
+        pointer_plan
+    else {
+        return;
+    };
+    if let Some(ws) = wayland {
+        ws.lock()
+            .send_pointer_button_to_pane(&pane_id, wx, wy, evdev, is_pressed);
+        return;
+    }
+    let action = if is_pressed {
+        MouseButtonAction::Down
+    } else {
+        MouseButtonAction::Up
+    };
+    let servo_button = match button {
+        winit::event::MouseButton::Left => ServoMouseButton::Primary,
+        winit::event::MouseButton::Right => ServoMouseButton::Secondary,
+        winit::event::MouseButton::Middle => ServoMouseButton::Auxiliary,
+        winit::event::MouseButton::Back => ServoMouseButton::Back,
+        winit::event::MouseButton::Forward => ServoMouseButton::Forward,
+        winit::event::MouseButton::Other(v) => ServoMouseButton::Other(v),
+    };
+    if is_remote {
+        if let Some(fd) = remote_fd {
+            if let Some(pane) = instance.panes.get(&target_id) {
+                if let Some(ref consumer) = pane.remote_consumer {
+                    if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
+                        translated.x *= consumer.tex_width as f32 / pw;
+                        translated.y *= consumer.tex_height as f32 / ph;
+                    }
+                }
+            }
+            let kind = if is_pressed { "MouseDown" } else { "MouseUp" };
+            let btn_num = match servo_button {
+                ServoMouseButton::Primary => 0,
+                ServoMouseButton::Auxiliary => 1,
+                ServoMouseButton::Secondary => 2,
+                _ => 0,
+            };
+            let surface_id = format!("{}:{}", uuid, pane_id);
+            let msg = serde_json::json!({
+                "type": "Input",
+                "event": {
+                    "kind": kind,
+                    "surface_id": surface_id,
+                    "generation": 1,
+                    "button": btn_num,
+                    "x": translated.x,
+                    "y": translated.y,
+                    "modifiers": instance.modifiers.bits(),
+                }
+            })
+            .to_string();
+            forward_remote_input(fd, &msg);
+        }
+    } else if let Some(pane) = instance.panes.get_mut(&target_id) {
+        pane.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+            action,
+            servo_button,
+            servo::WebViewPoint::Device(translated),
+        )));
+    }
+}
+
 /// Whether a pane should receive mouse hit-testing.
 /// Crash-covered remotes never get input (chrome overlay owns the slot). Host recovery
 /// chrome (`__lotus_crash_*`) is hittable as soon as `pending_visible` is set — do not
@@ -404,14 +1142,17 @@ fn pane_accepts_pointer_input(pane: &PaneInstance) -> bool {
     if pane.under_crash_cover {
         return false;
     }
-    if pane.is_visible {
+    if pane.pointer_passthrough {
+        return false;
+    }
+    if pane.pending_visible {
         return true;
     }
-    // Overlays / crash chrome: pending_visible is enough to interact on the first frames.
-    pane.pending_visible
-        && (pane.id.starts_with("__lotus_crash_")
-            || pane.id.starts_with("__lotus_select_overlay")
-            || pane.anchor == PaneAnchor::None)
+    // Hide in flight: still committed visible but pending_visible already false.
+    if pane.is_visible {
+        return false;
+    }
+    false
 }
 
 /// True floating overlays beat gutters. Tree-backed leaves (including sandboxed
@@ -523,12 +1264,486 @@ fn enter_gutter_hover(
 }
 
 /// Read the window's current monitor refresh rate in millihertz (fallback 60 Hz).
+/// `ATRIUM_REFRESH` (Hz) overrides when set — gamescope-style `-r`.
 fn monitor_refresh_rate_millihertz(window: &winit::window::Window) -> u32 {
+    if let Ok(hz) = std::env::var("ATRIUM_REFRESH") {
+        if let Ok(n) = hz.parse::<u32>() {
+            if n > 0 {
+                return n.saturating_mul(1000);
+            }
+        }
+    }
     window
         .current_monitor()
         .and_then(|m| m.refresh_rate_millihertz())
         .filter(|&mhz| mhz > 0)
         .unwrap_or(60_000)
+}
+
+#[cfg(target_os = "linux")]
+fn x11_root_size(display: &str) -> Option<(u32, u32)> {
+    let out = std::process::Command::new("xwininfo")
+        .args(["-display", display, "-root"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut w = None;
+    let mut h = None;
+    for line in s.lines() {
+        if let Some(rest) = line.trim().strip_prefix("Width:") {
+            w = rest.trim().parse().ok();
+        } else if let Some(rest) = line.trim().strip_prefix("Height:") {
+            h = rest.trim().parse().ok();
+        }
+    }
+    match (w, h) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
+}
+
+/// eglSwapInterval on the current EGL display.
+/// Gamescope fifo present deadlocks with interval=1 — use 0 there and phase-align in software.
+#[cfg(target_os = "linux")]
+pub(crate) fn atrium_set_egl_swap_interval_pub(interval: i32) {
+    atrium_set_egl_swap_interval(interval);
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_set_egl_swap_interval(interval: i32) {
+    use std::os::raw::{c_int, c_void};
+    unsafe extern "C" {
+        fn eglGetCurrentDisplay() -> *mut c_void;
+        fn eglSwapInterval(dpy: *mut c_void, interval: c_int) -> u32;
+    }
+    unsafe {
+        let dpy = eglGetCurrentDisplay();
+        if dpy.is_null() {
+            atrium_host_diag("eglSwapInterval: no current EGL display");
+            return;
+        }
+        let ok = eglSwapInterval(dpy, interval as c_int);
+        if std::env::var_os("ATRIUM_PACING_DIAG").is_some() {
+            atrium_host_diag(&format!("eglSwapInterval({interval}) ok={ok}"));
+        }
+    }
+}
+
+/// Append a line to the atrium host log (always on — not gated by RUST_LOG).
+#[cfg(target_os = "linux")]
+pub(crate) fn atrium_host_diag_pub(msg: &str) {
+    atrium_host_diag(msg);
+}
+
+#[cfg(target_os = "linux")]
+fn atrium_host_diag(msg: &str) {
+    use std::io::Write;
+    let line = format!(
+        "[lotus-atrium] {}\n",
+        msg
+    );
+    // Mirror to tracing + durable log Steam/Game Mode can collect.
+    info!("{}", line.trim_end());
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/lotus-atrium-host.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// True when running under Bazzite/SteamOS Game Mode (embedded gamescope).
+#[cfg(target_os = "linux")]
+pub(crate) fn is_gamescope_session_pub() -> bool {
+    is_gamescope_session()
+}
+
+#[cfg(target_os = "linux")]
+fn is_gamescope_session() -> bool {
+    if std::env::var_os("ATRIUM_GAMEMODE").is_some_and(|v| v != "0") {
+        return true;
+    }
+    if std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some() {
+        return true;
+    }
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|d| d.to_ascii_lowercase().contains("gamescope"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn steam_app_id_for_gamescope() -> String {
+    std::env::var("SteamAppId")
+        .or_else(|_| std::env::var("SteamGameId"))
+        .or_else(|_| std::env::var("STEAM_COMPAT_APP_ID"))
+        .unwrap_or_else(|_| "1".into())
+}
+
+/// X11 display Steam/gamescope focused for this game launch.
+#[cfg(target_os = "linux")]
+fn gamescope_x11_display() -> String {
+    std::env::var("STEAM_GAME_DISPLAY_0")
+        .or_else(|_| std::env::var("DISPLAY"))
+        .unwrap_or_else(|_| ":0".into())
+}
+
+#[cfg(target_os = "linux")]
+fn x11_window_xid(window: &winit::window::Window) -> Option<u64> {
+    use raw_window_handle::RawWindowHandle;
+    match window.window_handle().ok().map(|h| h.as_raw()) {
+        Some(RawWindowHandle::Xlib(h)) => Some(h.window as u64),
+        Some(RawWindowHandle::Xcb(h)) => Some(h.window.get() as u64),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_xprop(args: &[&str]) -> bool {
+    match std::process::Command::new("xprop").args(args).status() {
+        Ok(st) if st.success() => true,
+        Ok(st) => {
+            warn!("[lotus-atrium] xprop {:?} exited {}", args, st);
+            false
+        }
+        Err(e) => {
+            warn!("[lotus-atrium] xprop {:?} failed: {}", args, e);
+            false
+        }
+    }
+}
+
+/// Make the lotus host window look like a Steam-launched game to embedded gamescope.
+/// Without these atoms Game Mode sits on a black/empty frame waiting forever.
+/// Mirrors ChimeraOS `gamescope-fg`: STEAM_GAME on the window + BASELAYER focus on root.
+#[cfg(target_os = "linux")]
+fn tag_window_for_gamescope(window: &winit::window::Window) {
+    if !is_gamescope_session() {
+        return;
+    }
+    let Some(xid) = x11_window_xid(window) else {
+        warn!(
+            "[lotus-atrium] Game Mode: host window is not X11 — cannot set STEAM_GAME \
+             (WINIT_UNIX_BACKEND=x11 required; bin/atrium sets this)"
+        );
+        return;
+    };
+
+    let app_id = steam_app_id_for_gamescope();
+    let display = gamescope_x11_display();
+    let id_arg = format!("0x{:x}", xid);
+
+    // Nested compositor model (like nested gamescope): atrium's host window IS the
+    // Steam game surface on STEAM_GAME_DISPLAY_0. Inner game+HUD live in our smithay
+    // panes — we are NOT STEAM_OVERLAY / GAMESCOPE_EXTERNAL_OVERLAY (mangoapp).
+    let steam_ok = run_xprop(&[
+        "-display",
+        &display,
+        "-id",
+        &id_arg,
+        "-f",
+        "STEAM_GAME",
+        "32c",
+        "-set",
+        "STEAM_GAME",
+        &app_id,
+    ]);
+
+    // Force fully opaque — transparent hosts often composite as "nothing" in gamescope.
+    let _ = run_xprop(&[
+        "-display",
+        &display,
+        "-id",
+        &id_arg,
+        "-f",
+        "_NET_WM_WINDOW_OPACITY",
+        "32c",
+        "-set",
+        "_NET_WM_WINDOW_OPACITY",
+        "4294967295",
+    ]);
+
+    // steamcompmgr prefers a fullscreen game window; logs showed _NET_WM_STATE missing.
+    let _ = run_xprop(&[
+        "-display",
+        &display,
+        "-id",
+        &id_arg,
+        "-f",
+        "_NET_WM_STATE",
+        "32a",
+        "-set",
+        "_NET_WM_STATE",
+        "_NET_WM_STATE_FULLSCREEN",
+    ]);
+
+    // Only our appid. Merging Steam's list lets 413091/769 float first and we
+    // never win pick_primary_focus even after we have commits.
+    let baselayer = app_id.clone();
+
+    let focus_ok = run_xprop(&[
+        "-display",
+        &display,
+        "-root",
+        "-format",
+        "GAMESCOPECTRL_BASELAYER_APPID",
+        "32co",
+        "-set",
+        "GAMESCOPECTRL_BASELAYER_APPID",
+        &baselayer,
+    ]);
+
+    // Do NOT pin GAMESCOPECTRL_BASELAYER_WINDOW until steamcompmgr has commits for
+    // us. steamcompmgr.cpp: pick selects the WINDOW first, then only sets
+    // focusWindow if window_has_commits(); otherwise FOCUSED_APP stays on Steam (769)
+    // and input never reaches atrium (F9/Discord invisible).
+
+    // Also nudge the UI display root (:0) — steamcompmgr often reads focus there.
+    if display != ":0" {
+        let _ = run_xprop(&[
+            "-display",
+            ":0",
+            "-root",
+            "-format",
+            "GAMESCOPECTRL_BASELAYER_APPID",
+            "32co",
+            "-set",
+            "GAMESCOPECTRL_BASELAYER_APPID",
+            &baselayer,
+        ]);
+        let _ = run_xprop(&[
+            "-display",
+            ":0",
+            "-root",
+            "-remove",
+            "GAMESCOPECTRL_BASELAYER_WINDOW",
+        ]);
+    }
+    let _ = run_xprop(&[
+        "-display",
+        &display,
+        "-root",
+        "-remove",
+        "GAMESCOPECTRL_BASELAYER_WINDOW",
+    ]);
+
+    if steam_ok {
+        info!(
+            "[lotus-atrium] Game Mode: STEAM_GAME={} on {} (display {}), baselayer focus={}",
+            app_id, id_arg, display, focus_ok
+        );
+    }
+
+    // Retry a few times — window may not be mapped on the first ShowWindow tick.
+    let retry_display = display.clone();
+    let retry_id = id_arg.clone();
+    let retry_app = app_id.clone();
+    let retry_baselayer = baselayer.clone();
+    let _ = std::thread::Builder::new()
+        .name("atrium-gamescope-tag".into())
+        .spawn(move || {
+            for i in 1..=8 {
+                std::thread::sleep(std::time::Duration::from_millis(150 * i as u64));
+                let _ = run_xprop(&[
+                    "-display",
+                    &retry_display,
+                    "-id",
+                    &retry_id,
+                    "-f",
+                    "STEAM_GAME",
+                    "32c",
+                    "-set",
+                    "STEAM_GAME",
+                    &retry_app,
+                ]);
+                let _ = run_xprop(&[
+                    "-display",
+                    &retry_display,
+                    "-root",
+                    "-format",
+                    "GAMESCOPECTRL_BASELAYER_APPID",
+                    "32co",
+                    "-set",
+                    "GAMESCOPECTRL_BASELAYER_APPID",
+                    &retry_baselayer,
+                ]);
+                if retry_display != ":0" {
+                    let _ = run_xprop(&[
+                        "-display",
+                        ":0",
+                        "-root",
+                        "-format",
+                        "GAMESCOPECTRL_BASELAYER_APPID",
+                        "32co",
+                        "-set",
+                        "GAMESCOPECTRL_BASELAYER_APPID",
+                        &retry_baselayer,
+                    ]);
+                }
+            }
+        });
+}
+
+/// Coalesce gamescope present kicks — a flood of RedrawWindow+Wake into winit's
+/// user-event drain livelocks with spin_event_loop → NewFrameReady → more events,
+/// so RedrawRequested never runs (stuck on black present #1).
+#[cfg(target_os = "linux")]
+pub(crate) static GAMESCOPE_CADENCE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Coalesce nested DMA-BUF/SHM commit wakes — one in-flight RedrawWindow drains
+/// pump_frames; commit spam must not flood the user-event queue.
+#[cfg(target_os = "linux")]
+pub(crate) static NESTED_REDRAW_PENDING: AtomicBool = AtomicBool::new(false);
+/// Bumped on every nested buffer import (coalesce + mid-present follow-up).
+#[cfg(target_os = "linux")]
+pub(crate) static NESTED_REDRAW_GEN: AtomicU64 = AtomicU64::new(0);
+/// Monotonic ns of last primary/game pane commit — drives game-driven VRR present.
+#[cfg(target_os = "linux")]
+pub(crate) static NESTED_LAST_PRIMARY_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+fn atrium_monotonic_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn atrium_note_primary_game_commit() {
+    NESTED_LAST_PRIMARY_COMMIT_NS.store(atrium_monotonic_ns(), Ordering::SeqCst);
+}
+
+/// True while the primary game is actively committing (VRR passthrough window).
+#[cfg(target_os = "linux")]
+pub(crate) fn atrium_game_commit_fresh(max_age: Duration) -> bool {
+    let last = NESTED_LAST_PRIMARY_COMMIT_NS.load(Ordering::SeqCst);
+    if last == 0 {
+        return false;
+    }
+    atrium_monotonic_ns().saturating_sub(last) < max_age.as_nanos() as u64
+}
+
+/// Game-driven present: composite+swap on primary commits; overlays piggyback.
+/// Independent host timers must NOT run in this window (they spoil VRR).
+#[cfg(target_os = "linux")]
+pub(crate) fn atrium_game_driven_present(instance: &WindowInstance) -> bool {
+    instance.game_mode
+        && instance.nested_compositor.is_some()
+        && atrium_game_commit_fresh(Duration::from_millis(50))
+}
+
+/// After present: allow the next commit wake; if a newer buffer arrived mid-frame,
+/// queue one immediate follow-up (game-driven coalesce, not a refresh timer).
+#[cfg(target_os = "linux")]
+fn atrium_finish_nested_redraw(instance: &WindowInstance, gen_at_start: u64) {
+    let newer = NESTED_REDRAW_GEN.load(Ordering::SeqCst) != gen_at_start;
+    NESTED_REDRAW_PENDING.store(false, Ordering::SeqCst);
+    if !newer {
+        return;
+    }
+    if !NESTED_REDRAW_PENDING.swap(true, Ordering::SeqCst) {
+        instance.window.request_redraw();
+    }
+}
+
+/// Kick one RedrawWindow per refresh period so gamescope X11 keeps scanning us out.
+#[cfg(target_os = "linux")]
+fn start_gamescope_present_cadence(window_id: String, refresh_mhz: u32) {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    let period_ms = (1_000_000u64 / refresh_mhz.max(1) as u64).max(1);
+    let _ = std::thread::Builder::new()
+        .name("atrium-gs-cadence".into())
+        .spawn(move || {
+            atrium_host_diag(&format!(
+                "gamescope present cadence thread start period={}ms window={}",
+                period_ms, window_id
+            ));
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(period_ms));
+                // Stall backup only — never kick while the game is driving presents (VRR).
+                if atrium_game_commit_fresh(std::time::Duration::from_millis(50)) {
+                    continue;
+                }
+                // One in-flight kick only — send_event already wakes the X11 loop.
+                if GAMESCOPE_CADENCE_PENDING.swap(true, AtomicOrdering::SeqCst) {
+                    continue;
+                }
+                let Some(proxy) = EVENT_LOOP_PROXY.get() else {
+                    GAMESCOPE_CADENCE_PENDING.store(false, AtomicOrdering::SeqCst);
+                    continue;
+                };
+                if proxy
+                    .send_event(EngineCommand::RedrawWindow(window_id.clone()))
+                    .is_err()
+                {
+                    GAMESCOPE_CADENCE_PENDING.store(false, AtomicOrdering::SeqCst);
+                }
+            }
+        });
+}
+
+/// Nested atrium Xwayland is not gamescope. Gamescope WSI (VkLayer_FROG_gamescope_wsi)
+/// keys off GAMESCOPE_WAYLAND_DISPLAY and will try to resolve our :N as a gamescope
+/// xwayland server id — that fails / stalls (XIO on nested :2). Strip outer session
+/// hints the way nested gamescope isolates its own children from a parent compositor.
+///
+/// `restore_steam_overlay`: only for the primary game pane. Host LD_PRELOAD has
+/// gameoverlayrenderer stripped (bin/atrium); Proton needs ATRIUM_SAVED_LD_PRELOAD.
+/// Never restore overlay onto Discord or other overlay panes.
+#[cfg(target_os = "linux")]
+fn sanitize_nested_gamescope_env(cmd: &mut std::process::Command, restore_steam_overlay: bool) {
+    cmd.env("ENABLE_GAMESCOPE_WSI", "0");
+    cmd.env("DISABLE_GAMESCOPE_WSI", "1");
+    cmd.env_remove("GAMESCOPE_WAYLAND_DISPLAY");
+    // Children talk to atrium's nested Xwayland, not Steam's game display.
+    // gamescope main.cpp: STEAM_GAME_DISPLAY_0 is the *outer* game xwayland (:1).
+    cmd.env_remove("STEAM_GAME_DISPLAY_0");
+    cmd.env_remove("STEAM_GAME_DISPLAY_1");
+    // Drop Gamescope-only WSI/Xwayland hints that break atrium's nested X11.
+    cmd.env_remove("vk_xwayland_wait_ready");
+    cmd.env_remove("vk_khr_present_wait");
+    cmd.env_remove("ENABLE_HDR_WSI");
+    cmd.env_remove("GAMESCOPE_LIMITER_FILE");
+    cmd.env_remove("LIBEI_SOCKET");
+
+    if restore_steam_overlay {
+        match std::env::var("ATRIUM_SAVED_LD_PRELOAD") {
+            Ok(saved) if !saved.is_empty() => {
+                cmd.env("LD_PRELOAD", &saved);
+                info!(
+                    "[lotus-atrium] restored ATRIUM_SAVED_LD_PRELOAD for game child (len={})",
+                    saved.len()
+                );
+            }
+            _ => {
+                cmd.env_remove("LD_PRELOAD");
+            }
+        }
+    } else {
+        // Discord / non-game: inherit host (overlay already stripped) and scrub leftovers.
+        if let Ok(preload) = std::env::var("LD_PRELOAD") {
+            let filtered: Vec<&str> = preload
+                .split(':')
+                .filter(|p| {
+                    let l = p.to_ascii_lowercase();
+                    !l.contains("gamescope") && !l.contains("gameoverlayrenderer")
+                })
+                .collect();
+            if filtered.is_empty() {
+                cmd.env_remove("LD_PRELOAD");
+            } else if filtered.len() != preload.split(':').count() {
+                cmd.env("LD_PRELOAD", filtered.join(":"));
+            }
+        }
+    }
 }
 
 /// Unfocused (and on Wayland, typically minimized too — no reliable signal): 10 Hz.
@@ -538,11 +1753,35 @@ const BACKGROUND_REFRESH_MILLIHERTZ: u32 = 10_000; // 10 Hz
 const HIDDEN_REFRESH_MILLIHERTZ: u32 = 0;
 
 fn window_is_viewable(instance: &WindowInstance) -> bool {
-    !instance.os_occluded && !instance.os_minimized && !instance.zero_size
+    if instance.zero_size {
+        return false;
+    }
+    // Embedded gamescope reports minimized/occluded/unfocused for the X11 game
+    // window it is actually scanning out. Treating that as hidden stops composite
+    // after the first black clear and starves nested frame callbacks (XIO on :2).
+    #[cfg(target_os = "linux")]
+    if is_gamescope_session() {
+        return true;
+    }
+    if instance.os_minimized {
+        return false;
+    }
+    !instance.os_occluded
 }
 
 fn effective_refresh_millihertz(instance: &WindowInstance, monitor_mhz: u32) -> u32 {
     let monitor = monitor_mhz.max(1);
+    // Embedded gamescope (Bazzite Game Mode) lies about focus/occlusion for X11
+    // clients — winit often sees unfocused+occluded even while steamcompmgr is
+    // showing us. Pausing paints → permanent black screen with Steam's B-to-exit
+    // bar, while nested audio (Discord/game) still works. Always run full rate.
+    #[cfg(target_os = "linux")]
+    if is_gamescope_session() {
+        if instance.zero_size {
+            return HIDDEN_REFRESH_MILLIHERTZ;
+        }
+        return monitor;
+    }
     if !window_is_viewable(instance) {
         HIDDEN_REFRESH_MILLIHERTZ // 0 = engine graphics pause
     } else if instance.os_focused {
@@ -587,6 +1826,10 @@ fn apply_refresh_policy(instance: &mut WindowInstance) {
         );
         instance.refresh_rate_millihertz = next;
         push_display_timing_to_remotes(instance);
+        #[cfg(target_os = "linux")]
+        if let Some(ref ws) = instance.nested_compositor {
+            ws.lock().set_output_refresh(next);
+        }
     }
 }
 
@@ -614,6 +1857,32 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         info!("Rust: Application Resumed");
     }
 
+    #[cfg(target_os = "linux")]
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // Raw relative deltas while the host cursor is grabbed in game mode.
+        // Absolute CursorMoved is suppressed while grabbed (avoids aim doubling).
+        let DeviceEvent::MouseMotion { delta: (dx, dy) } = event else {
+            return;
+        };
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        for instance in self.windows.values() {
+            if !instance.game_mode || !instance.host_pointer_grabbed {
+                continue;
+            }
+            let Some(ref ws) = instance.nested_compositor else {
+                continue;
+            };
+            ws.lock().send_pointer_relative_motion(dx, dy);
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Servo needs to process any queued internal events before the event loop sleeps.
         // This mirrors servoshell's `pump_servo_event_loop` call structure.
@@ -627,8 +1896,13 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         // Do NOT force-redraw every vsync merely because remotes exist: FramePublished
         // already calls requestRedraw, and blind redraws re-emit Vsync → double-drive
         // sandboxed paint/readback. Poll SHM for unread frames so unfocused drain still works.
+        //
+        // VRR / game-driven: primary commits wake RedrawWindow. Do NOT run a fixed
+        // present timer while the game is actively committing — that spoils adaptive sync.
+        // Stall fallback (>50ms since last primary commit) or overlay mode may pace.
         let mut pending_remote_work = false;
-        let mut remote_period = Duration::from_millis(16);
+        let mut pace_to_refresh = false;
+        let mut pace_refresh_mhz: u32 = 60000;
         for window in self.windows.values_mut() {
             sync_minimized_from_os(window);
             apply_refresh_policy(window);
@@ -636,10 +1910,27 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             let viewable = window_is_viewable(window);
             let mut any_needs_repaint = false;
             let mut reason = String::new();
-            let mhz = window.refresh_rate_millihertz.max(1) as u64;
+            let mhz = window.refresh_rate_millihertz.max(1);
+            pace_refresh_mhz = mhz;
+
+            #[cfg(target_os = "linux")]
+            let game_driven = atrium_game_driven_present(window);
+            #[cfg(not(target_os = "linux"))]
+            let game_driven = false;
+
+            // Stall / loading / overlay: keep gamescope scanned out with a soft cadence.
+            #[cfg(target_os = "linux")]
+            if viewable
+                && !game_driven
+                && (is_gamescope_session() || window.nested_compositor.is_some())
+            {
+                pace_to_refresh = true;
+                any_needs_repaint = true;
+                reason = "atrium stall/overlay present fallback".into();
+            }
+
             for pane in window.panes.values() {
                 if pane.is_remote {
-                    remote_period = Duration::from_nanos(1_000_000_000_000u64 / mhz);
                     // Hidden windows: do not wake the compositor for unread SHM —
                     // engines are already paused / backpressured.
                     if viewable {
@@ -652,7 +1943,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
                     }
                 }
-                if pane.needs_repaint && viewable {
+                // HUD/Servo: while game-driven, piggyback on the next game composite —
+                // never trigger an independent swap (VRR spoiler).
+                if pane.needs_repaint && viewable && !game_driven {
                     any_needs_repaint = true;
                     reason = format!("Pane '{}' needs repaint", pane.id);
                 }
@@ -663,19 +1956,32 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             }
         }
 
-        // Event-driven parking: never ControlFlow::Poll. Local animation is driven by
-        // NewFrameReady → request_redraw; remotes with unread SHM use WaitUntil(refresh).
-        // Idle sockets → Wait (block until winit/user/Servo event).
-        if pending_remote_work {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + remote_period));
+        if pace_to_refresh || pending_remote_work {
+            let period =
+                Duration::from_nanos(1_000_000_000_000u64 / pace_refresh_mhz.max(1) as u64);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + period));
         } else {
+            // Game-driven or idle: sleep until commit / input wakes us.
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: EngineCommand) {
-        if let Some(servo) = &self.servo {
-            servo.spin_event_loop();
+        // Wake/RedrawWindow are high-frequency under gamescope. Spinning Servo on
+        // every one re-queues NewFrameReady into the same winit user-event drain
+        // and never reaches RedrawRequested. Spin only for substantive commands.
+        let skip_spin = match &event {
+            EngineCommand::Wake | EngineCommand::RedrawWindow(_) => true,
+            #[cfg(target_os = "linux")]
+            EngineCommand::NestedCursor { .. } => true,
+            #[cfg(target_os = "linux")]
+            EngineCommand::NestedPointerLock { .. } => true,
+            _ => false,
+        };
+        if !skip_spin {
+            if let Some(servo) = &self.servo {
+                servo.spin_event_loop();
+            }
         }
         match event {
             EngineCommand::Wake => {
@@ -713,16 +2019,36 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                      info!("Rust: Winit window theme set to None (Default)");
                 }
 
-                info!("Rust: Creating window with visible=false, transparent={}", options.transparent);
+                // Game Mode: create unmapped, set STEAM_GAME, then map, then EGL.
+                // Tagging after map+present lets steamcompmgr hold the first two
+                // commits unretired and wedges Present #3. Map still happens before
+                // EGL so steamcompmgr gets commits (unmapped swaps never retire).
+                #[cfg(target_os = "linux")]
+                let gamescope_host = is_gamescope_session();
+                #[cfg(not(target_os = "linux"))]
+                let gamescope_host = false;
+
+                #[cfg(target_os = "linux")]
+                let (create_w, create_h) = if gamescope_host {
+                    x11_root_size(&gamescope_x11_display())
+                        .filter(|(w, h)| *w > 1 && *h > 1)
+                        .unwrap_or((options.width, options.height))
+                } else {
+                    (options.width, options.height)
+                };
+                #[cfg(not(target_os = "linux"))]
+                let (create_w, create_h) = (options.width, options.height);
+
+                info!(
+                    "Rust: Creating window with visible=false (pre-tag), transparent={}, size={}x{} gamescope={}",
+                    options.transparent, create_w, create_h, gamescope_host
+                );
 
                 let mut window_attrs = Window::default_attributes()
                     .with_title(options.title.clone())
-                    .with_inner_size(WinitPhysicalSize::new(
-                        options.width,
-                        options.height
-                    ))
+                    .with_inner_size(WinitPhysicalSize::new(create_w, create_h))
                     .with_decorations(!options.frameless)
-                    .with_visible(false) // Always start hidden
+                    .with_visible(false)
                     .with_transparent(options.transparent)
                     .with_theme(theme);
 
@@ -763,7 +2089,22 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 };
 
                 let winit_id = window.id();
-                
+
+                // Relative mouse deltas for FPS lock (DeviceEvent::MouseMotion).
+                // Needed on X11; Wayland host also emits these once CursorGrab::Locked.
+                #[cfg(target_os = "linux")]
+                event_loop.listen_device_events(DeviceEvents::WhenFocused);
+
+                // STEAM_GAME before map + before Present #1 (gamescope only).
+                #[cfg(target_os = "linux")]
+                if gamescope_host {
+                    tag_window_for_gamescope(&window);
+                    window.set_visible(true);
+                    atrium_host_diag(
+                        "gamescope: STEAM_GAME tagged then mapped before EGL surface",
+                    );
+                }
+
                 let display_handle = match window.display_handle() {
                     Ok(h) => h,
                     Err(e) => {
@@ -779,7 +2120,14 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     }
                 };
                 let size = window.inner_size();
-                
+
+                // Surfman Connection::from_display_handle(winit) — same X11 Display*
+                // as winit so Mesa DRI3 PRESENT IDLE/COMPLETE events are pumped.
+                #[cfg(target_os = "linux")]
+                atrium_host_diag(
+                    "host EGL via WindowRenderingContext::from_display_handle (shared winit Display)",
+                );
+
                 let rendering_context = match WindowRenderingContext::new(
                     display_handle,
                     window_handle,
@@ -815,6 +2163,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 }
                 
                 let _ = rendering_context.make_current();
+
+                // Gamescope's Xwayland does not release GLX/EGL buffers on vblank for a
+                // nested client. eglSwapBuffers then blocks forever on the 3rd present
+                // (both buffers outstanding) — host stuck on the black clear, game audio
+                // still runs. Interval 0 returns as soon as the swap is queued.
+                #[cfg(target_os = "linux")]
+                if gamescope_host {
+                    atrium_set_egl_swap_interval(0);
+                }
 
                 let gl = rendering_context.glow_gl_api();
 
@@ -976,6 +2333,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         is_dirty: true,
                         needs_repaint: false,
                         is_visible: false,
+                        pointer_passthrough: false,
                         drag_regions: Vec::new(),
                         no_drag_regions: Vec::new(),
                         offscreen_ctx: p_offscreen,
@@ -1001,6 +2359,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         resize_generation: 0,
                         under_crash_cover: false,
                         await_host_composited_frame: false,
+                        #[cfg(target_os = "linux")]
+                        external_surface_slot: None,
+                        #[cfg(target_os = "linux")]
+                        external_wayland_server: None,
+                        #[cfg(target_os = "linux")]
+                        external_child_pid: None,
                     };
                     panes.insert(pane_opt.id.clone(), pane);
                 }
@@ -1081,6 +2445,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     u_stencil_size_loc: None,
                     u_stencil_radius_loc: None,
                     comp_program: None,
+                    comp_program_oes: None,
                     comp_fbo: None,
                     comp_tex: None,
                     comp_vao: None,
@@ -1088,6 +2453,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     u_comp_size_loc: None,
                     u_comp_radius_loc: None,
                     u_comp_flip_loc: None,
+                    u_comp_oes_size_loc: None,
+                    u_comp_oes_radius_loc: None,
+                    u_comp_oes_flip_loc: None,
                     comp_tex_size: None,
                     scene_fbo: None,
                     scene_tex: None,
@@ -1112,6 +2480,24 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     pending_gutter_delta: None,
                     gutter_hover: None,
                     hover_pane_id: None,
+                    game_mode: true,
+                    #[cfg(target_os = "linux")]
+                    host_pointer_grabbed: false,
+                    #[cfg(target_os = "linux")]
+                    game_pointer_constraint_active: false,
+                    #[cfg(target_os = "linux")]
+                    game_cursor_hidden: false,
+                    #[cfg(target_os = "linux")]
+                    game_cursor: None,
+                    primary_game_pane: None,
+                    last_stats_send: None,
+                    force_scene_repaint: false,
+                    #[cfg(target_os = "linux")]
+                    nested_cursor: None,
+                    #[cfg(target_os = "linux")]
+                    nested_cursor_applied: false,
+                    #[cfg(target_os = "linux")]
+                    nested_compositor: None,
                 };
 
                 instance.init_stencil_program();
@@ -1136,6 +2522,13 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     window.set_visible(true);
                 }
                 window.request_redraw();
+
+                // Gamescope X11 often drops coalesced request_redraw after the first
+                // frames. Drive RedrawWindow + Wake from a side thread at refresh.
+                #[cfg(target_os = "linux")]
+                if gamescope_host {
+                    start_gamescope_present_cadence(window_id.clone(), monitor_refresh_rate_millihertz(&window));
+                }
 
                 if let Some(state) = APP_STATE.get() {
                     if let Ok(s) = state.lock() {
@@ -1266,7 +2659,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             EngineCommand::CloseWindow(window_id) => {
                 self.winit_id_to_uuid.retain(|_, v| v != &window_id);
-                self.windows.remove(&window_id);
+                if let Some(mut instance) = self.windows.remove(&window_id) {
+                    #[cfg(target_os = "linux")]
+                    atrium_teardown_window(&mut instance);
+                }
                 // Clean up per-window metadata so long-running apps don't leak.
                 if let Some(state) = APP_STATE.get() {
                     if let Ok(mut s) = state.lock() {
@@ -1316,8 +2712,30 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     }
                 }
             },            EngineCommand::ShowWindow(window_id) => {
-                if let Some(instance) = self.windows.get(&window_id) {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
                     instance.window.set_visible(true);
+                    #[cfg(target_os = "linux")]
+                    {
+                        // surfman set_window() asserts (EGL_NO_SURFACE) under gamescope
+                        // Xwayland — never rebuild the widget surface that way. Just map,
+                        // resize the bound surface to the root, tag, and keep presenting.
+                        if is_gamescope_session() {
+                            if let Some((rw, rh)) = x11_root_size(&gamescope_x11_display()) {
+                                if rw > 1 && rh > 1 {
+                                    let size = winit::dpi::PhysicalSize::new(rw, rh);
+                                    let _ = instance.window.request_inner_size(size);
+                                    instance.rendering_context.resize(size);
+                                    let _ = instance.rendering_context.make_current();
+                                    atrium_set_egl_swap_interval(0);
+                                    atrium_host_diag(&format!(
+                                        "gamescope show: resized bound surface to root {}x{}",
+                                        rw, rh
+                                    ));
+                                }
+                            }
+                        }
+                        tag_window_for_gamescope(&instance.window);
+                    }
                     instance.window.request_redraw();
                 }
             },
@@ -1376,15 +2794,14 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     if let Some(pane) = instance.panes.get_mut(&pane_id) {
                         trace!("Rust: [Lifecycle] EngineCommand::NewFrameReady for window {} pane {}", window_id, pane_id);
-                        
-                        // Unlock BEFORE painting to allow Servo to begin preparing the NEXT frame
-                        pane.ready_to_repaint.store(true, Ordering::SeqCst);
-                        
-                        // Accept the frame Servo just spent time rendering!
+
+                        // Queue-of-1: keep ready_to_repaint false until RedrawRequested
+                        // paints. Re-arming here + spin_event_loop livelocks the user-event
+                        // drain under gamescope cadence (never reaches present #2).
                         pane.current_servo_size = pane.requested_servo_size;
                         pane.ready_frame_size = Some(pane.current_servo_size);
                         pane.needs_repaint = true;
-                        
+
                         let was_first_frame = !pane.first_frame_painted;
                         if was_first_frame {
                             pane.first_frame_painted_time = Some(std::time::Instant::now());
@@ -1400,10 +2817,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // AGGREGATION FIX: Only emit when all visible panes have painted
                         if !instance.emitted_ready_to_show {
                                 let all_ready = instance.panes.values().all(|p| !p.pending_visible || p.first_frame_painted);
-                                
+
                                 if all_ready {
                                     instance.emitted_ready_to_show = true;
-                                    
+
                                     if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
                                         "event": "ready-to-show",
                                         "window_id": window_id,
@@ -1416,11 +2833,45 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     }
                                 }
                             }
-                        instance.window.request_redraw();
                     }
                 }
             },
+            #[cfg(target_os = "linux")]
+            EngineCommand::NestedCursor {
+                window_id,
+                cursor,
+                from_primary,
+            } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if from_primary {
+                        // Always keep game shoes up to date — even while overlay is up.
+                        atrium_record_game_cursor(instance, &cursor);
+                        if instance.game_mode {
+                            atrium_wear_game_pointer_shoes(instance, Some(event_loop));
+                        }
+                    } else if !instance.game_mode {
+                        // Discord/overlay visual only — never clobber game shoes.
+                        atrium_paint_host_cursor(instance, event_loop, &cursor);
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            EngineCommand::NestedPointerLock { window_id, active } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    // Sticky game shoe — survives overlay; host grab only in game mode.
+                    instance.game_pointer_constraint_active = active;
+                    if instance.game_mode {
+                        atrium_wear_game_pointer_shoes(instance, Some(event_loop));
+                    }
+                }
+            }
             EngineCommand::RedrawWindow(window_id) => {
+                #[cfg(target_os = "linux")]
+                {
+                    // Do not clear NESTED_REDRAW_PENDING here — RedrawRequested clears
+                    // after present so mid-frame commits stay coalesced.
+                    GAMESCOPE_CADENCE_PENDING.store(false, Ordering::SeqCst);
+                }
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     sync_minimized_from_os(instance);
                     apply_refresh_policy(instance);
@@ -1535,6 +2986,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         is_dirty: true,
                         needs_repaint: false,
                         is_visible: false,
+                        pointer_passthrough: false,
                         drag_regions: Vec::new(),
 
                         no_drag_regions: Vec::new(),
@@ -1561,7 +3013,25 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         resize_generation: 0,
                         under_crash_cover: false,
                         await_host_composited_frame: false,
+                        #[cfg(target_os = "linux")]
+                        external_surface_slot: None,
+                        #[cfg(target_os = "linux")]
+                        external_wayland_server: None,
+                        #[cfg(target_os = "linux")]
+                        external_child_pid: None,
                     };
+                    let fixed = match anchor {
+                        PaneAnchor::Left | PaneAnchor::Right => rect.size.width,
+                        PaneAnchor::Top | PaneAnchor::Bottom => rect.size.height,
+                        _ => 0.0,
+                    };
+                    crate::layout::ensure_dock_leaf(
+                        &mut instance.layout_root,
+                        &pane_id,
+                        anchor,
+                        fixed,
+                        dock_order as usize,
+                    );
                     instance.panes.insert(pane_id, pane);
                     let physical_size = instance.window.inner_size();
                     let scale_factor = instance.window.scale_factor() as f32;
@@ -1628,6 +3098,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // false so lock-step dispatch is not permanently blocked.
                         needs_repaint: false,
                         is_visible: visible,
+                        pointer_passthrough: false,
                         drag_regions: Vec::new(),
                         no_drag_regions: Vec::new(),
                         offscreen_ctx,
@@ -1654,6 +3125,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         resize_generation: 0,
                         under_crash_cover: false,
                         await_host_composited_frame: false,
+                        #[cfg(target_os = "linux")]
+                        external_surface_slot: None,
+                        #[cfg(target_os = "linux")]
+                        external_wayland_server: None,
+                        #[cfg(target_os = "linux")]
+                        external_child_pid: None,
                     };
                     let fixed = match anchor {
                         PaneAnchor::Left | PaneAnchor::Right => rect.size.width,
@@ -1674,6 +3151,397 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.window.request_redraw();
                 }
             },
+            #[cfg(target_os = "linux")]
+            EngineCommand::CreateExternalAppPane {
+                window_id,
+                pane_id,
+                command,
+                args,
+                rect,
+                z_index,
+                anchor,
+                dock_order,
+                visible,
+                dbus_notifications,
+                dbus_notification_apps,
+            } => {
+                let servo = self.ensure_servo().clone();
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if pane_id == "main" {
+                        instance.auto_resize_main = false;
+                    }
+
+                    // First external app created is designated the Base Game
+                    let is_primary = instance.primary_game_pane.is_none();
+                    if is_primary {
+                        instance.primary_game_pane = Some(pane_id.clone());
+                        info!("[lotus-atrium] designated primary base game pane: '{}'", pane_id);
+                    }
+
+                    // Host-bus Notify → atrium toast (Discord etc.). Primary game skips.
+                    if !is_primary {
+                        let mode = crate::dbus_notify::NotifyMode::parse(&dbus_notifications);
+                        crate::dbus_notify::register_external_notify(
+                            &window_id,
+                            mode,
+                            &dbus_notification_apps,
+                            Some(&pane_id),
+                        );
+                    }
+
+                    let hidpi_scale_factor_val = instance.window.scale_factor() as f32;
+                    let width = (rect.size.width * hidpi_scale_factor_val).round() as u32;
+                    let height = (rect.size.height * hidpi_scale_factor_val).round() as u32;
+                    let servo_size = ServoPhysicalSize::new(width.max(1), height.max(1));
+                    let offscreen_ctx = Rc::new(crate::gl::LotusPaneContext::new(
+                        instance.rendering_context.clone(),
+                        servo_size,
+                    ));
+                    let dummy_webview = WebViewBuilder::new(&servo, offscreen_ctx.clone()).build();
+
+                    let wayland_server = if let Some(ref ws) = instance.nested_compositor {
+                        ws.clone()
+                    } else {
+                        // Fixed nested output size (game render res), independent of pane layout —
+                        // same idea as gamescope -W/-H. Buffer is letterboxed into the pane.
+                        let (out_w, out_h) = crate::wayland::atrium_game_output_size();
+                        let refresh_mhz = instance.refresh_rate_millihertz.max(1);
+                        match crate::wayland::LotusWaylandServer::start(
+                            window_id.clone(),
+                            out_w,
+                            out_h,
+                            refresh_mhz,
+                        ) {
+                            Ok(s) => {
+                                let arc = Arc::new(parking_lot::Mutex::new(s));
+                                instance.nested_compositor = Some(arc.clone());
+                                // Backup display clock if WaitUntil is dropped (esp. X11/gamescope).
+                                start_gamescope_present_cadence(
+                                    window_id.clone(),
+                                    instance.refresh_rate_millihertz.max(1),
+                                );
+                                arc
+                            }
+                            Err(e) => {
+                                error!("[lotus-atrium] failed to start nested Wayland server: {}", e);
+                                return;
+                            }
+                        }
+                    };
+
+                    let surface_slot = Arc::new(parking_lot::Mutex::new(crate::wayland::ExternalSurfaceSlot::default()));
+
+                    // Primary → output_size; overlays → fixed high-res client size (cover-scaled).
+                    let client_hint = if is_primary {
+                        (width, height)
+                    } else {
+                        crate::wayland::atrium_overlay_client_size()
+                    };
+                    let pane_socket_name = wayland_server.lock().register_pane(
+                        pane_id.clone(),
+                        is_primary,
+                        client_hint,
+                        surface_slot.clone(),
+                        None,
+                    );
+
+                    let mut child_pid: Option<u32> = None;
+                    {
+                        let isolated_runtime = wayland_server.lock().runtime_dir.clone();
+                        let wayland_display = pane_socket_name;
+                        // Poll Xwayland readiness without holding the server mutex across
+                        // sleeps — otherwise pump_frames cannot import DMA-BUFs.
+                        let x11_display = {
+                            let start = Instant::now();
+                            let timeout = Duration::from_secs(8);
+                            let mut got = None;
+                            while start.elapsed() < timeout {
+                                if let Some(d) = wayland_server.lock().get_x11_display() {
+                                    got = Some(d);
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            got
+                        };
+
+                        let mut effective_args = args.clone();
+                        if command == "flatpak" {
+                            if let Some(pos) = effective_args.iter().position(|a| a == "run") {
+                                let mut to_insert = Vec::new();
+                                // Note: Do NOT use --nosocket=wayland or --nosocket=x11 as Flatpak's runner
+                                // forcefully unsets WAYLAND_DISPLAY and DISPLAY in the sandbox when those are present.
+                                // Complete sandbox isolation is achieved by redirecting XDG_RUNTIME_DIR to our
+                                // private session directory, so the app cannot see or reach /run/user/<uid>/wayland-0.
+                                to_insert.push(format!("--filesystem={}", isolated_runtime.display()));
+                                to_insert.push(format!("--env=XDG_RUNTIME_DIR={}", isolated_runtime.display()));
+                                to_insert.push(format!("--env=WAYLAND_DISPLAY={}", wayland_display));
+                                if let Some(d) = x11_display {
+                                    to_insert.push(format!("--env=DISPLAY=:{}", d));
+                                }
+                                to_insert.push("--filesystem=/tmp".to_string());
+
+                                for arg in to_insert.into_iter().rev() {
+                                    if !effective_args.contains(&arg) {
+                                        effective_args.insert(pos + 1, arg);
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut cmd = std::process::Command::new(&command);
+                        cmd.args(&effective_args);
+                        // Own process group so teardown can SIGTERM/SIGKILL the whole tree
+                        // (Proton → wineserver → game), not just the launcher PID.
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::process::CommandExt;
+                            unsafe {
+                                cmd.pre_exec(|| {
+                                    if libc::setpgid(0, 0) != 0 {
+                                        return Err(std::io::Error::last_os_error());
+                                    }
+                                    Ok(())
+                                });
+                            }
+                        }
+
+                        let log_path = format!("/tmp/lotus-atrium-child-{}.log", pane_id);
+                        if let Ok(file) = std::fs::File::create(&log_path) {
+                            if let Ok(err_file) = file.try_clone() {
+                                cmd.stdout(file);
+                                cmd.stderr(err_file);
+                            }
+                        }
+
+                        // Flatpak stays in the hermetic runtime. Native/Proton children keep the
+                        // host XDG_RUNTIME_DIR (Steam IPC) and get a symlink to the nested
+                        // Wayland socket under that dir — absolute WAYLAND_DISPLAY paths are
+                        // flaky in Wine, and reusing the name "wayland-0" would hit the host.
+                        let nested_wl_abs = isolated_runtime.join(&wayland_display);
+                        let is_flatpak = command == "flatpak";
+                        if is_flatpak {
+                            cmd.env("XDG_RUNTIME_DIR", &isolated_runtime);
+                            cmd.env("WAYLAND_DISPLAY", &wayland_display);
+                        } else if let Ok(host_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+                            let host_dir = std::path::PathBuf::from(&host_runtime);
+                            let child_wl_name = format!(
+                                "wayland-atrium-{}",
+                                isolated_runtime
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("session")
+                            );
+                            let link_path = host_dir.join(&child_wl_name);
+                            let _ = std::fs::remove_file(&link_path);
+                            if let Err(e) = std::os::unix::fs::symlink(&nested_wl_abs, &link_path) {
+                                warn!(
+                                    "[lotus-atrium] failed to symlink nested Wayland into host runtime: {}",
+                                    e
+                                );
+                                // Fallback: absolute path (libwayland accepts it).
+                                cmd.env("WAYLAND_DISPLAY", nested_wl_abs.as_os_str());
+                            } else {
+                                debug!(
+                                    "[lotus-atrium] nested Wayland exposed to host runtime as {}",
+                                    child_wl_name
+                                );
+                                cmd.env("WAYLAND_DISPLAY", &child_wl_name);
+                            }
+                        } else {
+                            cmd.env("WAYLAND_DISPLAY", nested_wl_abs.as_os_str());
+                        }
+                        cmd.env_remove("WAYLAND_SOCKET");
+                        // Nested compositor (gamescope-shaped): Proton/Wine speak X11 into
+                        // *our* Xwayland. Outer gamescope only sees atrium's host window on
+                        // STEAM_GAME_DISPLAY_0 (:1). Never launch the game onto :1 directly.
+                        if let Some(d) = x11_display {
+                            info!(
+                                "[lotus-atrium] nested Xwayland ready — child DISPLAY=:{} \
+                                 (host stays on gamescope game display)",
+                                d
+                            );
+                            cmd.env("DISPLAY", format!(":{}", d));
+                            if !is_flatpak {
+                                // Nested X11 only — leave Steam/Proton/Pulse env alone
+                                // (STEAM_COMPAT_*, SteamAppId, audio, etc. inherit).
+                                cmd.env_remove("WAYLAND_DISPLAY");
+                                cmd.env("SDL_VIDEODRIVER", "x11");
+                                cmd.env("QT_QPA_PLATFORM", "xcb");
+                                cmd.env("GDK_BACKEND", "x11");
+                                cmd.env_remove("PROTON_ENABLE_WAYLAND");
+                                // Restore Steam overlay preload only for the primary game pane.
+                                sanitize_nested_gamescope_env(&mut cmd, is_primary);
+                            } else {
+                                cmd.env("SDL_VIDEODRIVER", "wayland");
+                                cmd.env("QT_QPA_PLATFORM", "wayland");
+                                cmd.env("GDK_BACKEND", "wayland");
+                                sanitize_nested_gamescope_env(&mut cmd, false);
+                            }
+                        } else {
+                            warn!(
+                                "[lotus-atrium] nested Xwayland not ready in time — \
+                                 falling back to Wayland-only child (Proton may fail)"
+                            );
+                            cmd.env_remove("DISPLAY");
+                            cmd.env("SDL_VIDEODRIVER", "wayland");
+                            cmd.env("QT_QPA_PLATFORM", "wayland");
+                            cmd.env("GDK_BACKEND", "wayland");
+                            if !is_flatpak {
+                                cmd.env("PROTON_ENABLE_WAYLAND", "1");
+                                sanitize_nested_gamescope_env(&mut cmd, is_primary);
+                            } else {
+                                sanitize_nested_gamescope_env(&mut cmd, false);
+                            }
+                        }
+
+                        match cmd.spawn() {
+                            Ok(mut child) => {
+                                let pid = child.id();
+                                info!("[lotus-atrium] spawned '{}' with PID {}", command, pid);
+                                child_pid = Some(pid);
+                                wayland_server.lock().update_pane_pid(&pane_id, pid);
+                                // Reap exit; if the primary game dies (Alt+F4 etc.), tear down atrium.
+                                let exit_window_id = window_id.clone();
+                                let exit_pane_id = pane_id.clone();
+                                let close_on_exit = is_primary;
+                                let _ = std::thread::Builder::new()
+                                    .name(format!("atrium-wait-{}", pid))
+                                    .spawn(move || {
+                                        let status = child.wait();
+                                        info!(
+                                            "[lotus-atrium] external child pid {} exited ({:?}) pane='{}' primary={}",
+                                            pid,
+                                            status,
+                                            exit_pane_id,
+                                            close_on_exit
+                                        );
+                                        if close_on_exit {
+                                            if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                                                let _ = proxy.send_event(
+                                                    EngineCommand::CloseWindow(exit_window_id),
+                                                );
+                                            }
+                                        }
+                                    });
+                            }
+                            Err(e) => {
+                                error!("[lotus-atrium] failed to spawn '{}': {}", command, e);
+                            }
+                        }
+                    }
+
+                    let pane = PaneInstance {
+                        id: pane_id.clone(),
+                        webview: dummy_webview,
+                        rect,
+                        last_notified_rect: None,
+                        last_physical_rect: euclid::default::Rect::new(
+                            euclid::default::Point2D::new((rect.origin.x * hidpi_scale_factor_val).round() as i32, (rect.origin.y * hidpi_scale_factor_val).round() as i32),
+                            euclid::default::Size2D::new(servo_size.width as i32, servo_size.height as i32),
+                        ),
+                        z_index,
+                        anchor,
+                        dock_order,
+                        animating: false,
+                        is_dirty: true,
+                        needs_repaint: false,
+                        is_visible: visible,
+                        pointer_passthrough: false,
+                        drag_regions: Vec::new(),
+                        no_drag_regions: Vec::new(),
+                        offscreen_ctx,
+                        servo_busy: false,
+                        pending_servo_size: None,
+                        requested_servo_size: servo_size,
+                        current_servo_size: servo_size,
+                        ready_to_repaint: Arc::new(AtomicBool::new(true)),
+                        ready_frame_size: None,
+                        first_frame_painted: true,
+                        first_frame_painted_time: None,
+                        pending_physical_rect: None,
+                        is_resizing: false,
+                        pending_visible: visible,
+                        ghost_tex: None,
+                        ghost_tex_size: None,
+                        ghost_valid: false,
+                        frame_seq: 0,
+                        last_presented_seq: 0,
+                        is_remote: false,
+                        remote_consumer: None,
+                        remote_input_fd: None,
+                        resize_generation: 0,
+                        under_crash_cover: false,
+                        await_host_composited_frame: false,
+                        external_surface_slot: Some(surface_slot),
+                        external_wayland_server: Some(wayland_server),
+                        external_child_pid: child_pid,
+                    };
+
+                    let fixed = match anchor {
+                        PaneAnchor::Left | PaneAnchor::Right => rect.size.width,
+                        PaneAnchor::Top | PaneAnchor::Bottom => rect.size.height,
+                        _ => 0.0,
+                    };
+                    crate::layout::ensure_dock_leaf(
+                        &mut instance.layout_root,
+                        &pane_id,
+                        anchor,
+                        fixed,
+                        dock_order as usize,
+                    );
+                    instance.panes.insert(pane_id, pane);
+                    let physical_size = instance.window.inner_size();
+                    let scale_factor = instance.window.scale_factor() as f32;
+                    instance.recalculate_layout(physical_size, scale_factor);
+                    // Do not grab here — wait for the game's cursor/lock requests.
+                    instance.window.request_redraw();
+                }
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::SetGameMode(window_id, mode) => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    atrium_apply_game_mode(instance, mode, Some(event_loop));
+                    info!("[lotus-atrium] game mode set: {}", mode);
+                    push_renderer_ipc(
+                        &window_id,
+                        "atrium-game-mode-changed",
+                        serde_json::json!({ "game_mode": mode }),
+                    );
+                }
+            },
+            EngineCommand::SetFullscreen(window_id, enabled) => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if enabled {
+                        instance.window.set_fullscreen(Some(
+                            winit::window::Fullscreen::Borderless(None),
+                        ));
+                    } else {
+                        instance.window.set_fullscreen(None);
+                    }
+                    info!("[lotus-atrium] lotus window fullscreen={}", enabled);
+                    #[cfg(target_os = "linux")]
+                    tag_window_for_gamescope(&instance.window);
+                    push_renderer_ipc(
+                        &window_id,
+                        "atrium-fullscreen-changed",
+                        serde_json::json!({ "fullscreen": enabled }),
+                    );
+                    apply_refresh_policy(instance);
+                    #[cfg(target_os = "linux")]
+                    if let Some(ref ws) = instance.nested_compositor {
+                        ws.lock().set_output_refresh(instance.refresh_rate_millihertz);
+                    }
+                }
+            },
+            EngineCommand::SetPaneZIndex(window_id, pane_id, z_index) => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if let Some(pane) = instance.panes.get_mut(&pane_id) {
+                        pane.z_index = z_index;
+                        instance.window.request_redraw();
+                    }
+                }
+            },
             EngineCommand::RemovePane(window_id, pane_id) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     crate::gl::compositor::destroy_local_ghost(instance, &pane_id);
@@ -1689,6 +3557,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     if pane_id == "main" {
                         instance.auto_resize_main = false;
                     }
+                    let mut external_resize: Option<(u32, u32)> = None;
                     if let Some(pane) = instance.panes.get_mut(&pane_id) {
                         let scale_factor = instance.window.scale_factor() as f32;
                         let size_changed = pane.last_notified_rect.map(|r| r.size != rect.size).unwrap_or(true);
@@ -1705,12 +3574,18 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             euclid::default::Size2D::new((rect.size.width * scale_factor).round() as i32, (rect.size.height * scale_factor).round() as i32)
                         );
                         pane.pending_physical_rect = Some(pane_phys);
+                        pane.last_physical_rect = pane_phys;
                         pane.anchor = PaneAnchor::None;
 
                         let servo_size = ServoPhysicalSize::new(
                             ((rect.size.width * scale_factor).round() as u32).max(1),
                             ((rect.size.height * scale_factor).round() as u32).max(1)
                         );
+
+                        #[cfg(target_os = "linux")]
+                        if pane.external_wayland_server.is_some() {
+                            external_resize = Some((servo_size.width, servo_size.height));
+                        }
                         
                         debug!("Rust: SetPaneRect for '{}' -> {:?} (Physical: {}x{})", pane_id, rect, servo_size.width, servo_size.height);
                         
@@ -1725,6 +3600,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             pane.is_resizing = false;
                             pane.ghost_valid = false;
                             pane.pending_physical_rect = None;
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some((w, h)) = external_resize {
+                        if let Some(ref ws) = instance.nested_compositor {
+                            ws.lock().send_resize_pane(&pane_id, w, h);
                         }
                     }
                     instance.layout_root.set_leaf_detached(&pane_id, true);
@@ -1862,15 +3743,18 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             EngineCommand::SetPaneVisible(window_id, pane_id, visible) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
-                    instance.layout_root.set_leaf_visible(&pane_id, visible);
-                    if let Some(pane) = instance.panes.get_mut(&pane_id) {
-                        pane.pending_visible = visible;
-                        pane.is_dirty = true;
-                    }
+                    atrium_set_pane_visible(instance, &pane_id, visible);
                     let physical_size = instance.window.inner_size();
                     let scale_factor = instance.window.scale_factor() as f32;
                     instance.recalculate_layout(physical_size, scale_factor);
                     instance.window.request_redraw();
+                }
+            },
+            EngineCommand::SetPanePassthrough(window_id, pane_id, passthrough) => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if let Some(pane) = instance.panes.get_mut(&pane_id) {
+                        pane.pointer_passthrough = passthrough;
+                    }
                 }
             },
             EngineCommand::CoverRemoteWithCrashChrome {
@@ -2241,6 +4125,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
+        // Wait (or WaitUntil from about_to_wait). Poll fought phase-align and bunched frames.
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 
@@ -2291,6 +4176,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
         }
+        // about_to_wait upgrades to WaitUntil(refresh) under gamescope — keep Wait here.
         event_loop.set_control_flow(ControlFlow::Wait);
 
         if let Some(uuid) = self.winit_id_to_uuid.get(&window_id).cloned() {
@@ -2302,7 +4188,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         for pane in instance.panes.values_mut() {
                             pane.webview.set_hidpi_scale_factor(euclid::Scale::new(sf));
                         }
-                        instance.recalculate_layout(instance.active_window_size, sf);
+                        // Use live inner_size — active_window_size lags until nuclear flip
+                        // and would stage layout for the wrong physical size on maximize /
+                        // monitor moves that fire ScaleFactorChanged with Resized.
+                        let live = instance.window.inner_size();
+                        instance.recalculate_layout(live, sf);
                         instance.window.request_redraw();
                     },
                     WindowEvent::CloseRequested => {
@@ -2331,7 +4221,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             wrapped.extend(close_msg);
                             self.callback.call((uuid.clone(), vec![wrapped.into()]), ThreadsafeFunctionCallMode::NonBlocking);
                         }
-                        self.windows.remove(&uuid);
+                        if let Some(mut closing) = self.windows.remove(&uuid) {
+                            #[cfg(target_os = "linux")]
+                            atrium_teardown_window(&mut closing);
+                        }
                         self.winit_id_to_uuid.remove(&window_id);
                         info!("Rust: Window '{}' closed. {} windows remaining", uuid, self.windows.len());
 
@@ -2355,6 +4248,26 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
                     },
                     WindowEvent::RedrawRequested => {
+                        #[cfg(target_os = "linux")]
+                        let nested_gen_at_start = NESTED_REDRAW_GEN.load(Ordering::SeqCst);
+                        #[cfg(target_os = "linux")]
+                        {
+                            GAMESCOPE_CADENCE_PENDING.store(false, Ordering::SeqCst);
+                            // Keep NESTED_REDRAW_PENDING set until after present so commits
+                            // mid-frame coalesce instead of queuing a short follow-up present.
+                            if is_gamescope_session() {
+                                static REDRAW_N: AtomicU64 = AtomicU64::new(0);
+                                let n = REDRAW_N.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n <= 8 || n % 120 == 0 {
+                                    atrium_host_diag(&format!(
+                                        "RedrawRequested #{n} focused={} occluded={} nested={}",
+                                        instance.os_focused,
+                                        instance.os_occluded,
+                                        instance.nested_compositor.is_some()
+                                    ));
+                                }
+                            }
+                        }
                         sync_minimized_from_os(instance);
                         instance.zero_size = {
                             let s = instance.window.inner_size();
@@ -2369,7 +4282,21 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             trace!("Rust: [Lifecycle] RedrawRequested present-only (window not viewable)");
                             instance.window.pre_present_notify();
                             let _ = instance.rendering_context.make_current();
-                            instance.rendering_context.present();
+                            if gl::atrium_host_present(instance) {
+                                #[cfg(target_os = "linux")]
+                                if let Some(ref ws) = instance.nested_compositor {
+                                    let now_ms = (std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        & 0xFFFFFFFF) as u32;
+                                    let server = ws.lock();
+                                    server.notify_frame_done(now_ms);
+                                    server.release_previous_buffer();
+                                }
+                            }
+                            #[cfg(target_os = "linux")]
+                            atrium_finish_nested_redraw(instance, nested_gen_at_start);
                         } else {
                         let _ = instance.rendering_context.make_current();
                         let window_size = instance.window.inner_size();
@@ -2446,6 +4373,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         }
                                     }
                                     p.needs_repaint = false;
+                                    // Re-arm after paint so Servo can notify the next frame
+                                    // (NewFrameReady no longer re-arms — avoids user-event livelock).
+                                    p.ready_to_repaint.store(true, Ordering::SeqCst);
                                 }
                             }
 
@@ -2516,6 +4446,79 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                             }
 
+                            #[cfg(target_os = "linux")]
+                            if let Some(ref ws) = instance.nested_compositor {
+                                let mut server = ws.lock();
+                                let dirty_panes = server.pump_frames(&instance.gl);
+                                for pid in dirty_panes {
+                                    if let Some(p) = instance.panes.get_mut(&pid) {
+                                        p.is_dirty = true;
+                                        // scene_needs_present keys off frame_seq — without
+                                        // this, imported DMA-BUFs update the slot texture but
+                                        // the host skips composite/present until a resize.
+                                        p.frame_seq = p.frame_seq.wrapping_add(1);
+                                    }
+                                }
+                            }
+
+                            #[cfg(target_os = "linux")]
+                            {
+                                let should_send_stats = instance.last_stats_send
+                                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(100))
+                                    .unwrap_or(true);
+                                if should_send_stats {
+                                    instance.last_stats_send = Some(std::time::Instant::now());
+                                    let game_stats = instance.primary_game_pane.as_ref()
+                                        .and_then(|id| instance.panes.get(id))
+                                        .and_then(|p| p.external_surface_slot.as_ref())
+                                        .map(|slot| {
+                                            let guard = slot.lock();
+                                            let mut sorted = guard.rolling_frametimes.clone();
+                                            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                                            let pct_low = |p: f32| -> Option<f32> {
+                                                if sorted.is_empty() {
+                                                    return None;
+                                                }
+                                                // High frametime → low FPS. Take the worst p% of frames.
+                                                let idx = ((1.0 - p) * (sorted.len() as f32 - 1.0)).round() as usize;
+                                                let ft = sorted[idx.min(sorted.len() - 1)];
+                                                if ft > 0.0 { Some(1000.0 / ft) } else { None }
+                                            };
+                                            (
+                                                guard.current_fps,
+                                                guard.last_frame_time_ms,
+                                                guard.frame_counter,
+                                                guard.width,
+                                                guard.height,
+                                                pct_low(0.01),
+                                                pct_low(0.001),
+                                            )
+                                        });
+                                    if let Some((fps, frametime_ms, total_frames, width, height, fps_1_low, fps_01_low)) = game_stats {
+                                        // Always push — even fps==0 — so the HUD can show surface size
+                                        // once frames exist (frame_counter > 0).
+                                        if total_frames > 0 || fps > 0.0 || width > 0 {
+                                            let refresh_hz =
+                                                instance.refresh_rate_millihertz as f32 / 1000.0;
+                                            push_renderer_ipc(
+                                                &uuid,
+                                                "atrium-game-stats",
+                                                serde_json::json!({
+                                                    "fps": fps,
+                                                    "frametime_ms": frametime_ms,
+                                                    "total_frames": total_frames,
+                                                    "width": width,
+                                                    "height": height,
+                                                    "fps_1_low": fps_1_low,
+                                                    "fps_01_low": fps_01_low,
+                                                    "refresh_hz": refresh_hz,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
                             // 3. Evaluate Integrity against the COMMITTED target
                             let is_transaction_pending = instance.committed_layout.is_some();
                             let mut transaction_complete = false;
@@ -2525,6 +4528,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 for (id, staged_pane) in &committed.panes {
                                     if staged_pane.visible {
                                         if let Some(pane) = instance.panes.get(id) {
+                                            #[cfg(target_os = "linux")]
+                                            if pane.external_wayland_server.is_some() {
+                                                continue;
+                                            }
                                             let target_size = ServoPhysicalSize::new(
                                                 (staged_pane.rect.size.width as u32).max(1), 
                                                 (staged_pane.rect.size.height as u32).max(1)
@@ -2629,6 +4636,21 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             // intentional — presenting would re-arm the Wayland frame
                             // callback and pin the host at display rate with no damage.
                             // (Hidden windows still present-only above to release callbacks.)
+                            // Game-driven: present when panes damaged (commit → frame_seq).
+                            // Gamescope stall fallback: still force present so steamcompmgr
+                            // keeps scanning us out while the game is quiet.
+                            #[cfg(target_os = "linux")]
+                            let needs_present = {
+                                let game_driven = atrium_game_driven_present(instance);
+                                (!game_driven && is_gamescope_session())
+                                    || gl::scene_needs_present(
+                                        instance,
+                                        window_size,
+                                        _flip_occurred,
+                                        &pending_hides,
+                                    )
+                            };
+                            #[cfg(not(target_os = "linux"))]
                             let needs_present = gl::scene_needs_present(
                                 instance,
                                 window_size,
@@ -2669,19 +4691,63 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                                 let live_w = window_size.width.max(1) as i32;
                                 let live_h = window_size.height.max(1) as i32;
-                                gl::blit_scene_to_window(instance, live_w, live_h, scale_factor);
-                                gl::ack_presented_scene(instance, window_size);
+                                let swapped =
+                                    gl::blit_scene_to_window(instance, live_w, live_h, scale_factor);
+                                // Throttled gamescope skips must not ack — otherwise Servo/panes
+                                // think the frame scanned out and we stall on black forever.
+                                if swapped {
+                                    gl::ack_presented_scene(instance, window_size);
+                                    // Nested clients pace to real host presents only.
+                                    #[cfg(target_os = "linux")]
+                                    if let Some(ref ws) = instance.nested_compositor {
+                                        let now_ms = (std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                            & 0xFFFFFFFF) as u32;
+                                        let server = ws.lock();
+                                        server.notify_frame_done(now_ms);
+                                        server.release_previous_buffer();
+                                    }
+                                }
+
+                                // Gamescope steamcompmgr only focuses windows with commits
+                                // (window_has_commits). Log presents so we can tell "painting
+                                // but not scanned out" vs "not painting at all".
+                                #[cfg(target_os = "linux")]
+                                if swapped && is_gamescope_session() {
+                                    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+                                    static PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
+                                    let n = PRESENT_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                                    if n <= 5 || n % 120 == 0 {
+                                        atrium_host_diag(&format!(
+                                            "host present #{n} size={}x{} focused={} occluded={}",
+                                            live_w,
+                                            live_h,
+                                            instance.os_focused,
+                                            instance.os_occluded
+                                        ));
+                                    }
+                                }
 
                                 // Timing already applied at RedrawRequested entry; keep Vsync
                                 // pull-model while focused + viewable, or while awaiting respawn.
+                                // Gamescope rarely delivers Focused(true) — still drive nested vsync.
                                 if window_is_viewable(instance) {
                                     let presentation_time_ns = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .map(|d| d.as_nanos() as u64)
                                         .unwrap_or(0);
+                                    #[cfg(target_os = "linux")]
+                                    let force_vsync = is_gamescope_session();
+                                    #[cfg(not(target_os = "linux"))]
+                                    let force_vsync = false;
                                     for pane_id in &remotes_updated {
                                         if let Some(pane) = instance.panes.get(pane_id) {
-                                            if instance.os_focused || pane.await_host_composited_frame {
+                                            if force_vsync
+                                                || instance.os_focused
+                                                || pane.await_host_composited_frame
+                                            {
                                                 if let Some(fd) = pane.remote_input_fd {
                                                     let surface_id = format!("{}:{}", uuid, pane_id);
                                                     send_remote_vsync(
@@ -2715,7 +4781,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                             } else {
                                 trace!("Rust: [Lifecycle] RedrawRequested skip present (no damage)");
+                                // Do NOT FrameDone on skip — that free-runs nested clients.
                             }
+
+                            #[cfg(target_os = "linux")]
+                            atrium_finish_nested_redraw(instance, nested_gen_at_start);
 
                             // LOCK STEP: clear busy only after the nuclear flip lands.
                             // Always re-run layout dispatch afterward: paint may have just
@@ -2780,14 +4850,32 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 info!("Rust: Resized to {}x{}", size.width, size.height);
 
                 instance.recalculate_layout(size, scale_factor);
-                
+
+                // Never call surfman set_window under gamescope — CreatePlatformWindowSurface
+                // returns EGL_NO_SURFACE and asserts. resize_bound_surface is safe.
                 instance.rendering_context.resize(size);
-                // SYNCHRONOUS PRESENTATION ON RESIZE:
-                // Instantly stretch the last known good scene quad across the entire expanded window surface.
-                // This eliminates any asynchronous gap between Mutter/Xwayland surface resize and Winit RedrawRequested.
-                let live_w = size.width.max(1) as i32;
-                let live_h = size.height.max(1) as i32;
-                gl::blit_scene_to_window(instance, live_w, live_h, scale_factor);
+                #[cfg(target_os = "linux")]
+                if is_gamescope_session() {
+                    // No sync present on resize — extra DRI3 swaps outside RedrawRequested
+                    // flood the 2-buffer ring. Re-assert interval and wake for a paced redraw.
+                    let _ = instance.rendering_context.make_current();
+                    atrium_set_egl_swap_interval(0);
+                    atrium_host_diag(&format!(
+                        "gamescope resize: bound surface {}x{} (redraw only, no sync present)",
+                        size.width, size.height
+                    ));
+                } else {
+                    // Desktop: stretch last scene immediately to avoid resize flash.
+                    let live_w = size.width.max(1) as i32;
+                    let live_h = size.height.max(1) as i32;
+                    gl::blit_scene_to_window(instance, live_w, live_h, scale_factor);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let live_w = size.width.max(1) as i32;
+                    let live_h = size.height.max(1) as i32;
+                    gl::blit_scene_to_window(instance, live_w, live_h, scale_factor);
+                }
 
                 instance.window.request_redraw();
 
@@ -2834,11 +4922,70 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             instance.window.request_redraw();
                             return;
                         }
+
+                        #[cfg(target_os = "linux")]
+                        if instance.game_mode {
+                            // While host-grabbed, only DeviceEvent::MouseMotion (relative) feeds
+                            // the game. Forwarding absolute CursorMoved too doubles aim / jelly.
+                            if instance.host_pointer_grabbed {
+                                return;
+                            }
+                            let game_motion = instance.primary_game_pane.as_ref().and_then(|game_id| {
+                                let pane = instance.panes.get(game_id)?;
+                                let ws = pane.external_wayland_server.as_ref()?;
+                                let (tx, ty) =
+                                    atrium_pointer_coords(instance, pane, point, scale_factor);
+                                Some((game_id.clone(), ws.clone(), tx, ty))
+                            });
+                            if let Some((game_id, ws, tx, ty)) = game_motion {
+                                ws.lock().send_pointer_motion_to_pane(&game_id, tx, ty);
+                                atrium_sync_nested_cursor_for_hover(
+                                    instance,
+                                    Some(event_loop),
+                                    true,
+                                );
+                                return;
+                            }
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        if atrium_in_overlay_input_mode(instance) {
+                            atrium_route_cursor_moved(
+                                instance,
+                                event_loop,
+                                &uuid,
+                                point,
+                                scale_factor,
+                            );
+                            return;
+                        }
                         
                         // If mouse is down, route exclusively to the pane that received the Down event
                         if instance.is_mouse_down {
                             if let Some(pane_id) = &instance.last_mouse_down_pane_id {
+                                #[cfg(target_os = "linux")]
+                                let drag_layout = instance.panes.get(pane_id).map(|p| {
+                                    (
+                                        atrium_pane_hit_rect(instance, p, scale_factor),
+                                        p.external_wayland_server.as_ref().map(|ws| {
+                                            let (tx, ty) =
+                                                atrium_pointer_coords(instance, p, point, scale_factor);
+                                            (ws.clone(), tx, ty)
+                                        }),
+                                    )
+                                });
+                                #[cfg(target_os = "linux")]
+                                if let Some((_, Some((ws, tx, ty)))) = drag_layout.as_ref() {
+                                    ws.lock().send_pointer_motion_to_pane(pane_id, *tx, *ty);
+                                    return;
+                                }
                                 if let Some(pane) = instance.panes.get_mut(pane_id) {
+                                    #[cfg(target_os = "linux")]
+                                    let (px, py, pw, ph) = drag_layout
+                                        .as_ref()
+                                        .map(|(r, _)| *r)
+                                        .unwrap_or_else(|| pane.input_physical_rect(scale_factor));
+                                    #[cfg(not(target_os = "linux"))]
                                     let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
                                     let mut translated_point = Point2D::new(point.x - px, point.y - py);
                                     if pane.is_remote {
@@ -3007,7 +5154,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
                                 let mut translated_point = Point2D::new(point.x - px, point.y - py);
 
-                                if pane.is_remote {
+                                #[cfg(target_os = "linux")]
+                                if let Some(ref ws) = pane.external_wayland_server {
+                                    let server = ws.lock();
+                                    server.send_pointer_motion_to_pane(
+                                        &pane.id,
+                                        translated_point.x as f64,
+                                        translated_point.y as f64,
+                                    );
+                                } else if pane.is_remote {
                                     if let Some(ref consumer) = pane.remote_consumer {
                                         if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
                                             translated_point.x *= consumer.tex_width as f32 / pw;
@@ -3029,22 +5184,63 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                             }
                         } else {
-                            // Standard window: just find hovered pane and route
-                            let mut sorted_panes: Vec<_> = instance.panes.values().collect();
-                            sorted_panes.sort_by_key(|p| -p.z_index);
-                            for pane in sorted_panes {
-                                if !pane_accepts_pointer_input(pane) { continue; }
-                                let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
-                                let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
-
-                                if rect.contains(point) {
-                                    let hover_id = pane.id.clone();
-                                    let mut translated_point = Point2D::new(point.x - px, point.y - py);
+                            let hovered_pane = {
+                                #[cfg(target_os = "linux")]
+                                {
+                                    hit_test_pointer_pane(instance, point, scale_factor, false)
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let mut sorted_panes: Vec<_> = instance.panes.values().collect();
+                                    sorted_panes.sort_by_key(|p| -p.z_index);
+                                    sorted_panes.into_iter().find(|pane| {
+                                        if !pane_accepts_pointer_input(pane) {
+                                            return false;
+                                        }
+                                        let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
+                                        let rect = euclid::Rect::new(
+                                            euclid::Point2D::new(px, py),
+                                            euclid::Size2D::new(pw, ph),
+                                        );
+                                        rect.contains(point)
+                                    })
+                                }
+                            };
+                            if let Some(hover_id) =
+                                hovered_pane.map(|p| p.id.clone())
+                            {
+                                #[cfg(target_os = "linux")]
+                                {
+                                    let external_motion = instance.panes.get(&hover_id).and_then(|pane| {
+                                        pane.external_wayland_server.as_ref().map(|ws| {
+                                            let (tx, ty) =
+                                                atrium_pointer_coords(instance, pane, point, scale_factor);
+                                            (ws.clone(), tx, ty)
+                                        })
+                                    });
+                                    if let Some((ws, tx, ty)) = external_motion {
+                                        ws.lock().send_pointer_motion_to_pane(&hover_id, tx, ty);
+                                        instance.hover_pane_id = Some(hover_id.clone());
+                                        instance.active_pane_id = hover_id;
+                                        return;
+                                    }
+                                }
+                                if let Some(pane) = instance.panes.get(&hover_id) {
+                                    let (px, py, pw, ph) =
+                                        atrium_pane_hit_rect(instance, pane, scale_factor);
+                                    let mut translated_point =
+                                        Point2D::new(point.x - px, point.y - py);
                                     if pane.is_remote {
                                         if let Some(ref consumer) = pane.remote_consumer {
-                                            if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
-                                                translated_point.x *= consumer.tex_width as f32 / pw;
-                                                translated_point.y *= consumer.tex_height as f32 / ph;
+                                            if consumer.tex_width > 0
+                                                && consumer.tex_height > 0
+                                                && pw > 0.0
+                                                && ph > 0.0
+                                            {
+                                                translated_point.x *=
+                                                    consumer.tex_width as f32 / pw;
+                                                translated_point.y *=
+                                                    consumer.tex_height as f32 / ph;
                                             }
                                         }
                                         if let Some(fd) = pane.remote_input_fd {
@@ -3059,17 +5255,19 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                                     "y": translated_point.y,
                                                     "modifiers": instance.modifiers.bits(),
                                                 }
-                                            }).to_string();
+                                            })
+                                            .to_string();
                                             forward_remote_input(fd, &msg);
                                         }
                                     } else {
-                                        pane.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
-                                            servo::WebViewPoint::Device(translated_point)
-                                        )));
+                                        pane.webview.notify_input_event(InputEvent::MouseMove(
+                                            MouseMoveEvent::new(servo::WebViewPoint::Device(
+                                                translated_point,
+                                            )),
+                                        ));
                                     }
-                                    instance.hover_pane_id = Some(hover_id);
-                                    break;
                                 }
+                                instance.hover_pane_id = Some(hover_id);
                             }
                         }
                     },
@@ -3077,6 +5275,42 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         let is_pressed = state == winit::event::ElementState::Pressed;
                         instance.is_mouse_down = is_pressed;
                         let scale_factor = instance.window.scale_factor() as f32;
+
+                        #[cfg(target_os = "linux")]
+                        if instance.game_mode {
+                            if let Some(ref game_id) = instance.primary_game_pane {
+                                if let Some(pane) = instance.panes.get(game_id) {
+                                    if let Some(ref ws) = pane.external_wayland_server {
+                                        let (x, y) = atrium_pointer_coords(
+                                            instance,
+                                            pane,
+                                            instance.last_mouse_pos,
+                                            scale_factor,
+                                        );
+                                        ws.lock().send_pointer_button_to_pane(
+                                            game_id,
+                                            x,
+                                            y,
+                                            winit_mouse_button_evdev(button),
+                                            is_pressed,
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        if atrium_in_overlay_input_mode(instance) {
+                            atrium_route_mouse_button(
+                                instance,
+                                &uuid,
+                                button,
+                                is_pressed,
+                                scale_factor,
+                            );
+                            return;
+                        }
 
                         // Gutter release — keep current geometry (do not revert).
                         if !is_pressed && instance.active_gutter_drag.is_some() {
@@ -3211,20 +5445,38 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         let target_pane_id = if !is_pressed {
                             instance.last_mouse_down_pane_id.take()
                         } else {
-                            let mut sorted_panes: Vec<_> = instance.panes.values().collect();
-                            sorted_panes.sort_by_key(|p| -p.z_index);
-                            
-                            let mut found_id = None;
-                            for pane in sorted_panes {
-                                if !pane_accepts_pointer_input(pane) { continue; }
-                                let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
-                                let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
-
-                                if rect.contains(instance.last_mouse_pos) {
-                                    found_id = Some(pane.id.clone());
-                                    break;
+                            let found_id = {
+                                #[cfg(target_os = "linux")]
+                                {
+                                    hit_test_pointer_pane(
+                                        instance,
+                                        instance.last_mouse_pos,
+                                        scale_factor,
+                                        false,
+                                    )
+                                    .map(|p| p.id.clone())
                                 }
-                            }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let mut sorted_panes: Vec<_> = instance.panes.values().collect();
+                                    sorted_panes.sort_by_key(|p| -p.z_index);
+                                    sorted_panes.into_iter().find_map(|pane| {
+                                        if !pane_accepts_pointer_input(pane) {
+                                            return None;
+                                        }
+                                        let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
+                                        let rect = euclid::Rect::new(
+                                            euclid::Point2D::new(px, py),
+                                            euclid::Size2D::new(pw, ph),
+                                        );
+                                        if rect.contains(instance.last_mouse_pos) {
+                                            Some(pane.id.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                }
+                            };
                             if is_pressed {
                                 instance.last_mouse_down_pane_id = found_id.clone();
                             }
@@ -3232,8 +5484,29 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         };
 
                         if let Some(pane_id) = target_pane_id {
+                            #[cfg(target_os = "linux")]
+                            let pointer_layout = instance.panes.get(&pane_id).map(|p| {
+                                (
+                                    atrium_pane_hit_rect(instance, p, scale_factor),
+                                    p.external_wayland_server.as_ref().map(|ws| {
+                                        let (x, y) = atrium_pointer_coords(
+                                            instance,
+                                            p,
+                                            instance.last_mouse_pos,
+                                            scale_factor,
+                                        );
+                                        (ws.clone(), x, y)
+                                    }),
+                                )
+                            });
                             if let Some(pane) = instance.panes.get_mut(&pane_id) {
                                     // Unified physical coordinate translation
+                                    #[cfg(target_os = "linux")]
+                                    let (px, py, pw, ph) = pointer_layout
+                                        .as_ref()
+                                        .map(|(r, _)| *r)
+                                        .unwrap_or_else(|| pane.input_physical_rect(scale_factor));
+                                    #[cfg(not(target_os = "linux"))]
                                     let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
                                     let mut translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
                                     if pane.is_remote {
@@ -3326,7 +5599,19 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     instance.active_pane_id = pane.id.clone();
                                 }
 
-                                if pane.is_remote {
+                                #[cfg(target_os = "linux")]
+                                if let Some((ws, x, y)) =
+                                    pointer_layout.as_ref().and_then(|(_, ext)| ext.clone())
+                                {
+                                    ws.lock().send_pointer_button_to_pane(
+                                        &pane_id,
+                                        x,
+                                        y,
+                                        winit_mouse_button_evdev(button),
+                                        is_pressed,
+                                    );
+                                    return;
+                                } else if pane.is_remote {
                                     if let Some(fd) = pane.remote_input_fd {
                                         let surface_id = format!("{}:{}", uuid, pane.id);
                                         let kind = match action {
@@ -3380,6 +5665,62 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             mode: WheelMode::DeltaPixel,
                         };
 
+                        #[cfg(target_os = "linux")]
+                        if instance.game_mode {
+                            if let Some(ref game_id) = instance.primary_game_pane {
+                                if let Some(pane) = instance.panes.get(game_id) {
+                                    if let Some(ref ws) = pane.external_wayland_server {
+                                        let (mx, my) = atrium_pointer_coords(
+                                            instance,
+                                            pane,
+                                            instance.last_mouse_pos,
+                                            scale_factor,
+                                        );
+                                        ws.lock().send_pointer_axis_to_pane(
+                                            game_id,
+                                            mx,
+                                            my,
+                                            -x,
+                                            -y,
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        if atrium_in_overlay_input_mode(instance) {
+                            if let Some(target_id) = hit_test_pointer_pane(
+                                instance,
+                                instance.last_mouse_pos,
+                                scale_factor,
+                                true,
+                            )
+                            .map(|p| p.id.clone())
+                            {
+                                if let Some(pane) = instance.panes.get(&target_id) {
+                                    if let Some(ref ws) = pane.external_wayland_server {
+                                        let (mx, my) = atrium_pointer_coords(
+                                            instance,
+                                            pane,
+                                            instance.last_mouse_pos,
+                                            scale_factor,
+                                        );
+                                        ws.lock().send_pointer_axis_to_pane(
+                                            &target_id,
+                                            mx,
+                                            my,
+                                            -x,
+                                            -y,
+                                        );
+                                        instance.window.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
                         if let Some(_) = &instance.active_select {
                             let overlay_pane = instance.panes.get("__lotus_select_overlay");
                             let is_inside_overlay = overlay_pane.map(|p| {
@@ -3416,16 +5757,76 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             }
                         }
 
-                        let mut sorted_panes: Vec<_> = instance.panes.values_mut().collect();
-                        sorted_panes.sort_by_key(|p| -p.z_index);
-                        for pane in sorted_panes {
-                            if !pane_accepts_pointer_input(pane) { continue; }
-                            let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
-                            let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
-
-                            if rect.contains(instance.last_mouse_pos) {
+                        let wheel_pane = {
+                            #[cfg(target_os = "linux")]
+                            {
+                                hit_test_pointer_pane(
+                                    instance,
+                                    instance.last_mouse_pos,
+                                    scale_factor,
+                                    false,
+                                )
+                                .map(|p| p.id.clone())
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                let mut sorted_panes: Vec<_> = instance.panes.values().collect();
+                                sorted_panes.sort_by_key(|p| -p.z_index);
+                                sorted_panes.into_iter().find_map(|pane| {
+                                    if !pane_accepts_pointer_input(pane) {
+                                        return None;
+                                    }
+                                    let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
+                                    let rect = euclid::Rect::new(
+                                        euclid::Point2D::new(px, py),
+                                        euclid::Size2D::new(pw, ph),
+                                    );
+                                    if rect.contains(instance.last_mouse_pos) {
+                                        Some(pane.id.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            }
+                        };
+                        if let Some(pane_id) = wheel_pane {
+                            #[cfg(target_os = "linux")]
+                            let wheel_layout = instance.panes.get(&pane_id).map(|p| {
+                                (
+                                    atrium_pane_hit_rect(instance, p, scale_factor),
+                                    p.external_wayland_server.as_ref().map(|ws| {
+                                        let (mx, my) = atrium_pointer_coords(
+                                            instance,
+                                            p,
+                                            instance.last_mouse_pos,
+                                            scale_factor,
+                                        );
+                                        (ws.clone(), mx, my)
+                                    }),
+                                )
+                            });
+                            if let Some(pane) = instance.panes.get_mut(&pane_id) {
+                                #[cfg(target_os = "linux")]
+                                let (px, py, pw, ph) = wheel_layout
+                                    .as_ref()
+                                    .map(|(r, _)| *r)
+                                    .unwrap_or_else(|| pane.input_physical_rect(scale_factor));
+                                #[cfg(not(target_os = "linux"))]
+                                let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
                                 let mut translated_point = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
-                                if pane.is_remote {
+                                #[cfg(target_os = "linux")]
+                                if let Some((ws, mx, my)) =
+                                    wheel_layout.as_ref().and_then(|(_, ext)| ext.clone())
+                                {
+                                    ws.lock().send_pointer_axis_to_pane(
+                                        &pane_id,
+                                        mx,
+                                        my,
+                                        -x,
+                                        -y,
+                                    );
+                                    instance.window.request_redraw();
+                                } else if pane.is_remote {
                                     if let Some(ref consumer) = pane.remote_consumer {
                                         if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
                                             translated_point.x *= consumer.tex_width as f32 / pw;
@@ -3457,7 +5858,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     pane.needs_repaint = true;
                                 }
                                 instance.window.request_redraw();
-                                break;
                             }
                         }
                     },
@@ -3480,7 +5880,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             instance.os_occluded = occluded;
                             sync_minimized_from_os(instance);
                             apply_refresh_policy(instance);
-                            if !occluded {
+                            // Under gamescope, Occluded is unreliable — keep painting.
+                            #[cfg(target_os = "linux")]
+                            let keep_painting = is_gamescope_session() || !occluded;
+                            #[cfg(not(target_os = "linux"))]
+                            let keep_painting = !occluded;
+                            if keep_painting {
                                 instance.window.request_redraw();
                             }
                         }
@@ -3496,7 +5901,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 instance.cancel_gutter_drag_keep();
                             }
                             // Kick a redraw so focused remotes resume at full rate immediately.
-                            if focused {
+                            // Gamescope often never delivers Focused(true) to X11 clients.
+                            #[cfg(target_os = "linux")]
+                            let keep_painting = is_gamescope_session() || focused;
+                            #[cfg(not(target_os = "linux"))]
+                            let keep_painting = focused;
+                            if keep_painting {
                                 instance.window.request_redraw();
                             }
                         }
@@ -3599,10 +6009,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             instance.cancel_gutter_drag_keep();
                             clear_gutter_hover_state(instance);
                             instance.hover_pane_id = None;
+                            #[cfg(target_os = "linux")]
+                            atrium_clear_nested_cursor(instance);
                             instance.window.set_cursor(winit::window::CursorIcon::Default);
                         }
                     },
-                    WindowEvent::KeyboardInput { event, .. } => {
+                    WindowEvent::KeyboardInput {
+                        event,
+                        is_synthetic,
+                        ..
+                    } => {
                         // Escape during gutter drag: revert to start snapshot.
                         if event.state == winit::event::ElementState::Pressed
                             && instance.active_gutter_drag.is_some()
@@ -3620,6 +6036,123 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                                 instance.window.set_cursor(winit::window::CursorIcon::Default);
                                 return;
+                            }
+                        }
+
+                        // Focus-sync synthetics (winit) must not reach clients — they
+                        // re-press already-held keys and look like duplicates.
+                        if is_synthetic {
+                            return;
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        // Ignore key-repeat: holding F9/F12 was flipping open↔closed every
+                        // repeat tick (felt like a stuck double-toggle loop).
+                        if event.state == winit::event::ElementState::Pressed && !event.repeat {
+                            match &event.logical_key {
+                                winit::keyboard::Key::Named(winit::keyboard::NamedKey::F12) => {
+                                    let next = !instance.game_mode;
+                                    atrium_apply_game_mode(instance, next, Some(event_loop));
+                                    info!("[lotus-atrium] F12 pressed -> toggled game mode: {}", next);
+                                    push_renderer_ipc(
+                                        &uuid,
+                                        "atrium-game-mode-changed",
+                                        serde_json::json!({ "game_mode": next }),
+                                    );
+                                    return;
+                                }
+                                winit::keyboard::Key::Named(winit::keyboard::NamedKey::F9) => {
+                                    info!("[lotus-atrium] F9 pressed -> toggle discord overlay");
+                                    let next_visible = instance
+                                        .panes
+                                        .get("discord")
+                                        .map(|p| !p.pending_visible)
+                                        .unwrap_or(false);
+                                    if next_visible {
+                                        // Leave game mode *before* showing Discord so the
+                                        // visible configure grants Activated (not throttled).
+                                        if instance.game_mode {
+                                            atrium_apply_game_mode(
+                                                instance,
+                                                false,
+                                                Some(event_loop),
+                                            );
+                                            push_renderer_ipc(
+                                                &uuid,
+                                                "atrium-game-mode-changed",
+                                                serde_json::json!({ "game_mode": false }),
+                                            );
+                                        }
+                                        atrium_set_pane_visible(instance, "discord", true);
+                                        atrium_set_keyboard_focus(instance, "discord");
+                                    } else {
+                                        atrium_set_pane_visible(instance, "discord", false);
+                                    }
+                                    if !next_visible && instance.active_pane_id == "discord" {
+                                        instance.active_pane_id.clear();
+                                    }
+                                    let physical_size = instance.window.inner_size();
+                                    let scale_factor = instance.window.scale_factor() as f32;
+                                    instance.recalculate_layout(physical_size, scale_factor);
+                                    instance.window.request_redraw();
+                                    push_renderer_ipc(
+                                        &uuid,
+                                        "atrium-toggle-discord",
+                                        serde_json::json!({ "visible": next_visible }),
+                                    );
+                                    return;
+                                }
+                                winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
+                                    let next = instance.window.fullscreen().is_none();
+                                    info!("[lotus-atrium] F11 pressed -> lotus fullscreen={}", next);
+                                    if next {
+                                        instance.window.set_fullscreen(Some(
+                                            winit::window::Fullscreen::Borderless(None),
+                                        ));
+                                    } else {
+                                        instance.window.set_fullscreen(None);
+                                    }
+                                    #[cfg(target_os = "linux")]
+                                    tag_window_for_gamescope(&instance.window);
+                                    push_renderer_ipc(
+                                        &uuid,
+                                        "atrium-fullscreen-changed",
+                                        serde_json::json!({ "fullscreen": next }),
+                                    );
+                                    apply_refresh_policy(instance);
+                                    #[cfg(target_os = "linux")]
+                                    if let Some(ref ws) = instance.nested_compositor {
+                                        ws.lock().set_output_refresh(instance.refresh_rate_millihertz);
+                                    }
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        #[cfg(target_os = "linux")]
+                        if instance.game_mode {
+                            // Wayland clients repeat locally via wl_keyboard.repeat_info.
+                            // Forwarding winit repeats → duplicated characters.
+                            if event.repeat {
+                                return;
+                            }
+                            if let Some(ref game_id) = instance.primary_game_pane {
+                                if let Some(pane) = instance.panes.get(game_id) {
+                                    if let Some(ref ws) = pane.external_wayland_server {
+                                        use winit::platform::scancode::PhysicalKeyExtScancode;
+                                        if let Some(scancode) = event.physical_key.to_scancode() {
+                                            let is_pressed = event.state == winit::event::ElementState::Pressed;
+                                            let server = ws.lock();
+                                            server.send_keyboard_to_pane(
+                                                game_id,
+                                                scancode + 8,
+                                                is_pressed,
+                                            );
+                                        }
+                                        return;
+                                    }
+                                }
                             }
                         }
 
@@ -3641,34 +6174,75 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             false, // is_composing
                         );
                         
-                        if let Some(pane) = instance.panes.get(&instance.active_pane_id) {
-                            if pane.is_remote {
-                                if let Some(fd) = pane.remote_input_fd {
-                                    let surface_id = format!("{}:{}", uuid, pane.id);
-                                    let kind = match event.state {
-                                        winit::event::ElementState::Pressed => "KeyDown",
-                                        winit::event::ElementState::Released => "KeyUp",
-                                    };
-                                    let key_str = map_winit_logical_key(&event.logical_key);
-                                    let code_str = map_winit_physical_key(event.physical_key);
-                                    let repeat = event.repeat;
-                                    let msg = serde_json::json!({
-                                        "type": "Input",
-                                        "event": {
-                                            "kind": kind,
-                                            "surface_id": surface_id,
-                                            "generation": 1,
-                                            "key": key_str,
-                                            "code": code_str,
-                                            "keycode": 0,
-                                            "modifiers": instance.modifiers.bits(),
-                                            "repeat": repeat,
-                                        }
-                                    }).to_string();
-                                    forward_remote_input(fd, &msg);
-                                }
+                        // Overlay / normal lotus: sticky click focus only. Never follow
+                        // hover onto the game (that was sending keys into the game whenever
+                        // the cursor left Discord onto the wallpaper).
+                        #[cfg(target_os = "linux")]
+                        let keyboard_pane_id = {
+                            let id = instance.active_pane_id.clone();
+                            if id.is_empty()
+                                || (atrium_in_overlay_input_mode(instance)
+                                    && atrium_is_primary_game(instance, &id))
+                            {
+                                None
                             } else {
-                                pane.webview.notify_input_event(InputEvent::Keyboard(keyboard_event));
+                                Some(id)
+                            }
+                        };
+                        #[cfg(not(target_os = "linux"))]
+                        let keyboard_pane_id = Some(instance.active_pane_id.clone());
+
+                        if let Some(ref keyboard_pane_id) = keyboard_pane_id {
+                            if let Some(pane) = instance.panes.get(keyboard_pane_id) {
+                                #[cfg(target_os = "linux")]
+                                if let Some(ref ws) = pane.external_wayland_server {
+                                    // Same as game mode: client-side repeat only.
+                                    if event.repeat {
+                                        return;
+                                    }
+                                    use winit::platform::scancode::PhysicalKeyExtScancode;
+                                    if let Some(scancode) = event.physical_key.to_scancode() {
+                                        let is_pressed =
+                                            event.state == winit::event::ElementState::Pressed;
+                                        let server = ws.lock();
+                                        server.send_keyboard_to_pane(
+                                            &pane.id,
+                                            scancode + 8,
+                                            is_pressed,
+                                        );
+                                    }
+                                    return;
+                                }
+                                if pane.is_remote {
+                                    if let Some(fd) = pane.remote_input_fd {
+                                        let surface_id = format!("{}:{}", uuid, pane.id);
+                                        let kind = match event.state {
+                                            winit::event::ElementState::Pressed => "KeyDown",
+                                            winit::event::ElementState::Released => "KeyUp",
+                                        };
+                                        let key_str = map_winit_logical_key(&event.logical_key);
+                                        let code_str = map_winit_physical_key(event.physical_key);
+                                        let repeat = event.repeat;
+                                        let msg = serde_json::json!({
+                                            "type": "Input",
+                                            "event": {
+                                                "kind": kind,
+                                                "surface_id": surface_id,
+                                                "generation": 1,
+                                                "key": key_str,
+                                                "code": code_str,
+                                                "keycode": 0,
+                                                "modifiers": instance.modifiers.bits(),
+                                                "repeat": repeat,
+                                            }
+                                        })
+                                        .to_string();
+                                        forward_remote_input(fd, &msg);
+                                    }
+                                } else {
+                                    pane.webview
+                                        .notify_input_event(InputEvent::Keyboard(keyboard_event));
+                                }
                             }
                         }
                     },

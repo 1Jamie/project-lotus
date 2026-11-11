@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Atrium Notifications</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: transparent !important;
+      overflow: hidden;
+      font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+      color: #e2e8f0;
+      pointer-events: none;
+    }
+    #stack {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 8px;
+      padding: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+    .toast {
+      background: rgba(8, 12, 20, 0.88);
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 8px;
+      padding: 10px 12px 8px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+      animation: slide-in 220ms ease-out;
+      flex: 0 0 auto;
+    }
+    .toast.urgency-critical {
+      border-color: rgba(248, 113, 113, 0.65);
+    }
+    .toast.urgency-low {
+      opacity: 0.85;
+    }
+    .toast.leaving {
+      animation: slide-out 180ms ease-in forwards;
+    }
+    .meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .source {
+      color: #94a3b8;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #f8fafc;
+      line-height: 1.25;
+    }
+    .body {
+      margin-top: 4px;
+      font-size: 12px;
+      color: #cbd5e1;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .bar {
+      margin-top: 8px;
+      height: 2px;
+      background: rgba(148, 163, 184, 0.2);
+      border-radius: 1px;
+      overflow: hidden;
+    }
+    .bar > i {
+      display: block;
+      height: 100%;
+      width: 100%;
+      background: #38bdf8;
+      transform-origin: left center;
+      animation: drain linear forwards;
+    }
+    .toast.urgency-critical .bar > i { background: #f87171; }
+    @keyframes slide-in {
+      from { opacity: 0; transform: translateX(24px); }
+      to { opacity: 1; transform: translateX(0); }
+    }
+    @keyframes slide-out {
+      from { opacity: 1; transform: translateX(0); }
+      to { opacity: 0; transform: translateX(24px); }
+    }
+    @keyframes drain {
+      from { transform: scaleX(1); }
+      to { transform: scaleX(0); }
+    }
+  </style>
+</head>
+<body>
+  <div id="stack"></div>
+  <script>
+    const stack = document.getElementById('stack');
+    const MAX = 5;
+    const timers = new Map();
+
+    function dismiss(id, el) {
+      const t = timers.get(id);
+      if (t) clearTimeout(t);
+      timers.delete(id);
+      if (!el || !el.parentNode) return;
+      el.classList.add('leaving');
+      setTimeout(() => el.remove(), 180);
+    }
+
+    function pushToast(n) {
+      if (!n || (!n.title && !n.body)) return;
+      while (stack.children.length >= MAX) {
+        const oldest = stack.lastElementChild;
+        if (oldest) dismiss(oldest.dataset.id, oldest);
+        else break;
+      }
+      const el = document.createElement('div');
+      el.className = 'toast urgency-' + (n.urgency || 'normal');
+      el.dataset.id = String(n.id);
+      const src = n.source ? String(n.source) : '';
+      el.innerHTML =
+        '<div class="meta">' +
+          '<span class="source"></span>' +
+        '</div>' +
+        '<div class="title"></div>' +
+        (n.body ? '<div class="body"></div>' : '') +
+        '<div class="bar"><i></i></div>';
+      el.querySelector('.source').textContent = src;
+      el.querySelector('.title').textContent = n.title || '';
+      const bodyEl = el.querySelector('.body');
+      if (bodyEl) bodyEl.textContent = n.body || '';
+      const bar = el.querySelector('.bar > i');
+      const ms = Math.max(800, Number(n.timeoutMs) || 4500);
+      bar.style.animationDuration = ms + 'ms';
+      stack.prepend(el);
+      timers.set(String(n.id), setTimeout(() => dismiss(n.id, el), ms));
+    }
+
+    window.addEventListener('plugin:notifications:toast', (e) => pushToast(e.detail));
+    const waitPlugin = setInterval(() => {
+      if (window.AtriumPlugin) {
+        clearInterval(waitPlugin);
+        window.AtriumPlugin.on('toast', pushToast);
+      }
+    }, 100);
+  </script>
+</body>
+</html>
