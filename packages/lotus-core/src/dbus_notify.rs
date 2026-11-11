@@ -98,7 +98,7 @@ fn diag_enabled() -> bool {
 
 fn diag(msg: impl AsRef<str>) {
     if diag_enabled() {
-        info!("[lotus-atrium] dbus-diag {}", msg.as_ref());
+        info!("[lotus-nest] dbus-diag {}", msg.as_ref());
     }
 }
 
@@ -117,7 +117,7 @@ pub fn register_external_notify(
         st.window_id = Some(window_id.to_string());
         if apps.is_empty() {
             warn!(
-                "[lotus-atrium] dbus.notifications={:?} with empty notificationApps — ignored",
+                "[lotus-nest] dbus.notifications={:?} with empty notificationApps — ignored",
                 mode
             );
             return;
@@ -139,7 +139,7 @@ pub fn register_external_notify(
             }
         }
         info!(
-            "[lotus-atrium] dbus notify bridge filters={:?} window={} pane={:?}",
+            "[lotus-nest] dbus notify bridge filters={:?} window={} pane={:?}",
             st.filters.keys().collect::<Vec<_>>(),
             window_id,
             pane_id
@@ -170,7 +170,7 @@ fn ensure_started() {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    error!("[lotus-atrium] dbus notify runtime failed: {e}");
+                    error!("[lotus-nest] dbus notify runtime failed: {e}");
                     STARTED.store(false, Ordering::SeqCst);
                     return;
                 }
@@ -185,11 +185,11 @@ async fn supervisor_loop() {
     loop {
         match run_monitor_once().await {
             Ok(()) => {
-                warn!("[lotus-atrium] dbus notify monitor stream ended; reconnecting");
+                warn!("[lotus-nest] dbus notify monitor stream ended; reconnecting");
                 backoff_ms = BACKOFF_START_MS;
             }
             Err(e) => {
-                error!("[lotus-atrium] dbus notify monitor error (will retry): {e}");
+                error!("[lotus-nest] dbus notify monitor error (will retry): {e}");
             }
         }
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -415,7 +415,7 @@ fn emit_toast(draft: &ToastDraft, dbus_id: Option<u32>) {
     }
     let payload = draft_to_payload(draft, dbus_id);
     info!(
-        "[lotus-atrium] dbus Notify → atrium-notify app={:?} summary={:?} id={:?} mode={:?}",
+        "[lotus-nest] dbus Notify → atrium-notify app={:?} summary={:?} id={:?} mode={:?}",
         draft.app_name, draft.summary, dbus_id, draft.mode
     );
     enqueue_or_send("atrium-notify", payload);
@@ -460,7 +460,7 @@ async fn resolve_notifications_owner(conn: &Connection) -> Option<String> {
         Ok(owner) => Some(owner.as_str().to_string()),
         Err(e) => {
             warn!(
-                "[lotus-atrium] dbus notify: org.freedesktop.Notifications has no owner yet ({e})"
+                "[lotus-nest] dbus notify: org.freedesktop.Notifications has no owner yet ({e})"
             );
             None
         }
@@ -517,7 +517,7 @@ fn build_monitor_rules() -> zbus::Result<Vec<MatchRule<'static>>> {
 async fn run_monitor_once() -> zbus::Result<()> {
     let conn = Connection::session().await.map_err(|e| {
         error!(
-            "[lotus-atrium] dbus notify: cannot connect to session bus ({e}) — is DBUS_SESSION_BUS_ADDRESS set?"
+            "[lotus-nest] dbus notify: cannot connect to session bus ({e}) — is DBUS_SESSION_BUS_ADDRESS set?"
         );
         e
     })?;
@@ -528,13 +528,13 @@ async fn run_monitor_once() -> zbus::Result<()> {
     let mon = MonitoringProxy::new(&conn).await?;
     mon.become_monitor(&rules, 0).await.map_err(|e| {
         error!(
-            "[lotus-atrium] dbus notify BecomeMonitor failed ({e}) — Monitoring interface denied?"
+            "[lotus-nest] dbus notify BecomeMonitor failed ({e}) — Monitoring interface denied?"
         );
         e
     })?;
 
     info!(
-        "[lotus-atrium] dbus notify BecomeMonitor active (owner={:?}, filters={:?})",
+        "[lotus-nest] dbus notify BecomeMonitor active (owner={:?}, filters={:?})",
         owner,
         filter_key_names()
     );
@@ -551,7 +551,7 @@ async fn run_monitor_once() -> zbus::Result<()> {
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
-                warn!("[lotus-atrium] dbus notify stream error: {e}");
+                warn!("[lotus-nest] dbus notify stream error: {e}");
                 return Err(e.into());
             }
         };
@@ -665,7 +665,7 @@ fn handle_portal_add(msg: &Message) {
         match_keys,
     };
     info!(
-        "[lotus-atrium] dbus portal AddNotification → toast summary={:?}",
+        "[lotus-nest] dbus portal AddNotification → toast summary={:?}",
         draft.summary
     );
     emit_toast(&draft, None);
@@ -686,23 +686,23 @@ fn handle_notify_call(msg: &Message) {
         deserialized
     else {
         // Always log deserialize failures — usually means a different Notify shape.
-        warn!("[lotus-atrium] dbus Notify deserialize failed (wrong signature?)");
+        warn!("[lotus-nest] dbus Notify deserialize failed (wrong signature?)");
         return;
     };
     let desktop = hint_desktop_entry(&hints);
     // Log every Notify we see so missing filters are obvious without ATRIUM_DBUS_DIAG.
     info!(
-        "[lotus-atrium] dbus Notify seen app={app_name:?} desktop={desktop:?} summary={summary:?}"
+        "[lotus-nest] dbus Notify seen app={app_name:?} desktop={desktop:?} summary={summary:?}"
     );
     let Some((mode, match_keys)) = lookup_mode(&app_name, desktop.as_deref()) else {
         info!(
-            "[lotus-atrium] dbus Notify ignored (no filter match) app={app_name:?} desktop={desktop:?} filters={:?}",
+            "[lotus-nest] dbus Notify ignored (no filter match) app={app_name:?} desktop={desktop:?} filters={:?}",
             filter_key_names()
         );
         return;
     };
     if window_id().is_none() {
-        warn!("[lotus-atrium] dbus Notify matched but no window_id registered");
+        warn!("[lotus-nest] dbus Notify matched but no window_id registered");
         return;
     }
 
@@ -799,7 +799,7 @@ fn handle_notify_return(msg: &Message, notif_owner: &Option<String>) {
     if pending.draft.mode == NotifyMode::Capture {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            debug!("[lotus-atrium] dbus notify capture → CloseNotification({id})");
+            debug!("[lotus-nest] dbus notify capture → CloseNotification({id})");
             close_host_notification(id).await;
         });
     }
@@ -815,7 +815,7 @@ fn handle_signal(msg: &Message, notif_owner: &mut Option<String>) {
             if name == "org.freedesktop.Notifications" {
                 *notif_owner = if new.is_empty() { None } else { Some(new) };
                 info!(
-                    "[lotus-atrium] dbus notify NameOwnerChanged → {:?}",
+                    "[lotus-nest] dbus notify NameOwnerChanged → {:?}",
                     notif_owner
                 );
             }

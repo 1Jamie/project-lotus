@@ -271,7 +271,7 @@ impl LotusWaylandState {
 
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
         let mut seat_state = SeatState::new();
-        let mut seat = seat_state.new_wl_seat(&display_handle, "lotus-atrium-seat");
+        let mut seat = seat_state.new_wl_seat(&display_handle, "lotus-nest-seat");
 
         let _ = seat.add_keyboard(Default::default(), 200, 25);
         let _ = seat.add_pointer();
@@ -284,7 +284,7 @@ impl LotusWaylandState {
         // 1. Advertise wl_output with zxdg_output_manager_v1
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
         let output = Output::new(
-            "lotus-atrium-0".into(),
+            "lotus-nest-0".into(),
             PhysicalProperties {
                 size: (target_size.0 as i32, target_size.1 as i32).into(),
                 subpixel: Subpixel::HorizontalRgb,
@@ -318,7 +318,7 @@ impl LotusWaylandState {
 
         let refresh_hz = refresh_rate_millihertz as f32 / 1000.0;
         info!(
-            "[lotus-atrium] initialized nested sub-compositor: wl_output ({}x{}@{:.0}Hz) + wp_viewporter + relative_pointer + pointer_constraints + wp_presentation",
+            "[lotus-nest] initialized nested sub-compositor: wl_output ({}x{}@{:.0}Hz) + wp_viewporter + relative_pointer + pointer_constraints + wp_presentation",
             target_size.0, target_size.1, refresh_hz
         );
 
@@ -386,7 +386,7 @@ impl LotusWaylandState {
         );
         self.output.set_preferred(mode);
         info!(
-            "[lotus-atrium] nested wl_output refresh → {:.0}Hz",
+            "[lotus-nest] nested wl_output refresh → {:.0}Hz",
             millihertz as f32 / 1000.0
         );
     }
@@ -1062,7 +1062,7 @@ impl CompositorHandler for LotusWaylandState {
                         pane.active_surface_id.store(surface_id, Ordering::SeqCst);
                     }
                     s2p.insert(surface_id, pane.pane_id.clone());
-                    debug!("[lotus-atrium] dynamically assigned committed surface {} to pane '{}'", surface_id, pane.pane_id);
+                    debug!("[lotus-nest] dynamically assigned committed surface {} to pane '{}'", surface_id, pane.pane_id);
                 }
             }
         }
@@ -1114,7 +1114,7 @@ impl CompositorHandler for LotusWaylandState {
                             let n = DMA_COMMITS.fetch_add(1, Ordering::Relaxed) + 1;
                             if n <= 12 || n % 240 == 0 {
                                 info!(
-                                    "[lotus-atrium] surface {} committed DMA-BUF #{} ({}x{})",
+                                    "[lotus-nest] surface {} committed DMA-BUF #{} ({}x{})",
                                     surface_id,
                                     n,
                                     dmabuf.width(),
@@ -1151,7 +1151,7 @@ impl CompositorHandler for LotusWaylandState {
                         match shm_res {
                             Ok((width, height, stride, bytes)) => {
                                 log::trace!(
-                                    "[lotus-atrium] surface {} committed SHM buffer ({}x{})",
+                                    "[lotus-nest] surface {} committed SHM buffer ({}x{})",
                                     surface_id, width, height
                                 );
                                 let _ = self.event_sender.send(WaylandEvent::ShmFrameCommitted {
@@ -1165,7 +1165,7 @@ impl CompositorHandler for LotusWaylandState {
                             }
                             Err(shm_err) => {
                                 warn!(
-                                    "[lotus-atrium] surface {} buffer could not be imported as DMA-BUF ({:?}) nor SHM ({:?})",
+                                    "[lotus-nest] surface {} buffer could not be imported as DMA-BUF ({:?}) nor SHM ({:?})",
                                     surface_id, dma_err, shm_err
                                 );
                                 false
@@ -1189,7 +1189,7 @@ impl CompositorHandler for LotusWaylandState {
                         .unwrap_or(false)
                 };
                 let wake = if is_primary {
-                    crate::app::atrium_note_primary_game_commit();
+                    crate::app::nest_note_primary_game_commit();
                     // Constraint may have been destroyed without motion — refresh shoes.
                     if let Some(focus) = self.last_pointer_focus.clone() {
                         self.sync_pointer_lock_for_surface(&focus);
@@ -1201,7 +1201,7 @@ impl CompositorHandler for LotusWaylandState {
                     true
                 } else {
                     // Game mode: piggyback on primary commits (VRR); wake only if game stalled.
-                    !crate::app::atrium_game_commit_fresh(std::time::Duration::from_millis(50))
+                    !crate::app::nest_game_commit_fresh(std::time::Duration::from_millis(50))
                 };
                 if wake && !crate::app::NESTED_REDRAW_PENDING.swap(true, Ordering::SeqCst) {
                     if let Some(proxy) = crate::app::EVENT_LOOP_PROXY.get() {
@@ -1274,9 +1274,9 @@ impl XdgShellHandler for LotusWaylandState {
                 }
                 stack.push(surface_id);
 
-                debug!("[lotus-atrium] assigned Wayland toplevel surface {} to pane '{}' (target size: {}x{})", surface_id, p_id, assigned_size.0, assigned_size.1);
+                debug!("[lotus-nest] assigned Wayland toplevel surface {} to pane '{}' (target size: {}x{})", surface_id, p_id, assigned_size.0, assigned_size.1);
             } else {
-                debug!("[lotus-atrium] new XDG toplevel surface {} registered (fallback {}x{})", surface_id, assigned_size.0, assigned_size.1);
+                debug!("[lotus-nest] new XDG toplevel surface {} registered (fallback {}x{})", surface_id, assigned_size.0, assigned_size.1);
             }
         }
 
@@ -1348,7 +1348,7 @@ impl XdgShellHandler for LotusWaylandState {
         for (pane_id, stack) in self.pane_toplevel_stacks.iter_mut() {
             if let Some(pos) = stack.iter().position(|&id| id == surface_id) {
                 stack.remove(pos);
-                debug!("[lotus-atrium] toplevel surface {} destroyed on pane '{}'", surface_id, pane_id);
+                debug!("[lotus-nest] toplevel surface {} destroyed on pane '{}'", surface_id, pane_id);
                 if let Some(&top_id) = stack.last() {
                     pane_to_notify = Some((pane_id.clone(), top_id));
                     if let Some(top) = self.toplevel_surfaces.get(&top_id) {
@@ -1445,7 +1445,7 @@ impl XdgShellHandler for LotusWaylandState {
             let mut s2p = self.surface_to_pane.lock();
             if let Some(pane_id) = s2p.get(&parent_id).cloned() {
                 s2p.insert(surface_id, pane_id.clone());
-                debug!("[lotus-atrium] popup surface {} associated with parent {} on pane '{}'", surface_id, parent_id, pane_id);
+                debug!("[lotus-nest] popup surface {} associated with parent {} on pane '{}'", surface_id, parent_id, pane_id);
             }
         }
 
@@ -1589,7 +1589,7 @@ impl LotusWaylandState {
                 }
                 s2p.insert(surface_id, pane.pane_id.clone());
                 debug!(
-                    "[lotus-atrium] assigned X11 surface {} ({:?}) → primary '{}' at output {}x{}",
+                    "[lotus-nest] assigned X11 surface {} ({:?}) → primary '{}' at output {}x{}",
                     surface_id, title, pane.pane_id, w, h
                 );
             }
@@ -1624,7 +1624,7 @@ impl XWaylandShellHandler for LotusWaylandState {
         window: X11Surface,
     ) {
         debug!(
-            "[lotus-atrium] X11↔wl_surface associated (wl={})",
+            "[lotus-nest] X11↔wl_surface associated (wl={})",
             wl_surface.id().protocol_id()
         );
         self.configure_x11_to_pane(&window);
@@ -1639,11 +1639,11 @@ impl XwmHandler for LotusWaylandState {
     }
 
     fn new_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        debug!("[lotus-atrium] X11 window created: {:?}", window.title());
+        debug!("[lotus-nest] X11 window created: {:?}", window.title());
     }
 
     fn new_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        debug!("[lotus-atrium] X11 override-redirect window: {:?}", window.title());
+        debug!("[lotus-nest] X11 override-redirect window: {:?}", window.title());
     }
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -1651,7 +1651,7 @@ impl XwmHandler for LotusWaylandState {
         let class = window.class();
         let client_pid = window.get_client_pid().ok().or_else(|| window.pid());
         debug!(
-            "[lotus-atrium] mapping X11 window: {:?}, class: {:?}, pid: {:?}",
+            "[lotus-nest] mapping X11 window: {:?}, class: {:?}, pid: {:?}",
             title, class, client_pid
         );
         let _ = window.set_mapped(true);
@@ -1661,7 +1661,7 @@ impl XwmHandler for LotusWaylandState {
 
     fn map_window_notify(&mut self, _xwm: XwmId, window: X11Surface) {
         debug!(
-            "[lotus-atrium] X11 window mapped: {:?} (wl={})",
+            "[lotus-nest] X11 window mapped: {:?} (wl={})",
             window.title(),
             window
                 .wl_surface()
@@ -1673,7 +1673,7 @@ impl XwmHandler for LotusWaylandState {
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
         debug!(
-            "[lotus-atrium] X11 override-redirect mapped: {:?}",
+            "[lotus-nest] X11 override-redirect mapped: {:?}",
             window.title()
         );
         self.configure_x11_to_pane(&window);
@@ -1719,7 +1719,7 @@ impl XwmHandler for LotusWaylandState {
     ) {}
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        debug!("[lotus-atrium] X11 fullscreen_request: {:?}", window.title());
+        debug!("[lotus-nest] X11 fullscreen_request: {:?}", window.title());
         let _ = window.set_fullscreen(true);
         self.configure_x11_to_pane(&window);
     }

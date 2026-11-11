@@ -1,4 +1,4 @@
-//! Embedded nested Wayland sub-compositor for Lotus (lotus-atrium).
+//! Embedded nested Wayland sub-compositor for Lotus (nest).
 
 pub mod dmabuf;
 pub mod server;
@@ -149,7 +149,7 @@ pub struct LotusWaylandServer {
 
 /// Gamescope-style nested render size. Defaults 1920×1080; override with
 /// `ATRIUM_GAME_WIDTH` / `ATRIUM_GAME_HEIGHT`.
-pub fn atrium_game_output_size() -> (u32, u32) {
+pub fn nest_game_output_size() -> (u32, u32) {
     let w = std::env::var("ATRIUM_GAME_WIDTH")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -167,7 +167,7 @@ pub fn atrium_game_output_size() -> (u32, u32) {
 /// ≥1080p reference canvas so a 900p game still gets a hi-res Discord buffer that
 /// the host contain-scales into the smaller dock. Override with
 /// `ATRIUM_OVERLAY_WIDTH` / `ATRIUM_OVERLAY_HEIGHT` when both are set.
-pub fn atrium_overlay_client_size() -> (u32, u32) {
+pub fn nest_overlay_client_size() -> (u32, u32) {
     let env_w = std::env::var("ATRIUM_OVERLAY_WIDTH")
         .ok()
         .and_then(|s| s.parse::<u32>().ok());
@@ -184,7 +184,7 @@ pub fn atrium_overlay_client_size() -> (u32, u32) {
     const MIN_WIDTH: u32 = 280;
     const FRACTION: f32 = 0.38;
 
-    let (game_w, game_h) = atrium_game_output_size();
+    let (game_w, game_h) = nest_game_output_size();
     // Always size against at least a 1080p canvas so 900p games don't shrink Discord.
     let ref_w = game_w.max(1920);
     let ref_h = game_h.max(1080);
@@ -200,7 +200,7 @@ pub fn atrium_overlay_client_size() -> (u32, u32) {
 
 impl Drop for LotusWaylandServer {
     fn drop(&mut self) {
-        info!("[lotus-atrium] tearing down nested Wayland session");
+        info!("[lotus-nest] tearing down nested Wayland session");
         let _ = self.command_sender.send(WaylandCommand::Shutdown);
         if let Some(handle) = self.thread_handle.take() {
             // Xwayland/clients should exit once the socket closes; don't hang forever.
@@ -309,7 +309,7 @@ impl LotusWaylandServer {
         let output_size = (target_width.max(1), target_height.max(1));
         let refresh_rate_millihertz = refresh_rate_millihertz.max(1);
         info!(
-            "[lotus-atrium] nested output (game render size) {}x{} @ {:.0}Hz",
+            "[lotus-nest] nested output (game render size) {}x{} @ {:.0}Hz",
             output_size.0,
             output_size.1,
             refresh_rate_millihertz as f32 / 1000.0
@@ -321,7 +321,7 @@ impl LotusWaylandServer {
             .unwrap_or_default()
             .as_nanos();
         let session_token = format!("{}-{}", std::process::id(), now_ns);
-        let runtime_dir = std::env::temp_dir().join(format!("lotus-atrium-{}", session_token));
+        let runtime_dir = std::env::temp_dir().join(format!("lotus-nest-{}", session_token));
         let _ = std::fs::create_dir_all(&runtime_dir);
 
         #[cfg(unix)]
@@ -362,7 +362,7 @@ impl LotusWaylandServer {
         let surface_to_pane = Arc::new(ParkingMutex::new(std::collections::HashMap::new()));
         let surface_to_pane_thread = surface_to_pane.clone();
 
-        info!("[lotus-atrium] nested Wayland listening on {:?} (WAYLAND_DISPLAY={})", socket_path, socket_name);
+        info!("[lotus-nest] nested Wayland listening on {:?} (WAYLAND_DISPLAY={})", socket_path, socket_name);
 
         let host_window_id = window_id.clone();
         let thread_handle = thread::Builder::new()
@@ -448,7 +448,7 @@ impl LotusWaylandServer {
         loop_handle
             .insert_source(socket_source, move |_event, _fd, state| {
                 if let Ok(Some(stream)) = socket.accept() {
-                    debug!("[lotus-atrium] accepted new client connection");
+                    debug!("[lotus-nest] accepted new client connection");
                     let _ = state.display_handle.insert_client(stream, Arc::new(server::ClientState::default()));
                     let _ = state.event_sender.send(WaylandEvent::ClientConnected);
                 }
@@ -461,7 +461,7 @@ impl LotusWaylandServer {
         // smithay env_clear()s then sets WAYLAND_SOCKET. Do NOT set WAYLAND_DISPLAY=""
         // afterward — an empty value can make Xwayland ignore WAYLAND_SOCKET and attach
         // to the host/gamescope socket under XDG_RUNTIME_DIR (wrong display).
-        let xwayland_log = std::fs::File::create("/tmp/lotus-atrium-xwayland.log")
+        let xwayland_log = std::fs::File::create("/tmp/lotus-nest-xwayland.log")
             .map(|f| {
                 f.try_clone()
                     .map(|err| (Stdio::from(f), Stdio::from(err)))
@@ -486,7 +486,7 @@ impl LotusWaylandServer {
                 if let Err(e) = loop_handle.insert_source(xwayland, move |event, _, state| {
                     match event {
                         XWaylandEvent::Ready { x11_socket, display_number } => {
-                            info!("[lotus-atrium] nested Xwayland ready on DISPLAY=:{}", display_number);
+                            info!("[lotus-nest] nested Xwayland ready on DISPLAY=:{}", display_number);
                             x11_display_ev.store(display_number, Ordering::SeqCst);
                             let _ = event_tx_clone.send(WaylandEvent::XwaylandReady { display_number });
 
@@ -496,28 +496,28 @@ impl LotusWaylandServer {
                                 client_clone.clone(),
                             ) {
                                 Ok(wm) => {
-                                    info!("[lotus-atrium] attached X11 window manager to nested Xwayland");
+                                    info!("[lotus-nest] attached X11 window manager to nested Xwayland");
                                     state.xwm = Some(wm);
                                 }
                                 Err(e) => {
-                                    warn!("[lotus-atrium] failed to attach X11Wm to nested Xwayland: {:?}", e);
+                                    warn!("[lotus-nest] failed to attach X11Wm to nested Xwayland: {:?}", e);
                                 }
                             }
                         }
                         XWaylandEvent::Error => {
-                            warn!("[lotus-atrium] Xwayland exited unexpectedly");
+                            warn!("[lotus-nest] Xwayland exited unexpectedly");
                         }
                     }
                 }) {
-                    warn!("[lotus-atrium] failed to insert Xwayland source into event loop: {:?}", e);
+                    warn!("[lotus-nest] failed to insert Xwayland source into event loop: {:?}", e);
                 }
             }
             Err(e) => {
-                warn!("[lotus-atrium] Xwayland unavailable or failed to launch: {:?}", e);
+                warn!("[lotus-nest] Xwayland unavailable or failed to launch: {:?}", e);
             }
         }
 
-        info!("[lotus-atrium] Wayland event loop running");
+        info!("[lotus-nest] Wayland event loop running");
 
         // Nested clients pace via host present → FrameDone only. A stalled-host
         // watchdog (below) covers gamescope suppressing exposes so Xwayland does
@@ -633,7 +633,7 @@ impl LotusWaylandServer {
                         let pane_id_clone = pane_id.clone();
                         let _ = loop_handle.insert_source(socket_source, move |_event, _fd, state| {
                             if let Ok(Some(stream)) = socket.accept() {
-                                debug!("[lotus-atrium] accepted client on dedicated socket for pane '{}'", pane_id_clone);
+                                debug!("[lotus-nest] accepted client on dedicated socket for pane '{}'", pane_id_clone);
                                 let _ = state.display_handle.insert_client(
                                     stream,
                                     Arc::new(server::ClientState {
@@ -750,7 +750,7 @@ impl LotusWaylandServer {
                         state.set_pane_activated(&pane_id, activated);
                     }
                     WaylandCommand::Shutdown => {
-                        info!("[lotus-atrium] shutting down Wayland event loop");
+                        info!("[lotus-nest] shutting down Wayland event loop");
                         return;
                     }
                     // Motion arms are drained above into coalesced pending.
@@ -776,7 +776,7 @@ impl LotusWaylandServer {
             // Dispatch calloop events with a short timeout to handle commands responsively
             let dispatch_res = event_loop.dispatch(Some(Duration::from_millis(1)), &mut state);
             if let Err(e) = dispatch_res {
-                error!("[lotus-atrium] event loop dispatch error: {:?}", e);
+                error!("[lotus-nest] event loop dispatch error: {:?}", e);
             }
 
             // Stalled-host watchdog only — do NOT ack frames on a free-running 8ms
@@ -823,14 +823,14 @@ impl LotusWaylandServer {
         if !is_primary {
             match ListeningSocket::bind_absolute(socket_path.clone()) {
                 Ok(socket) => {
-                    info!("[lotus-atrium] bound dedicated socket for pane '{}' at {:?}", pane_id, socket_path);
+                    info!("[lotus-nest] bound dedicated socket for pane '{}' at {:?}", pane_id, socket_path);
                     let _ = self.command_sender.send(WaylandCommand::AddPaneListener {
                         pane_id: pane_id.clone(),
                         socket,
                     });
                 }
                 Err(e) => {
-                    warn!("[lotus-atrium] failed to bind dedicated socket for pane '{}' ({:?}), using default", pane_id, e);
+                    warn!("[lotus-nest] failed to bind dedicated socket for pane '{}' ({:?}), using default", pane_id, e);
                 }
             }
         }
@@ -840,17 +840,17 @@ impl LotusWaylandServer {
         let effective_size = if is_primary {
             self.output_size
         } else {
-            let overlay = atrium_overlay_client_size();
+            let overlay = nest_overlay_client_size();
             if target_size != overlay {
                 info!(
-                    "[lotus-atrium] overlay '{}' ignoring dock hint {}x{}; client stays {}x{}",
+                    "[lotus-nest] overlay '{}' ignoring dock hint {}x{}; client stays {}x{}",
                     pane_id, target_size.0, target_size.1, overlay.0, overlay.1
                 );
             }
             overlay
         };
         info!(
-            "[lotus-atrium] register pane '{}' primary={} client_size={}x{} (pane hint was {}x{})",
+            "[lotus-nest] register pane '{}' primary={} client_size={}x{} (pane hint was {}x{})",
             pane_id, is_primary, effective_size.0, effective_size.1, target_size.0, target_size.1
         );
 
@@ -872,7 +872,7 @@ impl LotusWaylandServer {
 
     pub fn send_resize_pane(&self, pane_id: &str, _width: u32, _height: u32) {
         // Nested clients keep a fixed client size (game: output_size, overlays:
-        // atrium_overlay_client_size). Dock/pane layout changes are composite-only —
+        // nest_overlay_client_size). Dock/pane layout changes are composite-only —
         // never push xdg configures from lotus layout ticks (squashes Discord/Electron).
         let _ = pane_id;
     }
@@ -1022,23 +1022,23 @@ impl LotusWaylandServer {
                     latest_shms.insert(surface_id, (width, height, stride, data));
                 }
                 WaylandEvent::XwaylandReady { display_number } => {
-                    debug!("[lotus-atrium] host notified Xwayland DISPLAY=:{}", display_number);
+                    debug!("[lotus-nest] host notified Xwayland DISPLAY=:{}", display_number);
                 }
                 WaylandEvent::ClientConnected => {
-                    debug!("[lotus-atrium] client connected to nested sub-compositor");
+                    debug!("[lotus-nest] client connected to nested sub-compositor");
                 }
                 WaylandEvent::ClientDisconnected => {
-                    debug!("[lotus-atrium] client disconnected from nested sub-compositor");
+                    debug!("[lotus-nest] client disconnected from nested sub-compositor");
                 }
                 WaylandEvent::SurfaceConfigured { .. } => {}
                 WaylandEvent::WindowCreated { pane_id, surface_id, title, app_id: _, role, width, height } => {
-                    debug!("[lotus-atrium] window created on pane '{}': id={}, role={}, title={:?}, {}x{}", pane_id, surface_id, role, title, width, height);
+                    debug!("[lotus-nest] window created on pane '{}': id={}, role={}, title={:?}, {}x{}", pane_id, surface_id, role, title, width, height);
                 }
                 WaylandEvent::WindowUpdated { pane_id, surface_id, title, app_id: _, width: _, height: _ } => {
-                    debug!("[lotus-atrium] window updated on pane '{}': id={}, title={:?}", pane_id, surface_id, title);
+                    debug!("[lotus-nest] window updated on pane '{}': id={}, title={:?}", pane_id, surface_id, title);
                 }
                 WaylandEvent::WindowClosed { pane_id, surface_id } => {
-                    debug!("[lotus-atrium] window closed on pane '{}': id={}", pane_id, surface_id);
+                    debug!("[lotus-nest] window closed on pane '{}': id={}", pane_id, surface_id);
                     self.on_primary_surface_closed(&pane_id, surface_id);
                 }
                 WaylandEvent::CursorChanged(_) => {
@@ -1124,7 +1124,7 @@ impl LotusWaylandServer {
                     }
                 }
                 Err(e) => {
-                    error!("[lotus-atrium] failed to import DMA-BUF for surface {}: {}", surface_id, e);
+                    error!("[lotus-nest] failed to import DMA-BUF for surface {}: {}", surface_id, e);
                     self.release_previous_buffer();
                 }
             }
@@ -1304,7 +1304,7 @@ impl LotusWaylandServer {
             let mut empty = self.primary_empty_since.lock();
             if empty.is_none() {
                 info!(
-                    "[lotus-atrium] primary game window gone (active={}, remaining={}) — arming exit debounce",
+                    "[lotus-nest] primary game window gone (active={}, remaining={}) — arming exit debounce",
                     was_active, remaining
                 );
                 *empty = Some(std::time::Instant::now());
@@ -1341,7 +1341,7 @@ impl LotusWaylandServer {
             return;
         }
         info!(
-            "[lotus-atrium] primary game gone — closing atrium window '{}'",
+            "[lotus-nest] primary game gone — closing atrium window '{}'",
             self.window_id
         );
         if let Some(proxy) = crate::app::EVENT_LOOP_PROXY.get() {
@@ -1417,7 +1417,7 @@ fn warm_smithay_shm_drop_thread() {
     use std::os::fd::OwnedFd;
 
     let path = std::env::temp_dir().join(format!(
-        "lotus-atrium-shm-warm-{}",
+        "lotus-nest-shm-warm-{}",
         std::process::id()
     ));
     let mut file = match std::fs::OpenOptions::new()
@@ -1429,7 +1429,7 @@ fn warm_smithay_shm_drop_thread() {
     {
         Ok(f) => f,
         Err(e) => {
-            warn!("[lotus-atrium] shm warm: open failed: {e}");
+            warn!("[lotus-nest] shm warm: open failed: {e}");
             return;
         }
     };
@@ -1440,10 +1440,10 @@ fn warm_smithay_shm_drop_thread() {
     match smithay::wayland::shm::pool::Pool::new(fd, size) {
         Ok(pool) => {
             drop(pool);
-            info!("[lotus-atrium] warmed smithay SHM drop thread before nesting clients");
+            info!("[lotus-nest] warmed smithay SHM drop thread before nesting clients");
         }
         Err(_) => {
-            warn!("[lotus-atrium] shm warm: Pool::new failed");
+            warn!("[lotus-nest] shm warm: Pool::new failed");
         }
     }
 }

@@ -486,7 +486,7 @@ fn winit_mouse_button_evdev(button: winit::event::MouseButton) -> u32 {
 
 /// Kill nested Proton/Discord children, then tear down the nested compositor.
 #[cfg(target_os = "linux")]
-fn atrium_teardown_window(instance: &mut WindowInstance) {
+fn nest_teardown_window(instance: &mut WindowInstance) {
     // Children first while the nested display is still alive.
     for pane in instance.panes.values_mut() {
         if let Some(pid) = pane.external_child_pid.take() {
@@ -496,11 +496,11 @@ fn atrium_teardown_window(instance: &mut WindowInstance) {
         pane.external_surface_slot = None;
     }
     if instance.nested_compositor.take().is_some() {
-        info!("[lotus-atrium] nested compositor dropped");
+        info!("[lotus-nest] nested compositor dropped");
     }
 }
 
-fn atrium_set_pane_visible(instance: &mut WindowInstance, pane_id: &str, visible: bool) {
+fn nest_set_pane_visible(instance: &mut WindowInstance, pane_id: &str, visible: bool) {
     instance.layout_root.set_leaf_visible(pane_id, visible);
     #[cfg(target_os = "linux")]
     crate::dbus_notify::set_source_pane_visible(pane_id, visible);
@@ -544,7 +544,7 @@ fn atrium_set_pane_visible(instance: &mut WindowInstance, pane_id: &str, visible
 
 /// Physical rect for pointer hit-testing; matches staged compositor placement in atrium.
 #[cfg(target_os = "linux")]
-fn atrium_pane_hit_rect(
+fn nest_pane_hit_rect(
     instance: &WindowInstance,
     pane: &PaneInstance,
     scale_factor: f32,
@@ -587,7 +587,7 @@ fn hit_test_pointer_pane<'a>(
         if !pane_accepts_pointer_input(pane) {
             continue;
         }
-        let (px, py, pw, ph) = atrium_pane_hit_rect(instance, pane, scale_factor);
+        let (px, py, pw, ph) = nest_pane_hit_rect(instance, pane, scale_factor);
         let rect = euclid::Rect::new(
             euclid::Point2D::new(px, py),
             euclid::Size2D::new(pw, ph),
@@ -600,13 +600,13 @@ fn hit_test_pointer_pane<'a>(
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_is_primary_game(instance: &WindowInstance, pane_id: &str) -> bool {
+fn nest_is_primary_game(instance: &WindowInstance, pane_id: &str) -> bool {
     instance.primary_game_pane.as_deref() == Some(pane_id)
 }
 
 /// Sticky keyboard/click focus for overlay surfaces. Does not follow the mouse.
 #[cfg(target_os = "linux")]
-fn atrium_set_keyboard_focus(instance: &mut WindowInstance, pane_id: &str) {
+fn nest_set_keyboard_focus(instance: &mut WindowInstance, pane_id: &str) {
     instance.active_pane_id = pane_id.to_string();
     if let Some(pane) = instance.panes.get(pane_id) {
         if let Some(ref ws) = pane.external_wayland_server {
@@ -620,7 +620,7 @@ fn atrium_set_keyboard_focus(instance: &mut WindowInstance, pane_id: &str) {
 /// Game cursor/lock "shoes" keep updating while overlay is up — switching modes only
 /// puts those shoes on/off the host. Overlay never wipes game state.
 #[cfg(target_os = "linux")]
-fn atrium_apply_game_mode(
+fn nest_apply_game_mode(
     instance: &mut WindowInstance,
     mode: bool,
     event_loop: Option<&ActiveEventLoop>,
@@ -673,7 +673,7 @@ fn atrium_apply_game_mode(
             {
                 instance.active_pane_id.clear();
             }
-            atrium_set_keyboard_focus(instance, gid);
+            nest_set_keyboard_focus(instance, gid);
             if let Some(ref ws) = instance.nested_compositor {
                 // Re-seat pointer on the game so constraints/cursor keep flowing.
                 ws.lock().focus_pane(gid);
@@ -684,7 +684,7 @@ fn atrium_apply_game_mode(
             crate::dbus_notify::set_source_pane_visible(id, false);
         }
         // Put the game's shoes back on the host.
-        atrium_wear_game_pointer_shoes(instance, event_loop);
+        nest_wear_game_pointer_shoes(instance, event_loop);
     } else {
         let game_id = instance.primary_game_pane.clone();
         let overlay_ids: Vec<String> = instance
@@ -696,7 +696,7 @@ fn atrium_apply_game_mode(
             })
             .map(|(id, _)| id.clone())
             .collect();
-        if atrium_is_primary_game(instance, &instance.active_pane_id) {
+        if nest_is_primary_game(instance, &instance.active_pane_id) {
             instance.active_pane_id.clear();
         }
         // Leave the game surface so it stops highlighting under the overlay cursor.
@@ -715,8 +715,8 @@ fn atrium_apply_game_mode(
             }
         }
         // Take host shoes off for Discord/HUD — game_* state stays as-is.
-        atrium_release_host_pointer_grab(instance);
-        atrium_clear_nested_cursor(instance);
+        nest_release_host_pointer_grab(instance);
+        nest_clear_nested_cursor(instance);
         instance.window.set_cursor_visible(true);
         instance.window.set_cursor(CursorIcon::Default);
         // Kick a present so any pending Discord wl_callbacks are released.
@@ -728,34 +728,34 @@ fn atrium_apply_game_mode(
             let scale = instance.window.scale_factor() as f32;
             let point = instance.last_mouse_pos;
             let wid = instance.window_id.clone();
-            atrium_route_cursor_moved(instance, el, &wid, point, scale);
+            nest_route_cursor_moved(instance, el, &wid, point, scale);
         }
     }
 }
 
 /// Host grab only in game mode, driven by the game's sticky shoes.
 #[cfg(target_os = "linux")]
-fn atrium_want_host_pointer_grab(instance: &WindowInstance) -> bool {
+fn nest_want_host_pointer_grab(instance: &WindowInstance) -> bool {
     instance.game_mode
         && instance.nested_compositor.is_some()
         && (instance.game_pointer_constraint_active || instance.game_cursor_hidden)
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_release_host_pointer_grab(instance: &mut WindowInstance) {
+fn nest_release_host_pointer_grab(instance: &mut WindowInstance) {
     use winit::window::CursorGrabMode;
     if instance.host_pointer_grabbed {
         let _ = instance.window.set_cursor_grab(CursorGrabMode::None);
         instance.host_pointer_grabbed = false;
-        info!("[lotus-atrium] host pointer grab off (overlay / unlocked)");
+        info!("[lotus-nest] host pointer grab off (overlay / unlocked)");
     }
 }
 
 /// Match host CursorGrab to game shoes while in game mode.
 #[cfg(target_os = "linux")]
-fn atrium_sync_pointer_grab(instance: &mut WindowInstance) {
+fn nest_sync_pointer_grab(instance: &mut WindowInstance) {
     use winit::window::CursorGrabMode;
-    let want = atrium_want_host_pointer_grab(instance);
+    let want = nest_want_host_pointer_grab(instance);
     if want == instance.host_pointer_grabbed {
         if want {
             instance.window.set_cursor_visible(false);
@@ -772,60 +772,60 @@ fn atrium_sync_pointer_grab(instance: &mut WindowInstance) {
                 instance.window.set_cursor_visible(false);
                 instance.host_pointer_grabbed = true;
                 info!(
-                    "[lotus-atrium] host pointer grab on (constraint={} cursor_hidden={})",
+                    "[lotus-nest] host pointer grab on (constraint={} cursor_hidden={})",
                     instance.game_pointer_constraint_active, instance.game_cursor_hidden
                 );
             }
             Err(err) => {
                 warn!(
-                    "[lotus-atrium] host pointer grab failed (relative aim may be soft): {:?}",
+                    "[lotus-nest] host pointer grab failed (relative aim may be soft): {:?}",
                     err
                 );
                 instance.host_pointer_grabbed = false;
             }
         }
     } else {
-        atrium_release_host_pointer_grab(instance);
+        nest_release_host_pointer_grab(instance);
     }
 }
 
 /// Record primary-game cursor into sticky shoes (never touches overlay Discord state).
 #[cfg(target_os = "linux")]
-fn atrium_record_game_cursor(instance: &mut WindowInstance, cursor: &crate::wayland::NestedCursor) {
+fn nest_record_game_cursor(instance: &mut WindowInstance, cursor: &crate::wayland::NestedCursor) {
     instance.game_cursor = Some(cursor.clone());
     instance.game_cursor_hidden = matches!(cursor, crate::wayland::NestedCursor::Hidden);
 }
 
 /// Apply the game's sticky shoes to the host (grab + cursor visual).
 #[cfg(target_os = "linux")]
-fn atrium_wear_game_pointer_shoes(
+fn nest_wear_game_pointer_shoes(
     instance: &mut WindowInstance,
     event_loop: Option<&ActiveEventLoop>,
 ) {
-    atrium_sync_pointer_grab(instance);
+    nest_sync_pointer_grab(instance);
     if instance.host_pointer_grabbed {
         instance.window.set_cursor_visible(false);
         instance.nested_cursor_applied = true;
         return;
     }
     if let (Some(el), Some(cursor)) = (event_loop, instance.game_cursor.clone()) {
-        atrium_paint_host_cursor(instance, el, &cursor);
+        nest_paint_host_cursor(instance, el, &cursor);
     } else if instance.game_cursor_hidden {
         instance.window.set_cursor_visible(false);
         instance.nested_cursor_applied = true;
     } else {
-        atrium_clear_nested_cursor(instance);
+        nest_clear_nested_cursor(instance);
     }
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_pointer_coords(
+fn nest_pointer_coords(
     instance: &WindowInstance,
     pane: &PaneInstance,
     point: Point2D<f32, servo::DevicePixel>,
     scale_factor: f32,
 ) -> (f64, f64) {
-    let (px, py, pw, ph) = atrium_pane_hit_rect(instance, pane, scale_factor);
+    let (px, py, pw, ph) = nest_pane_hit_rect(instance, pane, scale_factor);
     let lx = (point.x - px) as f64;
     let ly = (point.y - py) as f64;
     // Map host pane pixels → client buffer using the same contain-fit as composite.
@@ -853,12 +853,12 @@ fn atrium_pointer_coords(
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_in_overlay_input_mode(instance: &WindowInstance) -> bool {
+fn nest_in_overlay_input_mode(instance: &WindowInstance) -> bool {
     instance.nested_compositor.is_some() && !instance.game_mode
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_named_cursor_icon(name: &str) -> CursorIcon {
+fn nest_named_cursor_icon(name: &str) -> CursorIcon {
     name.parse::<CursorIcon>().unwrap_or_else(|_| match name {
         "dnd-ask" => CursorIcon::Copy,
         "all-resize" => CursorIcon::Move,
@@ -878,7 +878,7 @@ fn atrium_named_cursor_icon(name: &str) -> CursorIcon {
 
 /// Paint a nested cursor onto the host window (visual only — no game-shoe updates).
 #[cfg(target_os = "linux")]
-fn atrium_paint_host_cursor(
+fn nest_paint_host_cursor(
     instance: &mut WindowInstance,
     event_loop: &ActiveEventLoop,
     cursor: &crate::wayland::NestedCursor,
@@ -892,7 +892,7 @@ fn atrium_paint_host_cursor(
         }
         crate::wayland::NestedCursor::Named(name) => {
             instance.window.set_cursor_visible(true);
-            instance.window.set_cursor(atrium_named_cursor_icon(name));
+            instance.window.set_cursor(nest_named_cursor_icon(name));
             instance.nested_cursor_applied = true;
         }
         crate::wayland::NestedCursor::Custom {
@@ -916,7 +916,7 @@ fn atrium_paint_host_cursor(
                     instance.nested_cursor_applied = true;
                 }
                 Err(err) => {
-                    warn!("[lotus-atrium] nested custom cursor rejected: {:?}", err);
+                    warn!("[lotus-nest] nested custom cursor rejected: {:?}", err);
                     instance.window.set_cursor_visible(true);
                     instance.window.set_cursor(CursorIcon::Default);
                     instance.nested_cursor_applied = true;
@@ -927,7 +927,7 @@ fn atrium_paint_host_cursor(
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_clear_nested_cursor(instance: &mut WindowInstance) {
+fn nest_clear_nested_cursor(instance: &mut WindowInstance) {
     if instance.nested_cursor_applied {
         instance.window.set_cursor_visible(true);
         instance.window.set_cursor(CursorIcon::Default);
@@ -937,7 +937,7 @@ fn atrium_clear_nested_cursor(instance: &mut WindowInstance) {
 
 /// Re-apply the last nested host visual when the pointer is over an external pane.
 #[cfg(target_os = "linux")]
-fn atrium_sync_nested_cursor_for_hover(
+fn nest_sync_nested_cursor_for_hover(
     instance: &mut WindowInstance,
     event_loop: Option<&ActiveEventLoop>,
     over_external: bool,
@@ -947,17 +947,17 @@ fn atrium_sync_nested_cursor_for_hover(
             return;
         }
         if let (Some(el), Some(cursor)) = (event_loop, instance.nested_cursor.clone()) {
-            atrium_paint_host_cursor(instance, el, &cursor);
+            nest_paint_host_cursor(instance, el, &cursor);
         }
     } else {
-        atrium_clear_nested_cursor(instance);
+        nest_clear_nested_cursor(instance);
     }
 }
 
 /// Route cursor movement in atrium HUD/overlay mode (z-ordered hit test).
 /// Updates hover + pointer only — never steals sticky keyboard focus (`active_pane_id`).
 #[cfg(target_os = "linux")]
-fn atrium_route_cursor_moved(
+fn nest_route_cursor_moved(
     instance: &mut WindowInstance,
     event_loop: &ActiveEventLoop,
     uuid: &str,
@@ -968,7 +968,7 @@ fn atrium_route_cursor_moved(
         hit_test_pointer_pane(instance, point, scale_factor, true).map(|p| p.id.clone())
     else {
         instance.hover_pane_id = None;
-        atrium_clear_nested_cursor(instance);
+        nest_clear_nested_cursor(instance);
         // Not over Discord — reseat pointer on the game so lock/cursor shoes keep flowing.
         if let Some(ref gid) = instance.primary_game_pane {
             if let Some(ref ws) = instance.nested_compositor {
@@ -984,18 +984,18 @@ fn atrium_route_cursor_moved(
             return None;
         }
         let ws = pane.external_wayland_server.clone()?;
-        let (tx, ty) = atrium_pointer_coords(instance, pane, point, scale_factor);
+        let (tx, ty) = nest_pointer_coords(instance, pane, point, scale_factor);
         Some((ws, tx, ty))
     });
     if let Some((ws, tx, ty)) = external_motion {
         ws.lock().send_pointer_motion_to_pane(&hover_id, tx, ty);
         if !hovering_primary {
-            atrium_sync_nested_cursor_for_hover(instance, Some(event_loop), true);
+            nest_sync_nested_cursor_for_hover(instance, Some(event_loop), true);
         }
         return;
     }
     // Left nested overlay surface → Servo/HUD owns the cursor; reseat game for shoes.
-    atrium_clear_nested_cursor(instance);
+    nest_clear_nested_cursor(instance);
     if let Some(ref gid) = instance.primary_game_pane {
         if let Some(ref ws) = instance.nested_compositor {
             ws.lock().focus_pane(gid);
@@ -1003,7 +1003,7 @@ fn atrium_route_cursor_moved(
     }
     let (px, py, pw, ph, is_external, wayland, translated) =
         if let Some(pane) = instance.panes.get(&hover_id) {
-            let (px, py, pw, ph) = atrium_pane_hit_rect(instance, pane, scale_factor);
+            let (px, py, pw, ph) = nest_pane_hit_rect(instance, pane, scale_factor);
             let mut translated = Point2D::new(point.x - px, point.y - py);
             let is_external = pane.external_wayland_server.is_some();
             let wayland = pane.external_wayland_server.clone();
@@ -1047,7 +1047,7 @@ fn atrium_route_cursor_moved(
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_resolve_button_target(
+fn nest_resolve_button_target(
     instance: &WindowInstance,
     is_pressed: bool,
     scale_factor: f32,
@@ -1061,28 +1061,28 @@ fn atrium_resolve_button_target(
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_route_mouse_button(
+fn nest_route_mouse_button(
     instance: &mut WindowInstance,
     uuid: &str,
     button: winit::event::MouseButton,
     is_pressed: bool,
     scale_factor: f32,
 ) {
-    let Some(target_id) = atrium_resolve_button_target(instance, is_pressed, scale_factor) else {
+    let Some(target_id) = nest_resolve_button_target(instance, is_pressed, scale_factor) else {
         return;
     };
     if is_pressed {
         instance.last_mouse_down_pane_id = Some(target_id.clone());
         // Click-to-focus: sticky until the next overlay click (or return to game mode).
-        atrium_set_keyboard_focus(instance, &target_id);
+        nest_set_keyboard_focus(instance, &target_id);
     } else {
         instance.last_mouse_down_pane_id = None;
     }
     let pointer_plan = instance.panes.get(&target_id).map(|pane| {
-        let (px, py, pw, ph) = atrium_pane_hit_rect(instance, pane, scale_factor);
+        let (px, py, pw, ph) = nest_pane_hit_rect(instance, pane, scale_factor);
         let translated = Point2D::new(instance.last_mouse_pos.x - px, instance.last_mouse_pos.y - py);
         let evdev = winit_mouse_button_evdev(button);
-        let (wx, wy) = atrium_pointer_coords(instance, pane, instance.last_mouse_pos, scale_factor);
+        let (wx, wy) = nest_pointer_coords(instance, pane, instance.last_mouse_pos, scale_factor);
         (
             pane.external_wayland_server.clone(),
             pane.is_remote,
@@ -1335,12 +1335,12 @@ fn x11_root_size(display: &str) -> Option<(u32, u32)> {
 /// eglSwapInterval on the current EGL display.
 /// Gamescope fifo present deadlocks with interval=1 — use 0 there and phase-align in software.
 #[cfg(target_os = "linux")]
-pub(crate) fn atrium_set_egl_swap_interval_pub(interval: i32) {
-    atrium_set_egl_swap_interval(interval);
+pub(crate) fn nest_set_egl_swap_interval_pub(interval: i32) {
+    nest_set_egl_swap_interval(interval);
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_set_egl_swap_interval(interval: i32) {
+fn nest_set_egl_swap_interval(interval: i32) {
     use std::os::raw::{c_int, c_void};
     unsafe extern "C" {
         fn eglGetCurrentDisplay() -> *mut c_void;
@@ -1349,27 +1349,27 @@ fn atrium_set_egl_swap_interval(interval: i32) {
     unsafe {
         let dpy = eglGetCurrentDisplay();
         if dpy.is_null() {
-            atrium_host_diag("eglSwapInterval: no current EGL display");
+            nest_host_diag("eglSwapInterval: no current EGL display");
             return;
         }
         let ok = eglSwapInterval(dpy, interval as c_int);
         if std::env::var_os("ATRIUM_PACING_DIAG").is_some() {
-            atrium_host_diag(&format!("eglSwapInterval({interval}) ok={ok}"));
+            nest_host_diag(&format!("eglSwapInterval({interval}) ok={ok}"));
         }
     }
 }
 
 /// Append a line to the atrium host log (always on — not gated by RUST_LOG).
 #[cfg(target_os = "linux")]
-pub(crate) fn atrium_host_diag_pub(msg: &str) {
-    atrium_host_diag(msg);
+pub(crate) fn nest_host_diag_pub(msg: &str) {
+    nest_host_diag(msg);
 }
 
 #[cfg(target_os = "linux")]
-fn atrium_host_diag(msg: &str) {
+fn nest_host_diag(msg: &str) {
     use std::io::Write;
     let line = format!(
-        "[lotus-atrium] {}\n",
+        "[lotus-nest] {}\n",
         msg
     );
     // Mirror to tracing + durable log Steam/Game Mode can collect.
@@ -1377,7 +1377,7 @@ fn atrium_host_diag(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/lotus-atrium-host.log")
+        .open("/tmp/lotus-nest-host.log")
     {
         let _ = f.write_all(line.as_bytes());
     }
@@ -1433,11 +1433,11 @@ fn run_xprop(args: &[&str]) -> bool {
     match std::process::Command::new("xprop").args(args).status() {
         Ok(st) if st.success() => true,
         Ok(st) => {
-            warn!("[lotus-atrium] xprop {:?} exited {}", args, st);
+            warn!("[lotus-nest] xprop {:?} exited {}", args, st);
             false
         }
         Err(e) => {
-            warn!("[lotus-atrium] xprop {:?} failed: {}", args, e);
+            warn!("[lotus-nest] xprop {:?} failed: {}", args, e);
             false
         }
     }
@@ -1453,7 +1453,7 @@ fn tag_window_for_gamescope(window: &winit::window::Window) {
     }
     let Some(xid) = x11_window_xid(window) else {
         warn!(
-            "[lotus-atrium] Game Mode: host window is not X11 — cannot set STEAM_GAME \
+            "[lotus-nest] Game Mode: host window is not X11 — cannot set STEAM_GAME \
              (WINIT_UNIX_BACKEND=x11 required; bin/atrium sets this)"
         );
         return;
@@ -1559,7 +1559,7 @@ fn tag_window_for_gamescope(window: &winit::window::Window) {
 
     if steam_ok {
         info!(
-            "[lotus-atrium] Game Mode: STEAM_GAME={} on {} (display {}), baselayer focus={}",
+            "[lotus-nest] Game Mode: STEAM_GAME={} on {} (display {}), baselayer focus={}",
             app_id, id_arg, display, focus_ok
         );
     }
@@ -1632,7 +1632,7 @@ pub(crate) static NESTED_REDRAW_GEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static NESTED_LAST_PRIMARY_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
-fn atrium_monotonic_ns() -> u64 {
+fn nest_monotonic_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -1640,33 +1640,33 @@ fn atrium_monotonic_ns() -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn atrium_note_primary_game_commit() {
-    NESTED_LAST_PRIMARY_COMMIT_NS.store(atrium_monotonic_ns(), Ordering::SeqCst);
+pub(crate) fn nest_note_primary_game_commit() {
+    NESTED_LAST_PRIMARY_COMMIT_NS.store(nest_monotonic_ns(), Ordering::SeqCst);
 }
 
 /// True while the primary game is actively committing (VRR passthrough window).
 #[cfg(target_os = "linux")]
-pub(crate) fn atrium_game_commit_fresh(max_age: Duration) -> bool {
+pub(crate) fn nest_game_commit_fresh(max_age: Duration) -> bool {
     let last = NESTED_LAST_PRIMARY_COMMIT_NS.load(Ordering::SeqCst);
     if last == 0 {
         return false;
     }
-    atrium_monotonic_ns().saturating_sub(last) < max_age.as_nanos() as u64
+    nest_monotonic_ns().saturating_sub(last) < max_age.as_nanos() as u64
 }
 
 /// Game-driven present: composite+swap on primary commits; overlays piggyback.
 /// Independent host timers must NOT run in this window (they spoil VRR).
 #[cfg(target_os = "linux")]
-pub(crate) fn atrium_game_driven_present(instance: &WindowInstance) -> bool {
+pub(crate) fn nest_game_driven_present(instance: &WindowInstance) -> bool {
     instance.game_mode
         && instance.nested_compositor.is_some()
-        && atrium_game_commit_fresh(Duration::from_millis(50))
+        && nest_game_commit_fresh(Duration::from_millis(50))
 }
 
 /// After present: allow the next commit wake; if a newer buffer arrived mid-frame,
 /// queue one immediate follow-up (game-driven coalesce, not a refresh timer).
 #[cfg(target_os = "linux")]
-fn atrium_finish_nested_redraw(instance: &WindowInstance, gen_at_start: u64) {
+fn nest_finish_nested_redraw(instance: &WindowInstance, gen_at_start: u64) {
     let newer = NESTED_REDRAW_GEN.load(Ordering::SeqCst) != gen_at_start;
     NESTED_REDRAW_PENDING.store(false, Ordering::SeqCst);
     if !newer {
@@ -1689,14 +1689,14 @@ fn start_gamescope_present_cadence(window_id: String, refresh_mhz: u32) {
     let _ = std::thread::Builder::new()
         .name("atrium-gs-cadence".into())
         .spawn(move || {
-            atrium_host_diag(&format!(
+            nest_host_diag(&format!(
                 "gamescope present cadence thread start period={}ms window={}",
                 period_ms, window_id
             ));
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(period_ms));
                 // Stall backup only — never kick while the game is driving presents (VRR).
-                if atrium_game_commit_fresh(std::time::Duration::from_millis(50)) {
+                if nest_game_commit_fresh(std::time::Duration::from_millis(50)) {
                     continue;
                 }
                 // One in-flight kick only — send_event already wakes the X11 loop.
@@ -1746,7 +1746,7 @@ fn sanitize_nested_gamescope_env(cmd: &mut std::process::Command, restore_steam_
             Ok(saved) if !saved.is_empty() => {
                 cmd.env("LD_PRELOAD", &saved);
                 info!(
-                    "[lotus-atrium] restored ATRIUM_SAVED_LD_PRELOAD for game child (len={})",
+                    "[lotus-nest] restored ATRIUM_SAVED_LD_PRELOAD for game child (len={})",
                     saved.len()
                 );
             }
@@ -1941,7 +1941,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             pace_refresh_mhz = mhz;
 
             #[cfg(target_os = "linux")]
-            let game_driven = atrium_game_driven_present(window);
+            let game_driven = nest_game_driven_present(window);
             #[cfg(not(target_os = "linux"))]
             let game_driven = false;
 
@@ -2127,7 +2127,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 if gamescope_host {
                     tag_window_for_gamescope(&window);
                     window.set_visible(true);
-                    atrium_host_diag(
+                    nest_host_diag(
                         "gamescope: STEAM_GAME tagged then mapped before EGL surface",
                     );
                 }
@@ -2151,7 +2151,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 // Surfman Connection::from_display_handle(winit) — same X11 Display*
                 // as winit so Mesa DRI3 PRESENT IDLE/COMPLETE events are pumped.
                 #[cfg(target_os = "linux")]
-                atrium_host_diag(
+                nest_host_diag(
                     "host EGL via WindowRenderingContext::from_display_handle (shared winit Display)",
                 );
 
@@ -2197,7 +2197,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 // still runs. Interval 0 returns as soon as the swap is queued.
                 #[cfg(target_os = "linux")]
                 if gamescope_host {
-                    atrium_set_egl_swap_interval(0);
+                    nest_set_egl_swap_interval(0);
                 }
 
                 let gl = rendering_context.glow_gl_api();
@@ -2692,7 +2692,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 self.winit_id_to_uuid.retain(|_, v| v != &window_id);
                 if let Some(mut instance) = self.windows.remove(&window_id) {
                     #[cfg(target_os = "linux")]
-                    atrium_teardown_window(&mut instance);
+                    nest_teardown_window(&mut instance);
                 }
                 // Clean up per-window metadata so long-running apps don't leak.
                 if let Some(state) = APP_STATE.get() {
@@ -2757,8 +2757,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     let _ = instance.window.request_inner_size(size);
                                     instance.rendering_context.resize(size);
                                     let _ = instance.rendering_context.make_current();
-                                    atrium_set_egl_swap_interval(0);
-                                    atrium_host_diag(&format!(
+                                    nest_set_egl_swap_interval(0);
+                                    nest_host_diag(&format!(
                                         "gamescope show: resized bound surface to root {}x{}",
                                         rw, rh
                                     ));
@@ -2876,13 +2876,13 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     if from_primary {
                         // Always keep game shoes up to date — even while overlay is up.
-                        atrium_record_game_cursor(instance, &cursor);
+                        nest_record_game_cursor(instance, &cursor);
                         if instance.game_mode {
-                            atrium_wear_game_pointer_shoes(instance, Some(event_loop));
+                            nest_wear_game_pointer_shoes(instance, Some(event_loop));
                         }
                     } else if !instance.game_mode {
                         // Discord/overlay visual only — never clobber game shoes.
-                        atrium_paint_host_cursor(instance, event_loop, &cursor);
+                        nest_paint_host_cursor(instance, event_loop, &cursor);
                     }
                 }
             }
@@ -2892,7 +2892,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     // Sticky game shoe — survives overlay; host grab only in game mode.
                     instance.game_pointer_constraint_active = active;
                     if instance.game_mode {
-                        atrium_wear_game_pointer_shoes(instance, Some(event_loop));
+                        nest_wear_game_pointer_shoes(instance, Some(event_loop));
                     }
                 }
             }
@@ -3206,7 +3206,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     let is_primary = instance.primary_game_pane.is_none();
                     if is_primary {
                         instance.primary_game_pane = Some(pane_id.clone());
-                        info!("[lotus-atrium] designated primary base game pane: '{}'", pane_id);
+                        info!("[lotus-nest] designated primary base game pane: '{}'", pane_id);
                     }
 
                     // Host-bus Notify → atrium toast (Discord etc.). Primary game skips.
@@ -3235,7 +3235,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     } else {
                         // Fixed nested output size (game render res), independent of pane layout —
                         // same idea as gamescope -W/-H. Buffer is letterboxed into the pane.
-                        let (out_w, out_h) = crate::wayland::atrium_game_output_size();
+                        let (out_w, out_h) = crate::wayland::nest_game_output_size();
                         let refresh_mhz = instance.refresh_rate_millihertz.max(1);
                         match crate::wayland::LotusWaylandServer::start(
                             window_id.clone(),
@@ -3254,7 +3254,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 arc
                             }
                             Err(e) => {
-                                error!("[lotus-atrium] failed to start nested Wayland server: {}", e);
+                                error!("[lotus-nest] failed to start nested Wayland server: {}", e);
                                 return;
                             }
                         }
@@ -3266,7 +3266,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     let client_hint = if is_primary {
                         (width, height)
                     } else {
-                        crate::wayland::atrium_overlay_client_size()
+                        crate::wayland::nest_overlay_client_size()
                     };
                     let pane_socket_name = wayland_server.lock().register_pane(
                         pane_id.clone(),
@@ -3337,7 +3337,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             }
                         }
 
-                        let log_path = format!("/tmp/lotus-atrium-child-{}.log", pane_id);
+                        let log_path = format!("/tmp/lotus-nest-child-{}.log", pane_id);
                         if let Ok(file) = std::fs::File::create(&log_path) {
                             if let Ok(err_file) = file.try_clone() {
                                 cmd.stdout(file);
@@ -3367,14 +3367,14 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             let _ = std::fs::remove_file(&link_path);
                             if let Err(e) = std::os::unix::fs::symlink(&nested_wl_abs, &link_path) {
                                 warn!(
-                                    "[lotus-atrium] failed to symlink nested Wayland into host runtime: {}",
+                                    "[lotus-nest] failed to symlink nested Wayland into host runtime: {}",
                                     e
                                 );
                                 // Fallback: absolute path (libwayland accepts it).
                                 cmd.env("WAYLAND_DISPLAY", nested_wl_abs.as_os_str());
                             } else {
                                 debug!(
-                                    "[lotus-atrium] nested Wayland exposed to host runtime as {}",
+                                    "[lotus-nest] nested Wayland exposed to host runtime as {}",
                                     child_wl_name
                                 );
                                 cmd.env("WAYLAND_DISPLAY", &child_wl_name);
@@ -3388,7 +3388,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // STEAM_GAME_DISPLAY_0 (:1). Never launch the game onto :1 directly.
                         if let Some(d) = x11_display {
                             info!(
-                                "[lotus-atrium] nested Xwayland ready — child DISPLAY=:{} \
+                                "[lotus-nest] nested Xwayland ready — child DISPLAY=:{} \
                                  (host stays on gamescope game display)",
                                 d
                             );
@@ -3411,7 +3411,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             }
                         } else {
                             warn!(
-                                "[lotus-atrium] nested Xwayland not ready in time — \
+                                "[lotus-nest] nested Xwayland not ready in time — \
                                  falling back to Wayland-only child (Proton may fail)"
                             );
                             cmd.env_remove("DISPLAY");
@@ -3429,7 +3429,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         match cmd.spawn() {
                             Ok(mut child) => {
                                 let pid = child.id();
-                                info!("[lotus-atrium] spawned '{}' with PID {}", command, pid);
+                                info!("[lotus-nest] spawned '{}' with PID {}", command, pid);
                                 child_pid = Some(pid);
                                 wayland_server.lock().update_pane_pid(&pane_id, pid);
                                 // Reap exit; if the primary game dies (Alt+F4 etc.), tear down atrium.
@@ -3441,7 +3441,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     .spawn(move || {
                                         let status = child.wait();
                                         info!(
-                                            "[lotus-atrium] external child pid {} exited ({:?}) pane='{}' primary={}",
+                                            "[lotus-nest] external child pid {} exited ({:?}) pane='{}' primary={}",
                                             pid,
                                             status,
                                             exit_pane_id,
@@ -3457,7 +3457,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     });
                             }
                             Err(e) => {
-                                error!("[lotus-atrium] failed to spawn '{}': {}", command, e);
+                                error!("[lotus-nest] failed to spawn '{}': {}", command, e);
                             }
                         }
                     }
@@ -3539,7 +3539,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             "[lotus-nest] setGameMode(true) ignored: nested compositor not started yet"
                         );
                     } else {
-                        atrium_apply_game_mode(instance, mode, Some(event_loop));
+                        nest_apply_game_mode(instance, mode, Some(event_loop));
                         info!("[lotus-nest] game mode set: {}", mode);
                         push_renderer_ipc(
                             &window_id,
@@ -3827,7 +3827,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             EngineCommand::SetPaneVisible(window_id, pane_id, visible) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
-                    atrium_set_pane_visible(instance, &pane_id, visible);
+                    nest_set_pane_visible(instance, &pane_id, visible);
                     let physical_size = instance.window.inner_size();
                     let scale_factor = instance.window.scale_factor() as f32;
                     instance.recalculate_layout(physical_size, scale_factor);
@@ -4307,7 +4307,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
                         if let Some(mut closing) = self.windows.remove(&uuid) {
                             #[cfg(target_os = "linux")]
-                            atrium_teardown_window(&mut closing);
+                            nest_teardown_window(&mut closing);
                         }
                         self.winit_id_to_uuid.remove(&window_id);
                         info!("Rust: Window '{}' closed. {} windows remaining", uuid, self.windows.len());
@@ -4343,7 +4343,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 static REDRAW_N: AtomicU64 = AtomicU64::new(0);
                                 let n = REDRAW_N.fetch_add(1, Ordering::Relaxed) + 1;
                                 if n <= 8 || n % 120 == 0 {
-                                    atrium_host_diag(&format!(
+                                    nest_host_diag(&format!(
                                         "RedrawRequested #{n} focused={} occluded={} nested={}",
                                         instance.os_focused,
                                         instance.os_occluded,
@@ -4380,7 +4380,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                             }
                             #[cfg(target_os = "linux")]
-                            atrium_finish_nested_redraw(instance, nested_gen_at_start);
+                            nest_finish_nested_redraw(instance, nested_gen_at_start);
                         } else {
                         let _ = instance.rendering_context.make_current();
                         let window_size = instance.window.inner_size();
@@ -4725,7 +4725,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             // keeps scanning us out while the game is quiet.
                             #[cfg(target_os = "linux")]
                             let needs_present = {
-                                let game_driven = atrium_game_driven_present(instance);
+                                let game_driven = nest_game_driven_present(instance);
                                 (!game_driven && is_gamescope_session())
                                     || gl::scene_needs_present(
                                         instance,
@@ -4804,7 +4804,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     static PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
                                     let n = PRESENT_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                                     if n <= 5 || n % 120 == 0 {
-                                        atrium_host_diag(&format!(
+                                        nest_host_diag(&format!(
                                             "host present #{n} size={}x{} focused={} occluded={}",
                                             live_w,
                                             live_h,
@@ -4869,7 +4869,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             }
 
                             #[cfg(target_os = "linux")]
-                            atrium_finish_nested_redraw(instance, nested_gen_at_start);
+                            nest_finish_nested_redraw(instance, nested_gen_at_start);
 
                             // LOCK STEP: clear busy only after the nuclear flip lands.
                             // Always re-run layout dispatch afterward: paint may have just
@@ -4943,8 +4943,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     // No sync present on resize — extra DRI3 swaps outside RedrawRequested
                     // flood the 2-buffer ring. Re-assert interval and wake for a paced redraw.
                     let _ = instance.rendering_context.make_current();
-                    atrium_set_egl_swap_interval(0);
-                    atrium_host_diag(&format!(
+                    nest_set_egl_swap_interval(0);
+                    nest_host_diag(&format!(
                         "gamescope resize: bound surface {}x{} (redraw only, no sync present)",
                         size.width, size.height
                     ));
@@ -5018,12 +5018,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 let pane = instance.panes.get(game_id)?;
                                 let ws = pane.external_wayland_server.as_ref()?;
                                 let (tx, ty) =
-                                    atrium_pointer_coords(instance, pane, point, scale_factor);
+                                    nest_pointer_coords(instance, pane, point, scale_factor);
                                 Some((game_id.clone(), ws.clone(), tx, ty))
                             });
                             if let Some((game_id, ws, tx, ty)) = game_motion {
                                 ws.lock().send_pointer_motion_to_pane(&game_id, tx, ty);
-                                atrium_sync_nested_cursor_for_hover(
+                                nest_sync_nested_cursor_for_hover(
                                     instance,
                                     Some(event_loop),
                                     true,
@@ -5033,8 +5033,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
 
                         #[cfg(target_os = "linux")]
-                        if atrium_in_overlay_input_mode(instance) {
-                            atrium_route_cursor_moved(
+                        if nest_in_overlay_input_mode(instance) {
+                            nest_route_cursor_moved(
                                 instance,
                                 event_loop,
                                 &uuid,
@@ -5050,10 +5050,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 #[cfg(target_os = "linux")]
                                 let drag_layout = instance.panes.get(pane_id).map(|p| {
                                     (
-                                        atrium_pane_hit_rect(instance, p, scale_factor),
+                                        nest_pane_hit_rect(instance, p, scale_factor),
                                         p.external_wayland_server.as_ref().map(|ws| {
                                             let (tx, ty) =
-                                                atrium_pointer_coords(instance, p, point, scale_factor);
+                                                nest_pointer_coords(instance, p, point, scale_factor);
                                             (ws.clone(), tx, ty)
                                         }),
                                     )
@@ -5298,7 +5298,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     let external_motion = instance.panes.get(&hover_id).and_then(|pane| {
                                         pane.external_wayland_server.as_ref().map(|ws| {
                                             let (tx, ty) =
-                                                atrium_pointer_coords(instance, pane, point, scale_factor);
+                                                nest_pointer_coords(instance, pane, point, scale_factor);
                                             (ws.clone(), tx, ty)
                                         })
                                     });
@@ -5311,7 +5311,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                                 if let Some(pane) = instance.panes.get(&hover_id) {
                                     let (px, py, pw, ph) =
-                                        atrium_pane_hit_rect(instance, pane, scale_factor);
+                                        nest_pane_hit_rect(instance, pane, scale_factor);
                                     let mut translated_point =
                                         Point2D::new(point.x - px, point.y - py);
                                     if pane.is_remote {
@@ -5365,7 +5365,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             if let Some(ref game_id) = instance.primary_game_pane {
                                 if let Some(pane) = instance.panes.get(game_id) {
                                     if let Some(ref ws) = pane.external_wayland_server {
-                                        let (x, y) = atrium_pointer_coords(
+                                        let (x, y) = nest_pointer_coords(
                                             instance,
                                             pane,
                                             instance.last_mouse_pos,
@@ -5385,8 +5385,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
 
                         #[cfg(target_os = "linux")]
-                        if atrium_in_overlay_input_mode(instance) {
-                            atrium_route_mouse_button(
+                        if nest_in_overlay_input_mode(instance) {
+                            nest_route_mouse_button(
                                 instance,
                                 &uuid,
                                 button,
@@ -5571,9 +5571,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             #[cfg(target_os = "linux")]
                             let pointer_layout = instance.panes.get(&pane_id).map(|p| {
                                 (
-                                    atrium_pane_hit_rect(instance, p, scale_factor),
+                                    nest_pane_hit_rect(instance, p, scale_factor),
                                     p.external_wayland_server.as_ref().map(|ws| {
-                                        let (x, y) = atrium_pointer_coords(
+                                        let (x, y) = nest_pointer_coords(
                                             instance,
                                             p,
                                             instance.last_mouse_pos,
@@ -5754,7 +5754,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             if let Some(ref game_id) = instance.primary_game_pane {
                                 if let Some(pane) = instance.panes.get(game_id) {
                                     if let Some(ref ws) = pane.external_wayland_server {
-                                        let (mx, my) = atrium_pointer_coords(
+                                        let (mx, my) = nest_pointer_coords(
                                             instance,
                                             pane,
                                             instance.last_mouse_pos,
@@ -5774,7 +5774,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
 
                         #[cfg(target_os = "linux")]
-                        if atrium_in_overlay_input_mode(instance) {
+                        if nest_in_overlay_input_mode(instance) {
                             if let Some(target_id) = hit_test_pointer_pane(
                                 instance,
                                 instance.last_mouse_pos,
@@ -5785,7 +5785,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             {
                                 if let Some(pane) = instance.panes.get(&target_id) {
                                     if let Some(ref ws) = pane.external_wayland_server {
-                                        let (mx, my) = atrium_pointer_coords(
+                                        let (mx, my) = nest_pointer_coords(
                                             instance,
                                             pane,
                                             instance.last_mouse_pos,
@@ -5877,9 +5877,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             #[cfg(target_os = "linux")]
                             let wheel_layout = instance.panes.get(&pane_id).map(|p| {
                                 (
-                                    atrium_pane_hit_rect(instance, p, scale_factor),
+                                    nest_pane_hit_rect(instance, p, scale_factor),
                                     p.external_wayland_server.as_ref().map(|ws| {
-                                        let (mx, my) = atrium_pointer_coords(
+                                        let (mx, my) = nest_pointer_coords(
                                             instance,
                                             p,
                                             instance.last_mouse_pos,
@@ -6094,7 +6094,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             clear_gutter_hover_state(instance);
                             instance.hover_pane_id = None;
                             #[cfg(target_os = "linux")]
-                            atrium_clear_nested_cursor(instance);
+                            nest_clear_nested_cursor(instance);
                             instance.window.set_cursor(winit::window::CursorIcon::Default);
                         }
                     },
@@ -6219,8 +6219,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         let keyboard_pane_id = {
                             let id = instance.active_pane_id.clone();
                             if id.is_empty()
-                                || (atrium_in_overlay_input_mode(instance)
-                                    && atrium_is_primary_game(instance, &id))
+                                || (nest_in_overlay_input_mode(instance)
+                                    && nest_is_primary_game(instance, &id))
                             {
                                 None
                             } else {

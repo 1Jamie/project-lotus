@@ -469,7 +469,7 @@ pub fn terminate_external_child(pid: u32) {
         let mut status = 0;
         let _ = libc::waitpid(pid_i, &mut status, libc::WNOHANG);
     }
-    log::info!("[lotus-atrium] terminated external child pid {}", pid);
+    log::info!("[lotus-nest] terminated external child pid {}", pid);
 }
 
 impl Drop for PaneInstance {
@@ -773,7 +773,7 @@ impl WindowInstance {
             self.gl.compile_shader(fs_oes);
             if !self.gl.get_shader_compile_status(fs_oes) {
                 log::warn!(
-                    "[lotus-atrium] COMP_FS_OES compile failed (external dmabufs may stay black): {}",
+                    "[lotus-nest] COMP_FS_OES compile failed (external dmabufs may stay black): {}",
                     self.gl.get_shader_info_log(fs_oes)
                 );
                 self.gl.delete_shader(fs_oes);
@@ -785,7 +785,7 @@ impl WindowInstance {
                 self.gl.link_program(oes_program);
                 if !self.gl.get_program_link_status(oes_program) {
                     log::warn!(
-                        "[lotus-atrium] COMP_FS_OES link failed: {}",
+                        "[lotus-nest] COMP_FS_OES link failed: {}",
                         self.gl.get_program_info_log(oes_program)
                     );
                     self.gl.detach_shader(oes_program, vs);
@@ -808,7 +808,7 @@ impl WindowInstance {
                         self.gl.use_program(None);
                     }
                     self.comp_program_oes = Some(oes_program);
-                    log::info!("[lotus-atrium] COMP_FS_OES ready (samplerExternalOES)");
+                    log::info!("[lotus-nest] COMP_FS_OES ready (samplerExternalOES)");
                 }
             }
 

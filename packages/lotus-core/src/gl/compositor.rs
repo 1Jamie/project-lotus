@@ -750,7 +750,7 @@ pub fn atrium_host_present(instance: &WindowInstance) -> bool {
         static LAST_PRESENT_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
         let gamescope = crate::app::is_gamescope_session_pub();
-        let game_driven = crate::app::atrium_game_driven_present(instance);
+        let game_driven = crate::app::nest_game_driven_present(instance);
         let mhz = instance.refresh_rate_millihertz.max(1);
         let min_period_ms = 1_000_000.0f32 / mhz as f32;
         let pacing_diag = std::env::var_os("ATRIUM_PACING_DIAG").is_some();
@@ -758,14 +758,14 @@ pub fn atrium_host_present(instance: &WindowInstance) -> bool {
         // Never phase-sleep here — that imposes a fixed timer and kills VRR.
         // gamescope FIFO deadlocks with interval 1; game-driven needs interval 0 too.
         if gamescope || game_driven {
-            crate::app::atrium_set_egl_swap_interval_pub(0);
+            crate::app::nest_set_egl_swap_interval_pub(0);
         } else {
-            crate::app::atrium_set_egl_swap_interval_pub(1);
+            crate::app::nest_set_egl_swap_interval_pub(1);
         }
 
         let n = SWAP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         if pacing_diag && (n <= 8 || n % 120 == 0) {
-            crate::app::atrium_host_diag_pub(&format!(
+            crate::app::nest_host_diag_pub(&format!(
                 "pre-swap #{n} gamescope={gamescope} game_driven={game_driven} focused={} min_period_ms={:.2}",
                 instance.os_focused, min_period_ms
             ));
@@ -786,7 +786,7 @@ pub fn atrium_host_present(instance: &WindowInstance) -> bool {
                 || swap_ms > 50.0
                 || present_dt_ms.map(|d| d > 50.0).unwrap_or(false))
         {
-            crate::app::atrium_host_diag_pub(&format!(
+            crate::app::nest_host_diag_pub(&format!(
                 "post-swap #{n} swap={swap_ms:.2}ms present_dt={} focused={} occluded={}",
                 present_dt_ms
                     .map(|d| format!("{d:.2}ms"))
