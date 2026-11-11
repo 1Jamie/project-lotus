@@ -423,8 +423,10 @@ pub struct PaneInstance {
     /// `frame_seq` at the last host present that included this pane.
     pub last_presented_seq: u64,
     pub is_remote: bool,
+    /// Linux sandbox remote pane SHM consumer (always `None` on Windows).
     pub remote_consumer: Option<crate::gl::RemotePaneConsumer>,
-    pub remote_input_fd: Option<std::os::unix::io::RawFd>,
+    /// Linux control-socket FD for remote input (`None` on Windows).
+    pub remote_input_fd: Option<i32>,
     pub resize_generation: u64,
     /// Host crash chrome is covering this remote — still pull SHM/vsync, but do not
     /// draw the (possibly stale) texture into the scene.
@@ -476,6 +478,7 @@ pub fn terminate_external_child(pid: u32) {
 
 impl Drop for PaneInstance {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         if let Some(fd) = self.remote_input_fd.take() {
             if fd >= 0 {
                 unsafe { libc::close(fd) };
@@ -1098,6 +1101,7 @@ impl WindowInstance {
                     );
                     if pane.current_servo_size != target_size || !pane.first_frame_painted {
                         if pane.is_remote {
+                            #[cfg(target_os = "linux")]
                             if let Some(fd) = pane.remote_input_fd {
                                 if target_size.width > 0 && target_size.height > 0 {
                                     pane.resize_generation += 1;
@@ -1177,6 +1181,7 @@ impl WindowInstance {
     /// Grow a sealed remote pixel plane (never shrink during interactive resize).
     /// Steps dimensions to 512px multiples after 1.5× headroom, dual-maps the
     /// consumer, and sends `ReplacePixelPlane` + the new RW fd to the engine.
+    #[cfg(target_os = "linux")]
     fn realloc_remote_pixel_plane(
         pane: &mut PaneInstance,
         surface_id: &str,

@@ -14,7 +14,6 @@ napi = { version = "2", features = ["napi4"] }
 napi-derive = "2"
 winit = { version = "0.30" }
 euclid = "0.22"
-servo-url = { path = "servo/components/url" }
 
 # Cross-platform dependencies
 aes-gcm = "0.10"
@@ -29,7 +28,6 @@ log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libc = "0.2"
-lotus-supervisor = { path = "../lotus-supervisor" }
 rmp-serde = "1.3.1"
 rmpv = { version = "1.3", features = ["with-serde"] }
 byteorder = "1.5.0"
@@ -51,9 +49,12 @@ http = "1.4.0"
 window-vibrancy = "0.5"
 dark-light = "1.0"
 
-# Linux-only dependencies
+# Servo must use one canonical crates.io source for all targets (Cargo requirement).
+# Linux builds redirect it to the patched submodule via [patch.crates-io] (injected by
+# scripts/apply-servo-patch.sh). Windows/other hosts stay on stock crates.io 0.7.0.
 [target.'cfg(target_os = "linux")'.dependencies]
-servo = { path = "servo/components/servo", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgl", "media-gstreamer"] }
+lotus-supervisor = { path = "../lotus-supervisor" }
+servo = { version = "=0.7.0", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgl", "media-gstreamer"] }
 webgl = { package = "servo-webgl", path = "servo/components/webgl" }
 servo_canvas_traits = { package = "servo-canvas-traits", path = "servo/components/shared/canvas" }
 servo_base = { package = "servo-base", path = "servo/components/shared/base" }
@@ -69,14 +70,12 @@ drm-fourcc = "2.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 zvariant = "5"
 
-# Windows-only dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
-servo = { path = "servo/components/servo", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "webcrypto", "webgl", "media-gstreamer"] }
+servo = { version = "=0.7.0", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "webcrypto", "webgl", "media-gstreamer"] }
 windows-sys = { version = "0.52", features = ["Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_Foundation"] }
 
-# For any other platform (like macOS)
 [target.'cfg(not(any(target_os = "linux", target_os = "windows")))'.dependencies]
-servo = { path = "servo/components/servo", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgl", "media-gstreamer"] }
+servo = { version = "=0.7.0", default-features = false, features = ["js_jit", "clipboard", "webcrypto", "webgl", "media-gstreamer"] }
 
 [build-dependencies]
 napi-build = "2"
@@ -94,6 +93,10 @@ panic = "abort"
 
 # Game Mode: smithay's SHM drop-thread LazyLock unwrap()'d on EAGAIN and killed
 # the nested compositor (navy host, dead Discord/game). Patched to retry.
+#
+# NOTE: On Linux, apply-servo-patch.sh also injects:
+#   servo = { path = "servo/components/servo" }
+# so the sandbox GPU broker / jail networking patch is used. Windows CI never
+# runs that injection and builds stock crates.io Servo.
 [patch.crates-io]
 smithay = { path = "vendor/smithay" }
-

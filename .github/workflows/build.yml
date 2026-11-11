@@ -128,7 +128,8 @@ jobs:
         shell: powershell
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          # Windows/BSD use crates.io Servo; Linux needs the patched submodule.
+          submodules: ${{ runner.os == 'Linux' }}
       # MSVC/mozangle still hit legacy MAX_PATH under deep GitHub workspaces (e.g. packages/lotus-core/target/...).
       - name: Short Cargo and temp dirs (Windows)
         if: runner.os == 'Windows'

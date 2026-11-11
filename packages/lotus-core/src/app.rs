@@ -178,6 +178,8 @@ pub enum EngineCommand {
 
     // Pane-specific commands
     CreatePane(String, String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>, i32, PaneAnchor, u32, bool), // window_id, pane_id, url, rect, z_index, anchor, dock_order, visible
+    /// Linux sandbox remote pane (SHM + supervisor). Not available on Windows.
+    #[cfg(target_os = "linux")]
     CreateRemotePane {
         window_id: String,
         pane_id: String,
@@ -205,10 +207,12 @@ pub enum EngineCommand {
     SetPaneVisible(String, String, bool), // window_id, pane_id, visible
     SetPanePassthrough(String, String, bool), // window_id, pane_id, pointer_passthrough
     FocusPane(String, String), // window_id, pane_id
+    #[cfg(target_os = "linux")]
     AttachRemotePaneInput(String, String, std::os::unix::io::RawFd), // window_id, pane_id, fd
     /// Keep a remote pane docked+visible (so it receives compositor vsync) while a host
     /// crash-chrome pane covers it as a high-z absolute overlay. Used during crash UI and
     /// respawn so we never gate first-frame production on revealing the remote early.
+    #[cfg(target_os = "linux")]
     CoverRemoteWithCrashChrome {
         window_id: String,
         remote_pane_id: String,
@@ -216,11 +220,13 @@ pub enum EngineCommand {
     },
     /// After a successor engine is attached: invalidate stale GL/SHM cache and arm the
     /// gate that emits `remote-frame-composited` once a fresh frame is uploaded.
+    #[cfg(target_os = "linux")]
     ArmCrashCoverFreshFrame {
         window_id: String,
         remote_pane_id: String,
     },
     /// Lift cover bookkeeping after JS hides crash chrome.
+    #[cfg(target_os = "linux")]
     ClearRemoteCrashCover {
         window_id: String,
         remote_pane_id: String,
@@ -444,6 +450,7 @@ fn map_winit_physical_key(k: winit::keyboard::PhysicalKey) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn forward_remote_input(fd: std::os::unix::io::RawFd, json: &str) {
     let mut bytes = json.as_bytes().to_vec();
     bytes.push(b'\n');
@@ -451,6 +458,9 @@ pub(crate) fn forward_remote_input(fd: std::os::unix::io::RawFd, json: &str) {
         let _ = libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn forward_remote_input(_fd: i32, _json: &str) {}
 
 /// Push a Track-1 IPC batch to renderer WebSockets. Renderer `_processRaw` requires the
 /// leading `MSG_TYPE_DATA` (0x02) byte — bare msgpack is silently dropped.
@@ -1860,6 +1870,7 @@ fn apply_refresh_policy(instance: &mut WindowInstance) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn send_remote_display_timing(fd: std::os::unix::io::RawFd, millihertz: u32) {
     // 0 = host-authoritative graphics pause (explicit hide only).
     let msg = format!(
@@ -1869,6 +1880,10 @@ fn send_remote_display_timing(fd: std::os::unix::io::RawFd, millihertz: u32) {
     forward_remote_input(fd, &msg);
 }
 
+#[cfg(not(target_os = "linux"))]
+fn send_remote_display_timing(_fd: i32, _millihertz: u32) {}
+
+#[cfg(target_os = "linux")]
 fn send_remote_vsync(fd: std::os::unix::io::RawFd, surface_id: &str, presentation_time_ns: u64) {
     let msg = format!(
         "{{\"type\":\"Vsync\",\"surface_id\":{},\"presentation_time_ns\":{}}}",
@@ -1877,6 +1892,9 @@ fn send_remote_vsync(fd: std::os::unix::io::RawFd, surface_id: &str, presentatio
     );
     forward_remote_input(fd, &msg);
 }
+
+#[cfg(not(target_os = "linux"))]
+fn send_remote_vsync(_fd: i32, _surface_id: &str, _presentation_time_ns: u64) {}
 
 impl ApplicationHandler<EngineCommand> for LotusApp {
     fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
@@ -3070,6 +3088,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.window.request_redraw();
                 }
             },
+            #[cfg(target_os = "linux")]
             EngineCommand::CreateRemotePane {
                 window_id,
                 pane_id,
@@ -3841,6 +3860,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     }
                 }
             },
+            #[cfg(target_os = "linux")]
             EngineCommand::CoverRemoteWithCrashChrome {
                 window_id,
                 remote_pane_id,
@@ -3913,6 +3933,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.window.request_redraw();
                 }
             },
+            #[cfg(target_os = "linux")]
             EngineCommand::ArmCrashCoverFreshFrame {
                 window_id,
                 remote_pane_id,
@@ -3947,6 +3968,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.window.request_redraw();
                 }
             },
+            #[cfg(target_os = "linux")]
             EngineCommand::ClearRemoteCrashCover {
                 window_id,
                 remote_pane_id,
@@ -3964,6 +3986,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     instance.active_pane_id = pane_id;
                 }
             },
+            #[cfg(target_os = "linux")]
             EngineCommand::AttachRemotePaneInput(window_id, pane_id, fd) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     let mut attached_fd: Option<std::os::unix::io::RawFd> = None;

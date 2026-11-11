@@ -4694,7 +4694,6 @@ dependencies = [
  "servo-base",
  "servo-canvas-traits",
  "servo-paint-api",
- "servo-url",
  "servo-webgl",
  "smithay",
  "surfman",

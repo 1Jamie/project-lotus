@@ -1,6 +1,10 @@
 pub mod compositor;
 pub mod pane_context;
+#[cfg(target_os = "linux")]
 pub mod shm_consumer;
+#[cfg(not(target_os = "linux"))]
+pub mod shm_consumer_stub;
+#[cfg(target_os = "linux")]
 pub mod webgl_broker;
 
 pub use compositor::{
@@ -8,4 +12,7 @@ pub use compositor::{
     ensure_textures, scene_needs_present, CompositeRemoteResult,
 };
 pub use pane_context::LotusPaneContext;
+#[cfg(target_os = "linux")]
 pub use shm_consumer::RemotePaneConsumer;
+#[cfg(not(target_os = "linux"))]
+pub use shm_consumer_stub::RemotePaneConsumer;

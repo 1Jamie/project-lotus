@@ -281,6 +281,7 @@ impl WindowHandle {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[napi]
     pub fn create_remote_pane(
         &self,
@@ -419,6 +420,7 @@ impl WindowHandle {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[napi]
     pub fn attach_remote_pane_input(&self, pane_id: String, input_fd: i32) -> napi::Result<()> {
         let dup_fd = unsafe { libc::dup(input_fd) };
@@ -562,6 +564,7 @@ impl WindowHandle {
 
     /// Cover a docked remote with host crash chrome as a high-z overlay while keeping the
     /// remote visible so it continues to receive compositor vsync / SHM pull.
+    #[cfg(target_os = "linux")]
     #[napi]
     pub fn cover_remote_with_crash_chrome(&self, remote_pane_id: String, crash_pane_id: String) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
@@ -574,6 +577,7 @@ impl WindowHandle {
     }
 
     /// After attaching a successor engine: wait for host GL upload before lifting chrome.
+    #[cfg(target_os = "linux")]
     #[napi]
     pub fn arm_crash_cover_fresh_frame(&self, remote_pane_id: String) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
@@ -585,6 +589,7 @@ impl WindowHandle {
     }
 
     /// Clear under-cover / fresh-frame gates after crash chrome is dismissed.
+    #[cfg(target_os = "linux")]
     #[napi]
     pub fn clear_remote_crash_cover(&self, remote_pane_id: String) {
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
@@ -903,6 +908,7 @@ pub struct ShmPlaneAllocation {
     pub height: u32,
 }
 
+#[cfg(target_os = "linux")]
 #[napi]
 pub fn allocate_remote_pane_shm(name: String, width: u32, height: u32) -> napi::Result<ShmPlaneAllocation> {
     let geom = lotus_supervisor::shm::calculate_shm_geometry(width, height)
@@ -945,10 +951,23 @@ pub fn allocate_remote_pane_shm(name: String, width: u32, height: u32) -> napi::
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+#[napi]
+pub fn allocate_remote_pane_shm(
+    _name: String,
+    _width: u32,
+    _height: u32,
+) -> napi::Result<ShmPlaneAllocation> {
+    Err(napi::Error::from_reason(
+        "sandboxed remote panes are only supported on Linux",
+    ))
+}
+
 /// Synchronously sanitize both the producer control header and consumer ack header
 /// of a remote pane SHM allocation before spawning a successor engine. This guarantees
 /// that no stale `STATE_READY` frames or non-zero `pub_seq` from a dead engine
 /// can be consumed by the host compositor during crash recovery.
+#[cfg(target_os = "linux")]
 #[napi]
 pub fn reset_remote_pane_shm(pixel_rw_fd: i32, ack_rw_fd: i32) -> napi::Result<()> {
     if pixel_rw_fd >= 0 {
@@ -1012,6 +1031,14 @@ pub fn reset_remote_pane_shm(pixel_rw_fd: i32, ack_rw_fd: i32) -> napi::Result<(
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+#[napi]
+pub fn reset_remote_pane_shm(_pixel_rw_fd: i32, _ack_rw_fd: i32) -> napi::Result<()> {
+    Err(napi::Error::from_reason(
+        "sandboxed remote panes are only supported on Linux",
+    ))
+}
+
 #[napi(object)]
 pub struct ControlSocketPair {
     pub host_fd: i32,
@@ -1024,6 +1051,7 @@ pub struct GpuSocketPair {
     pub child_fd: i32,
 }
 
+#[cfg(target_os = "linux")]
 #[napi]
 pub fn create_control_socket_pair() -> napi::Result<ControlSocketPair> {
     let mut fds = [0i32; 2];
@@ -1037,6 +1065,15 @@ pub fn create_control_socket_pair() -> napi::Result<ControlSocketPair> {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+#[napi]
+pub fn create_control_socket_pair() -> napi::Result<ControlSocketPair> {
+    Err(napi::Error::from_reason(
+        "sandbox control sockets are only supported on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 #[napi]
 pub fn create_gpu_socket_pair() -> napi::Result<GpuSocketPair> {
     let mut fds = [0i32; 2];
@@ -1050,6 +1087,15 @@ pub fn create_gpu_socket_pair() -> napi::Result<GpuSocketPair> {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+#[napi]
+pub fn create_gpu_socket_pair() -> napi::Result<GpuSocketPair> {
+    Err(napi::Error::from_reason(
+        "GPU broker sockets are only supported on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
 #[napi]
 pub fn send_fds_over_socket(socket_fd: i32, fds_to_send: Vec<i32>, payload: String) -> napi::Result<()> {
     if fds_to_send.is_empty() {
@@ -1097,6 +1143,18 @@ pub fn send_fds_over_socket(socket_fd: i32, fds_to_send: Vec<i32>, payload: Stri
     }
 
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[napi]
+pub fn send_fds_over_socket(
+    _socket_fd: i32,
+    _fds_to_send: Vec<i32>,
+    _payload: String,
+) -> napi::Result<()> {
+    Err(napi::Error::from_reason(
+        "SCM_RIGHTS FD passing is only supported on Linux",
+    ))
 }
 
 #[napi]
