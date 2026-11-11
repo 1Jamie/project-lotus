@@ -120,15 +120,7 @@
           render();
         }
       });
-      eventSource.on('atrium-game-mode-changed', (data) => {
-        const ipc = lotusIpc();
-        if (ipc?.send) ipc.send('atrium-forward-mode', data);
-        if (data && data.game_mode !== undefined) {
-          mode = data.game_mode ? 'game' : 'overlay';
-          render();
-        }
-      });
-      eventSource.on('atrium-fullscreen-changed', (data) => {
+      eventSource.on('nest:fullscreen', (data) => {
         const ipc = lotusIpc();
         if (ipc?.send && data && data.fullscreen !== undefined) {
           ipc.send('atrium-forward-fullscreen', !!data.fullscreen);

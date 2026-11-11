@@ -263,25 +263,13 @@
             : (window.lotus?.ipc?.on ? window.lotus.ipc : null);
         if (eventSource) {
             eventSource.on('atrium-game-stats', updateLiveStats);
-            eventSource.on('atrium-game-mode-changed', (data) => {
+            eventSource.on('nest:game-mode', (data) => {
                 if (data && data.game_mode !== undefined) setUiInputMode(data.game_mode);
             });
-            eventSource.on('atrium-toggle-discord', (data) => {
-                // Host F9 already toggled the pane in Rust. Only mirror the button —
-                // do NOT call set-discord-visible here (that re-entered setVisible/setRect
-                // and caused open↔close loops + a delayed resize over the HUD buttons).
-                if (data && data.visible !== undefined) {
-                    discordOn = !!data.visible;
-                } else {
-                    discordOn = !discordOn;
-                }
-                discordBtn.classList.toggle('active', discordOn);
-                const ipc = lotusIpc();
-                if (ipc?.send) ipc.send('discord-ui-sync', discordOn);
-            });
-            eventSource.on('atrium-fullscreen-changed', (data) => {
+            eventSource.on('nest:fullscreen', (data) => {
                 if (data && data.fullscreen !== undefined) setFullscreenUi(!!data.fullscreen);
             });
+            // Discord / hotkeys are owned by atrium shell (nest:hotkey), not this legacy HUD.
         }
 
         // Ensure IPC websocket is up even if userscript connect raced before port was set.

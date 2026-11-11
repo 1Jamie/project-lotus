@@ -2641,7 +2641,7 @@ class ServoWindow extends EventEmitter {
                 dbusNotificationApps
             );
         } else {
-            console.warn('[lotus-atrium] createExternalAppPane not supported on this platform');
+            console.warn('[lotus-nest] createExternalAppPane not supported on this platform');
         }
 
         this.panes.set(id, pane);

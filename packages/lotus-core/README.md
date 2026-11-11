@@ -7,6 +7,7 @@ The runtime engine for Lotus desktop applications.
 * [**Step-by-Step Tutorial (Building Your First Lotus App)**](https://github.com/1Jamie/project-lotus/blob/main/TUTORIAL.md)
 * [**What's New in v0.5.0-devel & Architecture Overview**](https://github.com/1Jamie/project-lotus/blob/main/README.md#whats-new-in-v050-devel)
 * [**`@lotus-gui/dev` CLI & Packager Docs**](https://github.com/1Jamie/project-lotus/blob/main/packages/lotus-dev/README.md)
+* [**Nested external apps (Linux)**](./NEST.md) — `createExternalAppPane`, `setGameMode`, host hotkeys
 
 ---
 

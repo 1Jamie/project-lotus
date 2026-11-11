@@ -3546,12 +3546,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             "nest:game-mode",
                             serde_json::json!({ "game_mode": mode }),
                         );
-                        // Compat for atrium shell chrome until listeners migrate.
-                        push_renderer_ipc(
-                            &window_id,
-                            "atrium-game-mode-changed",
-                            serde_json::json!({ "game_mode": mode }),
-                        );
                     }
                 }
             },
@@ -3609,12 +3603,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     } else {
                         instance.window.set_fullscreen(None);
                     }
-                    info!("[lotus-atrium] lotus window fullscreen={}", enabled);
+                    info!("[lotus-nest] lotus window fullscreen={}", enabled);
                     #[cfg(target_os = "linux")]
                     tag_window_for_gamescope(&instance.window);
                     push_renderer_ipc(
                         &window_id,
-                        "atrium-fullscreen-changed",
+                        "nest:fullscreen",
                         serde_json::json!({ "fullscreen": enabled }),
                     );
                     apply_refresh_policy(instance);
