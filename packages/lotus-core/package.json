@@ -54,7 +54,9 @@
   "scripts": {
     "prebuild": "bash ../../scripts/apply-servo-patch.sh",
     "prebuild:debug": "bash ../../scripts/apply-servo-patch.sh",
+    "prebuild:fast": "bash ../../scripts/apply-servo-patch.sh",
     "build": "napi build --platform --release",
+    "build:fast": "napi build --platform --profile release-fast",
     "build:debug": "napi build --platform",
     "extract-angle": "node scripts/extract_angle_dlls.js",
     "clean": "node scripts/clean.js",

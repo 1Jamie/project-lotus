@@ -3,10 +3,10 @@ env:
   DEBUG: napi:*
   APP_NAME: lotus
   MACOSX_DEPLOYMENT_TARGET: '10.13'
-  # Plain devel tags iterate often — skip LTO and ship debug napi binaries.
-  # Include "rc" in the tag (e.g. v0.5.0-devel-rc.0) for an LTO'd devel cut.
-  # Stable / non-devel tags always use optimized `npm run build`.
-  LOTUS_NAPI_BUILD: ${{ contains(github.ref_name, 'devel') && !contains(github.ref_name, 'rc') && 'build:debug' || 'build' }}
+  # Devel tags: stripped release-fast (no LTO) — small enough for npm, faster CI.
+  # Stable tags: full release LTO. "rc" in the ref is label-only (GitHub prerelease /
+  # npm dist-tag); it does not change the cargo profile.
+  LOTUS_NAPI_BUILD: ${{ contains(github.ref_name, 'devel') && 'build:fast' || 'build' }}
 permissions:
   contents: write
   id-token: write
@@ -299,16 +299,22 @@ jobs:
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
           CORE_VER=$(node -p "require('./packages/lotus-core/package.json').version")
           DEV_VER=$(node -p "require('./packages/lotus-dev/package.json').version")
+          # Dist-tag is label-only: devel / rc / latest. Cargo profile is chosen separately
+          # from the git ref (devel → release-fast, otherwise full release LTO).
           if [[ "$CORE_VER" == *"-devel"* ]]; then
             TAG=devel
-            echo "Devel release detected (@lotus-gui/core@$CORE_VER) — publishing with --tag devel"
+          elif [[ "$CORE_VER" == *"-rc"* ]]; then
+            TAG=rc
+          else
+            TAG=
+          fi
+          if [[ -n "$TAG" ]]; then
+            echo "Prerelease (@lotus-gui/core@$CORE_VER) — publishing with --tag $TAG"
             npm publish --workspace=@lotus-gui/core --access public --tag "$TAG"
-            # Skip @lotus-gui/dev unless this exact version is not on the registry yet
-            # (devel cuts often only bump core).
             if npm view "@lotus-gui/dev@${DEV_VER}" version >/dev/null 2>&1; then
               echo "@lotus-gui/dev@${DEV_VER} already published — skipping"
             else
-              echo "Publishing @lotus-gui/dev@${DEV_VER} with --tag devel"
+              echo "Publishing @lotus-gui/dev@${DEV_VER} with --tag $TAG"
               npm publish --workspace=@lotus-gui/dev --access public --tag "$TAG"
             fi
           else
