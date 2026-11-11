@@ -40,7 +40,7 @@ jobs:
               for attempt in 1 2 3; do
                 if sudo apt-get install -y --fix-missing \
                   libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev dpkg-dev fakeroot rpm \
-                  pkg-config libdbus-1-dev clang libclang-dev lld cmake \
+                  pkg-config libdbus-1-dev libxkbcommon-dev clang libclang-dev lld cmake \
                   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
                   libgstreamer-plugins-bad1.0-dev; then
                   break

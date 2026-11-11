@@ -43,7 +43,7 @@ jobs:
               for attempt in 1 2 3; do
                 if sudo apt-get install -y --fix-missing \
                   libfontconfig1-dev libgl1-mesa-dev libssl-dev \
-                  libdbus-1-dev pkg-config \
+                  libdbus-1-dev libxkbcommon-dev pkg-config \
                   clang libclang-dev lld cmake \
                   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
                   libgstreamer-plugins-bad1.0-dev; then
