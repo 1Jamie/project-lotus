@@ -33,11 +33,28 @@ jobs:
           - host: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             build_id: x86_64-unknown-linux-gnu
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             setup: |
+              export DEBIAN_FRONTEND=noninteractive
               sudo apt-get update
-              sudo apt-get install -y libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev dpkg-dev fakeroot rpm pkg-config libdbus-1-dev clang libclang-dev lld cmake libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev
-              sudo apt-get install -y libgstreamer-plugins-good1.0-dev || sudo apt-get install -y libgstreamer-plugins-extra1.0-dev || true
+              # Azure mirror flakes are common; retry with --fix-missing before failing the job.
+              for attempt in 1 2 3; do
+                if sudo apt-get install -y --fix-missing \
+                  libgl1-mesa-dev libssl-dev python3 libfontconfig1-dev dpkg-dev fakeroot rpm \
+                  pkg-config libdbus-1-dev clang libclang-dev lld cmake \
+                  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+                  libgstreamer-plugins-bad1.0-dev; then
+                  break
+                fi
+                echo "apt install failed (attempt $attempt); refreshing mirrors and retrying..."
+                sudo apt-get update || true
+                if [[ "$attempt" -eq 3 ]]; then
+                  exit 1
+                fi
+                sleep 15
+              done
+              sudo apt-get install -y libgstreamer-plugins-good1.0-dev \
+                || sudo apt-get install -y libgstreamer-plugins-extra1.0-dev \
+                || true
             build: |
               npm run build --workspace=@lotus-gui/core -- --target x86_64-unknown-linux-gnu
           - host: ubuntu-24.04
@@ -140,20 +157,40 @@ jobs:
           $gstVer = "1.24.13"
           $gstBase = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVer/msvc"
           $ua = "chocolatey command line"
+          # Full devel MSI is ~690MB+; truncated downloads previously passed a weak 50MB check.
+          $minDevelBytes = 500MB
           Write-Host "Installing GStreamer $gstVer runtime via choco..."
           choco install gstreamer --version $gstVer --no-progress -y
           $gstRoot = [System.Environment]::GetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", "Machine")
           if (-not $gstRoot) { $gstRoot = "D:\gstreamer\1.0\msvc_x86_64" }
           $gstRoot = $gstRoot.TrimEnd('\')
           Write-Host "GStreamer runtime root: $gstRoot"
-          Write-Host "Downloading GStreamer $gstVer devel MSI..."
           $devel = Join-Path $env:TEMP "gstreamer-devel.msi"
-          & curl.exe -fsSL --user-agent $ua `
-            -o $devel "$gstBase/gstreamer-1.0-devel-msvc-x86_64-$gstVer.msi"
-          $develSize = (Get-Item -LiteralPath $devel).Length
-          Write-Host "Devel MSI size: $develSize bytes"
-          if ($develSize -lt 50000000) {
-            throw "Devel MSI is too small ($develSize B); download failed or is not a valid MSI"
+          $develUrl = "$gstBase/gstreamer-1.0-devel-msvc-x86_64-$gstVer.msi"
+          $ok = $false
+          for ($attempt = 1; $attempt -le 4; $attempt++) {
+            Write-Host "Downloading GStreamer $gstVer devel MSI (attempt $attempt/4)..."
+            Remove-Item -LiteralPath $devel -Force -ErrorAction SilentlyContinue
+            & curl.exe -fL --retry 5 --retry-all-errors --retry-delay 5 `
+              --connect-timeout 30 --max-time 900 `
+              --user-agent $ua -o $devel $develUrl
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "curl failed with exit $LASTEXITCODE"
+              Start-Sleep -Seconds (10 * $attempt)
+              continue
+            }
+            $develSize = (Get-Item -LiteralPath $devel).Length
+            Write-Host "Devel MSI size: $develSize bytes"
+            if ($develSize -lt $minDevelBytes) {
+              Write-Host "Devel MSI too small (need >= $minDevelBytes); retrying..."
+              Start-Sleep -Seconds (10 * $attempt)
+              continue
+            }
+            $ok = $true
+            break
+          }
+          if (-not $ok) {
+            throw "Failed to download a complete GStreamer devel MSI after retries"
           }
           $installDir = Split-Path (Split-Path $gstRoot -Parent) -Parent
           Write-Host "Installing GStreamer devel to $installDir ..."
