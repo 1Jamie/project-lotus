@@ -226,7 +226,21 @@ jobs:
         run: ${{ matrix.settings.build }}
         shell: bash
       - name: Upload artifact
+        id: upload_bindings
         if: success()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.build_id }}
+          path: |
+            packages/lotus-core/*.node
+            packages/lotus-core/index.js
+            packages/lotus-core/index.d.ts
+            packages/lotus-core/windows/*.dll
+          if-no-files-found: error
+      # GitHub artifact API sometimes returns HTML (transient outage); retry once.
+      - name: Retry upload artifact
+        if: success() && steps.upload_bindings.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.settings.build_id }}

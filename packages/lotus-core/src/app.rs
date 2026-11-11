@@ -553,12 +553,12 @@ fn nest_set_pane_visible(instance: &mut WindowInstance, pane_id: &str, visible: 
 }
 
 /// Physical rect for pointer hit-testing; matches staged compositor placement in atrium.
-#[cfg(target_os = "linux")]
 fn nest_pane_hit_rect(
     instance: &WindowInstance,
     pane: &PaneInstance,
     scale_factor: f32,
 ) -> (f32, f32, f32, f32) {
+    #[cfg(target_os = "linux")]
     if instance.nested_compositor.is_some() {
         if let Some(staged) = instance.staged_layout.panes.get(&pane.id) {
             if staged.rect.size.width > 0 && staged.rect.size.height > 0 {
@@ -572,6 +572,8 @@ fn nest_pane_hit_rect(
             }
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = instance;
     pane.input_physical_rect(scale_factor)
 }
 

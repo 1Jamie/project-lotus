@@ -239,7 +239,18 @@ jobs:
         run: ${{ matrix.settings.build }}
         shell: bash
       - name: Upload artifact
+        id: upload_bindings
         if: success()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.build_id }}
+          path: |
+            packages/lotus-core/${{ env.APP_NAME }}.*.node
+            packages/lotus-core/windows/*.dll
+          if-no-files-found: error
+      - name: Retry upload artifact
+        if: success() && steps.upload_bindings.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: bindings-${{ matrix.settings.build_id }}

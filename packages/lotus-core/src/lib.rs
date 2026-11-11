@@ -281,7 +281,8 @@ impl WindowHandle {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    /// Linux sandbox remote pane. Stubbed on other platforms so `#[napi]` on the
+    /// `impl` block still resolves `__napi__*` registration symbols.
     #[napi]
     pub fn create_remote_pane(
         &self,
@@ -300,6 +301,28 @@ impl WindowHandle {
         max_shm_width: Option<u32>,
         max_shm_height: Option<u32>,
     ) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                &self.id,
+                pane_id,
+                ro_fd,
+                shm_size,
+                ack_rw_fd,
+                x,
+                y,
+                width,
+                height,
+                z_index,
+                anchor,
+                dock_order,
+                visible,
+                max_shm_width,
+                max_shm_height,
+            );
+            return;
+        }
+        #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let rect: euclid::Rect<f32, servo::DeviceIndependentPixel> = euclid::Rect::new(
                 euclid::Point2D::new(x as f32, y as f32),
@@ -322,7 +345,6 @@ impl WindowHandle {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[napi]
     pub fn create_external_app_pane(
         &self,
@@ -340,6 +362,27 @@ impl WindowHandle {
         dbus_notifications: Option<String>,
         dbus_notification_apps: Option<Vec<String>>,
     ) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                &self.id,
+                pane_id,
+                command,
+                args,
+                x,
+                y,
+                width,
+                height,
+                z_index,
+                anchor,
+                dock_order,
+                visible,
+                dbus_notifications,
+                dbus_notification_apps,
+            );
+            return;
+        }
+        #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let rect: euclid::Rect<f32, servo::DeviceIndependentPixel> = euclid::Rect::new(
                 euclid::Point2D::new(x as f32, y as f32),
@@ -361,11 +404,16 @@ impl WindowHandle {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[napi]
     pub fn set_game_mode(&self, enabled: bool) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = enabled;
+            return;
+        }
         // Do not guard nest readiness here — CreateExternalAppPane and SetGameMode
         // share the winit FIFO queue (EC4). Guard lives in the event handler.
+        #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::SetGameMode(self.id.clone(), enabled));
         }
@@ -373,9 +421,14 @@ impl WindowHandle {
 
     /// Register a window-scoped host hotkey (PhysicalKey / KeyboardEvent.code).
     /// Works with or without a nested compositor when the table is non-empty (EC3).
-    #[cfg(target_os = "linux")]
     #[napi]
     pub fn register_host_hotkey(&self, id: String, key: String, modifiers: Option<u32>) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, key, modifiers);
+            return;
+        }
+        #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::RegisterHostHotkey {
                 window_id: self.id.clone(),
@@ -386,9 +439,14 @@ impl WindowHandle {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[napi]
     pub fn unregister_host_hotkey(&self, id: String) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            return;
+        }
+        #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::UnregisterHostHotkey {
                 window_id: self.id.clone(),
@@ -397,9 +455,13 @@ impl WindowHandle {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[napi]
     pub fn clear_host_hotkeys(&self) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return;
+        }
+        #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::ClearHostHotkeys(self.id.clone()));
         }
@@ -420,20 +482,29 @@ impl WindowHandle {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[napi]
     pub fn attach_remote_pane_input(&self, pane_id: String, input_fd: i32) -> napi::Result<()> {
-        let dup_fd = unsafe { libc::dup(input_fd) };
-        if dup_fd < 0 {
-            let err = unsafe { *libc::__errno_location() };
-            return Err(napi::Error::from_reason(format!("dup failed for input_fd: errno {}", err)));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (pane_id, input_fd);
+            return Err(napi::Error::from_reason(
+                "sandboxed remote panes are only supported on Linux",
+            ));
         }
-        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
-            let _ = proxy.send_event(EngineCommand::AttachRemotePaneInput(self.id.clone(), pane_id, dup_fd));
-        } else {
-            unsafe { libc::close(dup_fd); };
+        #[cfg(target_os = "linux")]
+        {
+            let dup_fd = unsafe { libc::dup(input_fd) };
+            if dup_fd < 0 {
+                let err = unsafe { *libc::__errno_location() };
+                return Err(napi::Error::from_reason(format!("dup failed for input_fd: errno {}", err)));
+            }
+            if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                let _ = proxy.send_event(EngineCommand::AttachRemotePaneInput(self.id.clone(), pane_id, dup_fd));
+            } else {
+                unsafe { libc::close(dup_fd); };
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     #[napi]
@@ -564,9 +635,14 @@ impl WindowHandle {
 
     /// Cover a docked remote with host crash chrome as a high-z overlay while keeping the
     /// remote visible so it continues to receive compositor vsync / SHM pull.
-    #[cfg(target_os = "linux")]
     #[napi]
     pub fn cover_remote_with_crash_chrome(&self, remote_pane_id: String, crash_pane_id: String) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (remote_pane_id, crash_pane_id);
+            return;
+        }
+        #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::CoverRemoteWithCrashChrome {
                 window_id: self.id.clone(),
@@ -577,9 +653,14 @@ impl WindowHandle {
     }
 
     /// After attaching a successor engine: wait for host GL upload before lifting chrome.
-    #[cfg(target_os = "linux")]
     #[napi]
     pub fn arm_crash_cover_fresh_frame(&self, remote_pane_id: String) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = remote_pane_id;
+            return;
+        }
+        #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::ArmCrashCoverFreshFrame {
                 window_id: self.id.clone(),
@@ -589,9 +670,14 @@ impl WindowHandle {
     }
 
     /// Clear under-cover / fresh-frame gates after crash chrome is dismissed.
-    #[cfg(target_os = "linux")]
     #[napi]
     pub fn clear_remote_crash_cover(&self, remote_pane_id: String) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = remote_pane_id;
+            return;
+        }
+        #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::ClearRemoteCrashCover {
                 window_id: self.id.clone(),
