@@ -30,17 +30,18 @@ const possibleTargetDirs = [
 for (const targetDir of possibleTargetDirs) {
     if (!fs.existsSync(targetDir)) continue;
 
-    // We search recursively in the target directory for release/build/mozangle-*
-    // because the exact path depends on the target triple used by cargo.
+    // Typical cargo layout (profile depends on napi build vs build:debug):
+    //   target/{debug,release}/build/mozangle-*
+    //   target/x86_64-pc-windows-msvc/{debug,release}/build/mozangle-*
+    // Also honor CARGO_TARGET_DIR (e.g. D:/t on Windows CI).
 
-    // Instead of deep recursive search which could be slow, we'll check the typical targets:
-    // target/release/build/mozangle-*
-    // target/x86_64-pc-windows-msvc/release/build/mozangle-*
-
-    const tryDirs = [
-        path.join(targetDir, 'release', 'build'),
-        path.join(targetDir, 'x86_64-pc-windows-msvc', 'release', 'build')
-    ];
+    const tryDirs = [];
+    for (const profile of ['debug', 'release']) {
+        tryDirs.push(
+            path.join(targetDir, profile, 'build'),
+            path.join(targetDir, 'x86_64-pc-windows-msvc', profile, 'build'),
+        );
+    }
 
     for (const buildDir of tryDirs) {
         if (!fs.existsSync(buildDir)) continue;
