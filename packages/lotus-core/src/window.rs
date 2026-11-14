@@ -126,6 +126,263 @@ void main() {
 }
 "#;
 
+/// Fragment adaptation of Qualcomm Snapdragon Game Super Resolution 1.0 for lotus.
+///
+/// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+/// SPDX-License-Identifier: BSD-3-Clause
+/// https://github.com/qualcomm/Snapdragon-Game-Super-Resolution
+///
+/// Rewritten as a GL 3.3 fragment shader (`texture` taps, not compute / `textureGather`)
+/// so it can sample `samplerExternalOES` DMA-BUFs directly into the scene FBO.
+/// `u_flip_y` is applied to `v_uv` before any neighborhood offset, matching `COMP_FS` /
+/// `COMP_FS_OES`. Offsets are symmetric in that UV space (`±u_texel_size`), so a flipped
+/// V axis stays consistent as long as every tap uses the same flipped coordinate.
+#[cfg(target_os = "linux")]
+pub fn sgsr_fragment_source(external: bool) -> String {
+    let extensions = if external {
+        "#extension GL_OES_EGL_image_external_essl3 : enable\n\
+         #extension GL_OES_EGL_image_external : require\n"
+    } else {
+        ""
+    };
+    let sampler = if external {
+        "samplerExternalOES"
+    } else {
+        "sampler2D"
+    };
+    format!(
+        r#"#version 330 core
+{extensions}in vec2 v_pos;
+in vec2 v_uv;
+out vec4 f_color;
+
+uniform {sampler} u_texture;
+uniform vec2 u_size;
+uniform float u_radius;
+uniform int u_flip_y;
+uniform vec2 u_texel_size;
+uniform vec2 u_src_size;
+uniform float u_edge_sharpness;
+uniform float u_edge_threshold;
+
+float sdRoundedBox(vec2 p, vec2 b, float r) {{
+    vec2 q = abs(p) - b + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}}
+
+float luma(vec3 rgb) {{
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}}
+
+float fast_lanczos2(float x) {{
+    float wA = x - 4.0;
+    float wB = x * wA - wA;
+    wA *= wA;
+    return wB * wA;
+}}
+
+vec2 weight_y(float dx, float dy, float c, vec3 data) {{
+    float std = data.x;
+    vec2 dir = data.yz;
+    float edge_dis = (dx * dir.y) + (dy * dir.x);
+    float x = fma(edge_dis * edge_dis, (clamp(c * c * std, 0.0, 1.0) * 0.7 - 1.0), (dx * dx + dy * dy));
+    float w = fast_lanczos2(x);
+    return vec2(w, w * c);
+}}
+
+vec2 edge_direction(vec4 left, vec4 right) {{
+    vec2 delta;
+    delta.x = (right.x - left.z) + (right.w - left.y);
+    delta.y = (right.x - left.z) - (right.w - left.y);
+    return delta * inversesqrt(dot(delta, delta) + 3.075740e-05);
+}}
+
+void main() {{
+    vec2 p = v_pos * u_size * 0.5;
+    vec2 b = u_size * 0.5;
+    float distance = sdRoundedBox(p, b, u_radius);
+    float smoothing = fwidth(distance);
+    float alpha_mask = 1.0 - smoothstep(-smoothing, smoothing, distance);
+
+    // Same V flip as COMP_FS_OES, applied before SGSR taps.
+    vec2 uv = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
+    vec4 color = texture(u_texture, uv);
+
+    vec2 img_coord = uv * u_src_size;
+    vec2 base_coord = floor(img_coord - 0.5) + 0.5;
+    vec2 pl = img_coord - base_coord;
+    vec2 base_uv = base_coord * u_texel_size;
+
+    float l00 = luma(texture(u_texture, base_uv).rgb);
+    float l10 = luma(texture(u_texture, base_uv + vec2(u_texel_size.x, 0.0)).rgb);
+    float l01 = luma(texture(u_texture, base_uv + vec2(0.0, u_texel_size.y)).rgb);
+    float l11 = luma(texture(u_texture, base_uv + u_texel_size).rgb);
+
+    vec4 left = vec4(
+        luma(texture(u_texture, base_uv + vec2(-u_texel_size.x, u_texel_size.y)).rgb),
+        l01,
+        l00,
+        luma(texture(u_texture, base_uv + vec2(-u_texel_size.x, 0.0)).rgb)
+    );
+    vec4 right = vec4(
+        l11,
+        luma(texture(u_texture, base_uv + vec2(2.0 * u_texel_size.x, u_texel_size.y)).rgb),
+        luma(texture(u_texture, base_uv + vec2(2.0 * u_texel_size.x, 0.0)).rgb),
+        l10
+    );
+    vec4 up_down = vec4(
+        luma(texture(u_texture, base_uv + vec2(0.0, -u_texel_size.y)).rgb),
+        luma(texture(u_texture, base_uv + vec2(u_texel_size.x, -u_texel_size.y)).rgb),
+        luma(texture(u_texture, base_uv + vec2(u_texel_size.x, 2.0 * u_texel_size.y)).rgb),
+        luma(texture(u_texture, base_uv + vec2(0.0, 2.0 * u_texel_size.y)).rgb)
+    );
+
+    float center_luma = luma(color.rgb);
+    float edge_vote = abs(left.z - left.y) + abs(center_luma - left.y) + abs(center_luma - left.z);
+
+    if (edge_vote > u_edge_threshold) {{
+        float mean = (left.y + left.z + right.x + right.w) * 0.25;
+        left -= vec4(mean);
+        right -= vec4(mean);
+        up_down -= vec4(mean);
+        float c_rel = center_luma - mean;
+
+        float sum = dot(abs(left) + abs(right) + abs(up_down), vec4(1.0));
+        float sum_mean = 1.014185e+01 / max(sum, 1e-5);
+        vec3 data = vec3(sum_mean * sum_mean, edge_direction(left, right));
+
+        vec2 aWY = weight_y(pl.x,       pl.y + 1.0, up_down.x, data);
+        aWY     += weight_y(pl.x - 1.0, pl.y + 1.0, up_down.y, data);
+        aWY     += weight_y(pl.x - 1.0, pl.y - 2.0, up_down.z, data);
+        aWY     += weight_y(pl.x,       pl.y - 2.0, up_down.w, data);
+        aWY     += weight_y(pl.x + 1.0, pl.y - 1.0, left.x,    data);
+        aWY     += weight_y(pl.x,       pl.y - 1.0, left.y,    data);
+        aWY     += weight_y(pl.x,       pl.y,       left.z,    data);
+        aWY     += weight_y(pl.x + 1.0, pl.y,       left.w,    data);
+        aWY     += weight_y(pl.x - 1.0, pl.y - 1.0, right.x,   data);
+        aWY     += weight_y(pl.x - 2.0, pl.y - 1.0, right.y,   data);
+        aWY     += weight_y(pl.x - 2.0, pl.y,       right.z,   data);
+        aWY     += weight_y(pl.x - 1.0, pl.y,       right.w,   data);
+
+        float final_y = aWY.y / aWY.x;
+        float max_y = max(max(left.y, left.z), max(right.x, right.w));
+        float min_y = min(min(left.y, left.z), min(right.x, right.w));
+        float delta_y = clamp(u_edge_sharpness * final_y, min_y, max_y) - c_rel;
+        delta_y = clamp(delta_y, -23.0 / 255.0, 23.0 / 255.0);
+        color.rgb = clamp(color.rgb + vec3(delta_y), 0.0, 1.0);
+    }}
+
+    f_color = vec4(color.rgb, color.a) * alpha_mask;
+}}
+"#
+    )
+}
+
+/// Host spatial upscaler for nest game panes larger than the client buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostUpscale {
+    Off,
+    Sgsr,
+    Fsr1,
+}
+
+#[cfg(target_os = "linux")]
+pub fn host_upscale() -> HostUpscale {
+    static MODE: std::sync::OnceLock<HostUpscale> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("ATRIUM_UPSCALE")
+            .ok()
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("1") | Some("on") | Some("sgsr") => HostUpscale::Sgsr,
+            Some("fsr1") | Some("fsr") | Some("easu") => HostUpscale::Fsr1,
+            _ => HostUpscale::Off,
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn sgsr_upscale_enabled() -> bool {
+    host_upscale() == HostUpscale::Sgsr
+}
+
+#[cfg(target_os = "linux")]
+pub fn fsr1_upscale_enabled() -> bool {
+    host_upscale() == HostUpscale::Fsr1
+}
+
+/// Optional RCAS sharpen pass after upscale (or on bilinear).
+#[cfg(target_os = "linux")]
+pub fn host_sharpen_rcas() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ATRIUM_SHARPEN")
+                .ok()
+                .as_deref()
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref(),
+            Some("rcas") | Some("cas") | Some("1") | Some("on")
+        )
+    })
+}
+
+/// SGSR edge threshold in [0,1]. Default 8/255 (Qualcomm mobile).
+#[cfg(target_os = "linux")]
+pub fn sgsr_edge_threshold() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        parse_sgsr_threshold(std::env::var("ATRIUM_SGSR_THRESHOLD").ok().as_deref())
+            .unwrap_or(8.0 / 255.0)
+    })
+}
+
+/// SGSR edge sharpness. Default 2.0 (Qualcomm).
+#[cfg(target_os = "linux")]
+pub fn sgsr_edge_sharpness() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ATRIUM_SGSR_SHARPNESS")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(2.0)
+    })
+}
+
+/// RCAS stops: 0 = max sharpen, higher = softer. Default 0.2.
+#[cfg(target_os = "linux")]
+pub fn rcas_sharpness_stops() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ATRIUM_RCAS_SHARPNESS")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.2)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_sgsr_threshold(raw: Option<&str>) -> Option<f32> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // "8" → 8/255; "0.03" → as-is if ≤1.
+    let v: f32 = s.parse().ok()?;
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    if v > 1.0 {
+        Some((v / 255.0).clamp(0.0, 1.0))
+    } else {
+        Some(v)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WindowMetadata {
     pub root_path: Option<PathBuf>,
@@ -440,6 +697,11 @@ pub struct PaneInstance {
     pub external_wayland_server: Option<Arc<parking_lot::Mutex<crate::wayland::LotusWaylandServer>>>,
     #[cfg(target_os = "linux")]
     pub external_child_pid: Option<u32>,
+    #[cfg(target_os = "linux")]
+    pub external_follow_dock: bool,
+    #[cfg(target_os = "linux")]
+    pub external_client_upscale_sgsr: bool,
+    pub overlay_resize: Option<crate::overlay_resize::OverlayResizePolicy>,
 }
 
 /// Terminate an atrium external child (Proton/flatpak) and its process group.
@@ -570,6 +832,58 @@ pub struct WindowInstance {
     pub comp_program: Option<glow::Program>,
     /// Compose program for GL_TEXTURE_EXTERNAL_OES (Proton modifier dmabufs).
     pub comp_program_oes: Option<glow::Program>,
+    /// SGSR 1.0 fragment upscale (sampler2D). Linux, opt-in.
+    #[cfg(target_os = "linux")]
+    pub sgsr_program: Option<glow::Program>,
+    /// SGSR 1.0 fragment upscale (samplerExternalOES).
+    #[cfg(target_os = "linux")]
+    pub sgsr_program_oes: Option<glow::Program>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_size_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_radius_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_flip_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_texel_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_src_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_sharp_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_threshold_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_oes_size_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_oes_radius_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_oes_flip_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_oes_texel_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_oes_src_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_oes_sharp_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_oes_threshold_loc: Option<glow::UniformLocation>,
+    /// FSR1 EASU (sampler2D + textureGather).
+    #[cfg(target_os = "linux")]
+    pub fsr1_easu_program: Option<glow::Program>,
+    /// FSR1 EASU (samplerExternalOES, 4-tap — no gather).
+    #[cfg(target_os = "linux")]
+    pub fsr1_easu_program_oes: Option<glow::Program>,
+    /// RCAS sharpen (sampler2D temp → scene).
+    #[cfg(target_os = "linux")]
+    pub fsr1_rcas_program: Option<glow::Program>,
+    #[cfg(target_os = "linux")]
+    pub fsr1_locs: crate::gl::fsr1::Fsr1Locations,
+    /// Upright RGBA8 temp for upscale→RCAS (NEAREST / CLAMP_TO_EDGE).
+    #[cfg(target_os = "linux")]
+    pub upscale_temp_fbo: Option<glow::NativeFramebuffer>,
+    #[cfg(target_os = "linux")]
+    pub upscale_temp_tex: Option<glow::NativeTexture>,
+    #[cfg(target_os = "linux")]
+    pub upscale_temp_size: Option<(u32, u32)>,
     pub comp_fbo: Option<glow::NativeFramebuffer>,
     pub comp_tex: Option<glow::NativeTexture>,
     pub comp_vao: Option<glow::VertexArray>,
@@ -616,6 +930,9 @@ pub struct WindowInstance {
     pub pending_gutter_delta: Option<i32>,
     /// Currently hovered gutter key `(left_id, right_id)` for leave/cursor restore.
     pub gutter_hover: Option<(String, String)>,
+    /// Floating overlay edge resize drag (host-owned, no chrome).
+    pub active_overlay_resize: Option<crate::overlay_resize::ActiveOverlayResizeDrag>,
+    pub overlay_resize_hover: Option<(String, crate::overlay_resize::ActiveResizeEdge)>,
     /// Last pane that received a routed MouseMove (for synthetic leave on gutter entry).
     pub hover_pane_id: Option<String>,
     /// When true, input goes directly to the embedded Wayland/X11 game pane.
@@ -630,7 +947,7 @@ pub struct WindowInstance {
     #[cfg(target_os = "linux")]
     pub host_pointer_grabbed: bool,
     /// Game-owned shoes: pointer-constraints lock/confine last requested by the primary.
-    /// Survives overlay mode so returning to game just re-applies.
+    /// Snapshot survives overlay; host grab is only worn while `game_mode` is true.
     #[cfg(target_os = "linux")]
     pub game_pointer_constraint_active: bool,
     /// Game-owned shoes: last primary cursor was Hidden (Wine/X11 trap).
@@ -639,6 +956,10 @@ pub struct WindowInstance {
     /// Game-owned shoes: last cursor image from the primary game client.
     #[cfg(target_os = "linux")]
     pub game_cursor: Option<crate::wayland::NestedCursor>,
+    /// Last nest coords on a non-primary overlay (Discord, …) for F12 leave restore
+    /// when the host cursor is still parked on the game wallpaper after unlock.
+    #[cfg(target_os = "linux")]
+    pub last_overlay_pointer: Option<(String, f64, f64)>,
     /// Designates the primary base game pane ID.
     pub primary_game_pane: Option<String>,
     /// Last instant telemetry stats were sent to the HUD webview.
@@ -653,9 +974,62 @@ pub struct WindowInstance {
     pub nested_cursor_applied: bool,
     #[cfg(target_os = "linux")]
     pub nested_compositor: Option<Arc<parking_lot::Mutex<crate::wayland::LotusWaylandServer>>>,
+    /// Output-scoped VRR vs fixed-VSync presentation clock.
+    #[cfg(target_os = "linux")]
+    pub pacing_policy: crate::pacing::PacingPolicy,
+    #[cfg(target_os = "linux")]
+    pub pacing_policy_generation: u64,
+    /// Servo/HUD wants repaint — piggyback on next game present while GameActive (Guard B).
+    #[cfg(target_os = "linux")]
+    pub overlay_dirty: bool,
+    /// Slow nested FrameDone while host is occluded (Guard A).
+    #[cfg(target_os = "linux")]
+    pub last_occluded_frame_done: Option<std::time::Instant>,
 }
 
 impl WindowInstance {
+    /// Update a detached floating pane rect (overlay edge drag or JS setRect).
+    pub fn apply_floating_pane_rect(
+        &mut self,
+        pane_id: &str,
+        rect: euclid::Rect<f32, servo::DeviceIndependentPixel>,
+        scale_factor: f32,
+    ) {
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return;
+        };
+        pane.rect = rect;
+        pane.last_notified_rect = Some(rect);
+        let pane_phys = euclid::default::Rect::new(
+            euclid::default::Point2D::new(
+                (rect.origin.x * scale_factor).round() as i32,
+                (rect.origin.y * scale_factor).round() as i32,
+            ),
+            euclid::default::Size2D::new(
+                (rect.size.width * scale_factor).round() as i32,
+                (rect.size.height * scale_factor).round() as i32,
+            ),
+        );
+        pane.pending_physical_rect = Some(pane_phys);
+        pane.last_physical_rect = pane_phys;
+        pane.anchor = crate::layout::PaneAnchor::None;
+        pane.is_dirty = true;
+
+        #[cfg(target_os = "linux")]
+        if pane.external_wayland_server.is_some() {
+            if let Some(ref ws) = self.nested_compositor {
+                let w = ((rect.size.width * scale_factor).round() as u32).max(1);
+                let h = ((rect.size.height * scale_factor).round() as u32).max(1);
+                ws.lock().send_resize_pane(pane_id, w, h);
+            }
+        }
+
+        self.layout_root.set_leaf_detached(pane_id, true);
+        let physical_size = self.window.inner_size();
+        self.recalculate_layout(physical_size, scale_factor);
+        self.window.request_redraw();
+    }
+
     /// Apply pending gutter Δ (from start snapshot) once per frame. Returns true if layout mutated.
     pub fn flush_pending_gutter_drag(&mut self, scale_factor: f32) -> bool {
         let (drag, delta) = match (
@@ -732,6 +1106,224 @@ impl WindowInstance {
 
             let vao = self.gl.create_vertex_array().expect("Cannot create VAO");
             self.stencil_vao = Some(vao);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn compile_fsr1_programs(&mut self, vs: glow::Shader) {
+        use glow::HasContext;
+        self.fsr1_easu_program = self.link_fsr1_easu(vs, false);
+        self.fsr1_easu_program_oes = self.link_fsr1_easu(vs, true);
+        self.fsr1_rcas_program = self.link_fsr1_rcas(vs);
+        if fsr1_upscale_enabled() || host_sharpen_rcas() {
+            log::info!(
+                "[lotus-fsr1] easu_2d={} easu_oes={} rcas={} upscale={:?} sharpen_rcas={} rcas_stops={:.3}",
+                self.fsr1_easu_program.is_some(),
+                self.fsr1_easu_program_oes.is_some(),
+                self.fsr1_rcas_program.is_some(),
+                host_upscale(),
+                host_sharpen_rcas(),
+                rcas_sharpness_stops()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn link_fsr1_easu(&mut self, vs: glow::Shader, external: bool) -> Option<glow::Program> {
+        use glow::HasContext;
+        unsafe {
+            let program = self.gl.create_program().ok()?;
+            let fs = self.gl.create_shader(glow::FRAGMENT_SHADER).ok()?;
+            let src = if external {
+                crate::gl::fsr1::easu_fragment_oes()
+            } else {
+                crate::gl::fsr1::easu_fragment_2d()
+            };
+            self.gl.shader_source(fs, &src);
+            self.gl.compile_shader(fs);
+            if !self.gl.get_shader_compile_status(fs) {
+                log::warn!(
+                    "[lotus-fsr1] EASU compile failed (external={external}): {}",
+                    self.gl.get_shader_info_log(fs)
+                );
+                self.gl.delete_shader(fs);
+                self.gl.delete_program(program);
+                return None;
+            }
+            self.gl.attach_shader(program, vs);
+            self.gl.attach_shader(program, fs);
+            self.gl.link_program(program);
+            self.gl.detach_shader(program, vs);
+            self.gl.detach_shader(program, fs);
+            self.gl.delete_shader(fs);
+            if !self.gl.get_program_link_status(program) {
+                log::warn!(
+                    "[lotus-fsr1] EASU link failed (external={external}): {}",
+                    self.gl.get_program_info_log(program)
+                );
+                self.gl.delete_program(program);
+                return None;
+            }
+            if let Some(u_tex) = self.gl.get_uniform_location(program, "u_texture") {
+                self.gl.use_program(Some(program));
+                self.gl.uniform_1_i32(Some(&u_tex), 0);
+                self.gl.use_program(None);
+            }
+            let locs = &mut self.fsr1_locs;
+            if external {
+                locs.easu_oes_size = self.gl.get_uniform_location(program, "u_size");
+                locs.easu_oes_radius = self.gl.get_uniform_location(program, "u_radius");
+                locs.easu_oes_flip = self.gl.get_uniform_location(program, "u_flip_y");
+                locs.easu_oes_origin = self.gl.get_uniform_location(program, "u_origin");
+                locs.easu_oes_src = self.gl.get_uniform_location(program, "u_src_size");
+                locs.easu_oes_texel = self.gl.get_uniform_location(program, "u_texel_size");
+                locs.easu_oes_con0 = self.gl.get_uniform_location(program, "u_con0");
+                locs.easu_oes_con1 = self.gl.get_uniform_location(program, "u_con1");
+                locs.easu_oes_con2 = self.gl.get_uniform_location(program, "u_con2");
+                locs.easu_oes_con3 = self.gl.get_uniform_location(program, "u_con3");
+            } else {
+                locs.easu_size = self.gl.get_uniform_location(program, "u_size");
+                locs.easu_radius = self.gl.get_uniform_location(program, "u_radius");
+                locs.easu_flip = self.gl.get_uniform_location(program, "u_flip_y");
+                locs.easu_origin = self.gl.get_uniform_location(program, "u_origin");
+                locs.easu_src = self.gl.get_uniform_location(program, "u_src_size");
+                locs.easu_texel = self.gl.get_uniform_location(program, "u_texel_size");
+                locs.easu_con0 = self.gl.get_uniform_location(program, "u_con0");
+                locs.easu_con1 = self.gl.get_uniform_location(program, "u_con1");
+                locs.easu_con2 = self.gl.get_uniform_location(program, "u_con2");
+                locs.easu_con3 = self.gl.get_uniform_location(program, "u_con3");
+            }
+            Some(program)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn link_fsr1_rcas(&mut self, vs: glow::Shader) -> Option<glow::Program> {
+        use glow::HasContext;
+        unsafe {
+            let program = self.gl.create_program().ok()?;
+            let fs = self.gl.create_shader(glow::FRAGMENT_SHADER).ok()?;
+            self.gl
+                .shader_source(fs, &crate::gl::fsr1::rcas_fragment());
+            self.gl.compile_shader(fs);
+            if !self.gl.get_shader_compile_status(fs) {
+                log::warn!(
+                    "[lotus-fsr1] RCAS compile failed: {}",
+                    self.gl.get_shader_info_log(fs)
+                );
+                self.gl.delete_shader(fs);
+                self.gl.delete_program(program);
+                return None;
+            }
+            self.gl.attach_shader(program, vs);
+            self.gl.attach_shader(program, fs);
+            self.gl.link_program(program);
+            self.gl.detach_shader(program, vs);
+            self.gl.detach_shader(program, fs);
+            self.gl.delete_shader(fs);
+            if !self.gl.get_program_link_status(program) {
+                log::warn!(
+                    "[lotus-fsr1] RCAS link failed: {}",
+                    self.gl.get_program_info_log(program)
+                );
+                self.gl.delete_program(program);
+                return None;
+            }
+            if let Some(u_tex) = self.gl.get_uniform_location(program, "u_texture") {
+                self.gl.use_program(Some(program));
+                self.gl.uniform_1_i32(Some(&u_tex), 0);
+                self.gl.use_program(None);
+            }
+            self.fsr1_locs.rcas_size = self.gl.get_uniform_location(program, "u_size");
+            self.fsr1_locs.rcas_radius = self.gl.get_uniform_location(program, "u_radius");
+            self.fsr1_locs.rcas_origin = self.gl.get_uniform_location(program, "u_origin");
+            self.fsr1_locs.rcas_con = self.gl.get_uniform_location(program, "u_con");
+            Some(program)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn compile_sgsr_programs(&mut self, vs: glow::Shader) {
+        self.sgsr_program = self.link_sgsr_variant(vs, false);
+        self.sgsr_program_oes = self.link_sgsr_variant(vs, true);
+        if sgsr_upscale_enabled() {
+            log::info!(
+                "[lotus-sgsr] enabled (2d={} oes={}) sharpness={:.3} threshold={:.5} ({:.1}/255)",
+                self.sgsr_program.is_some(),
+                self.sgsr_program_oes.is_some(),
+                sgsr_edge_sharpness(),
+                sgsr_edge_threshold(),
+                sgsr_edge_threshold() * 255.0
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn link_sgsr_variant(&mut self, vs: glow::Shader, external: bool) -> Option<glow::Program> {
+        use glow::HasContext;
+        unsafe {
+            let program = self.gl.create_program().ok()?;
+            let fs = self.gl.create_shader(glow::FRAGMENT_SHADER).ok()?;
+            self.gl
+                .shader_source(fs, &sgsr_fragment_source(external));
+            self.gl.compile_shader(fs);
+            if !self.gl.get_shader_compile_status(fs) {
+                log::warn!(
+                    "[lotus-sgsr] compile failed (external={external}): {}",
+                    self.gl.get_shader_info_log(fs)
+                );
+                self.gl.delete_shader(fs);
+                self.gl.delete_program(program);
+                return None;
+            }
+            self.gl.attach_shader(program, vs);
+            self.gl.attach_shader(program, fs);
+            self.gl.link_program(program);
+            self.gl.detach_shader(program, vs);
+            self.gl.detach_shader(program, fs);
+            self.gl.delete_shader(fs);
+            if !self.gl.get_program_link_status(program) {
+                log::warn!(
+                    "[lotus-sgsr] link failed (external={external}): {}",
+                    self.gl.get_program_info_log(program)
+                );
+                self.gl.delete_program(program);
+                return None;
+            }
+            let size = self.gl.get_uniform_location(program, "u_size");
+            let radius = self.gl.get_uniform_location(program, "u_radius");
+            let flip = self.gl.get_uniform_location(program, "u_flip_y");
+            let texel = self.gl.get_uniform_location(program, "u_texel_size");
+            let src = self.gl.get_uniform_location(program, "u_src_size");
+            let sharp = self.gl.get_uniform_location(program, "u_edge_sharpness");
+            let threshold = self.gl.get_uniform_location(program, "u_edge_threshold");
+            if let Some(u_tex) = self.gl.get_uniform_location(program, "u_texture") {
+                let sharp_v = sgsr_edge_sharpness();
+                let thresh_v = sgsr_edge_threshold();
+                self.gl.use_program(Some(program));
+                self.gl.uniform_1_i32(Some(&u_tex), 0);
+                self.gl.uniform_1_f32(sharp.as_ref(), sharp_v);
+                self.gl.uniform_1_f32(threshold.as_ref(), thresh_v);
+                self.gl.use_program(None);
+            }
+            if external {
+                self.u_sgsr_oes_size_loc = size;
+                self.u_sgsr_oes_radius_loc = radius;
+                self.u_sgsr_oes_flip_loc = flip;
+                self.u_sgsr_oes_texel_loc = texel;
+                self.u_sgsr_oes_src_loc = src;
+                self.u_sgsr_oes_sharp_loc = sharp;
+                self.u_sgsr_oes_threshold_loc = threshold;
+            } else {
+                self.u_sgsr_size_loc = size;
+                self.u_sgsr_radius_loc = radius;
+                self.u_sgsr_flip_loc = flip;
+                self.u_sgsr_texel_loc = texel;
+                self.u_sgsr_src_loc = src;
+                self.u_sgsr_sharp_loc = sharp;
+                self.u_sgsr_threshold_loc = threshold;
+            }
+            Some(program)
         }
     }
 
@@ -828,6 +1420,11 @@ impl WindowInstance {
             {
                 self.comp_program_oes = None;
             }
+
+            #[cfg(target_os = "linux")]
+            self.compile_sgsr_programs(vs);
+            #[cfg(target_os = "linux")]
+            self.compile_fsr1_programs(vs);
 
             self.gl.delete_shader(vs);
 

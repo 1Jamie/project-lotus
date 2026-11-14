@@ -1,7 +1,9 @@
 //! Embedded nested Wayland sub-compositor for Lotus (nest).
 
 pub mod dmabuf;
+pub mod presentation_handoff;
 pub mod server;
+pub mod vsync_latch;
 
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -25,6 +27,8 @@ pub use server::{LotusWaylandState, NestedCursor, WaylandEvent};
 pub enum WaylandCommand {
     FrameDone { timestamp_ms: u32 },
     ReleasePreviousBuffer,
+    /// Locked vsync: `seq` is on screen. Release client buffers strictly older than it.
+    FramePresented { surface_id: u32, seq: u64 },
     Resize { width: u32, height: u32 },
     /// Update nested wl_output Mode.refresh (millihertz) to match host monitor.
     SetOutputRefresh { millihertz: u32 },
@@ -43,13 +47,24 @@ pub enum WaylandCommand {
         button: u32,
         pressed: bool,
     },
-    PointerAxis { horizontal: f64, vertical: f64 },
+    PointerAxis {
+        horizontal: f64,
+        vertical: f64,
+        /// Wayland `axis_value120` (120 = one wheel detent). `None` = continuous/pixel.
+        v120_horizontal: Option<i32>,
+        v120_vertical: Option<i32>,
+        /// `true` = `AxisSource::Wheel`, `false` = `AxisSource::Continuous`.
+        wheel: bool,
+    },
     PointerAxisForPane {
         pane_id: String,
         x: f64,
         y: f64,
         horizontal: f64,
         vertical: f64,
+        v120_horizontal: Option<i32>,
+        v120_vertical: Option<i32>,
+        wheel: bool,
     },
     KeyboardKeyForPane {
         pane_id: String,
@@ -57,6 +72,8 @@ pub enum WaylandCommand {
         pressed: bool,
     },
     SetFocusSurface { surface_id: u32 },
+    /// Keyboard focus via `surface_for_pane` (same target as pointer).
+    FocusKeyboardPane { pane_id: String },
     /// Drop seat keyboard focus (game-mode: overlay apps must look unfocused).
     ClearKeyboardFocus,
     /// Drop pointer focus so overlay clients get wl_pointer.leave (Electron blur).
@@ -73,6 +90,10 @@ pub enum WaylandCommand {
 pub struct PaneRegistration {
     pub pane_id: String,
     pub is_primary: bool,
+    /// Non-primary: xdg configure tracks the host dock rect (default for overlays).
+    pub follow_dock: bool,
+    /// Fixed client resolution when `follow_dock` is false.
+    pub configured_client_size: Option<(u32, u32)>,
     pub target_size: (u32, u32),
     /// Last size we pushed via xdg_toplevel configure (skip redundant resizes).
     pub last_configured_size: Arc<ParkingMutex<(u32, u32)>>,
@@ -98,6 +119,19 @@ pub struct ExternalSurfaceSlot {
     pub rolling_frametimes: Vec<f32>,
     pub last_frame_instant: Option<std::time::Instant>,
     pub stats_updated: bool,
+    /// DMA-BUF commit → commit (matches Steam overlay cadence).
+    pub ingest_fps: f32,
+    pub rolling_ingest_ms: Vec<f32>,
+    pub last_ingest_instant: Option<std::time::Instant>,
+    pub commit_counter: u64,
+    /// Host eglSwapBuffers cadence (felt photons).
+    pub present_fps: f32,
+    pub rolling_present_ms: Vec<f32>,
+    pub last_present_instant: Option<std::time::Instant>,
+    pub present_counter: u64,
+    /// Commits imported since the last host swap (rolling coalesce ratio).
+    pub ingest_since_present: u32,
+    pub last_commits_per_swap: f32,
 }
 
 impl Default for ExternalSurfaceSlot {
@@ -115,8 +149,28 @@ impl Default for ExternalSurfaceSlot {
             rolling_frametimes: Vec::new(),
             last_frame_instant: None,
             stats_updated: false,
+            ingest_fps: 0.0,
+            rolling_ingest_ms: Vec::new(),
+            last_ingest_instant: None,
+            commit_counter: 0,
+            present_fps: 0.0,
+            rolling_present_ms: Vec::new(),
+            last_present_instant: None,
+            present_counter: 0,
+            ingest_since_present: 0,
+            last_commits_per_swap: 0.0,
         }
     }
+}
+
+enum QueuedFrame {
+    Dma(DmabufFrameDescriptor),
+    Shm {
+        width: u32,
+        height: u32,
+        stride: u32,
+        data: Vec<u8>,
+    },
 }
 
 pub struct LotusWaylandServer {
@@ -145,6 +199,11 @@ pub struct LotusWaylandServer {
     /// CloseWindow already queued for primary-game-gone.
     primary_exit_requested: Arc<AtomicBool>,
     thread_handle: Option<thread::JoinHandle<()>>,
+    pub presentation_handoff: presentation_handoff::SharedPresentationHandoff,
+    /// Locked-vsync commits not yet handed to a present, oldest first.
+    vsync_latches: std::collections::HashMap<u32, vsync_latch::VsyncFrameLatch<QueuedFrame>>,
+    /// Seqs imported into a GL texture this pump, released only after swap.
+    awaiting_present: Vec<(u32, u64)>,
 }
 
 /// Gamescope-style nested render size. Defaults 1920×1080; override with
@@ -161,41 +220,15 @@ pub fn nest_game_output_size() -> (u32, u32) {
     (w.max(1), h.max(1))
 }
 
-/// Client buffer size for overlay apps (Discord, …).
-///
-/// Not the dock rect and not a hard-coded WxH. Mirrors `rightDrawerRect` against a
-/// ≥1080p reference canvas so a 900p game still gets a hi-res Discord buffer that
-/// the host contain-scales into the smaller dock. Override with
-/// `ATRIUM_OVERLAY_WIDTH` / `ATRIUM_OVERLAY_HEIGHT` when both are set.
-pub fn nest_overlay_client_size() -> (u32, u32) {
-    let env_w = std::env::var("ATRIUM_OVERLAY_WIDTH")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok());
-    let env_h = std::env::var("ATRIUM_OVERLAY_HEIGHT")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok());
-    if let (Some(w), Some(h)) = (env_w, env_h) {
-        return (w.max(1), h.max(1));
+fn pane_wayland_socket_name(pane_id: &str, is_primary: bool) -> String {
+    if is_primary {
+        return "wayland-0".to_string();
     }
-
-    // Same drawer policy as lib/atrium/bounds.js `rightDrawerRect`.
-    const TOP: u32 = 56;
-    const MAX_WIDTH: u32 = 900;
-    const MIN_WIDTH: u32 = 280;
-    const FRACTION: f32 = 0.38;
-
-    let (game_w, game_h) = nest_game_output_size();
-    // Always size against at least a 1080p canvas so 900p games don't shrink Discord.
-    let ref_w = game_w.max(1920);
-    let ref_h = game_h.max(1080);
-    let preferred = ((ref_w as f32) * FRACTION).floor() as u32;
-    let width = preferred
-        .min(MAX_WIDTH)
-        .min(ref_w)
-        .max(MIN_WIDTH.min(ref_w))
-        .max(1);
-    let height = ref_h.saturating_sub(TOP).max(1);
-    (env_w.unwrap_or(width).max(1), env_h.unwrap_or(height).max(1))
+    let safe: String = pane_id
+        .chars()
+        .map(|c| if c == ':' || c == '/' { '_' } else { c })
+        .collect();
+    format!("wayland-{safe}")
 }
 
 impl Drop for LotusWaylandServer {
@@ -211,11 +244,26 @@ impl Drop for LotusWaylandServer {
             });
             let _ = rx.recv_timeout(Duration::from_secs(2));
         }
-        // Host-runtime symlink created for Proton (wayland-nest-<session>).
+        // Host-runtime symlinks: Proton uses wayland-nest-<session>. Each
+        // non-primary pane uses its own socket name so clients do not retarget
+        // each other.
         if let Ok(host_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+            let host_dir = PathBuf::from(&host_runtime);
             if let Some(name) = self.runtime_dir.file_name().and_then(|s| s.to_str()) {
-                let link = PathBuf::from(host_runtime).join(format!("wayland-nest-{}", name));
+                let link = host_dir.join(format!("wayland-nest-{}", name));
                 let _ = std::fs::remove_file(&link);
+            }
+            for pane in self.panes.lock().iter() {
+                if pane.is_primary {
+                    continue;
+                }
+                let link = host_dir.join(pane_wayland_socket_name(&pane.pane_id, false));
+                let is_link = std::fs::symlink_metadata(&link)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                if is_link {
+                    let _ = std::fs::remove_file(&link);
+                }
             }
         }
         if self.runtime_dir.exists() {
@@ -361,6 +409,9 @@ impl LotusWaylandServer {
         let panes_thread = panes.clone();
         let surface_to_pane = Arc::new(ParkingMutex::new(std::collections::HashMap::new()));
         let surface_to_pane_thread = surface_to_pane.clone();
+        let presentation_handoff = Arc::new(presentation_handoff::PresentationHandoff::default());
+        presentation_handoff.set_policy(crate::pacing::resolve_pacing_policy());
+        let presentation_handoff_thread = presentation_handoff.clone();
 
         info!("[lotus-nest] nested Wayland listening on {:?} (WAYLAND_DISPLAY={})", socket_path, socket_name);
 
@@ -378,6 +429,7 @@ impl LotusWaylandServer {
                     refresh_rate_millihertz,
                     panes_thread,
                     surface_to_pane_thread,
+                    presentation_handoff_thread,
                 );
             })
             .map_err(|e| format!("Failed to spawn Wayland server thread: {}", e))?;
@@ -401,7 +453,14 @@ impl LotusWaylandServer {
             primary_empty_since: ParkingMutex::new(None),
             primary_exit_requested: Arc::new(AtomicBool::new(false)),
             thread_handle: Some(thread_handle),
+            presentation_handoff,
+            vsync_latches: std::collections::HashMap::new(),
+            awaiting_present: Vec::new(),
         })
+    }
+
+    pub fn set_pacing_policy(&self, policy: crate::pacing::PacingPolicy) {
+        self.presentation_handoff.set_policy(policy);
     }
 
     fn run_server_loop(
@@ -414,6 +473,7 @@ impl LotusWaylandServer {
         refresh_rate_millihertz: u32,
         pane_registrations: Arc<ParkingMutex<Vec<PaneRegistration>>>,
         surface_to_pane: Arc<ParkingMutex<std::collections::HashMap<u32, String>>>,
+        presentation_handoff: presentation_handoff::SharedPresentationHandoff,
     ) {
         // Init smithay's SHM drop thread *before* Proton/Discord exhaust the Game Mode
         // cgroup PID budget (otherwise Pool LazyLock panics and nested Xwayland dies).
@@ -427,6 +487,7 @@ impl LotusWaylandServer {
             window_id,
             display_handle.clone(),
             event_sender.clone(),
+            presentation_handoff,
             target_size,
             refresh_rate_millihertz,
             pane_registrations,
@@ -525,6 +586,8 @@ impl LotusWaylandServer {
         let mut last_host_frame_done = std::time::Instant::now();
 
         loop {
+            // VRR mailbox must not inherit locked-vsync buffer pins.
+            state.relax_vsync_pins_for_mailbox();
             // Coalesce pointer motion across a drain batch so a 1kHz mouse cannot
             // backlog the unbounded cmd channel (jello / delayed FrameDone).
             let mut pending_rel_dx = 0.0f64;
@@ -557,6 +620,14 @@ impl LotusWaylandServer {
                             &mut pending_rel_dy,
                         );
                         match other {
+                    // Host queues FramePresented before FrameDone on an advancing
+                    // present. wayland-client runs each event as it is read, so
+                    // wl_buffer.release has to be earlier in this flush than
+                    // wl_callback.done or a double-buffered client starts the
+                    // next frame with both buffers still busy.
+                    WaylandCommand::FramePresented { surface_id, seq } => {
+                        state.release_presented_buffer(surface_id, seq);
+                    }
                     WaylandCommand::FrameDone { timestamp_ms } => {
                         state.send_frame_callbacks(timestamp_ms);
                         state.send_presentation_feedback(timestamp_ms);
@@ -615,12 +686,22 @@ impl LotusWaylandServer {
                             }
                             state.clear_keyboard_focus();
                             state.clear_pointer_focus();
+                            // F12 overlay→game: always re-enter the primary pointer.
+                            // Lock shoe → activate constraint (FPS aim, no click-to-recapture).
+                            // Hide-only soft-cursor (RoR2 menus) → enter so absolute motion
+                            // is not dropped on an empty seat until the first CursorMoved.
+                            state.reactivate_primary_pointer_constraints();
                         } else {
                             // Leaving game mode: clear Suspended so Chromium can paint again.
                             // App activates visible overlays; we only unstick Suspended here.
                             for id in &overlay_ids {
                                 state.unsuspend_pane(id);
                             }
+                            // Drop any active game pointer-constraint at the seat so overlay
+                            // input is not fighting a lock. Host sticky shoes in app.rs still
+                            // remember to re-wear grab/cursor when game mode returns.
+                            state.deactivate_primary_pointer_constraints();
+                            state.clear_pointer_focus();
                         }
                     }
                     WaylandCommand::AddPaneListener { pane_id, socket } => {
@@ -701,19 +782,42 @@ impl LotusWaylandServer {
                     } => {
                         state.dispatch_pointer_button_to_pane(&pane_id, x, y, button, pressed);
                     }
-                    WaylandCommand::PointerAxis { horizontal, vertical } => {
+                    WaylandCommand::PointerAxis {
+                        horizontal,
+                        vertical,
+                        v120_horizontal,
+                        v120_vertical,
+                        wheel,
+                    } => {
                         let now_ms = (std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() & 0xFFFFFFFF) as u32;
                         if let Some(pointer) = state.seat.get_pointer() {
+                            let source = if wheel {
+                                smithay::backend::input::AxisSource::Wheel
+                            } else {
+                                smithay::backend::input::AxisSource::Continuous
+                            };
                             let mut frame = smithay::input::pointer::AxisFrame::new(now_ms)
-                                .source(smithay::backend::input::AxisSource::Wheel);
+                                .source(source);
                             if horizontal.abs() > 0.0 {
-                                frame = frame.value(smithay::backend::input::Axis::Horizontal, horizontal);
+                                frame = frame.value(
+                                    smithay::backend::input::Axis::Horizontal,
+                                    horizontal,
+                                );
                             }
                             if vertical.abs() > 0.0 {
-                                frame = frame.value(smithay::backend::input::Axis::Vertical, vertical);
+                                frame = frame.value(
+                                    smithay::backend::input::Axis::Vertical,
+                                    vertical,
+                                );
+                            }
+                            if let Some(v) = v120_horizontal.filter(|v| *v != 0) {
+                                frame = frame.v120(smithay::backend::input::Axis::Horizontal, v);
+                            }
+                            if let Some(v) = v120_vertical.filter(|v| *v != 0) {
+                                frame = frame.v120(smithay::backend::input::Axis::Vertical, v);
                             }
                             pointer.axis(&mut state, frame);
                             pointer.frame(&mut state);
@@ -725,8 +829,20 @@ impl LotusWaylandServer {
                         y,
                         horizontal,
                         vertical,
+                        v120_horizontal,
+                        v120_vertical,
+                        wheel,
                     } => {
-                        state.dispatch_pointer_axis_to_pane(&pane_id, x, y, horizontal, vertical);
+                        state.dispatch_pointer_axis_to_pane(
+                            &pane_id,
+                            x,
+                            y,
+                            horizontal,
+                            vertical,
+                            v120_horizontal,
+                            v120_vertical,
+                            wheel,
+                        );
                     }
                     WaylandCommand::KeyboardKeyForPane {
                         pane_id,
@@ -739,6 +855,9 @@ impl LotusWaylandServer {
                         if let Some(surf) = state.known_surfaces.get(&surface_id) {
                             state.set_focus_surface(Some(surf.clone()));
                         }
+                    }
+                    WaylandCommand::FocusKeyboardPane { pane_id } => {
+                        state.focus_keyboard_pane(&pane_id);
                     }
                     WaylandCommand::ClearKeyboardFocus => {
                         state.clear_keyboard_focus();
@@ -791,8 +910,11 @@ impl LotusWaylandServer {
                     .unwrap_or(0);
                 state.send_frame_callbacks(ms);
                 state.send_presentation_feedback(ms);
-                // Drop the previous DMA-BUF so double-buffered Xwayland can recycle
+                // Drop the previous DMA-BUF fd so double-buffered Xwayland can recycle
                 // when gamescope stops delivering host RedrawRequested.
+                // Do not drop `buffer_holds` here. Those pins are the scanned-out
+                // wl_buffer; releasing them on a 2-vblank stall lets the client
+                // rewrite the image a spare present then samples.
                 state.previous_dmabuf = None;
                 let _ = display.flush_clients();
                 last_host_frame_done = std::time::Instant::now();
@@ -800,25 +922,61 @@ impl LotusWaylandServer {
         }
     }
 
+    fn queue_client_configure(&self, pane_id: &str, width: u32, height: u32) {
+        let w = width.max(32);
+        let h = height.max(32);
+        let skip = {
+            let panes = self.panes.lock();
+            panes
+                .iter()
+                .find(|p| p.pane_id == pane_id)
+                .map(|p| *p.last_configured_size.lock() == (w, h))
+                .unwrap_or(true)
+        };
+        if skip {
+            return;
+        }
+        let _ = self.command_sender.send(WaylandCommand::ResizePane {
+            pane_id: pane_id.to_string(),
+            width: w,
+            height: h,
+        });
+    }
+
+    pub fn set_external_client_size(&self, pane_id: &str, width: u32, height: u32) {
+        let w = width.max(32);
+        let h = height.max(32);
+        {
+            let mut panes = self.panes.lock();
+            let Some(reg) = panes.iter_mut().find(|p| p.pane_id == pane_id) else {
+                return;
+            };
+            if reg.is_primary || reg.follow_dock {
+                warn!(
+                    "[lotus-nest] set_external_client_size ignored for '{}' (primary or follow_dock)",
+                    pane_id
+                );
+                return;
+            }
+            reg.configured_client_size = Some((w, h));
+            reg.target_size = (w, h);
+        }
+        self.queue_client_configure(pane_id, w, h);
+    }
+
     pub fn register_pane(
         &self,
         pane_id: String,
         is_primary: bool,
-        target_size: (u32, u32),
+        follow_dock: bool,
+        configured_client_size: Option<(u32, u32)>,
+        dock_physical: (u32, u32),
         slot: Arc<ParkingMutex<ExternalSurfaceSlot>>,
         child_pid: Option<u32>,
     ) -> String {
         // sun_path is ~108 bytes; colons confuse Flatpak/XDG WAYLAND_DISPLAY parsers.
         // Sanitize plugin:<id>:<local> → plugin_<id>_<local> for the socket filename only.
-        let socket_name = if is_primary {
-            "wayland-0".to_string()
-        } else {
-            let safe: String = pane_id
-                .chars()
-                .map(|c| if c == ':' || c == '/' { '_' } else { c })
-                .collect();
-            format!("wayland-{}", safe)
-        };
+        let socket_name = pane_wayland_socket_name(&pane_id, is_primary);
         let socket_path = self.runtime_dir.join(&socket_name);
         if !is_primary {
             match ListeningSocket::bind_absolute(socket_path.clone()) {
@@ -835,29 +993,37 @@ impl LotusWaylandServer {
             }
         }
 
-        // Primary/game → fixed nested output. Overlays → fixed high-res client size
-        // (not the dock); host cover-scales the buffer into the dock on composite.
+        let dock_w = dock_physical.0.max(32);
+        let dock_h = dock_physical.1.max(32);
+        let overlay_follow = follow_dock && !is_primary;
         let effective_size = if is_primary {
             self.output_size
+        } else if overlay_follow {
+            (dock_w, dock_h)
         } else {
-            let overlay = nest_overlay_client_size();
-            if target_size != overlay {
-                info!(
-                    "[lotus-nest] overlay '{}' ignoring dock hint {}x{}; client stays {}x{}",
-                    pane_id, target_size.0, target_size.1, overlay.0, overlay.1
-                );
-            }
-            overlay
+            configured_client_size.unwrap_or((dock_w, dock_h))
         };
         info!(
-            "[lotus-nest] register pane '{}' primary={} client_size={}x{} (pane hint was {}x{})",
-            pane_id, is_primary, effective_size.0, effective_size.1, target_size.0, target_size.1
+            "[lotus-nest] register pane '{}' primary={} follow_dock={} client_size={}x{} (dock {}x{})",
+            pane_id,
+            is_primary,
+            overlay_follow,
+            effective_size.0,
+            effective_size.1,
+            dock_w,
+            dock_h
         );
 
         let mut panes = self.panes.lock();
         panes.push(PaneRegistration {
             pane_id,
             is_primary,
+            follow_dock: overlay_follow,
+            configured_client_size: if overlay_follow {
+                None
+            } else {
+                configured_client_size.or(Some(effective_size))
+            },
             target_size: effective_size,
             last_configured_size: Arc::new(ParkingMutex::new((0, 0))),
             slot,
@@ -870,11 +1036,19 @@ impl LotusWaylandServer {
         socket_name
     }
 
-    pub fn send_resize_pane(&self, pane_id: &str, _width: u32, _height: u32) {
-        // Nested clients keep a fixed client size (game: output_size, overlays:
-        // nest_overlay_client_size). Dock/pane layout changes are composite-only —
-        // never push xdg configures from lotus layout ticks (squashes Discord/Electron).
-        let _ = pane_id;
+    pub fn send_resize_pane(&self, pane_id: &str, width: u32, height: u32) {
+        let follow = {
+            let panes = self.panes.lock();
+            panes
+                .iter()
+                .find(|p| p.pane_id == pane_id)
+                .map(|p| p.follow_dock && !p.is_primary)
+                .unwrap_or(false)
+        };
+        if !follow {
+            return;
+        }
+        self.queue_client_configure(pane_id, width, height);
     }
 
     pub fn send_pane_visible(&self, pane_id: &str, visible: bool) {
@@ -892,18 +1066,9 @@ impl LotusWaylandServer {
     }
 
     pub fn focus_pane(&self, pane_id: &str) {
-        let panes = self.panes.lock();
-        if let Some(p) = panes.iter().find(|p| p.pane_id == pane_id) {
-            let sid = p.active_surface_id.load(Ordering::SeqCst);
-            let sid = if sid != u32::MAX {
-                sid
-            } else {
-                p.surface_id.load(Ordering::SeqCst)
-            };
-            if sid != u32::MAX {
-                let _ = self.command_sender.send(WaylandCommand::SetFocusSurface { surface_id: sid });
-            }
-        }
+        let _ = self.command_sender.send(WaylandCommand::FocusKeyboardPane {
+            pane_id: pane_id.to_string(),
+        });
         let _ = self.command_sender.send(WaylandCommand::SetPaneActivated {
             pane_id: pane_id.to_string(),
             activated: true,
@@ -932,16 +1097,12 @@ impl LotusWaylandServer {
     pub fn focus_primary_pane(&self) -> Option<String> {
         let panes = self.panes.lock();
         if let Some(p) = panes.iter().find(|p| p.is_primary) {
-            let sid = p.active_surface_id.load(Ordering::SeqCst);
-            let sid = if sid != u32::MAX {
-                sid
-            } else {
-                p.surface_id.load(Ordering::SeqCst)
-            };
-            if sid != u32::MAX {
-                let _ = self.command_sender.send(WaylandCommand::SetFocusSurface { surface_id: sid });
-            }
-            return Some(p.pane_id.clone());
+            let pane_id = p.pane_id.clone();
+            drop(panes);
+            let _ = self.command_sender.send(WaylandCommand::FocusKeyboardPane {
+                pane_id: pane_id.clone(),
+            });
+            return Some(pane_id);
         }
         None
     }
@@ -978,6 +1139,9 @@ impl LotusWaylandServer {
         y: f64,
         horizontal: f64,
         vertical: f64,
+        v120_horizontal: Option<i32>,
+        v120_vertical: Option<i32>,
+        wheel: bool,
     ) {
         let _ = self.command_sender.send(WaylandCommand::PointerAxisForPane {
             pane_id: pane_id.to_string(),
@@ -985,6 +1149,9 @@ impl LotusWaylandServer {
             y,
             horizontal,
             vertical,
+            v120_horizontal,
+            v120_vertical,
+            wheel,
         });
     }
 
@@ -1001,25 +1168,179 @@ impl LotusWaylandServer {
         !dirty.is_empty()
     }
 
+    fn vsync_fifo(&self) -> bool {
+        !self
+            .presentation_handoff
+            .vrr_passthrough
+            .load(Ordering::Acquire)
+    }
+
+    fn enqueue_vsync_frame(&mut self, surface_id: u32, seq: u64, frame: QueuedFrame) {
+        if seq == 0 {
+            return;
+        }
+        let latch = self.vsync_latches.entry(surface_id).or_default();
+        if !latch.push(seq, frame) {
+            debug!(
+                "[lotus-nest] vsync dropped surface {surface_id} seq {seq} (not newer than the frame already accepted)"
+            );
+        }
+    }
+
+    /// One new client frame per present. Empty means hold the texture already shown.
+    fn promote_vsync_frames(
+        &mut self,
+        latest_descs: &mut std::collections::HashMap<u32, DmabufFrameDescriptor>,
+        latest_shms: &mut std::collections::HashMap<u32, (u64, u32, u32, u32, Vec<u8>)>,
+    ) {
+        let ids: Vec<u32> = self.vsync_latches.keys().copied().collect();
+        for id in ids {
+            let Some(latch) = self.vsync_latches.get_mut(&id) else {
+                continue;
+            };
+            let Some((seq, frame)) = latch.pop_next() else {
+                continue;
+            };
+            match frame {
+                QueuedFrame::Dma(mut desc) => {
+                    desc.commit_seq = seq;
+                    latest_descs.insert(id, desc);
+                }
+                QueuedFrame::Shm {
+                    width,
+                    height,
+                    stride,
+                    data,
+                } => {
+                    latest_shms.insert(id, (seq, width, height, stride, data));
+                }
+            }
+        }
+    }
+
+    /// Leaving locked vsync: show the newest queued frame and drop the rest.
+    fn collapse_vsync_latches(
+        &mut self,
+        latest_descs: &mut std::collections::HashMap<u32, DmabufFrameDescriptor>,
+        latest_shms: &mut std::collections::HashMap<u32, (u64, u32, u32, u32, Vec<u8>)>,
+    ) {
+        if self.vsync_latches.is_empty() {
+            return;
+        }
+        let latches = std::mem::take(&mut self.vsync_latches);
+        for (id, mut latch) in latches {
+            let mut last = None;
+            while let Some(frame) = latch.pop_next() {
+                last = Some(frame);
+            }
+            let Some((seq, frame)) = last else {
+                continue;
+            };
+            match frame {
+                QueuedFrame::Dma(mut desc) => {
+                    desc.commit_seq = seq;
+                    latest_descs.entry(id).or_insert(desc);
+                }
+                QueuedFrame::Shm {
+                    width,
+                    height,
+                    stride,
+                    data,
+                } => {
+                    latest_shms
+                        .entry(id)
+                        .or_insert((seq, width, height, stride, data));
+                }
+            }
+        }
+    }
+
+    fn note_vsync_frame(&mut self, surface_id: u32, seq: u64) {
+        if seq > 0 {
+            self.awaiting_present.push((surface_id, seq));
+        }
+    }
+
+    /// Seqs whose textures were imported. The caller sends these after a real swap.
+    pub fn take_frames_awaiting_present(&mut self) -> Vec<(u32, u64)> {
+        std::mem::take(&mut self.awaiting_present)
+    }
+
+    /// Put seqs back when the retire fence has not signaled, ahead of anything
+    /// imported by a later pump, so the next present retries the release.
+    pub fn restore_frames_awaiting_present(&mut self, mut frames: Vec<(u32, u64)>) {
+        if frames.is_empty() {
+            return;
+        }
+        frames.append(&mut self.awaiting_present);
+        self.awaiting_present = frames;
+    }
+
+    pub fn note_frame_presented(&self, surface_id: u32, seq: u64) {
+        if seq == 0 {
+            return;
+        }
+        let _ = self
+            .command_sender
+            .send(WaylandCommand::FramePresented { surface_id, seq });
+    }
+
+    /// True when a newer client frame is queued behind the one just imported.
+    pub fn vsync_frames_waiting(&self) -> bool {
+        self.vsync_latches.values().any(|latch| latch.waiting() > 0)
+    }
+
     pub fn pump_frames(&mut self, gl: &glow::Context) -> Vec<String> {
         let mut dirty_panes = Vec::new();
-        // Keep only the latest buffer per surface — intermediate commits are discarded
-        // so we present once per host redraw (monitor-paced), not once per spam commit.
+        let fifo = self.vsync_fifo();
+        // Mailbox keeps only the latest buffer per surface. Locked vsync queues
+        // every commit and imports one per present so a late frame holds instead
+        // of scanning an older buffer back out.
         let mut latest_descs: std::collections::HashMap<u32, DmabufFrameDescriptor> =
             std::collections::HashMap::new();
-        let mut latest_shms: std::collections::HashMap<u32, (u32, u32, u32, Vec<u8>)> =
+        let mut latest_shms: std::collections::HashMap<u32, (u64, u32, u32, u32, Vec<u8>)> =
             std::collections::HashMap::new();
         // Track which panes got a *presented* texture this pump (for stats once each).
         let mut presented_slots: Vec<(String, bool, Arc<ParkingMutex<ExternalSurfaceSlot>>)> =
             Vec::new();
 
+        if !fifo {
+            self.collapse_vsync_latches(&mut latest_descs, &mut latest_shms);
+        }
+
         while let Ok(event) = self.event_receiver.try_recv() {
             match event {
                 WaylandEvent::FrameCommitted(desc) => {
-                    latest_descs.insert(desc.surface_id, desc);
+                    if fifo && desc.commit_seq > 0 {
+                        let surface_id = desc.surface_id;
+                        let seq = desc.commit_seq;
+                        self.enqueue_vsync_frame(surface_id, seq, QueuedFrame::Dma(desc));
+                    } else {
+                        latest_descs.insert(desc.surface_id, desc);
+                    }
                 }
-                WaylandEvent::ShmFrameCommitted { surface_id, width, height, stride, data } => {
-                    latest_shms.insert(surface_id, (width, height, stride, data));
+                WaylandEvent::ShmFrameCommitted {
+                    surface_id,
+                    commit_seq,
+                    width,
+                    height,
+                    stride,
+                    data,
+                } => {
+                    if fifo && commit_seq > 0 {
+                        self.enqueue_vsync_frame(
+                            surface_id,
+                            commit_seq,
+                            QueuedFrame::Shm {
+                                width,
+                                height,
+                                stride,
+                                data,
+                            },
+                        );
+                    } else {
+                        latest_shms.insert(surface_id, (commit_seq, width, height, stride, data));
+                    }
                 }
                 WaylandEvent::XwaylandReady { display_number } => {
                     debug!("[lotus-nest] host notified Xwayland DISPLAY=:{}", display_number);
@@ -1047,12 +1368,18 @@ impl LotusWaylandServer {
             }
         }
 
+        if fifo {
+            self.promote_vsync_frames(&mut latest_descs, &mut latest_shms);
+        }
+
         let refresh_mhz = self.refresh_rate_millihertz.load(Ordering::SeqCst).max(1);
         let refresh_hz = refresh_mhz as f32 / 1000.0;
         let min_ft_ms = 1000.0 / refresh_hz.max(1.0);
 
         for (_surface_id, desc) in latest_descs {
             let surface_id = desc.surface_id;
+            let commit_seq = desc.commit_seq;
+            let mut latched_feedback = false;
             match self.importer.import_texture(gl, &desc) {
                 Ok(imported) => {
                     let pane_info = {
@@ -1120,6 +1447,9 @@ impl LotusWaylandServer {
                                 dirty_panes.push(pane_id.clone());
                                 presented_slots.push((pane_id, is_primary, slot.clone()));
                             }
+                            self.note_vsync_frame(surface_id, commit_seq);
+                            self.presentation_handoff.latch_surface(surface_id);
+                            latched_feedback = true;
                         }
                     }
                 }
@@ -1128,9 +1458,13 @@ impl LotusWaylandServer {
                     self.release_previous_buffer();
                 }
             }
+            if commit_seq > 0 && !latched_feedback {
+                self.presentation_handoff.discard_oldest(surface_id);
+            }
         }
 
-        for (surface_id, (width, height, _stride, data)) in latest_shms {
+        for (surface_id, (commit_seq, width, height, _stride, data)) in latest_shms {
+            let mut latched_feedback = false;
             let pane_info = {
                 let s2p = self.surface_to_pane.lock();
                 let panes = self.panes.lock();
@@ -1182,7 +1516,10 @@ impl LotusWaylandServer {
                     guard.is_external_oes = false;
                     guard.width = width;
                     guard.height = height;
-                    guard.y_inverted = true;
+                    // wl_shm is top-down. glTexImage2D stores row0 at the GL
+                    // bottom, so the compositor must flip V (y_inverted=false →
+                    // flip_y=1). Hardcoding true left weston-terminal upside-down.
+                    guard.y_inverted = false;
 
                     if is_primary {
                         let mut def_guard = self.slot.lock();
@@ -1190,6 +1527,7 @@ impl LotusWaylandServer {
                         def_guard.target = glow::TEXTURE_2D;
                         def_guard.width = width;
                         def_guard.height = height;
+                        def_guard.y_inverted = false;
                         if width > 64 && height > 64 {
                             self.note_primary_presented();
                         }
@@ -1199,40 +1537,46 @@ impl LotusWaylandServer {
                         dirty_panes.push(pane_id.clone());
                         presented_slots.push((pane_id, is_primary, slot.clone()));
                     }
+                    self.note_vsync_frame(surface_id, commit_seq);
+                    self.presentation_handoff.latch_surface(surface_id);
+                    latched_feedback = true;
                 }
+            }
+            if commit_seq > 0 && !latched_feedback {
+                self.presentation_handoff.discard_oldest(surface_id);
             }
         }
 
-        // One presentation sample per pane per host redraw — FPS tracks vsync, not commit spam.
+        // Ingest FPS — commit interval (matches Steam overlay cadence).
         let now = std::time::Instant::now();
         for (_pane_id, is_primary, slot) in presented_slots {
             let mut guard = slot.lock();
             guard.frame_counter = guard.frame_counter.wrapping_add(1);
-            let frametime_ms = if let Some(last) = guard.last_frame_instant {
+            guard.commit_counter = guard.commit_counter.wrapping_add(1);
+            guard.ingest_since_present = guard.ingest_since_present.saturating_add(1);
+            let ingest_ms = if let Some(last) = guard.last_ingest_instant {
                 now.duration_since(last).as_secs_f32() * 1000.0
             } else {
                 min_ft_ms
             };
-            // Floor near the monitor period so tiny Instant deltas can't report 100k+ FPS.
-            let frametime_ms = frametime_ms.max(min_ft_ms * 0.5);
-            guard.last_frame_instant = Some(now);
-            guard.last_frame_time_ms = frametime_ms;
-            let instant_fps = (1000.0 / frametime_ms).min(refresh_hz * 1.05);
-            if guard.current_fps == 0.0 {
-                guard.current_fps = instant_fps;
+            let ingest_ms = ingest_ms.max(min_ft_ms * 0.5);
+            guard.last_ingest_instant = Some(now);
+            let instant_ingest_fps = (1000.0 / ingest_ms).min(refresh_hz * 1.05);
+            if guard.ingest_fps == 0.0 {
+                guard.ingest_fps = instant_ingest_fps;
             } else {
-                guard.current_fps = guard.current_fps * 0.85 + instant_fps * 0.15;
+                guard.ingest_fps = guard.ingest_fps * 0.85 + instant_ingest_fps * 0.15;
             }
-            guard.rolling_frametimes.push(frametime_ms);
-            if guard.rolling_frametimes.len() > 60 {
-                guard.rolling_frametimes.remove(0);
+            guard.rolling_ingest_ms.push(ingest_ms);
+            if guard.rolling_ingest_ms.len() > 60 {
+                guard.rolling_ingest_ms.remove(0);
             }
             guard.stats_updated = true;
             if is_primary {
                 let mut def_guard = self.slot.lock();
                 def_guard.frame_counter = guard.frame_counter;
-                def_guard.last_frame_time_ms = frametime_ms;
-                def_guard.current_fps = guard.current_fps;
+                def_guard.commit_counter = guard.commit_counter;
+                def_guard.ingest_fps = guard.ingest_fps;
                 def_guard.stats_updated = true;
             }
         }
@@ -1373,8 +1717,21 @@ impl LotusWaylandServer {
     }
 
     /// Forward a pointer scroll/axis event to the sub-compositor.
-    pub fn send_pointer_axis(&self, horizontal: f64, vertical: f64) {
-        let _ = self.command_sender.send(WaylandCommand::PointerAxis { horizontal, vertical });
+    pub fn send_pointer_axis(
+        &self,
+        horizontal: f64,
+        vertical: f64,
+        v120_horizontal: Option<i32>,
+        v120_vertical: Option<i32>,
+        wheel: bool,
+    ) {
+        let _ = self.command_sender.send(WaylandCommand::PointerAxis {
+            horizontal,
+            vertical,
+            v120_horizontal,
+            v120_vertical,
+            wheel,
+        });
     }
 
     /// Resize the sub-compositor's target window geometry.

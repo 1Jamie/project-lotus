@@ -71,6 +71,8 @@ pub struct DmabufFrameDescriptor {
     pub modifier: u64,
     pub has_modifier: bool,
     pub y_inverted: bool,
+    /// Locked-vsync commit order. `0` is mailbox (no latch).
+    pub commit_seq: u64,
 }
 
 impl DmabufFrameDescriptor {
@@ -86,6 +88,7 @@ impl DmabufFrameDescriptor {
             modifier,
             has_modifier: dmabuf.has_modifier(),
             y_inverted: dmabuf.y_inverted(),
+            commit_seq: 0,
             dmabuf,
         }
     }

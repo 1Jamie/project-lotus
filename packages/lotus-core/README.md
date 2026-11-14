@@ -9,6 +9,22 @@ The runtime engine for Lotus desktop applications.
 * [**`@lotus-gui/dev` CLI & Packager Docs**](https://github.com/1Jamie/project-lotus/blob/main/packages/lotus-dev/README.md)
 * [**Nested external apps (Linux)**](./NEST.md) — `createExternalAppPane`, `setGameMode`, host hotkeys
 
+## Upscale
+
+The primary game pane can reconstruct a smaller buffer into a larger pane with a GL 3.3 fragment port of **Snapdragon Game Super Resolution 1.0** (Qualcomm, BSD-3-Clause). It is off by default so frame-pacing measurements stay on the bilinear compose path.
+
+```bash
+# Baseline present_dt (SGSR off)
+ATRIUM_PACING_DIAG=1 atrium
+
+# Then compare. Expect roughly +0.15–0.20 ms, not a change in cadence.
+ATRIUM_UPSCALE=sgsr ATRIUM_PACING_DIAG=1 atrium
+```
+
+Neighborhood taps use the same `u_flip_y` UV space as the existing compose shader. Same-size and downscale blits stay bilinear. HUD and Discord are never reconstructed.
+
+Source: https://github.com/qualcomm/Snapdragon-Game-Super-Resolution
+
 ---
 
 ## Installation

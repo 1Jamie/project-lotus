@@ -271,6 +271,27 @@ pub enum EngineCommand {
         dbus_notifications: String,
         /// App names / desktop-ids to match (case-insensitive), e.g. Discord.
         dbus_notification_apps: Vec<String>,
+        /// Extra child env (merged into Command before spawn). Prefer this over
+        /// `env KEY=VAL` argv so secrets never appear in /proc/<pid>/cmdline.
+        env: std::collections::HashMap<String, String>,
+        /// Overlay client buffer tracks dock rect (xdg configure on setRect).
+        follow_dock: bool,
+        client_width: Option<u32>,
+        client_height: Option<u32>,
+        client_upscale_sgsr: bool,
+        resize_edges: u32,
+        resize_anchor: u8,
+        resize_min_w: f32,
+        resize_min_h: f32,
+        resize_max_w: Option<f32>,
+        resize_max_h: Option<f32>,
+    },
+    #[cfg(target_os = "linux")]
+    SetExternalClientSize {
+        window_id: String,
+        pane_id: String,
+        width: u32,
+        height: u32,
     },
     #[cfg(target_os = "linux")]
     SetGameMode(String, bool),
@@ -483,14 +504,28 @@ fn push_renderer_ipc(window_id: &str, channel: &str, payload: serde_json::Value)
 }
 
 #[cfg(target_os = "linux")]
+/// Linux `BTN_*` codes for nested wl_pointer / Xwayland.
+///
+/// winit collapses BTN_SIDE|BTN_BACK → `Back` and BTN_EXTRA|BTN_FORWARD → `Forward`.
+/// Games expect mouse4/mouse5 as SIDE/EXTRA (0x113/0x114). Mapping Back→FORWARD and
+/// Forward→BACK (the old values) dropped Corsair side-button melee binds.
 fn winit_mouse_button_evdev(button: winit::event::MouseButton) -> u32 {
+    const BTN_LEFT: u32 = 0x110;
+    const BTN_RIGHT: u32 = 0x111;
+    const BTN_MIDDLE: u32 = 0x112;
+    const BTN_SIDE: u32 = 0x113;
+    const BTN_EXTRA: u32 = 0x114;
     match button {
-        winit::event::MouseButton::Left => 0x110,
-        winit::event::MouseButton::Right => 0x111,
-        winit::event::MouseButton::Middle => 0x112,
-        winit::event::MouseButton::Back => 0x115,
-        winit::event::MouseButton::Forward => 0x116,
-        winit::event::MouseButton::Other(v) => v as u32,
+        winit::event::MouseButton::Left => BTN_LEFT,
+        winit::event::MouseButton::Right => BTN_RIGHT,
+        winit::event::MouseButton::Middle => BTN_MIDDLE,
+        winit::event::MouseButton::Back => BTN_SIDE,
+        winit::event::MouseButton::Forward => BTN_EXTRA,
+        // Wayland `Other` is already an evdev code; X11 `Other` is a button number.
+        winit::event::MouseButton::Other(v) if (v as u32) >= BTN_LEFT => v as u32,
+        winit::event::MouseButton::Other(8) => BTN_SIDE,
+        winit::event::MouseButton::Other(9) => BTN_EXTRA,
+        winit::event::MouseButton::Other(v) => BTN_LEFT.saturating_add(v.saturating_sub(1) as u32),
     }
 }
 
@@ -552,6 +587,36 @@ fn nest_set_pane_visible(instance: &mut WindowInstance, pane_id: &str, visible: 
     instance.window.request_redraw();
 }
 
+/// Physical rect for overlay resize grips: staged layout + external contain-fit.
+///
+/// No CSD shadow inset — Ptyxis launches `--fullscreen` (flush content edge). The
+/// old ~12 CSS-px inset stacked on top of that and pushed left/bottom grips into
+/// the terminal. Drag math already uses `pane.rect`; hit-test must match the same
+/// visible edge.
+fn overlay_resize_pane_rect(
+    instance: &WindowInstance,
+    pane: &PaneInstance,
+    scale_factor: f32,
+) -> (f32, f32, f32, f32) {
+    let (px, py, pw, ph) = nest_pane_hit_rect(instance, pane, scale_factor);
+    #[cfg(target_os = "linux")]
+    if let Some(ref slot) = pane.external_surface_slot {
+        let guard = slot.lock();
+        if guard.width > 0 && guard.height > 0 {
+            return crate::overlay_resize::contain_fit_content_rect(
+                px,
+                py,
+                pw,
+                ph,
+                guard.width,
+                guard.height,
+            );
+        }
+    }
+    let _ = scale_factor;
+    (px, py, pw, ph)
+}
+
 /// Physical rect for pointer hit-testing; matches staged compositor placement in atrium.
 fn nest_pane_hit_rect(
     instance: &WindowInstance,
@@ -575,6 +640,123 @@ fn nest_pane_hit_rect(
     #[cfg(not(target_os = "linux"))]
     let _ = instance;
     pane.input_physical_rect(scale_factor)
+}
+
+/// Host overlay edge resize: cursor feedback + drag reflow (no visible chrome).
+fn overlay_resize_handle_cursor(
+    instance: &mut WindowInstance,
+    point: Point2D<f32, servo::DevicePixel>,
+    scale_factor: f32,
+) -> bool {
+    use crate::overlay_resize::{
+        compute_resized_rect, cursor_for_edge, hit_test_overlay_resize,
+    };
+
+    if let Some(ref drag) = instance.active_overlay_resize.clone() {
+        let Some(pane) = instance.panes.get(&drag.pane_id) else {
+            instance.active_overlay_resize = None;
+            return true;
+        };
+        let Some(policy) = pane.overlay_resize.clone() else {
+            instance.active_overlay_resize = None;
+            return true;
+        };
+        let window = instance.window.inner_size();
+        let window_w = window.width as f32 / scale_factor;
+        let window_h = window.height as f32 / scale_factor;
+        let cursor_x = point.x / scale_factor;
+        let cursor_y = point.y / scale_factor;
+        let next = compute_resized_rect(&policy, drag, cursor_x, cursor_y, window_w, window_h);
+        let edge = drag.edge;
+        let pane_id = drag.pane_id.clone();
+        instance.apply_floating_pane_rect(&pane_id, next, scale_factor);
+        // Host owns the cursor for the drag — don't let a stale nested flag block restore.
+        #[cfg(target_os = "linux")]
+        {
+            instance.nested_cursor_applied = false;
+        }
+        instance.window.set_cursor(cursor_for_edge(edge));
+        return true;
+    }
+
+    if !instance.is_mouse_down {
+        if let Some((pid, edge)) = hit_test_overlay_resize(
+            instance.panes.values(),
+            point,
+            scale_factor,
+            pane_accepts_pointer_input,
+            |p| overlay_resize_pane_rect(instance, p, scale_factor),
+        ) {
+            let was = instance.overlay_resize_hover.clone();
+            instance.overlay_resize_hover = Some((pid, edge));
+            // Entering a grip: host ColResize/RowResize must beat the nested client's
+            // last arrow. Clear the applied flag so leaving can re-sync the client cursor.
+            #[cfg(target_os = "linux")]
+            {
+                instance.nested_cursor_applied = false;
+            }
+            instance.window.set_cursor(cursor_for_edge(edge));
+            let _ = was;
+            return true;
+        }
+        if instance.overlay_resize_hover.take().is_some() {
+            // Leave grip → drop host resize cursor immediately. Nested re-sync happens
+            // on the subsequent nest_route_cursor_moved / pane hit path.
+            #[cfg(target_os = "linux")]
+            {
+                instance.nested_cursor_applied = false;
+                // Don't let nest_sync re-paint a stale CSD ColResize from the grip edge.
+                if instance
+                    .nested_cursor
+                    .as_ref()
+                    .is_some_and(nest_cursor_is_resize_shape)
+                {
+                    instance.nested_cursor = None;
+                }
+            }
+            instance.window.set_cursor(winit::window::CursorIcon::Default);
+        }
+    }
+    false
+}
+
+fn overlay_resize_handle_button(
+    instance: &mut WindowInstance,
+    point: Point2D<f32, servo::DevicePixel>,
+    scale_factor: f32,
+    is_pressed: bool,
+    button: winit::event::MouseButton,
+) -> bool {
+    use crate::overlay_resize::{hit_test_overlay_resize, ActiveOverlayResizeDrag};
+
+    if button != winit::event::MouseButton::Left {
+        return false;
+    }
+    if !is_pressed {
+        if instance.active_overlay_resize.take().is_some() {
+            return true;
+        }
+        return false;
+    }
+    let Some((pid, edge)) = hit_test_overlay_resize(
+        instance.panes.values(),
+        point,
+        scale_factor,
+        pane_accepts_pointer_input,
+        |p| overlay_resize_pane_rect(instance, p, scale_factor),
+    ) else {
+        return false;
+    };
+    let Some(start_rect) = instance.panes.get(&pid).map(|p| p.rect) else {
+        return false;
+    };
+    instance.active_overlay_resize = Some(ActiveOverlayResizeDrag {
+        pane_id: pid,
+        edge,
+        start_rect,
+    });
+    instance.last_mouse_down_pane_id = None;
+    true
 }
 
 /// Topmost pane under the cursor (z-order), same as standard lotus overlay routing.
@@ -629,8 +811,9 @@ fn nest_set_keyboard_focus(instance: &mut WindowInstance, pane_id: &str) {
 
 /// Enter/leave game-only input. Overlay uses click-to-focus; game mode always focuses the game.
 ///
-/// Game cursor/lock "shoes" keep updating while overlay is up — switching modes only
-/// puts those shoes on/off the host. Overlay never wipes game state.
+/// Game cursor/lock "shoes" (`game_cursor`, `game_pointer_constraint_active`, …) are a
+/// snapshot: overlay never wipes them, and never feeds the game pointer just to keep
+/// them "live". Mode switches only put those shoes on/off the host seat.
 #[cfg(target_os = "linux")]
 fn nest_apply_game_mode(
     instance: &mut WindowInstance,
@@ -675,11 +858,10 @@ fn nest_apply_game_mode(
             for id in &overlay_ids {
                 server.set_pane_activated(id, false);
             }
-            // Keyboard off overlays; restore pointer to the game so its cursor/lock
-            // channel stays live (do not wipe game shoes).
+            // Keyboard off overlays before re-seating the game.
             server.clear_keyboard_focus();
         }
-        if let Some(ref gid) = game_id {
+            if let Some(ref gid) = game_id {
             if instance.active_pane_id != *gid
                 && overlay_ids.iter().any(|id| id == &instance.active_pane_id)
             {
@@ -687,16 +869,20 @@ fn nest_apply_game_mode(
             }
             nest_set_keyboard_focus(instance, gid);
             if let Some(ref ws) = instance.nested_compositor {
-                // Re-seat pointer on the game so constraints/cursor keep flowing.
+                // Re-seat pointer on the game; constraints/cursor refresh from here.
                 ws.lock().focus_pane(gid);
             }
         }
         instance.hover_pane_id = None;
+        // Overlay visual cache must not leak back onto the game seat.
+        instance.nested_cursor = None;
         for id in &overlay_ids {
             crate::dbus_notify::set_source_pane_visible(id, false);
         }
-        // Put the game's shoes back on the host.
-        nest_wear_game_pointer_shoes(instance, event_loop);
+        // Cursor shoe now. Host grab waits for NestedPointerLock after nest
+        // SetHostGameMode reactivate — wearing grab here races ahead of seat enter
+        // and left OW/RoR2 unbound until click/pause.
+        nest_wear_game_cursor_shoe(instance, event_loop);
     } else {
         let game_id = instance.primary_game_pane.clone();
         let overlay_ids: Vec<String> = instance
@@ -726,9 +912,12 @@ fn nest_apply_game_mode(
                 server.set_pane_activated(id, visible);
             }
         }
-        // Take host shoes off for Discord/HUD — game_* state stays as-is.
+        // Take host shoes off for Discord/HUD — game_* snapshot stays as-is.
         nest_release_host_pointer_grab(instance);
         nest_clear_nested_cursor(instance);
+        // Drop overlay visual cache so we never re-paint the game's Hidden/crosshair
+        // onto Discord before its own CursorChanged arrives.
+        instance.nested_cursor = None;
         instance.window.set_cursor_visible(true);
         instance.window.set_cursor(CursorIcon::Default);
         // Kick a present so any pending Discord wl_callbacks are released.
@@ -736,21 +925,56 @@ fn nest_apply_game_mode(
         instance.window.request_redraw();
         // Immediate enter+motion on whatever is under the cursor — otherwise the first
         // Discord click hits a stale (0,0) enter and Chromium starts a CSD resize.
+        // After FPS lock, last_mouse_pos is usually parked on the game wallpaper, so
+        // fall back to the last overlay nest seat if the live hit misses Discord.
         if let Some(el) = event_loop {
             let scale = instance.window.scale_factor() as f32;
             let point = instance.last_mouse_pos;
             let wid = instance.window_id.clone();
             nest_route_cursor_moved(instance, el, &wid, point, scale);
+            let overlay_seated = instance.hover_pane_id.as_ref().is_some_and(|id| {
+                instance.primary_game_pane.as_deref() != Some(id.as_str())
+                    && instance
+                        .panes
+                        .get(id)
+                        .is_some_and(|p| p.external_wayland_server.is_some())
+            });
+            if !overlay_seated {
+                if let Some((pane_id, x, y)) = instance.last_overlay_pointer.clone() {
+                    let still_overlay = instance
+                        .panes
+                        .get(&pane_id)
+                        .is_some_and(|p| {
+                            p.external_wayland_server.is_some()
+                                && (p.is_visible || p.pending_visible)
+                        });
+                    if still_overlay {
+                        if let Some(ref ws) = instance.nested_compositor {
+                            ws.lock().send_pointer_motion_to_pane(&pane_id, x, y);
+                        }
+                        instance.hover_pane_id = Some(pane_id.clone());
+                        nest_set_keyboard_focus(instance, &pane_id);
+                        nest_sync_nested_cursor_for_hover(instance, Some(el), true);
+                    }
+                }
+            } else if let Some(ref id) = instance.hover_pane_id.clone() {
+                nest_set_keyboard_focus(instance, id);
+            }
         }
     }
 }
 
-/// Host grab only in game mode, driven by the game's sticky shoes.
+/// Host Locked/Confined grab for FPS relative-only aim.
+///
+/// Driven solely by a real `zwp_pointer_constraints` lock/confine shoe — **not**
+/// by a hidden nest cursor. Unity/Wine soft-cursor UIs (RoR2 menus, etc.) hide
+/// the OS cursor and still need absolute `wl_pointer.motion`; treating hide as
+/// lock starved absolute motion and only teleported on click.
 #[cfg(target_os = "linux")]
 fn nest_want_host_pointer_grab(instance: &WindowInstance) -> bool {
     instance.game_mode
         && instance.nested_compositor.is_some()
-        && (instance.game_pointer_constraint_active || instance.game_cursor_hidden)
+        && instance.game_pointer_constraint_active
 }
 
 #[cfg(target_os = "linux")]
@@ -808,7 +1032,29 @@ fn nest_record_game_cursor(instance: &mut WindowInstance, cursor: &crate::waylan
     instance.game_cursor_hidden = matches!(cursor, crate::wayland::NestedCursor::Hidden);
 }
 
+/// Apply only the game cursor visual (no host grab). Used on F12 enter before
+/// nest seat re-enter completes.
+#[cfg(target_os = "linux")]
+fn nest_wear_game_cursor_shoe(
+    instance: &mut WindowInstance,
+    event_loop: Option<&ActiveEventLoop>,
+) {
+    if instance.game_cursor_hidden {
+        instance.window.set_cursor_visible(false);
+        instance.nested_cursor_applied = true;
+        return;
+    }
+    if let (Some(el), Some(cursor)) = (event_loop, instance.game_cursor.clone()) {
+        nest_paint_host_cursor(instance, el, &cursor);
+    } else {
+        nest_clear_nested_cursor(instance);
+    }
+}
+
 /// Apply the game's sticky shoes to the host (grab + cursor visual).
+///
+/// Hide-without-lock: suppress the host cursor chrome but keep absolute
+/// CursorMoved flowing (soft-cursor games). Lock shoe: grab + relative-only.
 #[cfg(target_os = "linux")]
 fn nest_wear_game_pointer_shoes(
     instance: &mut WindowInstance,
@@ -820,14 +1066,7 @@ fn nest_wear_game_pointer_shoes(
         instance.nested_cursor_applied = true;
         return;
     }
-    if let (Some(el), Some(cursor)) = (event_loop, instance.game_cursor.clone()) {
-        nest_paint_host_cursor(instance, el, &cursor);
-    } else if instance.game_cursor_hidden {
-        instance.window.set_cursor_visible(false);
-        instance.nested_cursor_applied = true;
-    } else {
-        nest_clear_nested_cursor(instance);
-    }
+    nest_wear_game_cursor_shoe(instance, event_loop);
 }
 
 #[cfg(target_os = "linux")]
@@ -883,7 +1122,10 @@ fn nest_owns_host_window(instance: &WindowInstance) -> bool {
     }
 }
 
-/// Window-edge resize shapes from nested Electron CSD must not paint onto the host.
+/// Nested-client resize shapes must not paint onto the host.
+/// Atrium owns overlay/gutter grips via `set_cursor(cursor_for_edge)` directly;
+/// GTK/Chromium CSD (incl. ColResize from `sb_h_double_arrow`) would otherwise
+/// stick after leaving a host grip when `nest_sync` re-applies a stale bag.
 fn nest_is_window_chrome_resize_cursor(icon: CursorIcon) -> bool {
     matches!(
         icon,
@@ -895,7 +1137,35 @@ fn nest_is_window_chrome_resize_cursor(icon: CursorIcon) -> bool {
             | CursorIcon::SResize
             | CursorIcon::EResize
             | CursorIcon::WResize
+            | CursorIcon::ColResize
+            | CursorIcon::RowResize
+            | CursorIcon::NeswResize
+            | CursorIcon::NwseResize
     )
+}
+
+#[cfg(target_os = "linux")]
+fn nest_cursor_is_resize_shape(cursor: &crate::wayland::NestedCursor) -> bool {
+    match cursor {
+        crate::wayland::NestedCursor::Named(name) => {
+            // Classify before chrome remapping — nest_named_cursor_icon forces Default.
+            let raw = name
+                .parse::<CursorIcon>()
+                .unwrap_or_else(|_| match name.as_str() {
+                    "sb_h_double_arrow" | "h_double_arrow" | "col-resize" | "ew-resize" => {
+                        CursorIcon::ColResize
+                    }
+                    "sb_v_double_arrow" | "v_double_arrow" | "row-resize" | "ns-resize" => {
+                        CursorIcon::RowResize
+                    }
+                    "nesw-resize" => CursorIcon::NeswResize,
+                    "nwse-resize" => CursorIcon::NwseResize,
+                    _ => CursorIcon::Default,
+                });
+            nest_is_window_chrome_resize_cursor(raw)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1007,6 +1277,7 @@ fn nest_sync_nested_cursor_for_hover(
 
 /// Route cursor movement in atrium HUD/overlay mode (z-ordered hit test).
 /// Updates hover + pointer only — never steals sticky keyboard focus (`active_pane_id`).
+/// Never feeds the primary game: overlay owns the seat until game mode returns.
 #[cfg(target_os = "linux")]
 fn nest_route_cursor_moved(
     instance: &mut WindowInstance,
@@ -1015,15 +1286,24 @@ fn nest_route_cursor_moved(
     point: Point2D<f32, servo::DevicePixel>,
     scale_factor: f32,
 ) {
+    let prev_hover = instance.hover_pane_id.clone();
+    let prev_was_external = prev_hover.as_ref().is_some_and(|id| {
+        instance
+            .panes
+            .get(id)
+            .map(|p| p.external_wayland_server.is_some())
+            .unwrap_or(false)
+    });
     let Some(hover_id) =
         hit_test_pointer_pane(instance, point, scale_factor, true).map(|p| p.id.clone())
     else {
         instance.hover_pane_id = None;
         nest_clear_nested_cursor(instance);
-        // Not over Discord — reseat pointer on the game so lock/cursor shoes keep flowing.
-        if let Some(ref gid) = instance.primary_game_pane {
+        // Over empty/game wallpaper — drop seat focus once. Do not reseat the game
+        // (that re-armed locks/Hidden cursors and stole Discord clicks).
+        if prev_was_external {
             if let Some(ref ws) = instance.nested_compositor {
-                ws.lock().focus_pane(gid);
+                ws.lock().clear_pointer_focus();
             }
         }
         return;
@@ -1041,15 +1321,16 @@ fn nest_route_cursor_moved(
     if let Some((ws, tx, ty)) = external_motion {
         ws.lock().send_pointer_motion_to_pane(&hover_id, tx, ty);
         if !hovering_primary {
+            instance.last_overlay_pointer = Some((hover_id.clone(), tx, ty));
             nest_sync_nested_cursor_for_hover(instance, Some(event_loop), true);
         }
         return;
     }
-    // Left nested overlay surface → Servo/HUD owns the cursor; reseat game for shoes.
+    // Left nested overlay surface → Servo/HUD owns the cursor. Keep the game off-seat.
     nest_clear_nested_cursor(instance);
-    if let Some(ref gid) = instance.primary_game_pane {
+    if prev_was_external {
         if let Some(ref ws) = instance.nested_compositor {
-            ws.lock().focus_pane(gid);
+            ws.lock().clear_pointer_focus();
         }
     }
     let (px, py, pw, ph, is_external, wayland, translated) =
@@ -1319,7 +1600,15 @@ fn send_pane_mouse_leave(window_id: &str, pane: &PaneInstance) {
 }
 
 fn clear_gutter_hover_state(instance: &mut WindowInstance) {
-    instance.gutter_hover = None;
+    if instance.gutter_hover.take().is_some() {
+        // Same sticky-cursor trap as overlay resize: host Col/RowResize must be
+        // dropped so the next pane hit can re-apply the nested client cursor.
+        #[cfg(target_os = "linux")]
+        {
+            instance.nested_cursor_applied = false;
+        }
+        instance.window.set_cursor(winit::window::CursorIcon::Default);
+    }
 }
 
 fn enter_gutter_hover(
@@ -1337,6 +1626,10 @@ fn enter_gutter_hover(
         if let Some(pane) = instance.panes.get(&pid) {
             send_pane_mouse_leave(window_id, pane);
         }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        instance.nested_cursor_applied = false;
     }
     instance.gutter_hover = Some(key);
 }
@@ -1393,6 +1686,10 @@ pub(crate) fn nest_set_egl_swap_interval_pub(interval: i32) {
 #[cfg(target_os = "linux")]
 fn nest_set_egl_swap_interval(interval: i32) {
     use std::os::raw::{c_int, c_void};
+    // Mesa eglSwapInterval does Wayland/X11 round-trips — only call on change.
+    if crate::present_feedback::cached_swap_interval() == Some(interval) {
+        return;
+    }
     unsafe extern "C" {
         fn eglGetCurrentDisplay() -> *mut c_void;
         fn eglSwapInterval(dpy: *mut c_void, interval: c_int) -> u32;
@@ -1404,6 +1701,9 @@ fn nest_set_egl_swap_interval(interval: i32) {
             return;
         }
         let ok = eglSwapInterval(dpy, interval as c_int);
+        if ok != 0 {
+            crate::present_feedback::set_cached_swap_interval(interval);
+        }
         if std::env::var_os("ATRIUM_PACING_DIAG").is_some() {
             nest_host_diag(&format!("eglSwapInterval({interval}) ok={ok}"));
         }
@@ -1678,42 +1978,6 @@ pub(crate) static NESTED_REDRAW_PENDING: AtomicBool = AtomicBool::new(false);
 /// Bumped on every nested buffer import (coalesce + mid-present follow-up).
 #[cfg(target_os = "linux")]
 pub(crate) static NESTED_REDRAW_GEN: AtomicU64 = AtomicU64::new(0);
-/// Monotonic ns of last primary/game pane commit — drives game-driven VRR present.
-#[cfg(target_os = "linux")]
-pub(crate) static NESTED_LAST_PRIMARY_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(target_os = "linux")]
-fn nest_monotonic_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn nest_note_primary_game_commit() {
-    NESTED_LAST_PRIMARY_COMMIT_NS.store(nest_monotonic_ns(), Ordering::SeqCst);
-}
-
-/// True while the primary game is actively committing (VRR passthrough window).
-#[cfg(target_os = "linux")]
-pub(crate) fn nest_game_commit_fresh(max_age: Duration) -> bool {
-    let last = NESTED_LAST_PRIMARY_COMMIT_NS.load(Ordering::SeqCst);
-    if last == 0 {
-        return false;
-    }
-    nest_monotonic_ns().saturating_sub(last) < max_age.as_nanos() as u64
-}
-
-/// Game-driven present: composite+swap on primary commits; overlays piggyback.
-/// Independent host timers must NOT run in this window (they spoil VRR).
-#[cfg(target_os = "linux")]
-pub(crate) fn nest_game_driven_present(instance: &WindowInstance) -> bool {
-    instance.game_mode
-        && instance.nested_compositor.is_some()
-        && nest_game_commit_fresh(Duration::from_millis(50))
-}
-
 /// After present: allow the next commit wake; if a newer buffer arrived mid-frame,
 /// queue one immediate follow-up (game-driven coalesce, not a refresh timer).
 #[cfg(target_os = "linux")]
@@ -1746,8 +2010,14 @@ fn start_gamescope_present_cadence(window_id: String, refresh_mhz: u32) {
             ));
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(period_ms));
-                // Stall backup only — never kick while the game is driving presents (VRR).
-                if nest_game_commit_fresh(std::time::Duration::from_millis(50)) {
+                // VRR / game-driven: never kick while primary commits are fresh —
+                // free-running at panel max defeats adaptive-sync passthrough.
+                // Fixed SoftFifo: keep kicking so spare vblanks hold the last frame
+                // (mailbox rewind when the game sits well below refresh).
+                let game_fresh = crate::pacing::game_commit_fresh(std::time::Duration::from_millis(
+                    crate::pacing::PACING_IDLE_MS,
+                ));
+                if game_fresh && !crate::pacing::cadence_fills_spare_vblanks() {
                     continue;
                 }
                 // One in-flight kick only — send_event already wakes the X11 loop.
@@ -1777,6 +2047,41 @@ fn start_gamescope_present_cadence(window_id: String, refresh_mhz: u32) {
 /// gameoverlayrenderer stripped (bin/atrium); Proton needs ATRIUM_SAVED_LD_PRELOAD.
 /// Never restore overlay onto Discord or other overlay panes.
 #[cfg(target_os = "linux")]
+/// Gamescope often ships `LANG=C` / no session bus. Terminal TUIs need UTF-8
+/// (discordo QR block chars) and the user bus for libsecret / oo7 keyring tokens.
+fn nest_apply_session_env(cmd: &mut std::process::Command) {
+    let utf8 = std::env::var("LANG")
+        .ok()
+        .filter(|l| {
+            let u = l.to_ascii_uppercase();
+            u.contains("UTF-8") || u.contains("UTF8")
+        })
+        .unwrap_or_else(|| "C.UTF-8".into());
+    cmd.env("LANG", &utf8);
+    cmd.env("LC_CTYPE", &utf8);
+    cmd.env("LC_MESSAGES", &utf8);
+    // LC_ALL=C from gamescope would override the UTF-8 LANG above.
+    match std::env::var("LC_ALL") {
+        Ok(v) => {
+            let u = v.to_ascii_uppercase();
+            if v.is_empty() || v == "C" || v == "POSIX" || !(u.contains("UTF-8") || u.contains("UTF8"))
+            {
+                cmd.env_remove("LC_ALL");
+            }
+        }
+        Err(_) => {}
+    }
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        let bus_path = std::path::Path::new(&runtime).join("bus");
+        if bus_path.exists() {
+            cmd.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={}", bus_path.display()),
+            );
+        }
+    }
+}
+
 fn sanitize_nested_gamescope_env(cmd: &mut std::process::Command, restore_steam_overlay: bool) {
     cmd.env("ENABLE_GAMESCOPE_WSI", "0");
     cmd.env("DISABLE_GAMESCOPE_WSI", "1");
@@ -1791,6 +2096,7 @@ fn sanitize_nested_gamescope_env(cmd: &mut std::process::Command, restore_steam_
     cmd.env_remove("ENABLE_HDR_WSI");
     cmd.env_remove("GAMESCOPE_LIMITER_FILE");
     cmd.env_remove("LIBEI_SOCKET");
+    nest_apply_session_env(cmd);
 
     if restore_steam_overlay {
         match std::env::var("ATRIUM_SAVED_LD_PRELOAD") {
@@ -1831,20 +2137,20 @@ const BACKGROUND_REFRESH_MILLIHERTZ: u32 = 10_000; // 10 Hz
 const HIDDEN_REFRESH_MILLIHERTZ: u32 = 0;
 
 fn window_is_viewable(instance: &WindowInstance) -> bool {
-    if instance.zero_size {
-        return false;
-    }
-    // Embedded gamescope reports minimized/occluded/unfocused for the X11 game
-    // window it is actually scanning out. Treating that as hidden stops composite
-    // after the first black clear and starves nested frame callbacks (XIO on :2).
     #[cfg(target_os = "linux")]
-    if is_gamescope_session() {
-        return true;
+    {
+        return crate::pacing::window_is_viewable(instance);
     }
-    if instance.os_minimized {
-        return false;
+    #[cfg(not(target_os = "linux"))]
+    {
+        if instance.zero_size {
+            return false;
+        }
+        if instance.os_minimized {
+            return false;
+        }
+        !instance.os_occluded
     }
-    !instance.os_occluded
 }
 
 fn effective_refresh_millihertz(instance: &WindowInstance, monitor_mhz: u32) -> u32 {
@@ -1909,6 +2215,34 @@ fn apply_refresh_policy(instance: &mut WindowInstance) {
             ws.lock().set_output_refresh(next);
         }
     }
+    #[cfg(target_os = "linux")]
+    apply_pacing_policy(instance);
+}
+
+#[cfg(target_os = "linux")]
+fn apply_pacing_policy(instance: &mut WindowInstance) {
+    if instance.nested_compositor.is_none() {
+        return;
+    }
+    let resolved = crate::pacing::resolve_pacing_policy();
+    if resolved == instance.pacing_policy {
+        return;
+    }
+    let prev = instance.pacing_policy;
+    instance.pacing_policy = resolved;
+    instance.pacing_policy_generation = instance.pacing_policy_generation.wrapping_add(1);
+    info!(
+        "[lotus-pacing] policy {:?} → {:?} @ {} mHz (gen={})",
+        prev,
+        resolved,
+        instance.refresh_rate_millihertz,
+        instance.pacing_policy_generation,
+    );
+    if let Some(ref ws) = instance.nested_compositor {
+        ws.lock().set_pacing_policy(resolved);
+    }
+    instance.force_scene_repaint = true;
+    instance.window.request_redraw();
 }
 
 #[cfg(target_os = "linux")]
@@ -1988,7 +2322,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
         // Stall fallback (>50ms since last primary commit) or overlay mode may pace.
         let mut pending_remote_work = false;
         let mut pace_to_refresh = false;
+        let mut pace_occluded = false;
         let mut pace_refresh_mhz: u32 = 60000;
+        #[cfg(target_os = "linux")]
+        let mut soft_fifo_wake: Option<Instant> = None;
         for window in self.windows.values_mut() {
             sync_minimized_from_os(window);
             apply_refresh_policy(window);
@@ -1999,20 +2336,49 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             let mhz = window.refresh_rate_millihertz.max(1);
             pace_refresh_mhz = mhz;
 
+            // SoftFifo GameActive: WaitUntil owns the period. DeviceEvent wakes must
+            // NOT request_redraw (that latched SoftFifo to every mouse sample → 300+Hz).
+            // Only redraw when the gate is due; otherwise re-arm WaitUntil only.
             #[cfg(target_os = "linux")]
-            let game_driven = nest_game_driven_present(window);
-            #[cfg(not(target_os = "linux"))]
-            let game_driven = false;
-
-            // Stall / loading / overlay: keep gamescope scanned out with a soft cadence.
+            let soft_fifo_active = viewable
+                && crate::pacing::fixed_software_fifo(window)
+                && crate::pacing::present_activity(window)
+                    == crate::pacing::PresentActivity::GameActive;
             #[cfg(target_os = "linux")]
-            if viewable
-                && !game_driven
-                && (is_gamescope_session() || window.nested_compositor.is_some())
-            {
+            if soft_fifo_active {
+                if let Some(until) = crate::pacing::soft_fifo_gate_instant() {
+                    soft_fifo_wake = Some(match soft_fifo_wake {
+                        Some(prev) => prev.min(until),
+                        None => until,
+                    });
+                }
+                if crate::pacing::soft_fifo_gate_due() {
+                    any_needs_repaint = true;
+                    reason = "soft_fifo gate due".into();
+                }
+            } else if viewable && crate::pacing::wants_stall_present_timer(window) {
+                // UiIdle stall / non-SoftFifo hold — safe to pace-redraw.
                 pace_to_refresh = true;
                 any_needs_repaint = true;
-                reason = "atrium stall/overlay present fallback".into();
+                reason = if crate::pacing::wants_fixed_hold_cadence(window) {
+                    "fixed SoftFifo hold cadence".into()
+                } else {
+                    "atrium stall/overlay present fallback".into()
+                };
+            }
+            // Guard A: keep a slow FrameDone while the host is hidden so Proton
+            // does not deadlock, without calling eglSwapInterval(1).
+            #[cfg(target_os = "linux")]
+            if !viewable && window.nested_compositor.is_some() {
+                pace_occluded = true;
+                let due = window
+                    .last_occluded_frame_done
+                    .map(|t| t.elapsed() >= Duration::from_millis(150))
+                    .unwrap_or(true);
+                if due {
+                    any_needs_repaint = true;
+                    reason = "occluded nested FrameDone".into();
+                }
             }
 
             for pane in window.panes.values() {
@@ -2029,12 +2395,27 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
                     }
                 }
-                // HUD/Servo: while game-driven, piggyback on the next game composite —
-                // never trigger an independent swap (VRR spoiler).
-                if pane.needs_repaint && viewable && !game_driven {
+                // HUD/Servo: GameActive → defer to next game present (Guard B).
+                if pane.needs_repaint && viewable {
+                    #[cfg(target_os = "linux")]
+                    if window.nested_compositor.is_some()
+                        && crate::pacing::present_activity(window)
+                            == crate::pacing::PresentActivity::GameActive
+                    {
+                        window.overlay_dirty = true;
+                        continue;
+                    }
                     any_needs_repaint = true;
                     reason = format!("Pane '{}' needs repaint", pane.id);
                 }
+            }
+            #[cfg(target_os = "linux")]
+            if window.overlay_dirty
+                && viewable
+                && crate::pacing::present_activity(window) == crate::pacing::PresentActivity::UiIdle
+            {
+                any_needs_repaint = true;
+                reason = "overlay dirty (UiIdle)".into();
             }
             if any_needs_repaint {
                 trace!("Rust: [Lifecycle] Requesting Redraw for window (Reason: {})", reason);
@@ -2042,12 +2423,33 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             }
         }
 
-        if pace_to_refresh || pending_remote_work {
+        #[cfg(target_os = "linux")]
+        if let Some(until) = soft_fifo_wake {
+            // Prefer SoftFifo gate over generic refresh WaitUntil — same cadence,
+            // but aligned to the PLL deadline and non-blocking for DeviceEvents.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(until));
+        } else if pace_occluded {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(150),
+            ));
+        } else if pace_to_refresh || pending_remote_work {
             let period =
                 Duration::from_nanos(1_000_000_000_000u64 / pace_refresh_mhz.max(1) as u64);
             event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + period));
         } else {
             // Game-driven or idle: sleep until commit / input wakes us.
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+        #[cfg(not(target_os = "linux"))]
+        if pace_occluded {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(150),
+            ));
+        } else if pace_to_refresh || pending_remote_work {
+            let period =
+                Duration::from_nanos(1_000_000_000_000u64 / pace_refresh_mhz.max(1) as u64);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + period));
+        } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
@@ -2177,9 +2579,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 let winit_id = window.id();
 
                 // Relative mouse deltas for FPS lock (DeviceEvent::MouseMotion).
-                // Needed on X11; Wayland host also emits these once CursorGrab::Locked.
+                // Always (not WhenFocused): gamescope focus reports are flaky, and we
+                // still want raw deltas whenever host grab is on.
                 #[cfg(target_os = "linux")]
-                event_loop.listen_device_events(DeviceEvents::WhenFocused);
+                event_loop.listen_device_events(DeviceEvents::Always);
 
                 // STEAM_GAME before map + before Present #1 (gamescope only).
                 #[cfg(target_os = "linux")]
@@ -2250,10 +2653,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 
                 let _ = rendering_context.make_current();
 
-                // Gamescope's Xwayland does not release GLX/EGL buffers on vblank for a
-                // nested client. eglSwapBuffers then blocks forever on the 3rd present
-                // (both buffers outstanding) — host stuck on the black clear, game audio
-                // still runs. Interval 0 returns as soon as the swap is queued.
+                // Gamescope Xwayland: interval 1 deadlocks (buffers never retire on
+                // vblank). Interval 0 + Fixed software FIFO in atrium_host_present.
                 #[cfg(target_os = "linux")]
                 if gamescope_host {
                     nest_set_egl_swap_interval(0);
@@ -2451,6 +2852,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         external_wayland_server: None,
                         #[cfg(target_os = "linux")]
                         external_child_pid: None,
+                        #[cfg(target_os = "linux")]
+                        external_follow_dock: false,
+                        #[cfg(target_os = "linux")]
+                        external_client_upscale_sgsr: false,
+                        overlay_resize: None,
                     };
                     panes.insert(pane_opt.id.clone(), pane);
                 }
@@ -2532,6 +2938,52 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     u_stencil_radius_loc: None,
                     comp_program: None,
                     comp_program_oes: None,
+                    #[cfg(target_os = "linux")]
+                    sgsr_program: None,
+                    #[cfg(target_os = "linux")]
+                    sgsr_program_oes: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_size_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_radius_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_flip_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_texel_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_src_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_sharp_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_threshold_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_oes_size_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_oes_radius_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_oes_flip_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_oes_texel_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_oes_src_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_oes_sharp_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_oes_threshold_loc: None,
+                    #[cfg(target_os = "linux")]
+                    fsr1_easu_program: None,
+                    #[cfg(target_os = "linux")]
+                    fsr1_easu_program_oes: None,
+                    #[cfg(target_os = "linux")]
+                    fsr1_rcas_program: None,
+                    #[cfg(target_os = "linux")]
+                    fsr1_locs: crate::gl::fsr1::Fsr1Locations::default(),
+                    #[cfg(target_os = "linux")]
+                    upscale_temp_fbo: None,
+                    #[cfg(target_os = "linux")]
+                    upscale_temp_tex: None,
+                    #[cfg(target_os = "linux")]
+                    upscale_temp_size: None,
                     comp_fbo: None,
                     comp_tex: None,
                     comp_vao: None,
@@ -2563,6 +3015,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     layout_batch_depth: 0,
                     gutters: Vec::new(),
                     active_gutter_drag: None,
+                    active_overlay_resize: None,
+                    overlay_resize_hover: None,
                     pending_gutter_delta: None,
                     gutter_hover: None,
                     hover_pane_id: None,
@@ -2579,6 +3033,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     game_cursor_hidden: false,
                     #[cfg(target_os = "linux")]
                     game_cursor: None,
+                    #[cfg(target_os = "linux")]
+                    last_overlay_pointer: None,
                     primary_game_pane: None,
                     last_stats_send: None,
                     force_scene_repaint: false,
@@ -2588,6 +3044,14 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     nested_cursor_applied: false,
                     #[cfg(target_os = "linux")]
                     nested_compositor: None,
+                    #[cfg(target_os = "linux")]
+                    pacing_policy: crate::pacing::resolve_pacing_policy(),
+                    #[cfg(target_os = "linux")]
+                    pacing_policy_generation: 0,
+                    #[cfg(target_os = "linux")]
+                    overlay_dirty: false,
+                    #[cfg(target_os = "linux")]
+                    last_occluded_frame_done: None,
                 };
 
                 instance.init_stencil_program();
@@ -2816,6 +3280,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     let _ = instance.window.request_inner_size(size);
                                     instance.rendering_context.resize(size);
                                     let _ = instance.rendering_context.make_current();
+                                    // Present path re-applies policy; keep 0 here so a
+                                    // sync resize present cannot wedge the 2-buffer ring.
                                     nest_set_egl_swap_interval(0);
                                     nest_host_diag(&format!(
                                         "gamescope show: resized bound surface to root {}x{}",
@@ -2875,6 +3341,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // Servo notes that animation ticks are driven by repaint; if we
                         // miss a notify after resize the loop stalls until an external wake.
                         if animating && window_is_viewable(instance) {
+                            #[cfg(target_os = "linux")]
+                            if instance.nested_compositor.is_some()
+                                && crate::pacing::present_activity(instance)
+                                    == crate::pacing::PresentActivity::GameActive
+                            {
+                                instance.overlay_dirty = true;
+                            } else {
+                                instance.window.request_redraw();
+                            }
+                            #[cfg(not(target_os = "linux"))]
                             instance.window.request_redraw();
                         }
                     }
@@ -2902,7 +3378,22 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // LOCK STEP: Do not dispatch webview.resize here!
                         // RedrawRequested will paint this frame into the GPU FBO, flip layout, and present.
                         // Only after presentation is complete will the next queued resize step be dispatched.
-                        instance.window.request_redraw();
+                        // Guard B: while GameActive, piggyback on the next game present —
+                        // don't wake an overlay-only redraw that steals SoftFifo phase.
+                        #[cfg(target_os = "linux")]
+                        let defer_wake = instance.nested_compositor.is_some()
+                            && crate::pacing::present_activity(instance)
+                                == crate::pacing::PresentActivity::GameActive;
+                        #[cfg(not(target_os = "linux"))]
+                        let defer_wake = false;
+                        if defer_wake {
+                            #[cfg(target_os = "linux")]
+                            {
+                                instance.overlay_dirty = true;
+                            }
+                        } else {
+                            instance.window.request_redraw();
+                        }
 
                         // AGGREGATION FIX: Only emit when all visible panes have painted
                         if !instance.emitted_ready_to_show {
@@ -2934,14 +3425,21 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             } => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     if from_primary {
-                        // Always keep game shoes up to date — even while overlay is up.
+                        // Snapshot game shoes. Overlay must not paint these onto the host.
                         nest_record_game_cursor(instance, &cursor);
                         if instance.game_mode {
                             nest_wear_game_pointer_shoes(instance, Some(event_loop));
                         }
                     } else if !instance.game_mode {
-                        // Discord/overlay visual only — never clobber game shoes.
-                        nest_paint_host_cursor(instance, event_loop, &cursor);
+                        // Host owns overlay grip cursor — stash only, don't clobber ColResize.
+                        if instance.overlay_resize_hover.is_some()
+                            || instance.active_overlay_resize.is_some()
+                        {
+                            instance.nested_cursor = Some(cursor);
+                        } else {
+                            // Discord/overlay visual only — never clobber game shoes.
+                            nest_paint_host_cursor(instance, event_loop, &cursor);
+                        }
                     }
                 }
             }
@@ -2949,6 +3447,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             EngineCommand::NestedPointerLock { window_id, active } => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     // Sticky game shoe — survives overlay; host grab only in game mode.
+                    // Overlay never arms host grab from this (seat constraints are suspended).
                     instance.game_pointer_constraint_active = active;
                     if instance.game_mode {
                         nest_wear_game_pointer_shoes(instance, Some(event_loop));
@@ -3109,6 +3608,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         external_wayland_server: None,
                         #[cfg(target_os = "linux")]
                         external_child_pid: None,
+                        #[cfg(target_os = "linux")]
+                        external_follow_dock: false,
+                        #[cfg(target_os = "linux")]
+                        external_client_upscale_sgsr: false,
+                        overlay_resize: None,
                     };
                     let fixed = match anchor {
                         PaneAnchor::Left | PaneAnchor::Right => rect.size.width,
@@ -3222,6 +3726,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         external_wayland_server: None,
                         #[cfg(target_os = "linux")]
                         external_child_pid: None,
+                        #[cfg(target_os = "linux")]
+                        external_follow_dock: false,
+                        #[cfg(target_os = "linux")]
+                        external_client_upscale_sgsr: false,
+                        overlay_resize: None,
                     };
                     let fixed = match anchor {
                         PaneAnchor::Left | PaneAnchor::Right => rect.size.width,
@@ -3255,6 +3764,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 visible,
                 dbus_notifications,
                 dbus_notification_apps,
+                env: child_env,
+                follow_dock,
+                client_width,
+                client_height,
+                client_upscale_sgsr,
+                resize_edges,
+                resize_anchor,
+                resize_min_w,
+                resize_min_h,
+                resize_max_w,
+                resize_max_h,
             } => {
                 let servo = self.ensure_servo().clone();
                 if let Some(instance) = self.windows.get_mut(&window_id) {
@@ -3306,6 +3826,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             Ok(s) => {
                                 let arc = Arc::new(parking_lot::Mutex::new(s));
                                 instance.nested_compositor = Some(arc.clone());
+                                instance.pacing_policy = crate::pacing::resolve_pacing_policy();
+                                arc.lock()
+                                    .set_pacing_policy(instance.pacing_policy);
                                 // Backup display clock if WaitUntil is dropped (esp. X11/gamescope).
                                 start_gamescope_present_cadence(
                                     window_id.clone(),
@@ -3322,16 +3845,29 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                     let surface_slot = Arc::new(parking_lot::Mutex::new(crate::wayland::ExternalSurfaceSlot::default()));
 
-                    // Primary → output_size; overlays → fixed high-res client size (cover-scaled).
-                    let client_hint = if is_primary {
-                        (width, height)
+                    let overlay_follow = follow_dock && !is_primary;
+                    let configured_client = if overlay_follow || is_primary {
+                        None
                     } else {
-                        crate::wayland::nest_overlay_client_size()
+                        Some((
+                            client_width.unwrap_or(width).max(32),
+                            client_height.unwrap_or(height).max(32),
+                        ))
                     };
+                    let overlay_resize = crate::overlay_resize::OverlayResizePolicy::from_parts(
+                        resize_edges,
+                        resize_anchor,
+                        resize_min_w,
+                        resize_min_h,
+                        resize_max_w,
+                        resize_max_h,
+                    );
                     let pane_socket_name = wayland_server.lock().register_pane(
                         pane_id.clone(),
                         is_primary,
-                        client_hint,
+                        follow_dock,
+                        configured_client,
+                        (width, height),
                         surface_slot.clone(),
                         None,
                     );
@@ -3382,6 +3918,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                         let mut cmd = std::process::Command::new(&command);
                         cmd.args(&effective_args);
+                        // Spawn-env bag (e.g. DISCORDO_TOKEN) — never put secrets on argv.
+                        for (k, v) in &child_env {
+                            cmd.env(k, v);
+                        }
                         // Own process group so teardown can SIGTERM/SIGKILL the whole tree
                         // (Proton → wineserver → game), not just the launcher PID.
                         #[cfg(unix)]
@@ -3409,20 +3949,27 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // host XDG_RUNTIME_DIR (Steam IPC) and get a symlink to the nested
                         // Wayland socket under that dir — absolute WAYLAND_DISPLAY paths are
                         // flaky in Wine, and reusing the name "wayland-0" would hit the host.
+                        // Primary stays on nested X11 for Proton. Every other client keeps
+                        // its own pane socket; a single shared symlink would retarget them.
                         let nested_wl_abs = isolated_runtime.join(&wayland_display);
                         let is_flatpak = command == "flatpak";
+                        let wayland_client = is_flatpak || !is_primary;
                         if is_flatpak {
                             cmd.env("XDG_RUNTIME_DIR", &isolated_runtime);
                             cmd.env("WAYLAND_DISPLAY", &wayland_display);
                         } else if let Ok(host_runtime) = std::env::var("XDG_RUNTIME_DIR") {
                             let host_dir = std::path::PathBuf::from(&host_runtime);
-                            let child_wl_name = format!(
-                                "wayland-nest-{}",
-                                isolated_runtime
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("session")
-                            );
+                            let child_wl_name = if is_primary {
+                                format!(
+                                    "wayland-nest-{}",
+                                    isolated_runtime
+                                        .file_name()
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("session")
+                                )
+                            } else {
+                                wayland_display.clone()
+                            };
                             let link_path = host_dir.join(&child_wl_name);
                             let _ = std::fs::remove_file(&link_path);
                             if let Err(e) = std::os::unix::fs::symlink(&nested_wl_abs, &link_path) {
@@ -3447,13 +3994,35 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // *our* Xwayland. Outer gamescope only sees atrium's host window on
                         // STEAM_GAME_DISPLAY_0 (:1). Never launch the game onto :1 directly.
                         if let Some(d) = x11_display {
-                            info!(
-                                "[lotus-nest] nested Xwayland ready — child DISPLAY=:{} \
-                                 (host stays on gamescope game display)",
-                                d
-                            );
-                            cmd.env("DISPLAY", format!(":{}", d));
-                            if !is_flatpak {
+                            if wayland_client {
+                                if is_flatpak {
+                                    info!(
+                                        "[lotus-nest] nested Xwayland ready — flatpak child DISPLAY=:{} \
+                                         and WAYLAND_DISPLAY={} (host stays on gamescope game display)",
+                                        d, wayland_display
+                                    );
+                                    cmd.env("DISPLAY", format!(":{}", d));
+                                } else {
+                                    info!(
+                                        "[lotus-nest] pane '{}' on nested Wayland ({})",
+                                        pane_id, wayland_display
+                                    );
+                                    // DISPLAY set would let GTK/Qt open an X11 window, and
+                                    // every X11 window is assigned to the primary pane.
+                                    cmd.env_remove("DISPLAY");
+                                }
+                                cmd.env("SDL_VIDEODRIVER", "wayland");
+                                cmd.env("QT_QPA_PLATFORM", "wayland");
+                                cmd.env("GDK_BACKEND", "wayland");
+                                cmd.env_remove("PROTON_ENABLE_WAYLAND");
+                                sanitize_nested_gamescope_env(&mut cmd, false);
+                            } else {
+                                info!(
+                                    "[lotus-nest] nested Xwayland ready — child DISPLAY=:{} \
+                                     (host stays on gamescope game display)",
+                                    d
+                                );
+                                cmd.env("DISPLAY", format!(":{}", d));
                                 // Nested X11 only — leave Steam/Proton/Pulse env alone
                                 // (STEAM_COMPAT_*, SteamAppId, audio, etc. inherit).
                                 cmd.env_remove("WAYLAND_DISPLAY");
@@ -3463,11 +4032,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 cmd.env_remove("PROTON_ENABLE_WAYLAND");
                                 // Restore Steam overlay preload only for the primary game pane.
                                 sanitize_nested_gamescope_env(&mut cmd, is_primary);
-                            } else {
-                                cmd.env("SDL_VIDEODRIVER", "wayland");
-                                cmd.env("QT_QPA_PLATFORM", "wayland");
-                                cmd.env("GDK_BACKEND", "wayland");
-                                sanitize_nested_gamescope_env(&mut cmd, false);
                             }
                         } else {
                             warn!(
@@ -3496,10 +4060,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 let exit_window_id = window_id.clone();
                                 let exit_pane_id = pane_id.clone();
                                 let close_on_exit = is_primary;
+                                let spawned_at = Instant::now();
                                 let _ = std::thread::Builder::new()
                                     .name(format!("atrium-wait-{}", pid))
                                     .spawn(move || {
                                         let status = child.wait();
+                                        let code = status
+                                            .as_ref()
+                                            .ok()
+                                            .and_then(|s| s.code())
+                                            .unwrap_or(-1);
+                                        let lifetime_ms = spawned_at.elapsed().as_millis() as u64;
                                         info!(
                                             "[lotus-nest] external child pid {} exited ({:?}) pane='{}' primary={}",
                                             pid,
@@ -3510,9 +4081,20 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         if close_on_exit {
                                             if let Some(proxy) = EVENT_LOOP_PROXY.get() {
                                                 let _ = proxy.send_event(
-                                                    EngineCommand::CloseWindow(exit_window_id),
+                                                    EngineCommand::CloseWindow(exit_window_id.clone()),
                                                 );
                                             }
+                                        } else {
+                                            push_renderer_ipc(
+                                                &exit_window_id,
+                                                "nest:external-exit",
+                                                serde_json::json!({
+                                                    "pane_id": exit_pane_id,
+                                                    "pid": pid,
+                                                    "code": code,
+                                                    "lifetime_ms": lifetime_ms,
+                                                }),
+                                            );
                                         }
                                     });
                             }
@@ -3567,6 +4149,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         external_surface_slot: Some(surface_slot),
                         external_wayland_server: Some(wayland_server),
                         external_child_pid: child_pid,
+                        external_follow_dock: overlay_follow,
+                        external_client_upscale_sgsr: client_upscale_sgsr,
+                        overlay_resize: overlay_resize.clone(),
                     };
 
                     let fixed = match anchor {
@@ -3696,6 +4281,24 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     }
                 }
             },
+            #[cfg(target_os = "linux")]
+            EngineCommand::SetExternalClientSize {
+                window_id,
+                pane_id,
+                width,
+                height,
+            } => {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if let Some(ref ws) = instance.nested_compositor {
+                        ws.lock()
+                            .set_external_client_size(&pane_id, width, height);
+                    }
+                    if let Some(pane) = instance.panes.get_mut(&pane_id) {
+                        pane.is_dirty = true;
+                    }
+                    instance.window.request_redraw();
+                }
+            }
             EngineCommand::SetPaneRect(window_id, pane_id, rect) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
                     if pane_id == "main" {
@@ -4427,41 +5030,102 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // still present so Wayland frame callbacks are released (otherwise
                         // RedrawRequested busy-loops and pegs the host/Node event loop).
                         if !window_is_viewable(instance) {
-                            trace!("Rust: [Lifecycle] RedrawRequested present-only (window not viewable)");
-                            instance.window.pre_present_notify();
-                            let _ = instance.rendering_context.make_current();
-                            if gl::atrium_host_present(instance) {
-                                #[cfg(target_os = "linux")]
-                                if let Some(ref ws) = instance.nested_compositor {
-                                    let now_ms = (std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis()
-                                        & 0xFFFFFFFF) as u32;
-                                    let server = ws.lock();
-                                    server.notify_frame_done(now_ms);
-                                    server.release_previous_buffer();
+                            trace!("Rust: [Lifecycle] RedrawRequested occluded (Guard A — no blocking swap)");
+                            #[cfg(target_os = "linux")]
+                            let slow_fd = {
+                                let due = instance
+                                    .last_occluded_frame_done
+                                    .map(|t| t.elapsed() >= Duration::from_millis(150))
+                                    .unwrap_or(true);
+                                if due {
+                                    instance.last_occluded_frame_done = Some(Instant::now());
+                                    if let Some(ref ws) = instance.nested_compositor {
+                                        let now_ms = (std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                            & 0xFFFFFFFF) as u32;
+                                        let server = ws.lock();
+                                        server.notify_frame_done(now_ms);
+                                        server.release_previous_buffer();
+                                    }
                                 }
+                                due
+                            };
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                instance.window.pre_present_notify();
+                                let _ = instance.rendering_context.make_current();
+                                let _ = gl::atrium_host_present(instance);
+                            }
+                            #[cfg(target_os = "linux")]
+                            {
+                                let _ = slow_fd;
                             }
                             #[cfg(target_os = "linux")]
                             nest_finish_nested_redraw(instance, nested_gen_at_start);
                         } else {
+                        // SoftFifo not due yet: skip paint/composite/swap entirely.
+                        // Leave NESTED_REDRAW_PENDING set so commits coalesce; about_to_wait
+                        // WaitUntil requests redraw when the gate is due. Do not
+                        // nest_finish here — that would re-request and busy-spin.
+                        // Still spin Servo so NewFrameReady / shell chrome can queue.
+                        #[cfg(target_os = "linux")]
+                        if crate::pacing::fixed_software_fifo(instance)
+                            && crate::pacing::present_activity(instance)
+                                == crate::pacing::PresentActivity::GameActive
+                            && !crate::pacing::soft_fifo_gate_due()
+                        {
+                            if let Some(servo) = &self.servo {
+                                servo.spin_event_loop();
+                            }
+                            return;
+                        }
+
                         let _ = instance.rendering_context.make_current();
                         let window_size = instance.window.inner_size();
                         let scale_factor = instance.window.scale_factor() as f32;
+                        #[cfg(target_os = "linux")]
+                        let pacing_diag = std::env::var_os("ATRIUM_PACING_DIAG").is_some();
+                        #[cfg(target_os = "linux")]
+                        let frame_t0 = pacing_diag.then(std::time::Instant::now);
 
                         // Coalesce gutter drag to once per frame before paint/layout flush.
                         if instance.flush_pending_gutter_drag(scale_factor) {
                             instance.recalculate_layout(window_size, scale_factor);
                         }
 
+                        #[cfg(target_os = "linux")]
+                        let poll_ms = frame_t0
+                            .map(|t| t.elapsed().as_secs_f32() * 1000.0)
+                            .unwrap_or(0.0);
+                        #[cfg(target_os = "linux")]
+                        let servo_t0 = pacing_diag.then(std::time::Instant::now);
+
                         trace!("Rust: [Lifecycle] RedrawRequested (FBO) for window size {}x{}", window_size.width, window_size.height);
+
+                        // SoftFifo GameActive: if the gate budget is thin, skip Servo/HUD
+                        // paint and composite last FBOs so overlay work cannot delay the
+                        // game pageflip. needs_repaint stays set for a later catch-up.
+                        #[cfg(target_os = "linux")]
+                        let defer_overlay_servo =
+                            crate::pacing::should_defer_overlay_servo_paint(instance);
+                        #[cfg(not(target_os = "linux"))]
+                        let defer_overlay_servo = false;
+                        #[cfg(target_os = "linux")]
+                        if defer_overlay_servo {
+                            instance.overlay_dirty = true;
+                        }
 
                         unsafe {
                             // 1. UNIVERSAL PAINT BLOCK
                             // Paint any panes that have new rendered frames ready in Servo
                             for p in instance.panes.values_mut() {
                                 if p.is_remote {
+                                    continue;
+                                }
+                                // frame_seq>0 ⇒ we already have an FBO to composite.
+                                if defer_overlay_servo && p.needs_repaint && p.frame_seq > 0 {
                                     continue;
                                 }
                                 if p.needs_repaint {
@@ -4621,33 +5285,51 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         .and_then(|p| p.external_surface_slot.as_ref())
                                         .map(|slot| {
                                             let guard = slot.lock();
-                                            let mut sorted = guard.rolling_frametimes.clone();
+                                            let mut sorted = guard.rolling_present_ms.clone();
+                                            if sorted.is_empty() {
+                                                sorted = guard.rolling_frametimes.clone();
+                                            }
                                             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                                             let pct_low = |p: f32| -> Option<f32> {
                                                 if sorted.is_empty() {
                                                     return None;
                                                 }
-                                                // High frametime → low FPS. Take the worst p% of frames.
                                                 let idx = ((1.0 - p) * (sorted.len() as f32 - 1.0)).round() as usize;
                                                 let ft = sorted[idx.min(sorted.len() - 1)];
                                                 if ft > 0.0 { Some(1000.0 / ft) } else { None }
                                             };
+                                            let commits_per_swap = guard.last_commits_per_swap;
                                             (
-                                                guard.current_fps,
+                                                guard.present_fps.max(guard.current_fps),
                                                 guard.last_frame_time_ms,
                                                 guard.frame_counter,
                                                 guard.width,
                                                 guard.height,
                                                 pct_low(0.01),
                                                 pct_low(0.001),
+                                                guard.ingest_fps,
+                                                commits_per_swap,
                                             )
                                         });
-                                    if let Some((fps, frametime_ms, total_frames, width, height, fps_1_low, fps_01_low)) = game_stats {
+                                    if let Some((
+                                        fps,
+                                        frametime_ms,
+                                        total_frames,
+                                        width,
+                                        height,
+                                        fps_1_low,
+                                        fps_01_low,
+                                        fps_ingest,
+                                        commits_per_swap,
+                                    )) = game_stats
+                                    {
                                         // Always push — even fps==0 — so the HUD can show surface size
                                         // once frames exist (frame_counter > 0).
                                         if total_frames > 0 || fps > 0.0 || width > 0 {
                                             let refresh_hz =
                                                 instance.refresh_rate_millihertz as f32 / 1000.0;
+                                            let activity =
+                                                crate::pacing::present_activity(instance);
                                             push_renderer_ipc(
                                                 &uuid,
                                                 "atrium-game-stats",
@@ -4659,7 +5341,13 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                                     "height": height,
                                                     "fps_1_low": fps_1_low,
                                                     "fps_01_low": fps_01_low,
+                                                    "fps_ingest": fps_ingest,
+                                                    "commits_per_swap": commits_per_swap,
                                                     "refresh_hz": refresh_hz,
+                                                    "pacing_policy": crate::pacing::policy_label(instance.pacing_policy),
+                                                    "pacing_activity": crate::pacing::activity_label(activity),
+                                                    "soft_fifo": crate::pacing::fixed_software_fifo(instance),
+                                                    "hold_cadence": crate::pacing::wants_fixed_hold_cadence(instance),
                                                 }),
                                             );
                                         }
@@ -4788,16 +5476,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             // Gamescope stall fallback: still force present so steamcompmgr
                             // keeps scanning us out while the game is quiet.
                             #[cfg(target_os = "linux")]
-                            let needs_present = {
-                                let game_driven = nest_game_driven_present(instance);
-                                (!game_driven && is_gamescope_session())
-                                    || gl::scene_needs_present(
-                                        instance,
-                                        window_size,
-                                        _flip_occurred,
-                                        &pending_hides,
-                                    )
-                            };
+                            let servo_ms = servo_t0
+                                .map(|t| t.elapsed().as_secs_f32() * 1000.0)
+                                .unwrap_or(0.0);
+                            #[cfg(target_os = "linux")]
+                            let needs_present = gl::scene_needs_present(
+                                instance,
+                                window_size,
+                                _flip_occurred,
+                                &pending_hides,
+                            );
                             #[cfg(not(target_os = "linux"))]
                             let needs_present = gl::scene_needs_present(
                                 instance,
@@ -4810,6 +5498,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 let active_w = instance.active_window_size.width.max(1);
                                 let active_h = instance.active_window_size.height.max(1);
 
+                                #[cfg(target_os = "linux")]
+                                let draw_t0 = pacing_diag.then(std::time::Instant::now);
                                 gl::ensure_textures(instance, active_w, active_h);
                                 let composite_remotes = gl::composite_panes_to_scene(
                                     instance,
@@ -4837,6 +5527,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                     }
                                 }
 
+                                #[cfg(target_os = "linux")]
+                                if pacing_diag {
+                                    crate::pacing::set_frame_stages(crate::pacing::FrameStageMs {
+                                        poll_ms,
+                                        servo_ms,
+                                        draw_ms: draw_t0
+                                            .map(|t| t.elapsed().as_secs_f32() * 1000.0)
+                                            .unwrap_or(0.0),
+                                    });
+                                }
+
                                 let live_w = window_size.width.max(1) as i32;
                                 let live_h = window_size.height.max(1) as i32;
                                 let swapped =
@@ -4853,9 +5554,29 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                             .unwrap_or_default()
                                             .as_millis()
                                             & 0xFFFFFFFF) as u32;
-                                        let server = ws.lock();
+                                        let mut server = ws.lock();
+                                        // A new seq retires every older wl_buffer in this
+                                        // present, after the fence that covers its last
+                                        // sample. Hold presents (nothing awaiting) send a
+                                        // frame callback and keep the one pinned buffer.
+                                        // Releases are queued before the frame callback so
+                                        // a double-buffered client has a free buffer when
+                                        // wl_callback.done runs.
+                                        let presented = server.take_frames_awaiting_present();
+                                        let retire = !presented.is_empty();
+                                        if !retire || gl::wait_retired_sample_fence(&instance.gl) {
+                                            for (surface_id, seq) in presented {
+                                                server.note_frame_presented(surface_id, seq);
+                                            }
+                                        } else {
+                                            server.restore_frames_awaiting_present(presented);
+                                        }
                                         server.notify_frame_done(now_ms);
-                                        server.release_previous_buffer();
+                                        // Gamescope Fixed: keep previous dmabuf through the
+                                        // spare vblank. Next commit retires it via the slot.
+                                        if !crate::pacing::defer_nest_buffer_release(instance) {
+                                            server.release_previous_buffer();
+                                        }
                                     }
                                 }
 
@@ -4930,10 +5651,28 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             } else {
                                 trace!("Rust: [Lifecycle] RedrawRequested skip present (no damage)");
                                 // Do NOT FrameDone on skip — that free-runs nested clients.
+                                #[cfg(target_os = "linux")]
+                                if pacing_diag
+                                    && crate::pacing::vrr_requires_primary_damage(instance)
+                                {
+                                    if let Some(line) = crate::pacing::note_vrr_skip_present() {
+                                        nest_host_diag(line);
+                                    }
+                                }
                             }
 
                             #[cfg(target_os = "linux")]
                             nest_finish_nested_redraw(instance, nested_gen_at_start);
+                            #[cfg(target_os = "linux")]
+                            {
+                                let more_vsync = instance
+                                    .nested_compositor
+                                    .as_ref()
+                                    .is_some_and(|ws| ws.lock().vsync_frames_waiting());
+                                if more_vsync {
+                                    instance.window.request_redraw();
+                                }
+                            }
 
                             // LOCK STEP: clear busy only after the nuclear flip lands.
                             // Always re-run layout dispatch afterward: paint may have just
@@ -5071,6 +5810,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             return;
                         }
 
+                        if overlay_resize_handle_cursor(instance, point, scale_factor) {
+                            return;
+                        }
+
                         #[cfg(target_os = "linux")]
                         if instance.game_mode {
                             // While host-grabbed, only DeviceEvent::MouseMotion (relative) feeds
@@ -5087,11 +5830,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             });
                             if let Some((game_id, ws, tx, ty)) = game_motion {
                                 ws.lock().send_pointer_motion_to_pane(&game_id, tx, ty);
-                                nest_sync_nested_cursor_for_hover(
-                                    instance,
-                                    Some(event_loop),
-                                    true,
-                                );
+                                // Re-wear game shoes when a host grip cleared nested_cursor_applied
+                                // (nest_sync on nested_cursor would restore stale Discord ColResize).
+                                if !instance.nested_cursor_applied {
+                                    nest_wear_game_pointer_shoes(instance, Some(event_loop));
+                                }
                                 return;
                             }
                         }
@@ -5209,7 +5952,6 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                         if instance.gutter_hover.is_some() {
                             clear_gutter_hover_state(instance);
-                            instance.window.set_cursor(winit::window::CursorIcon::Default);
                         }
 
                         // Hit-test resize directions first
@@ -5465,6 +6207,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                         #[cfg(target_os = "linux")]
                         if nest_in_overlay_input_mode(instance) {
+                            if overlay_resize_handle_button(
+                                instance,
+                                instance.last_mouse_pos,
+                                scale_factor,
+                                is_pressed,
+                                button,
+                            ) {
+                                return;
+                            }
                             nest_route_mouse_button(
                                 instance,
                                 &uuid,
@@ -5472,6 +6223,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 is_pressed,
                                 scale_factor,
                             );
+                            return;
+                        }
+
+                        if overlay_resize_handle_button(
+                            instance,
+                            instance.last_mouse_pos,
+                            scale_factor,
+                            is_pressed,
+                            button,
+                        ) {
                             return;
                         }
 
@@ -5831,12 +6592,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     },
                     WindowEvent::MouseWheel { delta, .. } => {
                         let scale_factor = instance.window.scale_factor() as f32;
-                        // Standard browsers (Chromium/Firefox) scroll ~100 CSS px per wheel notch (approx. 4-5 text lines).
-                        // Scale by scale_factor so HiDPI displays maintain the intended CSS scroll distance.
-                        // Precision touchpads and smooth wheels emit PixelDelta, which is already in physical pixels.
+                        // Servo path: ~100 CSS px per wheel notch as device pixels.
+                        // Nest path must NOT reuse these — Wayland wheel clients treat
+                        // classic axis as ~10 units/detent (then ×120), so feeding
+                        // 100×DPR made Discord/Electron jump ~10–20× too far.
                         let line_scroll = 100.0 * scale_factor as f64;
                         let (x, y) = match delta {
-                            MouseScrollDelta::LineDelta(x, y) => (x as f64 * line_scroll, y as f64 * line_scroll),
+                            MouseScrollDelta::LineDelta(lx, ly) => {
+                                (lx as f64 * line_scroll, ly as f64 * line_scroll)
+                            }
                             MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
                         };
                         let wheel_delta = WheelDelta {
@@ -5844,6 +6608,25 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             y,
                             z: 0.0,
                             mode: WheelMode::DeltaPixel,
+                        };
+                        // Nest: smithay/winit convention — LineDelta → v120 (±120/detent)
+                        // + legacy value (±10/detent); PixelDelta → Continuous pixels.
+                        #[cfg(target_os = "linux")]
+                        let (nest_h, nest_v, nest_v120_h, nest_v120_v, nest_wheel) = match delta {
+                            MouseScrollDelta::LineDelta(lx, ly) => {
+                                let lx = lx as f64;
+                                let ly = ly as f64;
+                                (
+                                    -lx * 10.0,
+                                    -ly * 10.0,
+                                    Some((-lx * 120.0).round() as i32),
+                                    Some((-ly * 120.0).round() as i32),
+                                    true,
+                                )
+                            }
+                            MouseScrollDelta::PixelDelta(pos) => {
+                                (-pos.x, -pos.y, None, None, false)
+                            }
                         };
 
                         #[cfg(target_os = "linux")]
@@ -5861,8 +6644,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                             game_id,
                                             mx,
                                             my,
-                                            -x,
-                                            -y,
+                                            nest_h,
+                                            nest_v,
+                                            nest_v120_h,
+                                            nest_v120_v,
+                                            nest_wheel,
                                         );
                                         return;
                                     }
@@ -5892,8 +6678,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                             &target_id,
                                             mx,
                                             my,
-                                            -x,
-                                            -y,
+                                            nest_h,
+                                            nest_v,
+                                            nest_v120_h,
+                                            nest_v120_v,
+                                            nest_wheel,
                                         );
                                         instance.window.request_redraw();
                                         return;
@@ -6004,8 +6793,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         &pane_id,
                                         mx,
                                         my,
-                                        -x,
-                                        -y,
+                                        nest_h,
+                                        nest_v,
+                                        nest_v120_h,
+                                        nest_v120_v,
+                                        nest_wheel,
                                     );
                                     instance.window.request_redraw();
                                 } else if pane.is_remote {
@@ -6263,13 +7055,22 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                         })
                                         .map(|b| b.id.clone());
                                     if let Some(id) = matched_id {
-                                        instance.host_hotkey_pressed.insert(event.physical_key);
-                                        push_renderer_ipc(
-                                            &uuid,
-                                            "nest:hotkey",
-                                            serde_json::json!({ "id": id }),
-                                        );
-                                        return;
+                                        // Game input: only the mode toggle may steal
+                                        // keys from the nest. Overlay binds (Discord,
+                                        // HUD, …) must fall through so F9/F10 reach
+                                        // the game. Atrium only registers toggle-mode
+                                        // while game_mode; this is the safety net.
+                                        if instance.game_mode && id != "toggle-mode" {
+                                            // unmatched — forward below
+                                        } else {
+                                            instance.host_hotkey_pressed.insert(event.physical_key);
+                                            push_renderer_ipc(
+                                                &uuid,
+                                                "nest:hotkey",
+                                                serde_json::json!({ "id": id }),
+                                            );
+                                            return;
+                                        }
                                     }
                                 }
                             }

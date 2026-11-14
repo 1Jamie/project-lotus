@@ -16,12 +16,16 @@ pub mod origin;
 pub mod ipc_security;
 pub mod vfs;
 pub mod layout;
+pub mod overlay_resize;
 pub mod window;
 pub mod server;
 pub mod delegate;
 pub mod gl;
 pub mod userscripts;
 pub mod app;
+pub mod pacing;
+#[cfg(target_os = "linux")]
+pub mod present_feedback;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 #[cfg(target_os = "linux")]
@@ -361,6 +365,17 @@ impl WindowHandle {
         visible: Option<bool>,
         dbus_notifications: Option<String>,
         dbus_notification_apps: Option<Vec<String>>,
+        env: Option<HashMap<String, String>>,
+        follow_dock: Option<bool>,
+        client_width: Option<u32>,
+        client_height: Option<u32>,
+        client_upscale_sgsr: Option<bool>,
+        resize_edges: Option<u32>,
+        resize_anchor: Option<u8>,
+        resize_min_w: Option<f64>,
+        resize_min_h: Option<f64>,
+        resize_max_w: Option<f64>,
+        resize_max_h: Option<f64>,
     ) {
         #[cfg(not(target_os = "linux"))]
         {
@@ -379,6 +394,17 @@ impl WindowHandle {
                 visible,
                 dbus_notifications,
                 dbus_notification_apps,
+                env,
+                follow_dock,
+                client_width,
+                client_height,
+                client_upscale_sgsr,
+                resize_edges,
+                resize_anchor,
+                resize_min_w,
+                resize_min_h,
+                resize_max_w,
+                resize_max_h,
             );
             return;
         }
@@ -388,6 +414,8 @@ impl WindowHandle {
                 euclid::Point2D::new(x as f32, y as f32),
                 euclid::Size2D::new(width as f32, height as f32),
             );
+            let max_w = resize_max_w.map(|v| v as f32).filter(|v| v.is_finite() && *v > 0.0);
+            let max_h = resize_max_h.map(|v| v as f32).filter(|v| v.is_finite() && *v > 0.0);
             let _ = proxy.send_event(EngineCommand::CreateExternalAppPane {
                 window_id: self.id.clone(),
                 pane_id,
@@ -400,6 +428,36 @@ impl WindowHandle {
                 visible: visible.unwrap_or(true),
                 dbus_notifications: dbus_notifications.unwrap_or_else(|| "off".into()),
                 dbus_notification_apps: dbus_notification_apps.unwrap_or_default(),
+                env: env.unwrap_or_default(),
+                follow_dock: follow_dock.unwrap_or(true),
+                client_width,
+                client_height,
+                client_upscale_sgsr: client_upscale_sgsr.unwrap_or(false),
+                resize_edges: resize_edges.unwrap_or(0),
+                resize_anchor: resize_anchor.unwrap_or(0),
+                resize_min_w: resize_min_w.map(|v| v as f32).unwrap_or(32.0),
+                resize_min_h: resize_min_h.map(|v| v as f32).unwrap_or(32.0),
+                resize_max_w: max_w,
+                resize_max_h: max_h,
+            });
+        }
+    }
+
+    /// Wayland client buffer size for a decoupled external overlay pane.
+    #[napi]
+    pub fn set_external_client_size(&self, pane_id: String, width: u32, height: u32) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (&self.id, pane_id, width, height);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetExternalClientSize {
+                window_id: self.id.clone(),
+                pane_id,
+                width,
+                height,
             });
         }
     }

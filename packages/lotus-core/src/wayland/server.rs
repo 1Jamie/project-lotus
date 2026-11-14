@@ -9,6 +9,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer;
 use smithay::delegate_compositor;
 use smithay::delegate_cursor_shape;
+use smithay::delegate_data_device;
 use smithay::delegate_dmabuf;
 use smithay::delegate_output;
 use smithay::delegate_pointer_constraints;
@@ -22,10 +23,17 @@ use smithay::delegate_xwayland_shell;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::utils::{Logical, Point, Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
-use smithay::backend::renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state};
+use smithay::backend::renderer::utils::{
+    on_commit_buffer_handler, with_renderer_surface_state, Buffer as RendererBuffer,
+};
 use smithay::wayland::compositor::{
     with_states, CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
 };
+use smithay::wayland::selection::data_device::{
+    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
+    ServerDndGrabHandler,
+};
+use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::dmabuf::{
     DmabufFeedback, DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
 };
@@ -44,7 +52,7 @@ use smithay::wayland::pointer_constraints::{
     with_pointer_constraint, PointerConstraintsHandler, PointerConstraintsState,
 };
 use smithay::wayland::presentation::{
-    PresentationFeedbackCachedState, PresentationFeedbackCallback, PresentationState, Refresh,
+    PresentationFeedbackCachedState, PresentationState, Refresh,
 };
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::seat::CURSOR_IMAGE_ROLE;
@@ -59,6 +67,7 @@ use wayland_server::protocol::wl_surface::WlSurface;
 use wayland_server::{Client, DisplayHandle, Resource};
 
 use crate::wayland::dmabuf::DmabufFrameDescriptor;
+use crate::wayland::vsync_latch::VsyncBufferHolds;
 
 #[derive(Default)]
 pub struct ClientState {
@@ -88,6 +97,7 @@ pub enum WaylandEvent {
     FrameCommitted(DmabufFrameDescriptor),
     ShmFrameCommitted {
         surface_id: u32,
+        commit_seq: u64,
         width: u32,
         height: u32,
         stride: u32,
@@ -130,6 +140,9 @@ pub struct LotusWaylandState {
     pub shm_state: ShmState,
     pub seat_state: SeatState<Self>,
     pub seat: Seat<Self>,
+    /// wl_data_device_manager — GTK4 will not open a display without it.
+    #[allow(dead_code)]
+    pub data_device_state: DataDeviceState,
     #[allow(dead_code)] // retained so the wp_cursor_shape global stays alive
     pub cursor_shape_manager_state: CursorShapeManagerState,
     pub output_manager_state: OutputManagerState,
@@ -144,8 +157,8 @@ pub struct LotusWaylandState {
     /// wp_presentation — DXVK/VKD3D presentation_feedback pacing.
     #[allow(dead_code)]
     pub presentation_state: PresentationState,
-    /// Feedback objects drained from commits; marked presented after host swap.
-    pub pending_presentation_feedbacks: Vec<PresentationFeedbackCallback>,
+    /// Staged/latched wp_presentation_feedback (shared with host pump_frames).
+    pub presentation_handoff: crate::wayland::presentation_handoff::SharedPresentationHandoff,
     /// Presentation sequence counter for wp_presentation_feedback.presented.
     pub presentation_seq: u64,
     /// Last cursor surface used by `wl_pointer.set_cursor` (for commit updates).
@@ -163,6 +176,8 @@ pub struct LotusWaylandState {
     pub pending_frame_callbacks: Arc<Mutex<Vec<WlCallback>>>,
     pub active_dmabuf: Option<Dmabuf>,
     pub previous_dmabuf: Option<Dmabuf>,
+    /// Locked vsync: wl_buffers kept alive until a strictly newer frame is presented.
+    buffer_holds: HashMap<u32, VsyncBufferHolds<RendererBuffer>>,
     pub event_sender: Sender<WaylandEvent>,
     pub target_size: (u32, u32),
     pub xwayland_shell_state: XWaylandShellState,
@@ -178,6 +193,9 @@ pub struct LotusWaylandState {
     pub host_game_mode: bool,
     /// Last NestedPointerLock state we told the host about (debounce).
     pub last_emitted_pointer_lock: bool,
+    /// Last pointer location delivered to the primary/game surface (nest logical).
+    /// Used to re-enter after F12 instead of warping to output center.
+    pub last_primary_pointer_pos: Option<Point<f64, Logical>>,
 }
 
 /// CLOCK_MONOTONIC timestamp for wp_presentation (clk_id = 1).
@@ -216,6 +234,7 @@ impl LotusWaylandState {
         window_id: String,
         display_handle: DisplayHandle,
         event_sender: Sender<WaylandEvent>,
+        presentation_handoff: crate::wayland::presentation_handoff::SharedPresentationHandoff,
         target_size: (u32, u32),
         refresh_rate_millihertz: u32,
         pane_registrations: Arc<parking_lot::Mutex<Vec<crate::wayland::PaneRegistration>>>,
@@ -270,6 +289,7 @@ impl LotusWaylandState {
         );
 
         let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
+        let data_device_state = DataDeviceState::new::<Self>(&display_handle);
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&display_handle, "lotus-nest-seat");
 
@@ -331,6 +351,7 @@ impl LotusWaylandState {
             shm_state,
             seat_state,
             seat,
+            data_device_state,
             cursor_shape_manager_state,
             output_manager_state,
             output,
@@ -338,7 +359,7 @@ impl LotusWaylandState {
             relative_pointer_manager_state,
             pointer_constraints_state,
             presentation_state,
-            pending_presentation_feedbacks: Vec::new(),
+            presentation_handoff,
             presentation_seq: 0,
             current_cursor_surface: None,
             last_pointer_focus: None,
@@ -352,6 +373,7 @@ impl LotusWaylandState {
             pending_frame_callbacks: Arc::new(Mutex::new(Vec::new())),
             active_dmabuf: None,
             previous_dmabuf: None,
+            buffer_holds: HashMap::new(),
             event_sender,
             target_size,
             xwayland_shell_state,
@@ -364,6 +386,7 @@ impl LotusWaylandState {
             // Atrium windows start in game mode.
             host_game_mode: false,
             last_emitted_pointer_lock: false,
+            last_primary_pointer_pos: None,
         }
     }
 
@@ -406,11 +429,18 @@ impl LotusWaylandState {
         let min_period = std::time::Duration::from_nanos(
             1_000_000_000_000u64 / self.refresh_rate_millihertz.max(1) as u64,
         );
-        // Advertise variable refresh so VKD3D/DXVK can pace to VRR.
-        let refresh = Refresh::variable(min_period);
+        let vrr = self
+            .presentation_handoff
+            .vrr_passthrough
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let refresh = if vrr {
+            Refresh::variable(min_period)
+        } else {
+            Refresh::fixed(min_period)
+        };
         self.presentation_seq = self.presentation_seq.wrapping_add(1);
         let seq = self.presentation_seq;
-        let feedbacks = std::mem::take(&mut self.pending_presentation_feedbacks);
+        let feedbacks = self.presentation_handoff.take_latched();
         for feedback in feedbacks {
             feedback.presented(
                 &self.output,
@@ -418,6 +448,72 @@ impl LotusWaylandState {
                 refresh,
                 seq,
                 wp_presentation_feedback::Kind::Vsync,
+            );
+        }
+    }
+
+    fn vsync_fifo(&self) -> bool {
+        !self
+            .presentation_handoff
+            .vrr_passthrough
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn wl_buffer_id(buffer: &RendererBuffer) -> u32 {
+        buffer.id().protocol_id()
+    }
+
+    /// Pin a DMA-BUF until a newer frame is on screen.
+    ///
+    /// Returns `(seq, fresh)`. `fresh` is false when this commit reused the
+    /// wl_buffer already at the tail of the hold list (damage-only). That image
+    /// is still the latest frame, so it must not be queued again.
+    fn track_dma_buffer(&mut self, surface_id: u32, buffer: RendererBuffer) -> (u64, bool) {
+        if !self.vsync_fifo() {
+            return (0, true);
+        }
+        let id = Self::wl_buffer_id(&buffer);
+        let holds = self.buffer_holds.entry(surface_id).or_default();
+        let same = holds
+            .latest()
+            .is_some_and(|existing| Self::wl_buffer_id(existing) == id);
+        if same {
+            return (holds.latest_seq(), false);
+        }
+        (holds.push_new(buffer), true)
+    }
+
+    /// SHM pixels are copied at commit, and each commit is its own frame even
+    /// when the client reuses one wl_buffer.
+    fn track_shm_buffer(&mut self, surface_id: u32, buffer: RendererBuffer) -> u64 {
+        if !self.vsync_fifo() {
+            return 0;
+        }
+        self.buffer_holds
+            .entry(surface_id)
+            .or_default()
+            .push_new(buffer)
+    }
+
+    /// VRR must not keep the locked-vsync pins or the client swapchain stalls.
+    pub(crate) fn relax_vsync_pins_for_mailbox(&mut self) {
+        if !self.vsync_fifo() && !self.buffer_holds.is_empty() {
+            self.buffer_holds.clear();
+        }
+    }
+
+    /// Drop wl_buffers strictly older than `seq`. The presented buffer stays pinned.
+    pub(crate) fn release_presented_buffer(&mut self, surface_id: u32, seq: u64) {
+        let Some(holds) = self.buffer_holds.get_mut(&surface_id) else {
+            return;
+        };
+        let released = holds.release_before(seq);
+        if !released.is_empty() {
+            log::trace!(
+                "[lotus-nest] vsync released {} buffer(s) on surface {} older than seq {}",
+                released.len(),
+                surface_id,
+                seq
             );
         }
     }
@@ -468,19 +564,29 @@ impl LotusWaylandState {
     }
 
     fn sync_pointer_lock_for_surface(&mut self, surface: &WlSurface) {
-        let active = if let Some(pointer) = self.seat.get_pointer() {
-            with_pointer_constraint(surface, &pointer, |constraint| {
-                constraint.map(|c| c.is_active()).unwrap_or(false)
+        // 1 = active, 0 = present but inactive (client unlocked), -1 = absent
+        // (oneshot destroyed on leave / not yet recreated after F12 enter).
+        let status = if let Some(pointer) = self.seat.get_pointer() {
+            with_pointer_constraint(surface, &pointer, |constraint| match constraint {
+                Some(c) if c.is_active() => 1,
+                Some(_) => 0,
+                None => -1,
             })
         } else {
-            false
+            -1
         };
-        if active {
-            self.emit_pointer_lock(true);
-        } else if self.host_game_mode {
-            // Only clear the sticky shoe while game mode owns the seat. Overlay must
-            // not wipe lock state when Discord steals transient pointer focus.
-            self.emit_pointer_lock(false);
+        match status {
+            1 => self.emit_pointer_lock(true),
+            0 if self.host_game_mode => {
+                // Real unlock while game mode owns the seat.
+                self.emit_pointer_lock(false);
+            }
+            -1 => {
+                // Absent after leave/oneshot destroy — keep sticky shoe so host
+                // grab survives until the client recreates the constraint (or
+                // pause/unpause). Emitting false here left RoR2/OW hide-only.
+            }
+            _ => {}
         }
     }
 
@@ -554,28 +660,35 @@ impl LotusWaylandState {
         .flatten()
     }
 
-    /// Set input focus to a specific Wayland surface.
+    /// Keyboard (+ data-device) focus only.
+    ///
+    /// Must not move the pointer or rewrite `last_pointer_focus`. Teleporting to
+    /// (0,0) on every `focus_pane` left GTK/ptyxis with a dead keyboard while
+    /// mouse still worked — VTE never kept real key focus after the fake enter.
     pub fn set_focus_surface(&mut self, surface: Option<WlSurface>) {
         self.focused_surface = surface.clone();
-        // Before pointer.motion — cursor_image must not re-enter PointerHandle.
-        self.last_pointer_focus = surface.clone();
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let data_client = surface.as_ref().and_then(|s| s.client());
+        let dh = self.display_handle.clone();
+        set_data_device_focus(&dh, &self.seat, data_client);
         if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, surface.clone(), serial);
+            keyboard.set_focus(self, surface, serial);
         }
-        if let Some(pointer) = self.seat.get_pointer() {
-            let target = surface.map(|s| (s, Point::from((0.0, 0.0))));
-            pointer.motion(self, target, &smithay::input::pointer::MotionEvent {
-                location: Point::from((0.0, 0.0)),
-                serial,
-                time: 0,
-            });
-        }
+    }
+
+    /// Keyboard focus for a pane using the same surface resolution as pointer.
+    pub fn focus_keyboard_pane(&mut self, pane_id: &str) {
+        let Some(surface) = self.surface_for_pane(pane_id) else {
+            return;
+        };
+        self.set_focus_surface(Some(surface));
     }
 
     pub fn clear_keyboard_focus(&mut self) {
         self.focused_surface = None;
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let dh = self.display_handle.clone();
+        set_data_device_focus(&dh, &self.seat, None);
         if let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(self, None, serial);
         }
@@ -600,6 +713,108 @@ impl LotusWaylandState {
         }
         // Do NOT emit NestedPointerLock(false) here — host-initiated leave must not
         // wipe the game's sticky lock shoe while the user is in overlay.
+    }
+
+    /// Deactivate pointer-constraints on the primary/game surface without clearing the
+    /// host sticky lock shoe (`last_emitted_pointer_lock` stays put for re-wear).
+    pub fn deactivate_primary_pointer_constraints(&mut self) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let primary_id = {
+            let panes = self.pane_registrations.lock();
+            panes
+                .iter()
+                .find(|p| p.is_primary)
+                .map(|p| p.pane_id.clone())
+        };
+        let Some(pane_id) = primary_id else {
+            return;
+        };
+        let Some(surface) = self.surface_for_pane(&pane_id) else {
+            return;
+        };
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            if let Some(c) = constraint {
+                if c.is_active() {
+                    c.deactivate();
+                }
+            }
+        });
+    }
+
+    /// Re-seat the primary pointer after overlay→game (F12).
+    ///
+    /// Always enters the game surface (needed for hide-only soft-cursor UIs).
+    /// When a lock/confine shoe exists, also activates it so FPS relative aim
+    /// works immediately without click-to-recapture.
+    pub fn reactivate_primary_pointer_constraints(&mut self) {
+        if !self.host_game_mode {
+            return;
+        }
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let primary_id = {
+            let panes = self.pane_registrations.lock();
+            panes
+                .iter()
+                .find(|p| p.is_primary)
+                .map(|p| p.pane_id.clone())
+        };
+        let Some(pane_id) = primary_id else {
+            return;
+        };
+        let Some(surface) = self.surface_for_pane(&pane_id) else {
+            return;
+        };
+        // Seat must be on the game surface before activate. Prefer last nest
+        // coords (or preserved seat location) — center warps soft-cursor UIs and
+        // made OW/RoR2 feel unbound until click/pause.
+        let (nw, nh) = (
+            self.target_size.0.max(1) as f64,
+            self.target_size.1.max(1) as f64,
+        );
+        let raw = self
+            .last_primary_pointer_pos
+            .unwrap_or_else(|| pointer.current_location());
+        let location = Point::from((
+            raw.x.clamp(0.0, (nw - 1.0).max(0.0)),
+            raw.y.clamp(0.0, (nh - 1.0).max(0.0)),
+        ));
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let now_ms = self.now_ms();
+        let surface_origin = Point::from((0.0, 0.0));
+        self.last_pointer_focus = Some(surface.clone());
+        self.last_primary_pointer_pos = Some(location);
+        pointer.motion(
+            self,
+            Some((surface.clone(), surface_origin)),
+            &smithay::input::pointer::MotionEvent {
+                location,
+                serial,
+                time: now_ms,
+            },
+        );
+        let mut activated = false;
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            if let Some(c) = constraint {
+                if !c.is_active() {
+                    c.activate();
+                }
+                activated = c.is_active();
+            }
+        });
+        pointer.frame(self);
+        if activated || self.last_emitted_pointer_lock {
+            // Force host shoe re-wear after this enter. Sticky+Absent (oneshot
+            // destroyed on leave) still needs grab armed *after* seat focus, not
+            // before SetHostGameMode runs — otherwise relative aim hits an empty seat.
+            self.last_emitted_pointer_lock = false;
+            self.emit_pointer_lock(true);
+        } else {
+            self.sync_pointer_lock_for_surface(&surface);
+        }
     }
 
     /// Drop seat focus if it currently points at a surface owned by `pane_id`.
@@ -833,6 +1048,10 @@ impl LotusWaylandState {
         let now_ms = self.now_ms();
         let location = Point::from((x, y));
         let surface_origin = Point::from((0.0, 0.0));
+        let allow_constraints = self.host_game_mode && self.surface_is_primary(&surface);
+        if self.surface_is_primary(&surface) {
+            self.last_primary_pointer_pos = Some(location);
+        }
         if let Some(pointer) = self.seat.get_pointer() {
             let focus = Some((surface.clone(), surface_origin));
             pointer.motion(
@@ -844,17 +1063,22 @@ impl LotusWaylandState {
                     time: now_ms,
                 },
             );
-            // Re-activate lock/confine after enter (leave deactivates oneshot/persistent).
-            with_pointer_constraint(&surface, &pointer, |constraint| {
-                if let Some(c) = constraint {
-                    if !c.is_active() {
-                        c.activate();
+            // Re-activate lock/confine after enter only for the game seat. Overlay
+            // must never re-arm a game constraint (steals Discord clicks/cursors).
+            if allow_constraints {
+                with_pointer_constraint(&surface, &pointer, |constraint| {
+                    if let Some(c) = constraint {
+                        if !c.is_active() {
+                            c.activate();
+                        }
                     }
-                }
-            });
+                });
+            }
             pointer.frame(self);
         }
-        self.sync_pointer_lock_for_surface(&surface);
+        if allow_constraints {
+            self.sync_pointer_lock_for_surface(&surface);
+        }
     }
 
     pub fn dispatch_pointer_button_to_pane(
@@ -865,12 +1089,20 @@ impl LotusWaylandState {
         button: u32,
         pressed: bool,
     ) {
-        // Skip absolute re-motion only while the game lock shoe is active — otherwise
-        // Chromium/Discord CSD hit-tests a stale enter point (often 0,0 → resize grip).
+        // Skip absolute re-motion only for a locked *primary* aim path. Discord /
+        // Chromium always need fresh enter coords (stale 0,0 → CSD resize / dead clicks).
+        // `last_emitted_pointer_lock` is a sticky game shoe and stays true in overlay.
         let already_focused = self
             .surface_for_pane(pane_id)
             .is_some_and(|s| self.last_pointer_focus.as_ref() == Some(&s));
-        let skip_motion = already_focused && self.last_emitted_pointer_lock;
+        let is_primary = self
+            .pane_registrations
+            .lock()
+            .iter()
+            .find(|p| p.pane_id == pane_id)
+            .map(|p| p.is_primary)
+            .unwrap_or(false);
+        let skip_motion = already_focused && self.last_emitted_pointer_lock && is_primary;
         if !skip_motion {
             self.dispatch_pointer_motion_to_pane(pane_id, x, y);
         }
@@ -911,6 +1143,9 @@ impl LotusWaylandState {
         y: f64,
         horizontal: f64,
         vertical: f64,
+        v120_horizontal: Option<i32>,
+        v120_vertical: Option<i32>,
+        wheel: bool,
     ) {
         let already_focused = self
             .surface_for_pane(pane_id)
@@ -920,13 +1155,23 @@ impl LotusWaylandState {
         }
         let now_ms = self.now_ms();
         if let Some(pointer) = self.seat.get_pointer() {
-            let mut frame = smithay::input::pointer::AxisFrame::new(now_ms)
-                .source(smithay::backend::input::AxisSource::Wheel);
+            let source = if wheel {
+                smithay::backend::input::AxisSource::Wheel
+            } else {
+                smithay::backend::input::AxisSource::Continuous
+            };
+            let mut frame = smithay::input::pointer::AxisFrame::new(now_ms).source(source);
             if horizontal.abs() > 0.0 {
                 frame = frame.value(smithay::backend::input::Axis::Horizontal, horizontal);
             }
             if vertical.abs() > 0.0 {
                 frame = frame.value(smithay::backend::input::Axis::Vertical, vertical);
+            }
+            if let Some(v) = v120_horizontal.filter(|v| *v != 0) {
+                frame = frame.v120(smithay::backend::input::Axis::Horizontal, v);
+            }
+            if let Some(v) = v120_vertical.filter(|v| *v != 0) {
+                frame = frame.v120(smithay::backend::input::Axis::Vertical, v);
             }
             pointer.axis(self, frame);
             pointer.frame(self);
@@ -1091,9 +1336,10 @@ impl CompositorHandler for LotusWaylandState {
                 new_presentation_feedbacks = callbacks;
             }
         });
-        if !new_presentation_feedbacks.is_empty() {
-            self.pending_presentation_feedbacks
-                .extend(new_presentation_feedbacks);
+        let staged_feedback = !new_presentation_feedbacks.is_empty();
+        if staged_feedback {
+            self.presentation_handoff
+                .stage(surface_id, new_presentation_feedbacks);
         }
 
         // IMPORTANT: `on_commit_buffer_handler` above *takes* BufferAssignment::NewBuffer
@@ -1103,8 +1349,9 @@ impl CompositorHandler for LotusWaylandState {
         // later damage-only commits that keep the same wl_buffer).
         if !is_cursor {
             let imported = with_renderer_surface_state(surface, |state| {
+                let held = state.buffer().cloned();
                 let Some(wl_buf) = state.buffer() else {
-                    return false;
+                    return (false, false);
                 };
                 match smithay::wayland::dmabuf::get_dmabuf(wl_buf) {
                     Ok(dmabuf) => {
@@ -1122,13 +1369,22 @@ impl CompositorHandler for LotusWaylandState {
                                 );
                             }
                         }
-                        let desc = DmabufFrameDescriptor::new(surface_id, dmabuf.clone());
-                        let _ = self.event_sender.send(WaylandEvent::FrameCommitted(desc));
-                        // Keep only the live buffer + one previous. Drop anything older
-                        // immediately so a stalled host cannot pin the whole swapchain.
+                        let (commit_seq, fresh) = match held.clone() {
+                            Some(buf) => self.track_dma_buffer(surface_id, buf),
+                            None => (0, true),
+                        };
+                        if fresh {
+                            let mut desc = DmabufFrameDescriptor::new(surface_id, dmabuf.clone());
+                            desc.commit_seq = commit_seq;
+                            let _ = self.event_sender.send(WaylandEvent::FrameCommitted(desc));
+                        }
+                        // fd cache only. Locked vsync pins the wl_buffer in
+                        // `buffer_holds` until a newer frame is presented, so
+                        // dropping an older Dmabuf clone cannot recycle the
+                        // image still being scanned out.
                         let old = self.active_dmabuf.replace(dmabuf.clone());
                         self.previous_dmabuf = old;
-                        true
+                        (true, !fresh)
                     }
                     Err(dma_err) => {
                         let shm_res = smithay::wayland::shm::with_buffer_contents(
@@ -1154,27 +1410,36 @@ impl CompositorHandler for LotusWaylandState {
                                     "[lotus-nest] surface {} committed SHM buffer ({}x{})",
                                     surface_id, width, height
                                 );
+                                let commit_seq = match held {
+                                    Some(buf) => self.track_shm_buffer(surface_id, buf),
+                                    None => 0,
+                                };
                                 let _ = self.event_sender.send(WaylandEvent::ShmFrameCommitted {
                                     surface_id,
+                                    commit_seq,
                                     width,
                                     height,
                                     stride,
                                     data: bytes,
                                 });
-                                true
+                                (true, false)
                             }
                             Err(shm_err) => {
                                 warn!(
                                     "[lotus-nest] surface {} buffer could not be imported as DMA-BUF ({:?}) nor SHM ({:?})",
                                     surface_id, dma_err, shm_err
                                 );
-                                false
+                                (false, false)
                             }
                         }
                     }
                 }
             });
-            if imported == Some(true) {
+            let (wake_import, deduped) = imported.unwrap_or((false, false));
+            if self.vsync_fifo() && staged_feedback && (deduped || !wake_import) {
+                self.presentation_handoff.discard_newest(surface_id);
+            }
+            if wake_import {
                 // Game-driven present: primary commit wakes host for composite+swap.
                 // Overlay commits piggyback (no independent swap) while the game is live.
                 // FrameDone / wp_presentation fire only AFTER that swap (not here).
@@ -1189,7 +1454,7 @@ impl CompositorHandler for LotusWaylandState {
                         .unwrap_or(false)
                 };
                 let wake = if is_primary {
-                    crate::app::nest_note_primary_game_commit();
+                    crate::pacing::note_primary_game_commit();
                     // Constraint may have been destroyed without motion — refresh shoes.
                     if let Some(focus) = self.last_pointer_focus.clone() {
                         self.sync_pointer_lock_for_surface(&focus);
@@ -1200,8 +1465,10 @@ impl CompositorHandler for LotusWaylandState {
                     // on a live game leaves them FrameDone-starved and visually frozen.
                     true
                 } else {
-                    // Game mode: piggyback on primary commits (VRR); wake only if game stalled.
-                    !crate::app::nest_game_commit_fresh(std::time::Duration::from_millis(50))
+                    // Game mode: overlay commits piggyback on primary unless primary is idle.
+                    !crate::pacing::game_commit_fresh(std::time::Duration::from_millis(
+                        crate::pacing::PACING_IDLE_MS,
+                    ))
                 };
                 if wake && !crate::app::NESTED_REDRAW_PENDING.swap(true, Ordering::SeqCst) {
                     if let Some(proxy) = crate::app::EVENT_LOOP_PROXY.get() {
@@ -1519,6 +1786,18 @@ impl SeatHandler for LotusWaylandState {
 }
 delegate_seat!(LotusWaylandState);
 
+impl SelectionHandler for LotusWaylandState {
+    type SelectionUserData = ();
+}
+impl ClientDndGrabHandler for LotusWaylandState {}
+impl ServerDndGrabHandler for LotusWaylandState {}
+impl DataDeviceHandler for LotusWaylandState {
+    fn data_device_state(&self) -> &DataDeviceState {
+        &self.data_device_state
+    }
+}
+delegate_data_device!(LotusWaylandState);
+
 impl TabletSeatHandler for LotusWaylandState {}
 delegate_cursor_shape!(LotusWaylandState);
 
@@ -1528,8 +1807,9 @@ impl PointerConstraintsHandler for LotusWaylandState {
         // (games typically lock on match start while still focused).
         // Use last_pointer_focus — do not call pointer.current_focus() while smithay
         // may already hold the PointerHandle (same deadlock class as cursor_image).
+        // Overlay never arms locks — only the game seat in host game mode.
         let focused = self.last_pointer_focus.as_ref() == Some(surface);
-        if focused {
+        if focused && self.host_game_mode && self.surface_is_primary(surface) {
             with_pointer_constraint(surface, pointer, |constraint| {
                 if let Some(c) = constraint {
                     c.activate();

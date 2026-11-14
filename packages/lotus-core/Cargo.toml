@@ -106,4 +106,7 @@ codegen-units = 16
 # so the sandbox GPU broker / jail networking patch is used. Windows CI never
 # runs that injection and builds stock crates.io Servo.
 [patch.crates-io]
+# >>> lotus-servo-path-patch (linux build only; do not commit)
+servo = { path = "servo/components/servo" }
+# <<< lotus-servo-path-patch
 smithay = { path = "vendor/smithay" }

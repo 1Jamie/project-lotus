@@ -2037,6 +2037,23 @@ class Pane extends EventEmitter {
         this.window.handle.setPaneRect(this.id, x, y, width, height);
     }
 
+    /**
+     * Fixed client resolution for decoupled external panes (`clientSizing: { width, height }`).
+     * No-op when the pane follows the dock.
+     */
+    setClientSize(width, height) {
+        if (!this.isExternal || this._externalFollowsDock) {
+            return;
+        }
+        const w = Math.max(32, Math.floor(Number(width) || 0));
+        const h = Math.max(32, Math.floor(Number(height) || 0));
+        if (!w || !h) return;
+        if (this.window?.handle?.setExternalClientSize) {
+            this.window.handle.setExternalClientSize(this.id, w, h);
+        }
+        this._externalClientSize = { width: w, height: h };
+    }
+
     get zIndex() {
         return this._layout ? this._layout.zIndex : 0;
     }
@@ -2146,6 +2163,54 @@ class Pane extends EventEmitter {
     updateDragRegions(rects) {
         this.window.handle.updatePaneDragRegions(this.id, JSON.stringify(rects));
     }
+}
+
+function parseOverlayResize(resizable) {
+    const edgeMap = {
+        left: 1,
+        right: 2,
+        top: 4,
+        bottom: 8,
+        west: 1,
+        east: 2,
+        north: 4,
+        south: 8,
+    };
+    const anchorMap = {
+        'top-left': 0,
+        'top-right': 1,
+        'bottom-left': 2,
+        'bottom-right': 3,
+    };
+    if (!resizable) {
+        return { edges: 0, anchor: 0, minW: 32, minH: 32, maxW: null, maxH: null };
+    }
+    let edges = 0;
+    let anchor = 0;
+    let minW = 32;
+    let minH = 32;
+    let maxW = null;
+    let maxH = null;
+    if (resizable === true) {
+        edges = 15;
+    } else if (typeof resizable === 'object') {
+        const list = Array.isArray(resizable.edges) ? resizable.edges : null;
+        if (list && list.length) {
+            for (const e of list) {
+                edges |= edgeMap[String(e).toLowerCase()] || 0;
+            }
+        } else {
+            edges = 15;
+        }
+        if (resizable.anchor) {
+            anchor = anchorMap[String(resizable.anchor).toLowerCase()] ?? 0;
+        }
+        if (resizable.minWidth != null) minW = Math.max(32, Math.floor(Number(resizable.minWidth)));
+        if (resizable.minHeight != null) minH = Math.max(32, Math.floor(Number(resizable.minHeight)));
+        if (resizable.maxWidth != null) maxW = Math.floor(Number(resizable.maxWidth));
+        if (resizable.maxHeight != null) maxH = Math.floor(Number(resizable.maxHeight));
+    }
+    return { edges, anchor, minW, minH, maxW, maxH };
 }
 
 class ServoWindow extends EventEmitter {
@@ -2594,6 +2659,9 @@ class ServoWindow extends EventEmitter {
      * Create an external app pane (nested zero-copy Wayland + Xwayland game surface).
      * @param {string} id Unique pane identifier
      * @param {object} options External app options: command, args, anchor, zIndex, width, height, etc.
+     * @param {'dock' | { width: number, height: number }} [options.clientSizing] Default `'dock'`: client buffer tracks dock setRect.
+     * @param {'sgsr' | 'bilinear'} [options.clientUpscale] Upscale decoupled clients into a larger dock (SGSR when buffer is smaller).
+     * @param {boolean | { edges?: string[], anchor?: string, minWidth?: number, minHeight?: number }} [options.resizable] Host edge resize (no chrome).
      */
     createExternalAppPane(id, options = {}) {
         if (!this.handle) throw new Error("Window not created yet");
@@ -2623,6 +2691,26 @@ class ServoWindow extends EventEmitter {
             : Array.isArray(dbus.notificationApps)
               ? dbus.notificationApps
               : [];
+        // Spawn-env bag merged into Command::env — never put secrets on argv.
+        const env =
+            options.env && typeof options.env === 'object' && !Array.isArray(options.env)
+                ? options.env
+                : {};
+        const sizing = options.clientSizing;
+        let followDock = true;
+        let clientWidth = null;
+        let clientHeight = null;
+        if (sizing && typeof sizing === 'object' && sizing.width != null && sizing.height != null) {
+            followDock = false;
+            clientWidth = Math.max(32, Math.floor(Number(sizing.width) || width));
+            clientHeight = Math.max(32, Math.floor(Number(sizing.height) || height));
+        } else if (options.clientFollowsDock === false) {
+            followDock = false;
+            clientWidth = Math.max(32, Math.floor(width));
+            clientHeight = Math.max(32, Math.floor(height));
+        }
+        const clientUpscaleSgsr = options.clientUpscale === 'sgsr';
+        const resize = parseOverlayResize(options.resizable);
 
         if (typeof this.handle.createExternalAppPane === 'function') {
             this.handle.createExternalAppPane(
@@ -2638,12 +2726,26 @@ class ServoWindow extends EventEmitter {
                 pane.dockOrder,
                 visible,
                 dbusNotifications,
-                dbusNotificationApps
+                dbusNotificationApps,
+                env,
+                followDock,
+                clientWidth,
+                clientHeight,
+                clientUpscaleSgsr,
+                resize.edges,
+                resize.anchor,
+                resize.minW,
+                resize.minH,
+                resize.maxW,
+                resize.maxH
             );
         } else {
             console.warn('[lotus-nest] createExternalAppPane not supported on this platform');
         }
 
+        pane._externalFollowsDock = followDock;
+        pane._externalClientSize =
+            followDock ? null : { width: clientWidth, height: clientHeight };
         this.panes.set(id, pane);
         if (options.pointerPassthrough) {
             pane.setPassthrough(true);
