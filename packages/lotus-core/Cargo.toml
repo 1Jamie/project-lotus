@@ -69,6 +69,7 @@ smithay = { version = "0.7.0", default-features = false, features = ["wayland_fr
 drm-fourcc = "2.2"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 zvariant = "5"
+inotify = { version = "0.11", default-features = false, features = [] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 servo = { version = "=0.7.0", default-features = false, features = ["no-wgl", "js_jit", "clipboard", "webcrypto", "webgl", "media-gstreamer"] }

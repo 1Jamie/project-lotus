@@ -417,6 +417,8 @@ pub fn host_should_skip_blocking_present(instance: &WindowInstance) -> bool {
 /// the game sits much below the panel rate.
 #[cfg(target_os = "linux")]
 pub fn wants_fixed_hold_cadence(instance: &WindowInstance) -> bool {
+    // Keep SoftFifo spare-vblank holds while the nest is live — including under
+    // the overlay — so opening chrome does not free-run the mailbox at panel Hz.
     fixed_software_fifo(instance)
         && window_is_viewable(instance)
         && present_activity(instance) == PresentActivity::GameActive
@@ -602,8 +604,15 @@ pub enum SoftFifoWait {
 /// slot — never defer here. The old `budget < 4ms` check starved HUD/shell
 /// forever (due window is ≤1.5 ms, so every real present skipped Servo; F12
 /// chrome and perf-hud froze until a rare UiIdle catch-up).
+///
+/// Overlay input mode (`!game_mode`) never defers — atrium shell/plugin UI must
+/// paint on the next redraw or D-pad/toggles sit 1–2s behind the action while
+/// the nest game is still `GameActive` underneath.
 #[cfg(target_os = "linux")]
 pub fn should_defer_overlay_servo_paint(instance: &WindowInstance) -> bool {
+    if !instance.game_mode {
+        return false;
+    }
     if !fixed_software_fifo(instance) {
         return false;
     }
@@ -618,6 +627,16 @@ pub fn should_defer_overlay_servo_paint(instance: &WindowInstance) -> bool {
         Some(ms) => ms < OVERLAY_PAINT_MIN_BUDGET_MS,
         None => false,
     }
+}
+
+/// Guard B: piggyback Servo/HUD frames on the next game present instead of
+/// waking an overlay-only redraw. Only while the user is in game input mode —
+/// overlay/edit must wake immediately even if the nest is still committing.
+#[cfg(target_os = "linux")]
+pub fn defer_overlay_servo_wake(instance: &WindowInstance) -> bool {
+    instance.game_mode
+        && instance.nested_compositor.is_some()
+        && present_activity(instance) == PresentActivity::GameActive
 }
 
 /// Phase-locked software FIFO for Fixed + interval 0 (gamescope).

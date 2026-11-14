@@ -2765,6 +2765,113 @@ class ServoWindow extends EventEmitter {
     }
 
     /**
+     * Suspend physical pad grab while Steam/DE OSK is open (Steam Input needs the pad).
+     * @param {boolean} active
+     */
+    setOskActive(active) {
+        if (this.handle && typeof this.handle.setOskActive === 'function') {
+            this.handle.setOskActive(!!active);
+        }
+    }
+
+    /**
+     * Host nest upscaler / RCAS config.
+     * @returns {{ mode: 'off'|'sgsr'|'fsr1', sharpenRcas: boolean, sgsrEdgeThreshold: number, sgsrEdgeSharpness: number, sgsrUseEdgeDirection: boolean, rcasSharpnessStops: number }}
+     */
+    getHostUpscale() {
+        if (!this.handle || typeof this.handle.getHostUpscale !== 'function') {
+            return {
+                mode: 'off',
+                sharpenRcas: false,
+                sgsrEdgeThreshold: 8 / 255,
+                sgsrEdgeSharpness: 2,
+                sgsrUseEdgeDirection: true,
+                rcasSharpnessStops: 0.2,
+            };
+        }
+        try {
+            const raw = this.handle.getHostUpscale();
+            return typeof raw === 'string' ? JSON.parse(raw) : raw;
+        } catch (_) {
+            return {
+                mode: 'off',
+                sharpenRcas: false,
+                sgsrEdgeThreshold: 8 / 255,
+                sgsrEdgeSharpness: 2,
+                sgsrUseEdgeDirection: true,
+                rcasSharpnessStops: 0.2,
+            };
+        }
+    }
+
+    /**
+     * Apply host upscaler / RCAS (shaders link lazily on first use).
+     * @param {object} cfg
+     * @param {'off'|'sgsr'|'fsr1'} [cfg.mode]
+     * @param {boolean} [cfg.sharpenRcas]
+     * @param {number} [cfg.sgsrEdgeThreshold] 0–1 (or >1 as /255)
+     * @param {number} [cfg.sgsrEdgeSharpness]
+     * @param {boolean} [cfg.sgsrUseEdgeDirection]
+     * @param {number} [cfg.rcasSharpnessStops]
+     */
+    setHostUpscale(cfg = {}) {
+        if (!this.handle || typeof this.handle.setHostUpscale !== 'function') return;
+        const cur = this.getHostUpscale();
+        let threshold = cfg.sgsrEdgeThreshold != null ? Number(cfg.sgsrEdgeThreshold) : cur.sgsrEdgeThreshold;
+        if (Number.isFinite(threshold) && threshold > 1) threshold = threshold / 255;
+        const payload = {
+            mode: cfg.mode != null ? String(cfg.mode) : cur.mode,
+            sharpenRcas: cfg.sharpenRcas != null ? !!cfg.sharpenRcas : !!cur.sharpenRcas,
+            sgsrEdgeThreshold: threshold,
+            sgsrEdgeSharpness:
+                cfg.sgsrEdgeSharpness != null ? Number(cfg.sgsrEdgeSharpness) : cur.sgsrEdgeSharpness,
+            sgsrUseEdgeDirection:
+                cfg.sgsrUseEdgeDirection != null
+                    ? !!cfg.sgsrUseEdgeDirection
+                    : !!cur.sgsrUseEdgeDirection,
+            rcasSharpnessStops:
+                cfg.rcasSharpnessStops != null ? Number(cfg.rcasSharpnessStops) : cur.rcasSharpnessStops,
+        };
+        // Rust HostUpscaleConfig uses snake_case via serde rename? We used camel in JSON
+        // from get — Apply expects HostUpscaleConfig with serde fields. Map to snake.
+        const rustPayload = {
+            mode: payload.mode,
+            sharpen_rcas: payload.sharpenRcas,
+            sgsr_edge_threshold: payload.sgsrEdgeThreshold,
+            sgsr_edge_sharpness: payload.sgsrEdgeSharpness,
+            sgsr_use_edge_direction: payload.sgsrUseEdgeDirection,
+            rcas_sharpness_stops: payload.rcasSharpnessStops,
+        };
+        this.handle.setHostUpscale(JSON.stringify(rustPayload));
+    }
+
+    /**
+     * Forward overlay D-pad/A/B as arrows/Enter/Esc into this nest pane (TUI apps).
+     * Pass null/undefined to clear.
+     * @param {string|null|undefined} paneId
+     */
+    setPadKeyForwardPane(paneId) {
+        if (this.handle && typeof this.handle.setPadKeyForwardPane === 'function') {
+            this.handle.setPadKeyForwardPane(
+                paneId == null || paneId === '' ? null : String(paneId)
+            );
+        }
+    }
+
+    /**
+     * Servo tab pane for direct AtriumFocus Nav/Confirm (no Node hop — mouse-parity).
+     * Mutually exclusive with setPadKeyForwardPane. Pass null to clear.
+     * @param {string|null|undefined} paneId
+     */
+    setPadSpatialFocusPane(paneId) {
+        if (this.handle && typeof this.handle.setPadSpatialFocusPane === 'function') {
+            this.handle.setPadSpatialFocusPane(
+                paneId == null || paneId === '' ? null : String(paneId)
+            );
+        }
+    }
+
+    /**
      * Register a window-level host hotkey (beats game/pane focus).
      * @param {object} opts
      * @param {string} opts.id Stable action id (emitted as nest:hotkey)

@@ -18,6 +18,7 @@ pub mod vfs;
 pub mod layout;
 pub mod overlay_resize;
 pub mod window;
+pub mod host_upscale;
 pub mod server;
 pub mod delegate;
 pub mod gl;
@@ -30,6 +31,8 @@ pub mod present_feedback;
 pub mod wayland;
 #[cfg(target_os = "linux")]
 pub mod dbus_notify;
+#[cfg(target_os = "linux")]
+pub mod evdev_pad;
 
 use crate::window_state::WindowStateManager;
 pub use app::*;
@@ -474,6 +477,104 @@ impl WindowHandle {
         #[cfg(target_os = "linux")]
         if let Some(proxy) = EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(EngineCommand::SetGameMode(self.id.clone(), enabled));
+        }
+    }
+
+    /// While Steam/DE OSK is visible, drop physical pad EVIOCGRAB so Steam Input can type.
+    #[napi]
+    pub fn set_osk_active(&self, active: bool) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = active;
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetOskActive(self.id.clone(), active));
+        }
+    }
+
+    /// Current host upscaler / RCAS config as JSON.
+    #[napi]
+    pub fn get_host_upscale(&self) -> String {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return serde_json::json!({
+                "mode": "off",
+                "sharpenRcas": false,
+                "sgsrEdgeThreshold": 8.0 / 255.0,
+                "sgsrEdgeSharpness": 2.0,
+                "sgsrUseEdgeDirection": true,
+                "rcasSharpnessStops": 0.2,
+            })
+            .to_string();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self;
+            let c = crate::host_upscale::host_upscale_config();
+            serde_json::json!({
+                "mode": c.mode.as_str(),
+                "sharpenRcas": c.sharpen_rcas,
+                "sgsrEdgeThreshold": c.sgsr_edge_threshold,
+                "sgsrEdgeSharpness": c.sgsr_edge_sharpness,
+                "sgsrUseEdgeDirection": c.sgsr_use_edge_direction,
+                "rcasSharpnessStops": c.rcas_sharpness_stops,
+            })
+            .to_string()
+        }
+    }
+
+    /// Apply host upscaler / RCAS config (lazy-links shaders on the GL thread).
+    /// `config_json` keys: mode, sharpenRcas, sgsrEdgeThreshold, sgsrEdgeSharpness,
+    /// sgsrUseEdgeDirection, rcasSharpnessStops.
+    #[napi]
+    pub fn set_host_upscale(&self, config_json: String) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = config_json;
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::ApplyHostUpscale {
+                window_id: self.id.clone(),
+                config_json,
+            });
+        }
+    }
+
+    /// When set, overlay D-pad/A/B are injected as arrows/Enter/Esc into this nest pane.
+    #[napi]
+    pub fn set_pad_key_forward_pane(&self, pane_id: Option<String>) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pane_id;
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetPadKeyForwardPane(
+                self.id.clone(),
+                pane_id,
+            ));
+        }
+    }
+
+    /// Servo tab pane for direct AtriumFocus Nav/Confirm (bypasses Node — mouse-parity).
+    #[napi]
+    pub fn set_pad_spatial_focus_pane(&self, pane_id: Option<String>) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = pane_id;
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let _ = proxy.send_event(EngineCommand::SetPadSpatialFocusPane(
+                self.id.clone(),
+                pane_id,
+            ));
         }
     }
 

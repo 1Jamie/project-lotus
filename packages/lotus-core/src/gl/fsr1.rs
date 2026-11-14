@@ -1,8 +1,16 @@
 //! FSR 1.0 EASU + RCAS for nest pane upscale (AMD FidelityFX, MIT).
 //!
-//! - `sampler2D` EASU uses `textureGather` (`GL_ARB_texture_gather`).
-//! - `samplerExternalOES` EASU uses four point `texture()` taps (no gather/texelFetch).
+//! - `sampler2D` EASU emulates gather with `texelFetch` (GL 3.3-safe).
+//! - `samplerExternalOES` EASU uses four point `texture()` taps (no texelFetch).
 //! - RCAS always samples a `sampler2D` temp via `texelFetch`, upright, NEAREST.
+//!
+//! EASU's 12-tap kernel and gather swizzle assume D3D-like space: output (0,0) is
+//! the top-left pixel and texture UV y=0 is the top row. Wayland DMA-BUFs match
+//! that UV (row 0 = top of the game), but `gl_FragCoord` is GL Y-up (0 = bottom
+//! of the pane). When `u_flip_y` is set we mirror `ip.y` so EASU runs in texture
+//! space, and we do **not** flip gather UVs — flipping `p` before `textureGather`
+//! / `floor(p*size-0.5)` selects a different 2x2 and scrambles tap identities,
+//! which is why FSR1 looked worse than bilinear.
 
 use glow::UniformLocation;
 
@@ -67,8 +75,11 @@ pub fn rcas_con(stops: f32) -> [f32; 4] {
 
 fn easu_common_helpers() -> &'static str {
     r#"
-float APrxLoRcpF1(float a) { return 1.0 / a; }
-float APrxLoRsqF1(float a) { return inversesqrt(a); }
+// ffx_a.h bit tricks. Exact 1/x and inversesqrt turn a flat neighborhood
+// (0 * inf) into NaNs, which is why EASU looked broken next to bilinear.
+// Gamescope includes these unchanged.
+float APrxLoRcpF1(float a) { return uintBitsToFloat(0x7ef07ebbu - floatBitsToUint(a)); }
+float APrxLoRsqF1(float a) { return uintBitsToFloat(0x5f347d74u - (floatBitsToUint(a) >> 1u)); }
 float AMin3F1(float x, float y, float z) { return min(x, min(y, z)); }
 float AMax3F1(float x, float y, float z) { return max(x, max(y, z)); }
 vec3 AMin3F3(vec3 a, vec3 b, vec3 c) {
@@ -198,7 +209,7 @@ vec3 FsrEasuF(ivec2 ip, vec4 con0, vec4 con1, vec4 con2, vec4 con3) {
     FsrEasuTapF(aC, aW, vec2( 1.0,  0.0) - pp, dir, len2, lob, clp, vec3(klhgR.w, klhgG.w, klhgB.w));
     FsrEasuTapF(aC, aW, vec2( 1.0,  2.0) - pp, dir, len2, lob, clp, vec3(zzonR.z, zzonG.z, zzonB.z));
     FsrEasuTapF(aC, aW, vec2( 0.0,  2.0) - pp, dir, len2, lob, clp, vec3(zzonR.w, zzonG.w, zzonB.w));
-    return min(max4, max(min4, aC * vec3(1.0 / aW)));
+    return min(max4, max(min4, aC * vec3(1.0 / max(aW, 1e-4))));
 }
 "#
 }
@@ -213,17 +224,28 @@ void main() {
     float alpha_mask = 1.0 - smoothstep(-smoothing, smoothing, distance);
 
     ivec2 ip = ivec2(gl_FragCoord.xy) - ivec2(u_origin);
+    // Mirror into texture space (y=0 at top of the game) so gather/kernel
+    // offsets stay AMD's D3D layout. Do not flip sample UVs instead — that
+    // breaks textureGather's 2x2 identity.
+    if (u_flip_y != 0) {
+        ip.y = int(u_size.y) - 1 - ip.y;
+    }
     vec3 pix = FsrEasuF(ip, u_con0, u_con1, u_con2, u_con3);
     f_color = vec4(pix, 1.0) * alpha_mask;
 }
 "#
 }
 
-/// EASU fragment for `sampler2D` — `textureGather` path.
+/// EASU fragment for `sampler2D`.
+///
+/// GL 3.3 + `GL_ARB_texture_gather` alone does **not** expose `textureGather`
+/// (needs `GL_ARB_gpu_shader5` or GLSL 400). Mesa DMA-BUF imports prefer
+/// `TEXTURE_2D`, so a gather-based shader failed to compile and every FSR1
+/// draw silently fell back to bilinear — Off/SGSR/FSR looked identical.
+/// Emulate gather with `texelFetch` (Babylon / portable FSR path).
 pub fn easu_fragment_2d() -> String {
     format!(
         r#"#version 330 core
-#extension GL_ARB_texture_gather : enable
 in vec2 v_pos;
 in vec2 v_uv;
 out vec4 f_color;
@@ -240,13 +262,22 @@ uniform vec4 u_con1;
 uniform vec4 u_con2;
 uniform vec4 u_con3;
 
-vec2 map_uv(vec2 p) {{
-    return (u_flip_y != 0) ? vec2(p.x, 1.0 - p.y) : p;
+// GL textureGather order: .x=(0,1) .y=(1,1) .z=(1,0) .w=(0,0)
+vec4 gather_comp(vec2 p, int comp) {{
+    ivec2 texSize = textureSize(u_texture, 0);
+    ivec2 mx = texSize - ivec2(1);
+    ivec2 base = ivec2(floor(p * vec2(texSize) - 0.5));
+    return vec4(
+        texelFetch(u_texture, clamp(base + ivec2(0, 1), ivec2(0), mx), 0)[comp],
+        texelFetch(u_texture, clamp(base + ivec2(1, 1), ivec2(0), mx), 0)[comp],
+        texelFetch(u_texture, clamp(base + ivec2(1, 0), ivec2(0), mx), 0)[comp],
+        texelFetch(u_texture, clamp(base + ivec2(0, 0), ivec2(0), mx), 0)[comp]
+    );
 }}
 
-vec4 FsrEasuRF(vec2 p) {{ return textureGather(u_texture, map_uv(p), 0); }}
-vec4 FsrEasuGF(vec2 p) {{ return textureGather(u_texture, map_uv(p), 1); }}
-vec4 FsrEasuBF(vec2 p) {{ return textureGather(u_texture, map_uv(p), 2); }}
+vec4 FsrEasuRF(vec2 p) {{ return gather_comp(p, 0); }}
+vec4 FsrEasuGF(vec2 p) {{ return gather_comp(p, 1); }}
+vec4 FsrEasuBF(vec2 p) {{ return gather_comp(p, 2); }}
 
 {helpers}
 {main}
@@ -278,14 +309,11 @@ uniform vec4 u_con1;
 uniform vec4 u_con2;
 uniform vec4 u_con3;
 
-vec2 map_uv(vec2 p) {{
-    return (u_flip_y != 0) ? vec2(p.x, 1.0 - p.y) : p;
-}}
-
 // Emulate textureGather component order: .x=(0,1) .y=(1,1) .z=(1,0) .w=(0,0)
-// with bilinear-free point taps at texel centers.
+// with bilinear-free point taps at texel centers. `p` is already texture UV
+// (Y-flip was applied to the output pixel `ip`, not here).
 vec4 gather_comp(vec2 p, int comp) {{
-    vec2 base = floor(map_uv(p) * u_src_size - 0.5);
+    vec2 base = floor(p * u_src_size - 0.5);
     vec2 t00 = (base + vec2(0.5, 0.5)) * u_texel_size;
     vec2 t10 = (base + vec2(1.5, 0.5)) * u_texel_size;
     vec2 t01 = (base + vec2(0.5, 1.5)) * u_texel_size;
@@ -324,7 +352,10 @@ uniform vec4 u_con;
 
 #define FSR_RCAS_LIMIT (0.25-(1.0/16.0))
 
-float APrxMedRcpF1(float a) { return 1.0 / a; }
+float APrxMedRcpF1(float a) {
+    float b = uintBitsToFloat(0x7ef19fffu - floatBitsToUint(a));
+    return b * (-b * a + 2.0);
+}
 float AMin3F1(float x, float y, float z) { return min(x, min(y, z)); }
 float AMax3F1(float x, float y, float z) { return max(x, max(y, z)); }
 

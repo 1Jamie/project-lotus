@@ -126,17 +126,20 @@ void main() {
 }
 "#;
 
-/// Fragment adaptation of Qualcomm Snapdragon Game Super Resolution 1.0 for lotus.
+/// Fragment adaptation of gamescope's `src/shaders/sgsr1.h`.
 ///
 /// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 /// SPDX-License-Identifier: BSD-3-Clause
-/// https://github.com/qualcomm/Snapdragon-Game-Super-Resolution
+/// Gamescope adapts Qualcomm SGSR1 (`sgsr1_shader_mobile.frag`). On an edge it
+/// *replaces* each channel with a 12-tap Lanczos gather, clamped to the local
+/// 2x2. The previous port only added a ±23/255 luma nudge on top of bilinear,
+/// which is why SGSR looked the same as linear.
 ///
-/// Rewritten as a GL 3.3 fragment shader (`texture` taps, not compute / `textureGather`)
-/// so it can sample `samplerExternalOES` DMA-BUFs directly into the scene FBO.
-/// `u_flip_y` is applied to `v_uv` before any neighborhood offset, matching `COMP_FS` /
-/// `COMP_FS_OES`. Offsets are symmetric in that UV space (`±u_texel_size`), so a flipped
-/// V axis stays consistent as long as every tap uses the same flipped coordinate.
+/// `sampler2D` emulates `textureGather` with `texelFetch` — GL 3.3 does not
+/// expose gather from `GL_ARB_texture_gather` alone (needs gpu_shader5 / 400),
+/// and a failed link silently fell back to bilinear so Off/SGSR looked identical.
+/// `samplerExternalOES` uses four point `texture()` taps. Source stays LINEAR
+/// for the bilinear base sample. `u_edge_sharpness` 2 → gamescope kernel 0.8.
 #[cfg(target_os = "linux")]
 pub fn sgsr_fragment_source(external: bool) -> String {
     let extensions = if external {
@@ -149,6 +152,39 @@ pub fn sgsr_fragment_source(external: bool) -> String {
         "samplerExternalOES"
     } else {
         "sampler2D"
+    };
+    // GL textureGather order: .x=(0,1) .y=(1,1) .z=(1,0) .w=(0,0)
+    let gather = if external {
+        r#"
+vec4 sgsrGatherComp(vec2 p, int comp) {
+    vec2 base = floor(p * u_src_size - 0.5);
+    float w = texture(u_texture, (base + vec2(0.5, 0.5)) * u_texel_size)[comp];
+    float z = texture(u_texture, (base + vec2(1.5, 0.5)) * u_texel_size)[comp];
+    float x = texture(u_texture, (base + vec2(0.5, 1.5)) * u_texel_size)[comp];
+    float y = texture(u_texture, (base + vec2(1.5, 1.5)) * u_texel_size)[comp];
+    return vec4(x, y, z, w);
+}
+vec4 sgsrGatherR(vec2 p) { return sgsrGatherComp(p, 0); }
+vec4 sgsrGatherG(vec2 p) { return sgsrGatherComp(p, 1); }
+vec4 sgsrGatherB(vec2 p) { return sgsrGatherComp(p, 2); }
+"#
+    } else {
+        r#"
+vec4 sgsrGatherComp(vec2 p, int comp) {
+    ivec2 texSize = textureSize(u_texture, 0);
+    ivec2 mx = texSize - ivec2(1);
+    ivec2 base = ivec2(floor(p * vec2(texSize) - 0.5));
+    return vec4(
+        texelFetch(u_texture, clamp(base + ivec2(0, 1), ivec2(0), mx), 0)[comp],
+        texelFetch(u_texture, clamp(base + ivec2(1, 1), ivec2(0), mx), 0)[comp],
+        texelFetch(u_texture, clamp(base + ivec2(1, 0), ivec2(0), mx), 0)[comp],
+        texelFetch(u_texture, clamp(base + ivec2(0, 0), ivec2(0), mx), 0)[comp]
+    );
+}
+vec4 sgsrGatherR(vec2 p) { return sgsrGatherComp(p, 0); }
+vec4 sgsrGatherG(vec2 p) { return sgsrGatherComp(p, 1); }
+vec4 sgsrGatherB(vec2 p) { return sgsrGatherComp(p, 2); }
+"#
     };
     format!(
         r#"#version 330 core
@@ -164,37 +200,103 @@ uniform vec2 u_texel_size;
 uniform vec2 u_src_size;
 uniform float u_edge_sharpness;
 uniform float u_edge_threshold;
+uniform int u_use_edge_direction;
 
 float sdRoundedBox(vec2 p, vec2 b, float r) {{
     vec2 q = abs(p) - b + r;
     return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }}
 
-float luma(vec3 rgb) {{
-    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-}}
-
-float fast_lanczos2(float x) {{
+{gather}
+float sgsrFastLanczos2(float x) {{
+    x = min(x, 4.0);
     float wA = x - 4.0;
     float wB = x * wA - wA;
     wA *= wA;
     return wB * wA;
 }}
 
-vec2 weight_y(float dx, float dy, float c, vec3 data) {{
-    float std = data.x;
-    vec2 dir = data.yz;
-    float edge_dis = (dx * dir.y) + (dy * dir.x);
-    float x = fma(edge_dis * edge_dis, (clamp(c * c * std, 0.0, 1.0) * 0.7 - 1.0), (dx * dx + dy * dy));
-    float w = fast_lanczos2(x);
-    return vec2(w, w * c);
+float sgsrWeight(float dx, float dy, float g, float std) {{
+    float d2 = dx * dx + dy * dy;
+    float outlier = clamp(abs(g) * std, 0.0, 1.0) * min(d2 * 0.5, 1.0);
+    // sharpness 2 → gamescope's 0.8. Larger width drops far taps sooner.
+    float kernel = clamp(u_edge_sharpness * 0.4, 0.2, 1.6);
+    return sgsrFastLanczos2(d2 * kernel + outlier);
 }}
 
-vec2 edge_direction(vec4 left, vec4 right) {{
-    vec2 delta;
-    delta.x = (right.x - left.z) + (right.w - left.y);
-    delta.y = (right.x - left.z) - (right.w - left.y);
-    return delta * inversesqrt(dot(delta, delta) + 3.075740e-05);
+float sgsrChannel(float w0, float w1, float w2, float w3, float w4, float w5,
+                  float w6, float w7, float w8, float w9, float w10, float w11,
+                  vec4 ud, vec4 l, vec4 r, float invSum) {{
+    float acc = dot(vec4(w0, w1, w2, w3), ud)
+              + dot(vec4(w4, w5, w6, w7), l)
+              + dot(vec4(w8, w9, w10, w11), r);
+    float lo = min(min(l.y, l.z), min(r.x, r.w));
+    float hi = max(max(l.y, l.z), max(r.x, r.w));
+    return clamp(acc * invSum, lo, hi);
+}}
+
+vec4 sampleSgsr1(vec2 uv) {{
+    vec4 color = texture(u_texture, uv);
+    if (u_use_edge_direction == 0) {{
+        return color;
+    }}
+    vec4 viewport = vec4(1.0 / u_src_size, u_src_size);
+    vec2 imgCoord = (uv * viewport.zw) + vec2(-0.5, 0.5);
+    vec2 imgCoordPixel = floor(imgCoord);
+    vec2 coord = imgCoordPixel * viewport.xy;
+    vec2 pl = imgCoord - imgCoordPixel;
+    vec4 leftG = sgsrGatherG(coord);
+    float edgeVote = abs(leftG.z - leftG.y) + abs(color.g - leftG.y) + abs(color.g - leftG.z);
+    if (edgeVote > u_edge_threshold) {{
+        vec2 leftCoord = coord;
+        coord.x += viewport.x;
+        vec2 rightCoord = coord + vec2(viewport.x, 0.0);
+        vec2 upCoord = coord + vec2(0.0, -viewport.y);
+        vec2 downCoord = coord + vec2(0.0, viewport.y);
+        vec4 rightG = sgsrGatherG(rightCoord);
+        vec4 upDownG;
+        upDownG.xy = sgsrGatherG(upCoord).wz;
+        upDownG.zw = sgsrGatherG(downCoord).yx;
+
+        float meanG = (leftG.y + leftG.z + rightG.x + rightG.w) * 0.25;
+        leftG -= vec4(meanG);
+        rightG -= vec4(meanG);
+        upDownG -= vec4(meanG);
+
+        float sum = dot(abs(leftG) + abs(rightG) + abs(upDownG), vec4(1.0));
+        float std = 2.181818 / max(sum, 1e-5);
+
+        float w0 = sgsrWeight(pl.x,       pl.y + 1.0, upDownG.x, std);
+        float w1 = sgsrWeight(pl.x - 1.0, pl.y + 1.0, upDownG.y, std);
+        float w2 = sgsrWeight(pl.x - 1.0, pl.y - 2.0, upDownG.z, std);
+        float w3 = sgsrWeight(pl.x,       pl.y - 2.0, upDownG.w, std);
+        float w4 = sgsrWeight(pl.x + 1.0, pl.y - 1.0, leftG.x,    std);
+        float w5 = sgsrWeight(pl.x,       pl.y - 1.0, leftG.y,    std);
+        float w6 = sgsrWeight(pl.x,       pl.y,       leftG.z,    std);
+        float w7 = sgsrWeight(pl.x + 1.0, pl.y,       leftG.w,    std);
+        float w8 = sgsrWeight(pl.x - 1.0, pl.y - 1.0, rightG.x,   std);
+        float w9 = sgsrWeight(pl.x - 2.0, pl.y - 1.0, rightG.y,   std);
+        float w10 = sgsrWeight(pl.x - 2.0, pl.y,      rightG.z,   std);
+        float w11 = sgsrWeight(pl.x - 1.0, pl.y,      rightG.w,   std);
+        float invSum = 1.0 / max((w0+w1)+(w2+w3)+(w4+w5)+(w6+w7)+(w8+w9)+(w10+w11), 1e-5);
+
+        color.g = meanG + sgsrChannel(w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11,
+                                       upDownG, leftG, rightG, invSum);
+        vec4 l = sgsrGatherR(leftCoord);
+        vec4 r = sgsrGatherR(rightCoord);
+        vec4 ud;
+        ud.xy = sgsrGatherR(upCoord).wz;
+        ud.zw = sgsrGatherR(downCoord).yx;
+        color.r = sgsrChannel(w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11,
+                               ud, l, r, invSum);
+        l = sgsrGatherB(leftCoord);
+        r = sgsrGatherB(rightCoord);
+        ud.xy = sgsrGatherB(upCoord).wz;
+        ud.zw = sgsrGatherB(downCoord).yx;
+        color.b = sgsrChannel(w0, w1, w2, w3, w4, w5, w6, w7, w8, w9, w10, w11,
+                               ud, l, r, invSum);
+    }}
+    return color;
 }}
 
 void main() {{
@@ -204,183 +306,48 @@ void main() {{
     float smoothing = fwidth(distance);
     float alpha_mask = 1.0 - smoothstep(-smoothing, smoothing, distance);
 
-    // Same V flip as COMP_FS_OES, applied before SGSR taps.
     vec2 uv = (u_flip_y != 0) ? vec2(v_uv.x, 1.0 - v_uv.y) : v_uv;
-    vec4 color = texture(u_texture, uv);
-
-    vec2 img_coord = uv * u_src_size;
-    vec2 base_coord = floor(img_coord - 0.5) + 0.5;
-    vec2 pl = img_coord - base_coord;
-    vec2 base_uv = base_coord * u_texel_size;
-
-    float l00 = luma(texture(u_texture, base_uv).rgb);
-    float l10 = luma(texture(u_texture, base_uv + vec2(u_texel_size.x, 0.0)).rgb);
-    float l01 = luma(texture(u_texture, base_uv + vec2(0.0, u_texel_size.y)).rgb);
-    float l11 = luma(texture(u_texture, base_uv + u_texel_size).rgb);
-
-    vec4 left = vec4(
-        luma(texture(u_texture, base_uv + vec2(-u_texel_size.x, u_texel_size.y)).rgb),
-        l01,
-        l00,
-        luma(texture(u_texture, base_uv + vec2(-u_texel_size.x, 0.0)).rgb)
-    );
-    vec4 right = vec4(
-        l11,
-        luma(texture(u_texture, base_uv + vec2(2.0 * u_texel_size.x, u_texel_size.y)).rgb),
-        luma(texture(u_texture, base_uv + vec2(2.0 * u_texel_size.x, 0.0)).rgb),
-        l10
-    );
-    vec4 up_down = vec4(
-        luma(texture(u_texture, base_uv + vec2(0.0, -u_texel_size.y)).rgb),
-        luma(texture(u_texture, base_uv + vec2(u_texel_size.x, -u_texel_size.y)).rgb),
-        luma(texture(u_texture, base_uv + vec2(u_texel_size.x, 2.0 * u_texel_size.y)).rgb),
-        luma(texture(u_texture, base_uv + vec2(0.0, 2.0 * u_texel_size.y)).rgb)
-    );
-
-    float center_luma = luma(color.rgb);
-    float edge_vote = abs(left.z - left.y) + abs(center_luma - left.y) + abs(center_luma - left.z);
-
-    if (edge_vote > u_edge_threshold) {{
-        float mean = (left.y + left.z + right.x + right.w) * 0.25;
-        left -= vec4(mean);
-        right -= vec4(mean);
-        up_down -= vec4(mean);
-        float c_rel = center_luma - mean;
-
-        float sum = dot(abs(left) + abs(right) + abs(up_down), vec4(1.0));
-        float sum_mean = 1.014185e+01 / max(sum, 1e-5);
-        vec3 data = vec3(sum_mean * sum_mean, edge_direction(left, right));
-
-        vec2 aWY = weight_y(pl.x,       pl.y + 1.0, up_down.x, data);
-        aWY     += weight_y(pl.x - 1.0, pl.y + 1.0, up_down.y, data);
-        aWY     += weight_y(pl.x - 1.0, pl.y - 2.0, up_down.z, data);
-        aWY     += weight_y(pl.x,       pl.y - 2.0, up_down.w, data);
-        aWY     += weight_y(pl.x + 1.0, pl.y - 1.0, left.x,    data);
-        aWY     += weight_y(pl.x,       pl.y - 1.0, left.y,    data);
-        aWY     += weight_y(pl.x,       pl.y,       left.z,    data);
-        aWY     += weight_y(pl.x + 1.0, pl.y,       left.w,    data);
-        aWY     += weight_y(pl.x - 1.0, pl.y - 1.0, right.x,   data);
-        aWY     += weight_y(pl.x - 2.0, pl.y - 1.0, right.y,   data);
-        aWY     += weight_y(pl.x - 2.0, pl.y,       right.z,   data);
-        aWY     += weight_y(pl.x - 1.0, pl.y,       right.w,   data);
-
-        float final_y = aWY.y / aWY.x;
-        float max_y = max(max(left.y, left.z), max(right.x, right.w));
-        float min_y = min(min(left.y, left.z), min(right.x, right.w));
-        float delta_y = clamp(u_edge_sharpness * final_y, min_y, max_y) - c_rel;
-        delta_y = clamp(delta_y, -23.0 / 255.0, 23.0 / 255.0);
-        color.rgb = clamp(color.rgb + vec3(delta_y), 0.0, 1.0);
-    }}
-
+    vec4 color = sampleSgsr1(uv);
     f_color = vec4(color.rgb, color.a) * alpha_mask;
 }}
 "#
+        ,
+        extensions = extensions,
+        sampler = sampler,
+        gather = gather
     )
 }
 
-/// Host spatial upscaler for nest game panes larger than the client buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Host upscaler config lives in host_upscale.rs (mutable + lazy shader ensure).
+#[cfg(target_os = "linux")]
+pub use crate::host_upscale::{
+    fsr1_upscale_enabled, host_sharpen_rcas, host_upscale, host_upscale_config,
+    rcas_sharpness_stops, set_host_upscale_config, sgsr_edge_sharpness, sgsr_edge_threshold,
+    sgsr_upscale_enabled, sgsr_use_edge_direction, HostUpscale, HostUpscaleConfig,
+};
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HostUpscale {
+    #[default]
     Off,
     Sgsr,
     Fsr1,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "linux"))]
 pub fn host_upscale() -> HostUpscale {
-    static MODE: std::sync::OnceLock<HostUpscale> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        match std::env::var("ATRIUM_UPSCALE")
-            .ok()
-            .as_deref()
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("1") | Some("on") | Some("sgsr") => HostUpscale::Sgsr,
-            Some("fsr1") | Some("fsr") | Some("easu") => HostUpscale::Fsr1,
-            _ => HostUpscale::Off,
-        }
-    })
+    HostUpscale::Off
 }
 
-#[cfg(target_os = "linux")]
-pub fn sgsr_upscale_enabled() -> bool {
-    host_upscale() == HostUpscale::Sgsr
-}
-
-#[cfg(target_os = "linux")]
-pub fn fsr1_upscale_enabled() -> bool {
-    host_upscale() == HostUpscale::Fsr1
-}
-
-/// Optional RCAS sharpen pass after upscale (or on bilinear).
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "linux"))]
 pub fn host_sharpen_rcas() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("ATRIUM_SHARPEN")
-                .ok()
-                .as_deref()
-                .map(|s| s.to_ascii_lowercase())
-                .as_deref(),
-            Some("rcas") | Some("cas") | Some("1") | Some("on")
-        )
-    })
+    false
 }
 
-/// SGSR edge threshold in [0,1]. Default 8/255 (Qualcomm mobile).
-#[cfg(target_os = "linux")]
-pub fn sgsr_edge_threshold() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        parse_sgsr_threshold(std::env::var("ATRIUM_SGSR_THRESHOLD").ok().as_deref())
-            .unwrap_or(8.0 / 255.0)
-    })
-}
-
-/// SGSR edge sharpness. Default 2.0 (Qualcomm).
-#[cfg(target_os = "linux")]
-pub fn sgsr_edge_sharpness() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("ATRIUM_SGSR_SHARPNESS")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(2.0)
-    })
-}
-
-/// RCAS stops: 0 = max sharpen, higher = softer. Default 0.2.
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "linux"))]
 pub fn rcas_sharpness_stops() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("ATRIUM_RCAS_SHARPNESS")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.2)
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn parse_sgsr_threshold(raw: Option<&str>) -> Option<f32> {
-    let s = raw?.trim();
-    if s.is_empty() {
-        return None;
-    }
-    // "8" → 8/255; "0.03" → as-is if ≤1.
-    let v: f32 = s.parse().ok()?;
-    if !v.is_finite() || v < 0.0 {
-        return None;
-    }
-    if v > 1.0 {
-        Some((v / 255.0).clamp(0.0, 1.0))
-    } else {
-        Some(v)
-    }
+    0.2
 }
 
 #[derive(Debug, Clone)]
@@ -853,6 +820,8 @@ pub struct WindowInstance {
     #[cfg(target_os = "linux")]
     pub u_sgsr_threshold_loc: Option<glow::UniformLocation>,
     #[cfg(target_os = "linux")]
+    pub u_sgsr_use_edge_loc: Option<glow::UniformLocation>,
+    #[cfg(target_os = "linux")]
     pub u_sgsr_oes_size_loc: Option<glow::UniformLocation>,
     #[cfg(target_os = "linux")]
     pub u_sgsr_oes_radius_loc: Option<glow::UniformLocation>,
@@ -866,10 +835,15 @@ pub struct WindowInstance {
     pub u_sgsr_oes_sharp_loc: Option<glow::UniformLocation>,
     #[cfg(target_os = "linux")]
     pub u_sgsr_oes_threshold_loc: Option<glow::UniformLocation>,
-    /// FSR1 EASU (sampler2D + textureGather).
+    #[cfg(target_os = "linux")]
+    pub u_sgsr_oes_use_edge_loc: Option<glow::UniformLocation>,
+    /// Kept so SGSR/FSR1/RCAS can be linked lazily after startup.
+    #[cfg(target_os = "linux")]
+    pub comp_vs: Option<glow::Shader>,
+    /// FSR1 EASU (sampler2D, texelFetch gather).
     #[cfg(target_os = "linux")]
     pub fsr1_easu_program: Option<glow::Program>,
-    /// FSR1 EASU (samplerExternalOES, 4-tap — no gather).
+    /// FSR1 EASU (samplerExternalOES, 4-tap). Optional — often missing on desktop GL.
     #[cfg(target_os = "linux")]
     pub fsr1_easu_program_oes: Option<glow::Program>,
     /// RCAS sharpen (sampler2D temp → scene).
@@ -1111,21 +1085,10 @@ impl WindowInstance {
 
     #[cfg(target_os = "linux")]
     fn compile_fsr1_programs(&mut self, vs: glow::Shader) {
-        use glow::HasContext;
+        // Eager path kept for callers that already hold VS; prefer ensure_* lazy API.
         self.fsr1_easu_program = self.link_fsr1_easu(vs, false);
         self.fsr1_easu_program_oes = self.link_fsr1_easu(vs, true);
         self.fsr1_rcas_program = self.link_fsr1_rcas(vs);
-        if fsr1_upscale_enabled() || host_sharpen_rcas() {
-            log::info!(
-                "[lotus-fsr1] easu_2d={} easu_oes={} rcas={} upscale={:?} sharpen_rcas={} rcas_stops={:.3}",
-                self.fsr1_easu_program.is_some(),
-                self.fsr1_easu_program_oes.is_some(),
-                self.fsr1_rcas_program.is_some(),
-                host_upscale(),
-                host_sharpen_rcas(),
-                rcas_sharpness_stops()
-            );
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1246,16 +1209,6 @@ impl WindowInstance {
     fn compile_sgsr_programs(&mut self, vs: glow::Shader) {
         self.sgsr_program = self.link_sgsr_variant(vs, false);
         self.sgsr_program_oes = self.link_sgsr_variant(vs, true);
-        if sgsr_upscale_enabled() {
-            log::info!(
-                "[lotus-sgsr] enabled (2d={} oes={}) sharpness={:.3} threshold={:.5} ({:.1}/255)",
-                self.sgsr_program.is_some(),
-                self.sgsr_program_oes.is_some(),
-                sgsr_edge_sharpness(),
-                sgsr_edge_threshold(),
-                sgsr_edge_threshold() * 255.0
-            );
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1297,13 +1250,16 @@ impl WindowInstance {
             let src = self.gl.get_uniform_location(program, "u_src_size");
             let sharp = self.gl.get_uniform_location(program, "u_edge_sharpness");
             let threshold = self.gl.get_uniform_location(program, "u_edge_threshold");
+            let use_edge = self.gl.get_uniform_location(program, "u_use_edge_direction");
             if let Some(u_tex) = self.gl.get_uniform_location(program, "u_texture") {
                 let sharp_v = sgsr_edge_sharpness();
                 let thresh_v = sgsr_edge_threshold();
+                let use_edge_v = if sgsr_use_edge_direction() { 1 } else { 0 };
                 self.gl.use_program(Some(program));
                 self.gl.uniform_1_i32(Some(&u_tex), 0);
                 self.gl.uniform_1_f32(sharp.as_ref(), sharp_v);
                 self.gl.uniform_1_f32(threshold.as_ref(), thresh_v);
+                self.gl.uniform_1_i32(use_edge.as_ref(), use_edge_v);
                 self.gl.use_program(None);
             }
             if external {
@@ -1314,6 +1270,7 @@ impl WindowInstance {
                 self.u_sgsr_oes_src_loc = src;
                 self.u_sgsr_oes_sharp_loc = sharp;
                 self.u_sgsr_oes_threshold_loc = threshold;
+                self.u_sgsr_oes_use_edge_loc = use_edge;
             } else {
                 self.u_sgsr_size_loc = size;
                 self.u_sgsr_radius_loc = radius;
@@ -1322,8 +1279,126 @@ impl WindowInstance {
                 self.u_sgsr_src_loc = src;
                 self.u_sgsr_sharp_loc = sharp;
                 self.u_sgsr_threshold_loc = threshold;
+                self.u_sgsr_use_edge_loc = use_edge;
             }
             Some(program)
+        }
+    }
+
+    /// Compile SGSR programs on demand (GL thread). Safe to call repeatedly.
+    ///
+    /// `sampler2D` is required (DMA-BUF imports prefer TEXTURE_2D). OES is
+    /// optional — desktop GL often rejects `GL_OES_EGL_image_external` in
+    /// `#version 330`, and we only try it once.
+    #[cfg(target_os = "linux")]
+    pub fn ensure_sgsr_programs(&mut self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static OES_TRIED: AtomicBool = AtomicBool::new(false);
+
+        if self.sgsr_program.is_some() {
+            if self.sgsr_program_oes.is_none() && !OES_TRIED.swap(true, Ordering::Relaxed) {
+                if let Some(vs) = self.comp_vs {
+                    self.sgsr_program_oes = self.link_sgsr_variant(vs, true);
+                    if self.sgsr_program_oes.is_none() {
+                        log::warn!(
+                            "[lotus-sgsr] OES variant unavailable (ok — DMA-BUF uses sampler2D)"
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        let Some(vs) = self.comp_vs else {
+            log::warn!("[lotus-sgsr] ensure skipped: composition VS not kept");
+            return;
+        };
+        self.sgsr_program = self.link_sgsr_variant(vs, false);
+        if !OES_TRIED.swap(true, Ordering::Relaxed) {
+            self.sgsr_program_oes = self.link_sgsr_variant(vs, true);
+            if self.sgsr_program_oes.is_none() {
+                log::warn!("[lotus-sgsr] OES variant unavailable (ok — DMA-BUF uses sampler2D)");
+            }
+        }
+        if self.sgsr_program.is_some() {
+            log::info!(
+                "[lotus-sgsr] lazy link 2d=true oes={} sharpness={:.3} threshold={:.5} edge_dir={}",
+                self.sgsr_program_oes.is_some(),
+                sgsr_edge_sharpness(),
+                sgsr_edge_threshold(),
+                sgsr_use_edge_direction()
+            );
+        } else {
+            log::error!("[lotus-sgsr] lazy link FAILED (2d) — draws will use bilinear");
+        }
+    }
+
+    /// Compile FSR1 EASU + RCAS on demand (GL thread).
+    ///
+    /// `sampler2D` EASU is required. OES is optional and tried once — missing
+    /// OES is not a bilinear fallback when the 2D program linked.
+    #[cfg(target_os = "linux")]
+    pub fn ensure_fsr1_programs(&mut self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static OES_TRIED: AtomicBool = AtomicBool::new(false);
+
+        if self.fsr1_easu_program.is_some() && self.fsr1_rcas_program.is_some() {
+            if self.fsr1_easu_program_oes.is_none() && !OES_TRIED.swap(true, Ordering::Relaxed) {
+                if let Some(vs) = self.comp_vs {
+                    self.fsr1_easu_program_oes = self.link_fsr1_easu(vs, true);
+                    if self.fsr1_easu_program_oes.is_none() {
+                        log::warn!(
+                            "[lotus-fsr1] EASU OES unavailable (ok — DMA-BUF uses sampler2D)"
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        let Some(vs) = self.comp_vs else {
+            log::warn!("[lotus-fsr1] ensure skipped: composition VS not kept");
+            return;
+        };
+        if self.fsr1_easu_program.is_none() {
+            self.fsr1_easu_program = self.link_fsr1_easu(vs, false);
+        }
+        if self.fsr1_easu_program_oes.is_none() && !OES_TRIED.swap(true, Ordering::Relaxed) {
+            self.fsr1_easu_program_oes = self.link_fsr1_easu(vs, true);
+            if self.fsr1_easu_program_oes.is_none() {
+                log::warn!("[lotus-fsr1] EASU OES unavailable (ok — DMA-BUF uses sampler2D)");
+            }
+        }
+        if self.fsr1_rcas_program.is_none() {
+            self.fsr1_rcas_program = self.link_fsr1_rcas(vs);
+        }
+        let ok2d = self.fsr1_easu_program.is_some();
+        let ok_rcas = self.fsr1_rcas_program.is_some();
+        if ok2d {
+            log::info!(
+                "[lotus-fsr1] lazy link easu_2d=true easu_oes={} rcas={} stops={:.3}",
+                self.fsr1_easu_program_oes.is_some(),
+                ok_rcas,
+                rcas_sharpness_stops()
+            );
+        } else {
+            log::error!(
+                "[lotus-fsr1] lazy link FAILED easu_2d=false rcas={} — FSR draws will use bilinear",
+                ok_rcas
+            );
+        }
+    }
+
+    /// Ensure only the shaders required by the current host upscale config.
+    #[cfg(target_os = "linux")]
+    pub fn ensure_host_upscale_shaders(&mut self) {
+        let cfg = host_upscale_config();
+        match cfg.mode {
+            HostUpscale::Sgsr => self.ensure_sgsr_programs(),
+            HostUpscale::Fsr1 => self.ensure_fsr1_programs(),
+            HostUpscale::Off => {}
+        }
+        if cfg.sharpen_rcas {
+            // RCAS lives with FSR1 program set.
+            self.ensure_fsr1_programs();
         }
     }
 
@@ -1421,11 +1496,13 @@ impl WindowInstance {
                 self.comp_program_oes = None;
             }
 
+            // Keep VS for lazy SGSR/FSR1/RCAS link when the UI enables a mode.
             #[cfg(target_os = "linux")]
-            self.compile_sgsr_programs(vs);
-            #[cfg(target_os = "linux")]
-            self.compile_fsr1_programs(vs);
-
+            {
+                self.comp_vs = Some(vs);
+                self.ensure_host_upscale_shaders();
+            }
+            #[cfg(not(target_os = "linux"))]
             self.gl.delete_shader(vs);
 
             let vao = self.gl.create_vertex_array().expect("Cannot create VAO");

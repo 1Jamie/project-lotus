@@ -295,6 +295,34 @@ pub enum EngineCommand {
     },
     #[cfg(target_os = "linux")]
     SetGameMode(String, bool),
+    /// Semantic gamepad action from [`crate::evdev_pad`] → nest IPC / mode toggle.
+    #[cfg(target_os = "linux")]
+    ControllerPadAction {
+        window_id: String,
+        action: String,
+        dir: Option<String>,
+    },
+    /// Pad→key inject for the active external dock pane (discordo TUI, etc.).
+    #[cfg(target_os = "linux")]
+    ControllerPadKey {
+        window_id: String,
+        pane_id: String,
+        keycode: u32,
+        pressed: bool,
+    },
+    #[cfg(target_os = "linux")]
+    SetOskActive(String, bool),
+    #[cfg(target_os = "linux")]
+    SetPadKeyForwardPane(String, Option<String>),
+    /// Servo tab pane id for direct AtriumFocus inject (Nav/Confirm, no Node hop).
+    #[cfg(target_os = "linux")]
+    SetPadSpatialFocusPane(String, Option<String>),
+    /// Apply host upscaler/sharpen config and ensure shaders (GL thread).
+    #[cfg(target_os = "linux")]
+    ApplyHostUpscale {
+        window_id: String,
+        config_json: String,
+    },
     #[cfg(target_os = "linux")]
     RegisterHostHotkey {
         window_id: String,
@@ -454,6 +482,200 @@ impl LotusApp {
         }
         self.servo.as_ref().unwrap()
     }
+
+    /// Apply pad input from the dedicated queue (not the winit EngineCommand FIFO).
+    /// `allow_focus_step`: take at most one Nav/Confirm (once per about_to_wait /
+    /// present). UserEvent drains edges only so RedrawWindow storms cannot burst Nav.
+    /// `event_loop` is required so ToggleOverlay can re-wear game cursor shoes.
+    #[cfg(target_os = "linux")]
+    fn drain_pad_input(
+        &mut self,
+        allow_focus_step: bool,
+        event_loop: Option<&ActiveEventLoop>,
+    ) {
+        let pending = crate::evdev_pad::drain_pending_pad(allow_focus_step);
+        if pending.is_empty() {
+            return;
+        }
+        let mut injected = false;
+        for item in pending {
+            match item {
+                crate::evdev_pad::PendingPadInput::Action {
+                    window_id,
+                    action,
+                    dir,
+                } => {
+                    if self.apply_controller_pad_action(
+                        &window_id,
+                        &action,
+                        dir,
+                        event_loop,
+                    ) {
+                        injected = true;
+                    }
+                }
+                crate::evdev_pad::PendingPadInput::Key {
+                    window_id,
+                    pane_id,
+                    keycode,
+                    pressed,
+                } => {
+                    self.apply_controller_pad_key(&window_id, &pane_id, keycode, pressed);
+                }
+            }
+        }
+        // One spin for the whole batch so AtriumFocus scripts run without
+        // per-event NewFrameReady amplification inside a user-event flood.
+        if injected {
+            if let Some(servo) = &self.servo {
+                servo.spin_event_loop();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn apply_controller_pad_key(
+        &mut self,
+        window_id: &str,
+        pane_id: &str,
+        keycode: u32,
+        pressed: bool,
+    ) {
+        let Some(instance) = self.windows.get(window_id) else {
+            return;
+        };
+        let Some(pane) = instance.panes.get(pane_id) else {
+            return;
+        };
+        if let Some(ref ws) = pane.external_wayland_server {
+            ws.lock()
+                .send_keyboard_to_pane(pane_id, keycode, pressed);
+        }
+    }
+
+    /// Returns true when a spatial AtriumFocus script was queued.
+    #[cfg(target_os = "linux")]
+    fn apply_controller_pad_action(
+        &mut self,
+        window_id: &str,
+        action: &str,
+        dir: Option<String>,
+        event_loop: Option<&ActiveEventLoop>,
+    ) -> bool {
+        // Mode-local ToggleOverlay: flip Rust/evdev first, Node only mirrors state.
+        // Must pass event_loop so nest_wear_game_cursor_shoe can restore custom cursors.
+        if action == "ToggleOverlay" {
+            let new_game_mode = if let Some(instance) = self.windows.get_mut(window_id) {
+                let next = !instance.game_mode;
+                if next && instance.nested_compositor.is_none() {
+                    warn!(
+                        "[lotus-nest] ToggleOverlay→game ignored: nested compositor not started"
+                    );
+                    return false;
+                }
+                nest_apply_game_mode(instance, next, event_loop);
+                if next {
+                    // Re-assert shoes after mode flip (cursor visual + grab sync).
+                    nest_wear_game_pointer_shoes(instance, event_loop);
+                }
+                if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                    crate::evdev_pad::ensure_started(window_id.to_string(), proxy.clone());
+                }
+                crate::evdev_pad::set_overlay_mode(!next);
+                if next {
+                    crate::evdev_pad::set_key_forward_pane(None);
+                }
+                push_renderer_ipc(
+                    window_id,
+                    "nest:game-mode",
+                    serde_json::json!({ "game_mode": next }),
+                );
+                instance.overlay_dirty = true;
+                if window_is_viewable(instance) {
+                    instance.window.request_redraw();
+                }
+                info!("[lotus-nest] ToggleOverlay → game_mode={}", next);
+                next
+            } else {
+                return false;
+            };
+            push_host_ipc(
+                &self.callback,
+                window_id,
+                "nest-controller-action",
+                serde_json::json!({
+                    "action": "ToggleOverlay",
+                    "modeHandled": true,
+                    "gameMode": new_game_mode,
+                }),
+            );
+            return false;
+        }
+
+        let spatial = crate::evdev_pad::spatial_focus_pane();
+        let handled_spatial = if matches!(action, "Nav" | "Confirm") {
+            if let Some(ref pane_id) = spatial {
+                if let Some(instance) = self.windows.get_mut(window_id) {
+                    let pid = if pane_id == "main" && !instance.panes.contains_key("main") {
+                        instance.primary_pane_id.clone()
+                    } else {
+                        pane_id.clone()
+                    };
+                    if let Some(pane) = instance.panes.get(&pid) {
+                        let script = if action == "Nav" {
+                            let d = dir.as_deref().unwrap_or("down");
+                            format!(
+                                "window.AtriumFocus&&window.AtriumFocus.move({});",
+                                serde_json::to_string(d)
+                                    .unwrap_or_else(|_| "\"down\"".into())
+                            )
+                        } else {
+                            "window.AtriumFocus&&window.AtriumFocus.confirm();".to_string()
+                        };
+                        pane.webview.evaluate_javascript(&script, |_| {});
+                        instance.overlay_dirty = true;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if handled_spatial {
+            let mut payload =
+                serde_json::json!({ "action": action, "spatialHandled": true });
+            if let Some(ref d) = dir {
+                payload["dir"] = serde_json::Value::String(d.clone());
+            }
+            push_host_ipc(
+                &self.callback,
+                window_id,
+                "nest-controller-action",
+                payload,
+            );
+            true
+        } else {
+            let mut payload = serde_json::json!({ "action": action });
+            if let Some(ref d) = dir {
+                payload["dir"] = serde_json::Value::String(d.clone());
+            }
+            // Never Blocking-stall the GL thread on Node for pad actions.
+            push_host_ipc(
+                &self.callback,
+                window_id,
+                "nest-controller-action",
+                payload,
+            );
+            false
+        }
+    }
 }
 
 fn map_winit_logical_key(k: &winit::keyboard::Key) -> String {
@@ -501,6 +723,41 @@ fn push_renderer_ipc(window_id: &str, channel: &str, payload: serde_json::Value)
             let _ = entry.value().send(msg.clone());
         }
     }
+}
+
+/// Push a Track-1 IPC batch straight to the Node host callback (no Servo WS hop).
+/// Use for latency-sensitive atrium input (pad Nav / Tab / ToggleOverlay / hotkeys).
+fn push_host_ipc(
+    callback: &ThreadsafeFunction<(String, Vec<napi::bindgen_prelude::Buffer>), ErrorStrategy::Fatal>,
+    window_id: &str,
+    channel: &str,
+    payload: serde_json::Value,
+) {
+    push_host_ipc_mode(
+        callback,
+        window_id,
+        channel,
+        payload,
+        ThreadsafeFunctionCallMode::NonBlocking,
+    );
+}
+
+fn push_host_ipc_mode(
+    callback: &ThreadsafeFunction<(String, Vec<napi::bindgen_prelude::Buffer>), ErrorStrategy::Fatal>,
+    window_id: &str,
+    channel: &str,
+    payload: serde_json::Value,
+    mode: ThreadsafeFunctionCallMode,
+) {
+    let Ok(packed) = rmp_serde::encode::to_vec_named(&vec![(channel, payload)]) else {
+        return;
+    };
+    let mut wrapped = Vec::with_capacity(packed.len() + 1);
+    wrapped.push(MSG_TYPE_DATA);
+    wrapped.extend(packed);
+    // NonBlocking can drop under Node load (looks like controller-only lag spikes);
+    // Blocking keeps pad Tab/ToggleOverlay ordered with the UI thread.
+    let _ = callback.call((window_id.to_string(), vec![wrapped.into()]), mode);
 }
 
 #[cfg(target_os = "linux")]
@@ -918,15 +1175,16 @@ fn nest_apply_game_mode(
         // Drop overlay visual cache so we never re-paint the game's Hidden/crosshair
         // onto Discord before its own CursorChanged arrives.
         instance.nested_cursor = None;
+        // Host Default immediately — avoid one frame of a stale Custom cursor
+        // (or game software cursor) stretching across the upscaled nest.
         instance.window.set_cursor_visible(true);
         instance.window.set_cursor(CursorIcon::Default);
+        instance.nested_cursor_applied = false;
         // Kick a present so any pending Discord wl_callbacks are released.
         instance.force_scene_repaint = true;
         instance.window.request_redraw();
-        // Immediate enter+motion on whatever is under the cursor — otherwise the first
-        // Discord click hits a stale (0,0) enter and Chromium starts a CSD resize.
-        // After FPS lock, last_mouse_pos is usually parked on the game wallpaper, so
-        // fall back to the last overlay nest seat if the live hit misses Discord.
+        // Immediate enter+motion on overlay externals only — never the primary
+        // game (that re-armed software cursors / locks for a 1–2 frame flash).
         if let Some(el) = event_loop {
             let scale = instance.window.scale_factor() as f32;
             let point = instance.last_mouse_pos;
@@ -1319,11 +1577,22 @@ fn nest_route_cursor_moved(
         Some((ws, tx, ty))
     });
     if let Some((ws, tx, ty)) = external_motion {
-        ws.lock().send_pointer_motion_to_pane(&hover_id, tx, ty);
-        if !hovering_primary {
-            instance.last_overlay_pointer = Some((hover_id.clone(), tx, ty));
-            nest_sync_nested_cursor_for_hover(instance, Some(event_loop), true);
+        // Overlay must never feed the primary game — a leave-mode hit on the
+        // Fill wallpaper re-entered OW/etc and flashed a software cursor scaled
+        // to the full host for 1–2 frames.
+        if hovering_primary {
+            instance.hover_pane_id = None;
+            nest_clear_nested_cursor(instance);
+            if prev_was_external {
+                if let Some(ref nest) = instance.nested_compositor {
+                    nest.lock().clear_pointer_focus();
+                }
+            }
+            return;
         }
+        ws.lock().send_pointer_motion_to_pane(&hover_id, tx, ty);
+        instance.last_overlay_pointer = Some((hover_id.clone(), tx, ty));
+        nest_sync_nested_cursor_for_hover(instance, Some(event_loop), true);
         return;
     }
     // Left nested overlay surface → Servo/HUD owns the cursor. Keep the game off-seat.
@@ -2304,6 +2573,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Pad focus step once per loop turn (before spin/paint decisions).
+        #[cfg(target_os = "linux")]
+        self.drain_pad_input(true, Some(event_loop));
+
         // Servo needs to process any queued internal events before the event loop sleeps.
         // This mirrors servoshell's `pump_servo_event_loop` call structure.
         // Without this, Servo's internal work (like deferred layout/paint) doesn't get
@@ -2336,9 +2609,9 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             let mhz = window.refresh_rate_millihertz.max(1);
             pace_refresh_mhz = mhz;
 
-            // SoftFifo GameActive: WaitUntil owns the period. DeviceEvent wakes must
-            // NOT request_redraw (that latched SoftFifo to every mouse sample → 300+Hz).
-            // Only redraw when the gate is due; otherwise re-arm WaitUntil only.
+            // SoftFifo while nest is GameActive — including under the overlay —
+            // so chrome open does not free-run at panel Hz. Pad Wake still breaks
+            // WaitUntil; Nav is one-per-turn so gate defer is fine.
             #[cfg(target_os = "linux")]
             let soft_fifo_active = viewable
                 && crate::pacing::fixed_software_fifo(window)
@@ -2395,13 +2668,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         }
                     }
                 }
-                // HUD/Servo: GameActive → defer to next game present (Guard B).
+                // HUD/Servo: game input + GameActive → defer to next game present.
+                // Overlay/edit wakes immediately even if the nest is still live.
                 if pane.needs_repaint && viewable {
                     #[cfg(target_os = "linux")]
-                    if window.nested_compositor.is_some()
-                        && crate::pacing::present_activity(window)
-                            == crate::pacing::PresentActivity::GameActive
-                    {
+                    if crate::pacing::defer_overlay_servo_wake(window) {
                         window.overlay_dirty = true;
                         continue;
                     }
@@ -2410,12 +2681,29 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 }
             }
             #[cfg(target_os = "linux")]
-            if window.overlay_dirty
-                && viewable
-                && crate::pacing::present_activity(window) == crate::pacing::PresentActivity::UiIdle
-            {
+            if window.force_scene_repaint && viewable {
+                // Host upscale / mode changes must not wait on SoftFifo idle.
                 any_needs_repaint = true;
-                reason = "overlay dirty (UiIdle)".into();
+                reason = "force_scene_repaint".into();
+            } else if window.overlay_dirty && viewable {
+                // Under SoftFifo+GameActive, piggyback on the gate — do not let
+                // overlay_dirty free-run presents at panel Hz (60→120 regression).
+                if soft_fifo_active {
+                    if crate::pacing::soft_fifo_gate_due() {
+                        any_needs_repaint = true;
+                        reason = "overlay dirty (soft_fifo gate)".into();
+                    }
+                } else if !window.game_mode
+                    || crate::pacing::present_activity(window)
+                        == crate::pacing::PresentActivity::UiIdle
+                {
+                    any_needs_repaint = true;
+                    reason = if window.game_mode {
+                        "overlay dirty (UiIdle)".into()
+                    } else {
+                        "overlay dirty (overlay mode)".into()
+                    };
+                }
             }
             if any_needs_repaint {
                 trace!("Rust: [Lifecycle] Requesting Redraw for window (Reason: {})", reason);
@@ -2455,15 +2743,26 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: EngineCommand) {
-        // Wake/RedrawWindow are high-frequency under gamescope. Spinning Servo on
-        // every one re-queues NewFrameReady into the same winit user-event drain
-        // and never reaches RedrawRequested. Spin only for substantive commands.
+        // Edges only (Tab/Toggle) — Nav/Confirm wait for about_to_wait so a
+        // RedrawWindow flood cannot burst-apply focus steps.
+        #[cfg(target_os = "linux")]
+        self.drain_pad_input(false, Some(event_loop));
+
+        // High-frequency user events must NOT spin Servo here. winit drains the
+        // entire user-event queue before RedrawRequested; spin → NewFrameReady →
+        // more queue entries livelocks paint for 1–2s, then pad Nav snaps catch-up.
+        // about_to_wait spins once per loop turn instead.
         let skip_spin = match &event {
-            EngineCommand::Wake | EngineCommand::RedrawWindow(_) => true,
+            EngineCommand::Wake
+            | EngineCommand::RedrawWindow(_)
+            | EngineCommand::NewFrameReady(_, _)
+            | EngineCommand::ExecuteScript(_, _, _)
+            | EngineCommand::ApplyHostUpscale { .. } => true,
             #[cfg(target_os = "linux")]
-            EngineCommand::NestedCursor { .. } => true,
-            #[cfg(target_os = "linux")]
-            EngineCommand::NestedPointerLock { .. } => true,
+            EngineCommand::NestedCursor { .. }
+            | EngineCommand::NestedPointerLock { .. }
+            | EngineCommand::ControllerPadAction { .. }
+            | EngineCommand::ControllerPadKey { .. } => true,
             _ => false,
         };
         if !skip_spin {
@@ -2957,6 +3256,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     #[cfg(target_os = "linux")]
                     u_sgsr_threshold_loc: None,
                     #[cfg(target_os = "linux")]
+                    u_sgsr_use_edge_loc: None,
+                    #[cfg(target_os = "linux")]
                     u_sgsr_oes_size_loc: None,
                     #[cfg(target_os = "linux")]
                     u_sgsr_oes_radius_loc: None,
@@ -2970,6 +3271,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     u_sgsr_oes_sharp_loc: None,
                     #[cfg(target_os = "linux")]
                     u_sgsr_oes_threshold_loc: None,
+                    #[cfg(target_os = "linux")]
+                    u_sgsr_oes_use_edge_loc: None,
+                    #[cfg(target_os = "linux")]
+                    comp_vs: None,
                     #[cfg(target_os = "linux")]
                     fsr1_easu_program: None,
                     #[cfg(target_os = "linux")]
@@ -3251,7 +3556,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                 }
             },
             EngineCommand::ExecuteScript(window_id, pane_id, script) => {
-                if let Some(instance) = self.windows.get(&window_id) {
+                if let Some(instance) = self.windows.get_mut(&window_id) {
                     let pid = if pane_id == "main" && !instance.panes.contains_key("main") {
                         instance.primary_pane_id.clone()
                     } else {
@@ -3259,10 +3564,29 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     };
 
                     if let Some(pane) = instance.panes.get(&pid) {
-                        info!("Rust: [IPC] Executing script in window '{}' pane '{}' (len: {})", window_id, pid, script.len());
+                        // Hot path (pad Nav / chrome / per-frame telemetry) — keep off
+                        // info to avoid log I/O lag.
+                        log::debug!(
+                            "Rust: [IPC] ExecuteScript window='{}' pane='{}' len={}",
+                            window_id,
+                            pid,
+                            script.len()
+                        );
                         pane.webview.evaluate_javascript(&script, |_| {});
                     } else {
                         warn!("Rust: ExecuteScript failed - pane '{}' not found in window '{}'", pid, window_id);
+                    }
+                    // Do not spin or request_redraw here — perf-hud stats alone can be
+                    // 60–120 ExecuteScripts/sec; each spin+redraw starved RedrawRequested
+                    // inside winit's user-event drain (1–2s freeze then snap). Queue the
+                    // script and mark dirty; about_to_wait spins once and wakes paint.
+                    #[cfg(target_os = "linux")]
+                    {
+                        instance.overlay_dirty = true;
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    if window_is_viewable(instance) {
+                        instance.window.request_redraw();
                     }
                 }
             },            EngineCommand::ShowWindow(window_id) => {
@@ -3342,10 +3666,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // miss a notify after resize the loop stalls until an external wake.
                         if animating && window_is_viewable(instance) {
                             #[cfg(target_os = "linux")]
-                            if instance.nested_compositor.is_some()
-                                && crate::pacing::present_activity(instance)
-                                    == crate::pacing::PresentActivity::GameActive
-                            {
+                            if crate::pacing::defer_overlay_servo_wake(instance) {
                                 instance.overlay_dirty = true;
                             } else {
                                 instance.window.request_redraw();
@@ -3378,12 +3699,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // LOCK STEP: Do not dispatch webview.resize here!
                         // RedrawRequested will paint this frame into the GPU FBO, flip layout, and present.
                         // Only after presentation is complete will the next queued resize step be dispatched.
-                        // Guard B: while GameActive, piggyback on the next game present —
-                        // don't wake an overlay-only redraw that steals SoftFifo phase.
+                        // Guard B: in game input mode + GameActive, piggyback on the
+                        // next game present. Overlay/edit must wake immediately —
+                        // otherwise shell/plugin UI lags 1–2s while the nest still commits.
                         #[cfg(target_os = "linux")]
-                        let defer_wake = instance.nested_compositor.is_some()
-                            && crate::pacing::present_activity(instance)
-                                == crate::pacing::PresentActivity::GameActive;
+                        let defer_wake = crate::pacing::defer_overlay_servo_wake(instance);
                         #[cfg(not(target_os = "linux"))]
                         let defer_wake = false;
                         if defer_wake {
@@ -4186,11 +4506,116 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     } else {
                         nest_apply_game_mode(instance, mode, Some(event_loop));
                         info!("[lotus-nest] game mode set: {}", mode);
+                        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                            crate::evdev_pad::ensure_started(window_id.clone(), proxy.clone());
+                        }
+                        // overlay = !game_mode — always re-assert so a JS mode
+                        // desync cannot leave EVIOCGRAB stuck after "return to game".
+                        crate::evdev_pad::set_overlay_mode(!mode);
+                        if mode {
+                            crate::evdev_pad::set_key_forward_pane(None);
+                        }
                         push_renderer_ipc(
                             &window_id,
                             "nest:game-mode",
                             serde_json::json!({ "game_mode": mode }),
                         );
+                    }
+                }
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::ControllerPadAction {
+                window_id,
+                action,
+                dir,
+            } => {
+                // Legacy FIFO path — live pad traffic uses drain_pending_pad().
+                let injected = self.apply_controller_pad_action(
+                    &window_id,
+                    &action,
+                    dir,
+                    Some(event_loop),
+                );
+                if injected {
+                    if let Some(servo) = &self.servo {
+                        servo.spin_event_loop();
+                    }
+                }
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::ControllerPadKey {
+                window_id,
+                pane_id,
+                keycode,
+                pressed,
+            } => {
+                self.apply_controller_pad_key(&window_id, &pane_id, keycode, pressed);
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::SetOskActive(_window_id, active) => {
+                crate::evdev_pad::set_osk_active(active);
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::SetPadKeyForwardPane(_window_id, pane_id) => {
+                crate::evdev_pad::set_key_forward_pane(pane_id);
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::SetPadSpatialFocusPane(_window_id, pane_id) => {
+                crate::evdev_pad::set_spatial_focus_pane(pane_id);
+            },
+            #[cfg(target_os = "linux")]
+            EngineCommand::ApplyHostUpscale {
+                window_id,
+                config_json,
+            } => {
+                match serde_json::from_str::<crate::host_upscale::HostUpscaleConfig>(&config_json) {
+                    Ok(cfg) => {
+                        let applied = crate::window::set_host_upscale_config(cfg);
+                        info!(
+                            "[lotus-upscale] apply mode={} rcas={} sgsr_thr={:.5} sgsr_sharp={:.3} edge_dir={} rcas_stops={:.3}",
+                            applied.mode.as_str(),
+                            applied.sharpen_rcas,
+                            applied.sgsr_edge_threshold,
+                            applied.sgsr_edge_sharpness,
+                            applied.sgsr_use_edge_direction,
+                            applied.rcas_sharpness_stops
+                        );
+                        if let Some(instance) = self.windows.get_mut(&window_id) {
+                            // GL must be current to link FSR/SGSR/RCAS; SoftFifo
+                            // early-return must not drop this mode change.
+                            let _ = instance.rendering_context.make_current();
+                            instance.ensure_host_upscale_shaders();
+                            instance.force_scene_repaint = true;
+                            #[cfg(target_os = "linux")]
+                            {
+                                instance.overlay_dirty = true;
+                            }
+                            // Bump primary seq so scene_needs_present cannot idle-park
+                            // on the previous upscale path.
+                            if let Some(pid) = instance.primary_game_pane.clone() {
+                                if let Some(pane) = instance.panes.get_mut(&pid) {
+                                    pane.frame_seq = pane.frame_seq.wrapping_add(1);
+                                }
+                            }
+                            if window_is_viewable(instance) {
+                                instance.window.request_redraw();
+                            }
+                        }
+                        push_renderer_ipc(
+                            &window_id,
+                            "nest:host-upscale",
+                            serde_json::json!({
+                                "mode": applied.mode.as_str(),
+                                "sharpenRcas": applied.sharpen_rcas,
+                                "sgsrEdgeThreshold": applied.sgsr_edge_threshold,
+                                "sgsrEdgeSharpness": applied.sgsr_edge_sharpness,
+                                "sgsrUseEdgeDirection": applied.sgsr_use_edge_direction,
+                                "rcasSharpnessStops": applied.rcas_sharpness_stops,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        warn!("[lotus-upscale] ApplyHostUpscale bad json: {}", e);
                     }
                 }
             },
@@ -4873,8 +5298,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
         }
         
-        if let Some(servo) = &self.servo {
-            servo.spin_event_loop();
+        // Mirror leading skip_spin — trailing spin on RedrawWindow/ExecuteScript/pad
+        // re-queued NewFrameReady into the same drain and starved paint.
+        if !skip_spin {
+            if let Some(servo) = &self.servo {
+                servo.spin_event_loop();
+            }
         }
         // Wait (or WaitUntil from about_to_wait). Poll fought phase-align and bunched frames.
         event_loop.set_control_flow(ControlFlow::Wait);
@@ -4923,6 +5352,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             _ => {}
         }
+
+        // Edges only here; focus steps are applied in about_to_wait (one per turn).
+        #[cfg(target_os = "linux")]
+        self.drain_pad_input(false, Some(event_loop));
 
         if let Some(servo) = &self.servo {
             servo.spin_event_loop();
@@ -5065,16 +5498,18 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             #[cfg(target_os = "linux")]
                             nest_finish_nested_redraw(instance, nested_gen_at_start);
                         } else {
-                        // SoftFifo not due yet: skip paint/composite/swap entirely.
-                        // Leave NESTED_REDRAW_PENDING set so commits coalesce; about_to_wait
-                        // WaitUntil requests redraw when the gate is due. Do not
-                        // nest_finish here — that would re-request and busy-spin.
-                        // Still spin Servo so NewFrameReady / shell chrome can queue.
+                        // SoftFifo not due yet: skip paint/composite/swap so nest
+                        // commits cannot free-run the mailbox at panel Hz. Never
+                        // drop force_scene_repaint (host upscale swaps) or overlay
+                        // chrome dirty — those must reach composite; SoftFifo still
+                        // gates the actual eglSwapBuffers.
                         #[cfg(target_os = "linux")]
                         if crate::pacing::fixed_software_fifo(instance)
                             && crate::pacing::present_activity(instance)
                                 == crate::pacing::PresentActivity::GameActive
                             && !crate::pacing::soft_fifo_gate_due()
+                            && !instance.force_scene_repaint
+                            && !instance.overlay_dirty
                         {
                             if let Some(servo) = &self.servo {
                                 servo.spin_event_loop();
@@ -5258,17 +5693,22 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                             }
 
+                            // Overlay chrome dirty: skip nest DMA-BUF import this turn so
+                            // Servo focus/paint can present without waiting on nest. Nest
+                            // events stay queued and catch up on the next non-chrome redraw.
                             #[cfg(target_os = "linux")]
-                            if let Some(ref ws) = instance.nested_compositor {
-                                let mut server = ws.lock();
-                                let dirty_panes = server.pump_frames(&instance.gl);
-                                for pid in dirty_panes {
-                                    if let Some(p) = instance.panes.get_mut(&pid) {
-                                        p.is_dirty = true;
-                                        // scene_needs_present keys off frame_seq — without
-                                        // this, imported DMA-BUFs update the slot texture but
-                                        // the host skips composite/present until a resize.
-                                        p.frame_seq = p.frame_seq.wrapping_add(1);
+                            if instance.game_mode || !instance.overlay_dirty {
+                                if let Some(ref ws) = instance.nested_compositor {
+                                    let mut server = ws.lock();
+                                    let dirty_panes = server.pump_frames(&instance.gl);
+                                    for pid in dirty_panes {
+                                        if let Some(p) = instance.panes.get_mut(&pid) {
+                                            p.is_dirty = true;
+                                            // scene_needs_present keys off frame_seq — without
+                                            // this, imported DMA-BUFs update the slot texture but
+                                            // the host skips composite/present until a resize.
+                                            p.frame_seq = p.frame_seq.wrapping_add(1);
+                                        }
                                     }
                                 }
                             }
@@ -7064,9 +7504,10 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                             // unmatched — forward below
                                         } else {
                                             instance.host_hotkey_pressed.insert(event.physical_key);
-                                            push_renderer_ipc(
+                                            push_host_ipc(
+                                                &self.callback,
                                                 &uuid,
-                                                "nest:hotkey",
+                                                "nest-hotkey",
                                                 serde_json::json!({ "id": id }),
                                             );
                                             return;

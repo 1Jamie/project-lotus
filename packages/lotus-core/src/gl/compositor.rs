@@ -60,7 +60,9 @@ pub fn scene_needs_present(
 ) -> bool {
     #[cfg(target_os = "linux")]
     if instance.overlay_dirty
-        && crate::pacing::present_activity(instance) == crate::pacing::PresentActivity::UiIdle
+        && (!instance.game_mode
+            || crate::pacing::present_activity(instance)
+                == crate::pacing::PresentActivity::UiIdle)
     {
         return true;
     }
@@ -266,8 +268,9 @@ fn draw_pane_texture_ext(
 /// (clip). Used for cover-fit overlays: draw a larger quad, clip to the dock pane.
 /// `opaque`: primary/game fullscreen blit — skip blending for a pure 1:1 copy.
 ///
-/// When `ATRIUM_SHARPEN=rcas`: Pass1 upscales into an upright NEAREST temp (Y-flip
-/// applied here); Pass2 RCAS → scene with no flip (`FragCoord - origin`).
+/// When `ATRIUM_SHARPEN=rcas`: Pass1 upscales into an upright NEAREST temp
+/// (EASU mirrors `ip.y` for top-down DMA-BUFs); Pass2 RCAS → scene with no
+/// flip (`FragCoord - origin`).
 fn draw_pane_texture_ext_clipped(
     instance: &mut WindowInstance,
     tex: glow::NativeTexture,
@@ -459,6 +462,31 @@ fn draw_upscale_pass(
 
         let do_upscale = src_buf.is_some() && upscale != crate::window::HostUpscale::Off;
 
+        // sampler2D EASU is textureGather, which ignores the mag filter (gamescope
+        // binds this pass linear). SGSR's base sample is bilinear and must stay
+        // LINEAR. NEAREST is only for the OES 4-tap gather stand-in, and only
+        // once that program is actually going to draw — falling through to the
+        // bilinear shader with NEAREST left on is a nearest-neighbor upscale.
+        #[cfg(target_os = "linux")]
+        let point_taps = do_upscale
+            && upscale == crate::window::HostUpscale::Fsr1
+            && use_oes
+            && instance.fsr1_easu_program_oes.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let point_taps = false;
+        let filter = if point_taps {
+            glow::NEAREST
+        } else {
+            glow::LINEAR
+        };
+        instance.gl.bind_texture(target, Some(tex));
+        instance
+            .gl
+            .tex_parameter_i32(target, glow::TEXTURE_MIN_FILTER, filter as i32);
+        instance
+            .gl
+            .tex_parameter_i32(target, glow::TEXTURE_MAG_FILTER, filter as i32);
+
         #[cfg(target_os = "linux")]
         if do_upscale && upscale == crate::window::HostUpscale::Fsr1 {
             let (program, oes) = if use_oes {
@@ -466,6 +494,16 @@ fn draw_upscale_pass(
             } else {
                 (instance.fsr1_easu_program, false)
             };
+            if program.is_none() {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED_MISSING_EASU: AtomicBool = AtomicBool::new(false);
+                if !WARNED_MISSING_EASU.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "[lotus-upscale] FSR1 selected but easu program missing (oes={}) — bilinear fallback",
+                        use_oes
+                    );
+                }
+            }
             if let (Some(program), Some((sw, sh))) = (program, src_buf) {
                 let locs = &instance.fsr1_locs;
                 let (size_l, radius_l, flip_l, origin_l, src_l, texel_l, c0, c1, c2, c3) = if oes {
@@ -564,6 +602,14 @@ fn draw_upscale_pass(
                         instance.u_sgsr_src_loc.as_ref(),
                     )
                 } else {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static WARNED_MISSING_SGSR: AtomicBool = AtomicBool::new(false);
+                    if !WARNED_MISSING_SGSR.swap(true, Ordering::Relaxed) {
+                        log::warn!(
+                            "[lotus-upscale] SGSR selected but program missing (oes={}) — bilinear fallback",
+                            use_oes
+                        );
+                    }
                     (bilinear.0, bilinear.1, bilinear.2, bilinear.3, None, None)
                 }
             } else {
@@ -593,6 +639,33 @@ fn draw_upscale_pass(
                     let sh = sh.max(1) as f32;
                     instance.gl.uniform_2_f32(texel_loc, 1.0 / sw, 1.0 / sh);
                     instance.gl.uniform_2_f32(src_loc, sw, sh);
+                    let (sharp_loc, thresh_loc, edge_loc) = if use_oes {
+                        (
+                            instance.u_sgsr_oes_sharp_loc.as_ref(),
+                            instance.u_sgsr_oes_threshold_loc.as_ref(),
+                            instance.u_sgsr_oes_use_edge_loc.as_ref(),
+                        )
+                    } else {
+                        (
+                            instance.u_sgsr_sharp_loc.as_ref(),
+                            instance.u_sgsr_threshold_loc.as_ref(),
+                            instance.u_sgsr_use_edge_loc.as_ref(),
+                        )
+                    };
+                    instance
+                        .gl
+                        .uniform_1_f32(sharp_loc, crate::window::sgsr_edge_sharpness());
+                    instance
+                        .gl
+                        .uniform_1_f32(thresh_loc, crate::window::sgsr_edge_threshold());
+                    instance.gl.uniform_1_i32(
+                        edge_loc,
+                        if crate::window::sgsr_use_edge_direction() {
+                            1
+                        } else {
+                            0
+                        },
+                    );
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -741,6 +814,19 @@ pub fn composite_panes_to_scene(
         // scene — otherwise downsize jumps ahead and leaves black bars until flip.
         let pending_fits_active = instance.staged_layout.width == active_w
             && instance.staged_layout.height == active_h;
+
+        // Lazily link SGSR/FSR1/RCAS the first frame they are needed.
+        #[cfg(target_os = "linux")]
+        {
+            let cfg = crate::window::host_upscale_config();
+            let need = matches!(
+                cfg.mode,
+                crate::window::HostUpscale::Sgsr | crate::window::HostUpscale::Fsr1
+            ) || cfg.sharpen_rcas;
+            if need {
+                instance.ensure_host_upscale_shaders();
+            }
+        }
 
         let mut sorted_ids: Vec<_> = instance.panes.keys().cloned().collect();
         sorted_ids.sort_by_key(|id| {
@@ -1037,18 +1123,70 @@ pub fn composite_panes_to_scene(
                         let dx = layout_px + (layout_pw - dw) / 2;
                         (dx, layout_py, dw, layout_ph)
                     };
-                    let src_buf = if upscale != crate::window::HostUpscale::Off
-                        && (dw > buf_w as i32 + 1 || dh > buf_h as i32 + 1)
-                    {
+                    // Always feed buffer size when an upscaler is selected so EASU/SGSR
+                    // actually run. The old `dw > buf+1` gate silently fell back to
+                    // bilinear whenever nest size ≈ Fill pane (e.g. absorbed 900p host),
+                    // so Off vs FSR1 looked identical.
+                    let sharpen = crate::window::host_sharpen_rcas();
+                    let src_buf = if upscale != crate::window::HostUpscale::Off || sharpen {
                         Some((buf_w, buf_h))
                     } else {
                         None
                     };
-                    let upscale = if src_buf.is_some() {
-                        upscale
-                    } else {
-                        crate::window::HostUpscale::Off
-                    };
+                    #[cfg(target_os = "linux")]
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static LAST_UPSCALE_LOG: AtomicU64 = AtomicU64::new(0);
+                        let mode_bits: u64 = match upscale {
+                            crate::window::HostUpscale::Off => 0,
+                            crate::window::HostUpscale::Sgsr => 1,
+                            crate::window::HostUpscale::Fsr1 => 2,
+                        };
+                        let sig = (mode_bits << 48)
+                            | ((sharpen as u64) << 40)
+                            | ((buf_w as u64 & 0xffff) << 24)
+                            | ((buf_h as u64 & 0xffff) << 8)
+                            | (((dw as u64) & 0xfff) << 4)
+                            | (((dh as u64) >> 8) & 0xf);
+                        let prev = LAST_UPSCALE_LOG.load(Ordering::Relaxed);
+                        if prev != sig {
+                            LAST_UPSCALE_LOG.store(sig, Ordering::Relaxed);
+                            let path = match upscale {
+                                crate::window::HostUpscale::Fsr1 => {
+                                    if sharpen {
+                                        "fsr1+rcas"
+                                    } else {
+                                        "fsr1"
+                                    }
+                                }
+                                crate::window::HostUpscale::Sgsr => {
+                                    if sharpen {
+                                        "sgsr+rcas"
+                                    } else {
+                                        "sgsr"
+                                    }
+                                }
+                                crate::window::HostUpscale::Off => {
+                                    if sharpen {
+                                        "bilinear+rcas"
+                                    } else {
+                                        "bilinear"
+                                    }
+                                }
+                            };
+                            let scale_ok = dw > buf_w as i32 + 1 || dh > buf_h as i32 + 1;
+                            log::info!(
+                                "[lotus-upscale] draw path={} src={}x{} dst={}x{} scale_up={} oes={}",
+                                path,
+                                buf_w,
+                                buf_h,
+                                dw,
+                                dh,
+                                scale_ok,
+                                target == GL_TEXTURE_EXTERNAL_OES
+                            );
+                        }
+                    }
                     draw_pane_texture_ext(
                         instance,
                         tex,
@@ -1227,7 +1365,14 @@ pub fn atrium_host_present(instance: &WindowInstance) -> bool {
         let mut gate_ms = 0.0f32;
         let mut phase_err_ms = 0.0f32;
         let mut phase_slips = 0u64;
-        if soft_fifo {
+        // SoftFifo must stay armed under the overlay while the nest is GameActive —
+        // gating only on game_mode free-ran presents at panel Hz (60→120) when chrome
+        // opened. Pad Nav is coalesced + WaitUntil-waking, so gate defer is safe again.
+        let soft_fifo_enforce = soft_fifo
+            && (instance.game_mode
+                || crate::pacing::present_activity(instance)
+                    == crate::pacing::PresentActivity::GameActive);
+        if soft_fifo_enforce {
             let mut pacer_guard = SOFT_PACER.lock().unwrap_or_else(|e| e.into_inner());
             let pacer = pacer_guard.get_or_insert_with(|| crate::pacing::SoftFifoPacer::new(period_ns));
             pacer.set_period_ns(period_ns);
@@ -1251,6 +1396,16 @@ pub fn atrium_host_present(instance: &WindowInstance) -> bool {
                 crate::pacing::SoftFifoWait::Ready { gate_ms: g } => {
                     gate_ms = g;
                 }
+            }
+        } else if soft_fifo {
+            // Keep the existing SoftFifo grid/pacer across overlay presents so
+            // returning to game mode does not re-seed from zero every F12.
+            // Do not wait_for_swap_slot — that would re-introduce the defer lag.
+            let mut pacer_guard = SOFT_PACER.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pacer) = pacer_guard.as_mut() {
+                pacer.set_period_ns(period_ns);
+                phase_err_ms = pacer.last_phase_err_ns as f32 / 1_000_000.0;
+                phase_slips = pacer.phase_slips;
             }
         } else {
             *SOFT_PACER.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1291,7 +1446,7 @@ pub fn atrium_host_present(instance: &WindowInstance) -> bool {
 
         let mut drm_sample_ok = false;
         let mut pll_applied = false;
-        if soft_fifo {
+        if soft_fifo_enforce {
             // Gamescope X11: DRM vblank UST ≈ wp_presentation.presented. Apply PLL
             // against the deadline we just targeted, then advance the absolute grid.
             drm_sample_ok = crate::present_feedback::sample_drm_vblank_feedback(period_ns);
