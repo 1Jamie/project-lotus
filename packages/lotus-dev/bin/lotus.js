@@ -437,15 +437,24 @@ globalThis.__LOTUS_ENCRYPTED_BUILD__ = ${encrypt ? 'true' : 'false'};
         }
 
         console.log('Extracting msgpackr renderer script...');
-        let msgpackrRendererPath;
-        try {
-            msgpackrRendererPath = require.resolve('msgpackr/dist/index.min.js', { paths: [process.cwd()] });
-        } catch (e) {
+        const msgpackrCandidates = [
+            path.join(process.cwd(), 'node_modules', 'msgpackr', 'dist', 'index.min.js'),
+            path.join(__dirname, '..', '..', '..', 'node_modules', 'msgpackr', 'dist', 'index.min.js'),
+        ];
+        let msgpackrRendererPath = msgpackrCandidates.find((p) => fs.existsSync(p));
+        if (!msgpackrRendererPath && typeof require.resolve === 'function') {
             try {
-                msgpackrRendererPath = path.join(path.dirname(require.resolve('msgpackr', { paths: [process.cwd()] })), 'index.min.js');
-            } catch (e2) {
-                console.warn('Could not locate msgpackr in node_modules! IPC may fail.');
+                msgpackrRendererPath = require.resolve('msgpackr/dist/index.min.js', { paths: [process.cwd(), __dirname] });
+            } catch (e) {
+                try {
+                    msgpackrRendererPath = path.join(path.dirname(require.resolve('msgpackr', { paths: [process.cwd(), __dirname] })), 'index.min.js');
+                } catch (e2) {
+                    msgpackrRendererPath = null;
+                }
             }
+        }
+        if (!msgpackrRendererPath) {
+            console.warn('Could not locate msgpackr in node_modules! IPC may fail.');
         }
         if (msgpackrRendererPath && fs.existsSync(msgpackrRendererPath)) {
             fs.copyFileSync(msgpackrRendererPath, path.join(appDir, 'msgpackr-renderer.js'));

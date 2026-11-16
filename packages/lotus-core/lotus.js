@@ -1144,7 +1144,7 @@ function ensureApp() {
                 msgpackrSource = fs.readFileSync(usrLibMsgpackr, 'utf8');
             } else if (fs.existsSync(appLibMsgpackr)) {
                 msgpackrSource = fs.readFileSync(appLibMsgpackr, 'utf8');
-            } else {
+            } else if (typeof require.resolve === 'function') {
                 let msgpackrPath;
                 try {
                     // Try to resolve it via subpath (might fail due to 'exports' in newer node)
