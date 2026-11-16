@@ -119,8 +119,16 @@ function verifyInjectedData(binPath, isWindows, expectedSizes) {
         }
     } else {
         const readelfOut = execSync(`readelf -S "${binPath}"`, { encoding: 'utf8' });
-        if (!readelfOut.includes('NODE_SEA_BLOB')) {
-            throw new Error('Verification failed: Final ELF binary is missing NODE_SEA_BLOB section.');
+        const elf = fs.readFileSync(binPath);
+        // postject + Node 22 embed SEA via a sentinel fuse; it is not always a
+        // named ELF section visible in readelf -S.
+        const hasSea =
+            elf.includes(Buffer.from('NODE_SEA_FUSE_')) ||
+            readelfOut.includes('NODE_SEA_BLOB');
+        if (!hasSea) {
+            throw new Error(
+                'Verification failed: Final ELF binary is missing injected Node SEA blob (no NODE_SEA_FUSE / NODE_SEA_BLOB marker).'
+            );
         }
         if (expectedSizes) {
             for (const [name, minSize] of Object.entries(expectedSizes)) {
