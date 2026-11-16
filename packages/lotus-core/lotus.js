@@ -1129,38 +1129,38 @@ function ensureApp() {
             console.warn('[Lotus] Could not read package.json, using default app identifier');
         }
 
-        // Read msgpackr source from node_modules
+        // Browser bundle injected into Servo panes. The page IPC bootstrap
+        // reads window.msgpackr. The UMD build attaches to `exports` when a
+        // CommonJS `module` is in scope, which leaves window.msgpackr unset.
         let msgpackrSource = '// msgpackr not found';
         try {
             const path = require('path');
             const fs = require('fs');
-            const execDirMsgpackr = path.join(path.dirname(process.execPath), 'msgpackr-renderer.js');
-            const usrLibMsgpackr = path.join('/usr/lib', path.basename(process.execPath), 'msgpackr-renderer.js');
-            const appLibMsgpackr = path.join('/app/lib', path.basename(process.execPath), 'msgpackr-renderer.js');
-
-            if (fs.existsSync(execDirMsgpackr)) {
-                msgpackrSource = fs.readFileSync(execDirMsgpackr, 'utf8');
-            } else if (fs.existsSync(usrLibMsgpackr)) {
-                msgpackrSource = fs.readFileSync(usrLibMsgpackr, 'utf8');
-            } else if (fs.existsSync(appLibMsgpackr)) {
-                msgpackrSource = fs.readFileSync(appLibMsgpackr, 'utf8');
-            } else if (typeof require.resolve === 'function') {
-                let msgpackrPath;
-                try {
-                    // Try to resolve it via subpath (might fail due to 'exports' in newer node)
-                    msgpackrPath = require.resolve('msgpackr/dist/index.min.js');
-                } catch (e) {
-                    // Fallback: use the main entry point to find the directory
-                    // msgpackr exports its node version in dist/node.cjs
-                    const mainPath = require.resolve('msgpackr');
-                    msgpackrPath = path.join(path.dirname(mainPath), 'index.min.js');
-                }
-
-                if (fs.existsSync(msgpackrPath)) {
-                    msgpackrSource = fs.readFileSync(msgpackrPath, 'utf8');
-                } else {
-                    console.warn('[Lotus] msgpackr minified source not found at:', msgpackrPath);
-                }
+            const candidates = [
+                path.join(path.dirname(process.execPath), 'msgpackr-renderer.js'),
+                path.join('/usr/lib', path.basename(process.execPath), 'msgpackr-renderer.js'),
+                path.join('/app/lib', path.basename(process.execPath), 'msgpackr-renderer.js'),
+            ];
+            let dir = __dirname;
+            for (let i = 0; i < 6; i++) {
+                candidates.push(path.join(dir, 'node_modules', 'msgpackr', 'dist', 'index.min.js'));
+                const parent = path.dirname(dir);
+                if (parent === dir) break;
+                dir = parent;
+            }
+            const found = candidates.find((p) => {
+                try { return fs.existsSync(p); } catch (_) { return false; }
+            });
+            if (!found) {
+                console.warn('[Lotus] msgpackr browser bundle not found');
+            } else {
+                const raw = fs.readFileSync(found, 'utf8');
+                msgpackrSource =
+                    '(function(window){\n' +
+                    raw +
+                    '\nif (typeof window.msgpackr === "undefined" && typeof globalThis !== "undefined" && globalThis.msgpackr) window.msgpackr = globalThis.msgpackr;\n' +
+                    '}).call(typeof window !== "undefined" ? window : this, typeof window !== "undefined" ? window : this);\n';
+                console.log('[Lotus] msgpackr renderer', found, 'bytes', raw.length);
             }
         } catch (e) {
             console.warn('[Lotus] Could not load msgpackr source for renderer:', e.message);
