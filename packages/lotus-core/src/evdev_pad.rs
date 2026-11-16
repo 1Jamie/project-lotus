@@ -1,11 +1,10 @@
-//! Physical gamepad watcher for nest overlay chords (Start+Select) and semantic actions.
+//! Read-only gamepad watcher for the Start+Select overlay chord.
 //!
-//! Critical rules (see atrium plugin-dock plan):
-//! - Never open Atrium/Edge-Gestures OSK summon pads. Steam Input's virtual Xbox pad
-//!   (vendor 0x28DE) is watched for chords when the physical node is locked (Bazzite).
-//! - Neutral flush: `write()` ABS midpoints + BTN releases + SYN, then immediate EVIOCGRAB.
-//! - While `osk_active`, drop grab so Steam Input can drive the Steam OSK.
-//! - Hotplug via inotify on `/dev/input`.
+//! Pads are opened `O_RDONLY`. Events are copies, so the game keeps its own fd.
+//! Never `EVIOCGRAB` or `write()` — exclusive grab on Steam's virtual Xbox pad
+//! destroys that node and the game does not see input again until replug.
+//! Overlay navigation is mouse, keyboard, and touch. This thread only emits
+//! `ToggleOverlay`.
 
 #![cfg(target_os = "linux")]
 
@@ -313,27 +312,22 @@ struct TrackedPad {
     select_down: bool,
     start_down: bool,
     chord_latched: bool,
+    /// Last ABS_HAT0X / ABS_HAT0Y — Nav only on edges so a held hat cannot
+    /// re-queue "up" every poll after coalesced drain.
+    hat_x: i32,
+    hat_y: i32,
 }
 
 impl TrackedPad {
     fn open(path: &Path) -> io::Result<Option<Self>> {
-        // Brief settle for udev perms on hotplug.
+        // Read-only. A writeable fd is what makes EVIOCGRAB possible; we never
+        // want that. Evdev delivers a copy to every reader.
         thread::sleep(Duration::from_millis(50));
-        let (file, can_grab) = match OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
-            .write(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-        {
-            Ok(f) => (f, true),
-            Err(_) => {
-                let f = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(path)?;
-                (f, false)
-            }
-        };
+            .open(path)?;
+        let can_grab = false;
         let fd = file.as_raw_fd();
         let id = read_id(fd)?;
         let name = read_name(fd);
@@ -379,9 +373,15 @@ impl TrackedPad {
         }
 
         let mut axes = Vec::new();
-        for axis in [ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ] {
+        // Sticks + hats. Hats were missing from the neutral flush — overlay Nav
+        // via ABS_HAT0Y left the axis at -1 after ungrab, so the game saw stuck
+        // "up" and ignored the rest of the pad until restart.
+        for axis in [
+            ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ, ABS_HAT0X, ABS_HAT0Y,
+        ] {
             if bit_test(&abs_bits, axis) {
                 if let Some(info) = read_absinfo(fd, axis) {
+                    // Hats are typically -1/0/1; abs_center → 0.
                     axes.push((axis, abs_center(&info)));
                 }
             }
@@ -434,6 +434,8 @@ impl TrackedPad {
             select_down: false,
             start_down: false,
             chord_latched: false,
+            hat_x: 0,
+            hat_y: 0,
         }))
     }
 
@@ -448,6 +450,10 @@ impl TrackedPad {
         match write_neutral_then_grab(self.fd(), &self.axes, &self.keys) {
             Ok(()) => {
                 self.grabbed = true;
+                self.hat_x = 0;
+                self.hat_y = 0;
+                self.select_down = false;
+                self.start_down = false;
                 info!(
                     "[evdev-pad] grabbed {} (steam_virt={}) for overlay exclusive",
                     self.path.display(),
@@ -463,16 +469,55 @@ impl TrackedPad {
     }
 
     fn leave_grab(&mut self) {
-        if !self.grabbed {
-            if self.can_grab {
-                let _ = write_neutral(self.fd(), &self.axes, &self.keys);
+        // Always attempt EVIOCGRAB(0) when we can — a desynced `grabbed=false`
+        // while the fd is still exclusive leaves the game with no pad until restart.
+        let was = self.grabbed;
+        if self.can_grab {
+            // Neutral while still exclusive, then drop grab, then neutral again so
+            // Steam/Proton definitely observe sticks/hats/buttons released (open
+            // overlay → Nav up → close must not leave ABS_HAT0Y=-1 latched).
+            let _ = write_neutral(self.fd(), &self.axes, &self.keys);
+            let _ = ioctl_grab(self.fd(), false);
+            self.grabbed = false;
+            if let Err(e) = write_neutral(self.fd(), &self.axes, &self.keys) {
+                warn!(
+                    "[evdev-pad] post-ungrab neutral flush failed on {}: {}",
+                    self.path.display(),
+                    e
+                );
             }
+        } else {
+            self.grabbed = false;
+        }
+        self.hat_x = 0;
+        self.hat_y = 0;
+        self.select_down = false;
+        self.start_down = false;
+        self.chord_latched = false;
+        if was {
+            info!(
+                "[evdev-pad] ungrabbed {} (steam_virt={}) — game may read pads",
+                self.path.display(),
+                self.steam_virtual
+            );
+        }
+    }
+
+    /// Force a full neutral report without changing grab (overlay open path /
+    /// mode swap hygiene).
+    fn flush_neutral(&mut self) {
+        if !self.can_grab {
             return;
         }
-        let _ = ioctl_grab(self.fd(), false);
-        self.grabbed = false;
-        let _ = write_neutral(self.fd(), &self.axes, &self.keys);
-        debug!("[evdev-pad] ungrabbed {}", self.path.display());
+        if let Err(e) = write_neutral(self.fd(), &self.axes, &self.keys) {
+            warn!(
+                "[evdev-pad] neutral flush failed on {}: {}",
+                self.path.display(),
+                e
+            );
+        }
+        self.hat_x = 0;
+        self.hat_y = 0;
     }
 }
 
@@ -482,6 +527,8 @@ struct SharedPadState {
     overlay: bool,
     /// true while Steam/DE OSK is up — forces ungrab.
     osk_active: bool,
+    /// Re-run grab policy even when overlay/osk flags are unchanged.
+    force_grab_refresh: bool,
     /// External nest pane that should receive pad→key (arrows/enter/esc).
     key_forward_pane: Option<String>,
     /// Servo plugin tab pane for direct AtriumFocus inject (no Node hop).
@@ -531,12 +578,44 @@ pub fn set_overlay_mode(overlay: bool) {
     if let Ok(guard) = hub_mutex().lock() {
         if let Some(hub) = guard.as_ref() {
             if let Ok(mut st) = hub.state.lock() {
+                let changed = st.overlay != overlay;
                 st.overlay = overlay;
                 if !overlay {
                     // Closing overlay: drop forwards so we never keep eating
                     // pad→key / spatial inject while game_mode is restored.
                     st.key_forward_pane = None;
                     st.spatial_focus_pane = None;
+                }
+                // Always refresh grab policy. Closing with force=false skipped
+                // apply when `overlay` was already false after a chord-grab race,
+                // leaving EVIOCGRAB held — overlay dismissed, game got no pads.
+                st.force_grab_refresh = true;
+                if changed {
+                    // Drop coalesced Nav/Confirm so a held hat "up" cannot keep
+                    // scrolling atrium (or look stuck) across the mode swap.
+                    clear_pending_overlay_focus();
+                }
+            }
+            let _ = hub.proxy.send_event(EngineCommand::Wake);
+        }
+    }
+}
+
+/// Clear overlay focus steps queued while chrome was open / about to close.
+fn clear_pending_overlay_focus() {
+    if let Ok(mut st) = pending_pad_state().lock() {
+        st.nav = None;
+        st.confirm = None;
+    }
+}
+
+/// Re-attempt EVIOCGRAB on all RW pads while overlay is open (Steam Input race).
+pub fn retry_overlay_grabs() {
+    if let Ok(guard) = hub_mutex().lock() {
+        if let Some(hub) = guard.as_ref() {
+            if let Ok(mut st) = hub.state.lock() {
+                if st.overlay {
+                    st.force_grab_refresh = true;
                 }
             }
             let _ = hub.proxy.send_event(EngineCommand::Wake);
@@ -677,6 +756,8 @@ fn push_pending_pad(proxy: &EventLoopProxy<EngineCommand>, item: PendingPadInput
 /// - When `allow_focus_step`, also takes **at most one** Nav/Confirm (Confirm wins).
 ///   Pass `true` once per present/`about_to_wait`, not on every UserEvent, or a
 ///   RedrawWindow flood would still burst-apply focus steps.
+/// - ToggleOverlay in the same batch drops Nav/Confirm — a stale coalesced "up"
+///   from an earlier overlay visit must not apply after Start+Select alone.
 pub fn drain_pending_pad(allow_focus_step: bool) -> Vec<PendingPadInput> {
     PAD_WAKE_PENDING.store(false, Ordering::SeqCst);
     let Ok(mut st) = pending_pad_state().lock() else {
@@ -686,7 +767,16 @@ pub fn drain_pending_pad(allow_focus_step: bool) -> Vec<PendingPadInput> {
     while let Some(edge) = st.edges.pop_front() {
         out.push(edge);
     }
-    if allow_focus_step {
+    let toggling = out.iter().any(|e| {
+        matches!(
+            e,
+            PendingPadInput::Action { action, .. } if action == "ToggleOverlay"
+        )
+    });
+    if toggling {
+        st.nav = None;
+        st.confirm = None;
+    } else if allow_focus_step {
         if let Some(window_id) = st.confirm.take() {
             st.nav = None;
             out.push(PendingPadInput::Action {
@@ -843,16 +933,23 @@ fn enumerate_pads(pads: &mut HashMap<PathBuf, TrackedPad>) {
     }
 }
 
+#[allow(dead_code)]
 fn apply_grab_policy(pads: &mut HashMap<PathBuf, TrackedPad>, overlay: bool, osk_active: bool) {
     let want_grab = overlay && !osk_active;
     // Games (Proton/SDL) read Steam Input's virtual Xbox node — NOT the physical
     // hidraw. The old policy grabbed physical only and left the virtual free, so
     // overlay chords hit atrium while the nest kept seeing the same presses
     // (laggy dual-path). Grab every RW pad, including steam_virtual, and neutral
-    // flush so the game sees sticks/buttons released.
+    // flush so the game sees sticks/buttons/hats released.
     for pad in pads.values_mut() {
         if !want_grab {
             pad.leave_grab();
+            continue;
+        }
+        // Already exclusive: still flush neutrals so a mid-overlay rescan cannot
+        // leave a latched hat from before the grab.
+        if pad.grabbed {
+            pad.flush_neutral();
             continue;
         }
         pad.enter_overlay_grab();
@@ -861,6 +958,7 @@ fn apply_grab_policy(pads: &mut HashMap<PathBuf, TrackedPad>, overlay: bool, osk
 
 /// Single source for overlay semantic actions — avoid physical + Steam virtual
 /// both firing TabNext/Nav for one press.
+#[allow(dead_code)]
 fn overlay_action_source(pads: &HashMap<PathBuf, TrackedPad>) -> Option<PathBuf> {
     let mut best: Option<(&PathBuf, i32)> = None;
     for (path, pad) in pads {
@@ -881,6 +979,7 @@ fn overlay_action_source(pads: &HashMap<PathBuf, TrackedPad>) -> Option<PathBuf>
     best.map(|(p, _)| p.clone())
 }
 
+#[allow(dead_code)]
 fn map_overlay_button(
     code: u16,
     pressed: bool,
@@ -990,25 +1089,13 @@ fn pad_thread(
 
     let mut inotify_buf = [0u8; 1024];
     let mut last_scan = Instant::now();
-    let mut last_overlay = false;
-    let mut last_osk = false;
     let mut debounce = ActionDebouncer::new();
 
     while !stop.load(Ordering::SeqCst) {
-        let (overlay, osk_active, key_pane) = {
-            let st = state.lock().unwrap();
-            (st.overlay, st.osk_active, st.key_forward_pane.clone())
-        };
-
-        if overlay != last_overlay || osk_active != last_osk {
-            apply_grab_policy(&mut pads, overlay, osk_active);
-            if last_overlay && !overlay {
-                info!("[evdev-pad] overlay closed — ungrab for game input");
-            } else if !last_overlay && overlay {
-                info!("[evdev-pad] overlay open — grab for shell input");
-            }
-            last_overlay = overlay;
-            last_osk = osk_active;
+        // Drop grab-refresh requests. This thread never takes the device.
+        {
+            let mut st = state.lock().unwrap();
+            st.force_grab_refresh = false;
         }
 
         // Hotplug events.
@@ -1025,37 +1112,25 @@ fn pad_thread(
                     if ev.mask.contains(EventMask::DELETE) {
                         if let Some(name) = ev.name {
                             let path = PathBuf::from("/dev/input").join(name);
-                            if let Some(mut pad) = pads.remove(&path) {
-                                pad.leave_grab();
-                            }
+                            pads.remove(&path);
                         }
                     }
                 }
                 if need_scan {
                     thread::sleep(Duration::from_millis(80));
                     enumerate_pads(&mut pads);
-                    apply_grab_policy(&mut pads, overlay, osk_active);
                 }
             }
         }
 
         if last_scan.elapsed() > Duration::from_secs(3) {
             enumerate_pads(&mut pads);
-            apply_grab_policy(&mut pads, overlay, osk_active);
             last_scan = Instant::now();
         }
 
-        // Read pad events. Overlay Nav/Tab only from one device so physical +
-        // Steam virtual don't double-fire; Start+Select still accepted on any.
-        let action_src = if overlay && !osk_active {
-            overlay_action_source(&pads)
-        } else {
-            None
-        };
-        let mut grab_all_for_overlay = false;
+        // Start+Select on any pad. No other buttons are consumed or forwarded.
         let paths: Vec<PathBuf> = pads.keys().cloned().collect();
         for path in paths {
-            let is_action_src = action_src.as_ref() == Some(&path);
             let Some(pad) = pads.get_mut(&path) else {
                 continue;
             };
@@ -1074,52 +1149,22 @@ fn pad_thread(
                                 )
                             };
                             if ev.type_ != EV_KEY {
-                                // Hat as dpad for some pads.
-                                if overlay && !osk_active && is_action_src && ev.type_ == EV_ABS {
-                                    let dir = match (ev.code, ev.value) {
-                                        (ABS_HAT0Y, v) if v < 0 => Some("up"),
-                                        (ABS_HAT0Y, v) if v > 0 => Some("down"),
-                                        (ABS_HAT0X, v) if v < 0 => Some("left"),
-                                        (ABS_HAT0X, v) if v > 0 => Some("right"),
-                                        _ => None,
-                                    };
-                                    if let Some(d) = dir {
-                                        if let Some(ref pane) = key_pane {
-                                            let key = match d {
-                                                "up" => KEY_UP,
-                                                "down" => KEY_DOWN,
-                                                "left" => KEY_LEFT,
-                                                "right" => KEY_RIGHT,
-                                                _ => continue,
-                                            };
-                                            emit_key(&proxy, &window_id, pane, key, true);
-                                            emit_key(&proxy, &window_id, pane, key, false);
-                                        } else {
-                                            emit_action(&proxy, &window_id, "Nav", Some(d));
-                                        }
-                                    }
-                                }
                                 continue;
                             }
                             let pressed = ev.value != 0;
                             match ev.code {
                                 BTN_SELECT => pad.select_down = pressed,
                                 BTN_START => pad.start_down = pressed,
-                                _ => {}
+                                _ => continue,
                             }
 
-                            // Start+Select chord → ToggleOverlay (gameplay: grab on chord).
-                            // Debounced across devices: Steam virt + USB pad both fire otherwise.
+                            // Start+Select → ToggleOverlay. Read-only: the game
+                            // still receives the buttons. Debounced so a Steam
+                            // virtual pad and a USB pad don't toggle twice.
                             if pad.select_down && pad.start_down {
                                 pad.chord_latched = true;
                                 if debounce.allow_toggle() {
-                                    if !overlay {
-                                        // Grab this node now; after the read loop grab every
-                                        // RW pad (incl. Steam virtual) so the nest stops seeing
-                                        // presses before SetGameMode(false) lands.
-                                        pad.enter_overlay_grab();
-                                        grab_all_for_overlay = true;
-                                    }
+                                    clear_pending_overlay_focus();
                                     emit_action(&proxy, &window_id, "ToggleOverlay", None);
                                 }
                                 continue;
@@ -1127,38 +1172,17 @@ fn pad_thread(
                             if !pad.select_down && !pad.start_down {
                                 pad.chord_latched = false;
                             }
-
-                            if overlay && !osk_active && is_action_src {
-                                // Don't forward the chord buttons themselves as Back/etc.
-                                if ev.code == BTN_SELECT || ev.code == BTN_START {
-                                    continue;
-                                }
-                                map_overlay_button(
-                                    ev.code,
-                                    pressed,
-                                    &proxy,
-                                    &window_id,
-                                    key_pane.as_deref(),
-                                    &mut debounce,
-                                );
-                            }
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
                         warn!("[evdev-pad] read {}: {}", path.display(), e);
-                        let mut dead = pads.remove(&path);
-                        if let Some(ref mut p) = dead {
-                            p.leave_grab();
-                        }
+                        pads.remove(&path);
                         break;
                     }
                 }
             }
-        }
-        if grab_all_for_overlay {
-            apply_grab_policy(&mut pads, true, osk_active);
         }
 
         let any_chord = pads
@@ -1166,12 +1190,8 @@ fn pad_thread(
             .any(|p| p.select_down && p.start_down);
         debounce.chord_released_all(any_chord);
 
-        // Overlay wants sub-frame poll; gameplay chords can tolerate a bit more.
-        thread::sleep(Duration::from_millis(if overlay { 1 } else { 4 }));
+        thread::sleep(Duration::from_millis(8));
     }
 
-    for pad in pads.values_mut() {
-        pad.leave_grab();
-    }
     info!("[evdev-pad] watcher stopped");
 }

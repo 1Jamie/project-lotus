@@ -535,11 +535,18 @@ impl LotusWaylandState {
         // NEVER call seat.get_pointer() here — `cursor_image` runs while smithay
         // already holds the pointer lock; re-entering deadlocks the nested loop
         // (Xwayland freezes → Overwatch never maps / XIO timeouts).
-        let from_primary = self
+        let focus_primary = self
             .last_pointer_focus
             .as_ref()
             .map(|s| self.surface_is_primary(s))
             .unwrap_or(false);
+        // Cursor-role commits can arrive while Discord briefly holds seat focus;
+        // still attribute to the game when the cursor surface belongs to X11/primary.
+        let cursor_from_primary = self
+            .current_cursor_surface
+            .as_ref()
+            .is_some_and(|s| self.cursor_surface_from_primary_client(s));
+        let from_primary = focus_primary || cursor_from_primary;
         let _ = self.event_sender.send(WaylandEvent::CursorChanged(cursor.clone()));
         if let Some(proxy) = crate::app::EVENT_LOOP_PROXY.get() {
             let _ = proxy.send_event(crate::app::EngineCommand::NestedCursor {
@@ -548,6 +555,33 @@ impl LotusWaylandState {
                 from_primary,
             });
         }
+    }
+
+    /// True when `surface`'s Wayland client also owns an X11/primary game window.
+    fn cursor_surface_from_primary_client(&self, surface: &WlSurface) -> bool {
+        let Some(client) = surface.client() else {
+            return false;
+        };
+        for x11 in self.x11_surfaces.values() {
+            if let Some(wl) = x11.wl_surface() {
+                if wl.client().is_some_and(|c| c == client) {
+                    return true;
+                }
+            }
+        }
+        // Tagged nest clients on the primary pane (non-X11 game paths).
+        if let Some(cs) = client.get_data::<ClientState>() {
+            if let Some(ref pane_id) = cs.pane_id {
+                let panes = self.pane_registrations.lock();
+                if panes
+                    .iter()
+                    .any(|p| p.is_primary && p.pane_id.as_str() == pane_id.as_str())
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn emit_pointer_lock(&mut self, active: bool) {
@@ -577,17 +611,62 @@ impl LotusWaylandState {
         };
         match status {
             1 => self.emit_pointer_lock(true),
-            0 if self.host_game_mode => {
-                // Real unlock while game mode owns the seat.
+            0 => {
+                // Real client unlock — always update game shoes, even while the
+                // host wears overlay shoes (OW menu/character select under chrome).
                 self.emit_pointer_lock(false);
             }
             -1 => {
-                // Absent after leave/oneshot destroy — keep sticky shoe so host
-                // grab survives until the client recreates the constraint (or
-                // pause/unpause). Emitting false here left RoR2/OW hide-only.
+                // Oneshot destroyed. Two cases:
+                // - Overlay (!host_game_mode): pointer leave often destroys oneshot;
+                //   keep the sticky shoe so F12 return can reactivate without
+                //   inventing a lock the client never asked for again.
+                // - Game mode + still focused: client tore down the constraint
+                //   while seated (OW load→hero-select / leave match). Emitting
+                //   false clears the host grab so absolute motion + custom
+                //   cursor can return — sticky-true here left the cursor dead
+                //   until process restart.
+                if self.host_game_mode && self.last_pointer_focus.as_ref() == Some(surface) {
+                    self.emit_pointer_lock(false);
+                }
             }
             _ => {}
         }
+    }
+
+    fn take_frame_callbacks(surface: &WlSurface, pending: &Arc<Mutex<Vec<WlCallback>>>) {
+        with_states(surface, |states| {
+            let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+            let current = attrs.current();
+            if !current.frame_callbacks.is_empty() {
+                let mut cbs = pending.lock().unwrap();
+                cbs.extend(std::mem::take(&mut current.frame_callbacks));
+            }
+        });
+    }
+
+    /// True for a pointer-sized buffer that does not yet have a shell or cursor role.
+    /// GTK's cursor surface is committed in this state, one request before set_cursor.
+    fn is_unroled_pointer_buffer(surface: &WlSurface) -> bool {
+        if smithay::wayland::compositor::get_role(surface).is_some() {
+            return false;
+        }
+        with_renderer_surface_state(surface, |state| {
+            let wl_buf = state.buffer()?;
+            if let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(wl_buf) {
+                let w = dmabuf.width().max(0) as u32;
+                let h = dmabuf.height().max(0) as u32;
+                return Some(w > 0 && h > 0 && w <= 128 && h <= 128);
+            }
+            smithay::wayland::shm::with_buffer_contents(wl_buf, |_ptr, _len, data| {
+                let w = data.width.max(0) as u32;
+                let h = data.height.max(0) as u32;
+                w > 0 && h > 0 && w <= 128 && h <= 128
+            })
+            .ok()
+        })
+        .flatten()
+        .unwrap_or(false)
     }
 
     /// Read SHM cursor pixels + hotspot into a host-ready `NestedCursor::Custom`.
@@ -743,11 +822,61 @@ impl LotusWaylandState {
         });
     }
 
+    /// Keep / restore pointer focus on the primary game surface without forcing
+    /// constraints. Used while overlay chrome owns the *host* seat so the game
+    /// nest client still believes it is focused and keeps cursor/lock shoes live.
+    pub fn reseat_primary_pointer_focus(&mut self) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let primary_id = {
+            let panes = self.pane_registrations.lock();
+            panes
+                .iter()
+                .find(|p| p.is_primary)
+                .map(|p| p.pane_id.clone())
+        };
+        let Some(pane_id) = primary_id else {
+            return;
+        };
+        let Some(surface) = self.surface_for_pane(&pane_id) else {
+            return;
+        };
+        let (nw, nh) = (
+            self.target_size.0.max(1) as f64,
+            self.target_size.1.max(1) as f64,
+        );
+        let raw = self
+            .last_primary_pointer_pos
+            .unwrap_or_else(|| pointer.current_location());
+        let location = Point::from((
+            raw.x.clamp(0.0, (nw - 1.0).max(0.0)),
+            raw.y.clamp(0.0, (nh - 1.0).max(0.0)),
+        ));
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        let now_ms = self.now_ms();
+        let surface_origin = Point::from((0.0, 0.0));
+        self.last_pointer_focus = Some(surface.clone());
+        self.last_primary_pointer_pos = Some(location);
+        pointer.motion(
+            self,
+            Some((surface.clone(), surface_origin)),
+            &smithay::input::pointer::MotionEvent {
+                location,
+                serial,
+                time: now_ms,
+            },
+        );
+        pointer.frame(self);
+        // Reflect client lock/cursor state into host shoes — do not force-activate.
+        self.sync_pointer_lock_for_surface(&surface);
+    }
+
     /// Re-seat the primary pointer after overlay→game (F12).
     ///
-    /// Always enters the game surface (needed for hide-only soft-cursor UIs).
-    /// When a lock/confine shoe exists, also activates it so FPS relative aim
-    /// works immediately without click-to-recapture.
+    /// Enters the game surface and restores a still-present lock/confine so FPS
+    /// relative aim works without click-to-recapture. Does not invent a lock the
+    /// client already unlocked (OW menu / character select).
     pub fn reactivate_primary_pointer_constraints(&mut self) {
         if !self.host_game_mode {
             return;
@@ -796,20 +925,22 @@ impl LotusWaylandState {
                 time: now_ms,
             },
         );
+        // Only re-activate when sticky shoes say the client still wants a lock
+        // (oneshot destroyed on a brief leave). Never force-activate a constraint
+        // the client explicitly unlocked for menu/character select.
         let mut activated = false;
+        let want_lock = self.last_emitted_pointer_lock;
         with_pointer_constraint(&surface, &pointer, |constraint| {
             if let Some(c) = constraint {
-                if !c.is_active() {
+                if want_lock && !c.is_active() {
                     c.activate();
                 }
                 activated = c.is_active();
             }
         });
         pointer.frame(self);
-        if activated || self.last_emitted_pointer_lock {
-            // Force host shoe re-wear after this enter. Sticky+Absent (oneshot
-            // destroyed on leave) still needs grab armed *after* seat focus, not
-            // before SetHostGameMode runs — otherwise relative aim hits an empty seat.
+        if activated {
+            // Force host shoe re-wear after seat enter (grab after focus).
             self.last_emitted_pointer_lock = false;
             self.emit_pointer_lock(true);
         } else {
@@ -1063,20 +1194,15 @@ impl LotusWaylandState {
                     time: now_ms,
                 },
             );
-            // Re-activate lock/confine after enter only for the game seat. Overlay
-            // must never re-arm a game constraint (steals Discord clicks/cursors).
-            if allow_constraints {
-                with_pointer_constraint(&surface, &pointer, |constraint| {
-                    if let Some(c) = constraint {
-                        if !c.is_active() {
-                            c.activate();
-                        }
-                    }
-                });
-            }
             pointer.frame(self);
         }
         if allow_constraints {
+            // Reflect client lock/unlock only — do not force-activate here.
+            // Blind activate() on every motion re-armed OW/RoR2 after they
+            // unlocked for menus / hero select, leaving the host grab sticky
+            // (relative-only, no absolute/custom cursor until restart).
+            // F12 return re-arms via reactivate_primary_pointer_constraints;
+            // fresh locks activate in PointerConstraintsHandler::new_constraint.
             self.sync_pointer_lock_for_surface(&surface);
         }
     }
@@ -1251,15 +1377,18 @@ impl CompositorHandler for LotusWaylandState {
                 .current_cursor_surface
                 .as_ref()
                 .is_some_and(|s| s == surface);
+        // GTK commits the cursor wl_surface before wl_pointer.set_cursor assigns
+        // CURSOR_IMAGE_ROLE. That commit has no role and a pointer-sized SHM
+        // buffer. Importing it as the pane frame stretches the cursor image to
+        // the window for 1–2 frames — the screen-tall flash when the pointer
+        // enters Ghostty off a resize grip.
+        if !is_active_cursor && Self::is_unroled_pointer_buffer(surface) {
+            Self::take_frame_callbacks(surface, &self.pending_frame_callbacks);
+            return;
+        }
+
         if is_active_cursor {
-            with_states(surface, |states| {
-                let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-                let current = attrs.current();
-                if !current.frame_callbacks.is_empty() {
-                    let mut cbs = self.pending_frame_callbacks.lock().unwrap();
-                    cbs.extend(std::mem::take(&mut current.frame_callbacks));
-                }
-            });
+            Self::take_frame_callbacks(surface, &self.pending_frame_callbacks);
             self.current_cursor_surface = Some(surface.clone());
             match Self::cursor_from_surface(surface) {
                 Some(cursor) => self.emit_cursor(cursor),
@@ -1455,9 +1584,18 @@ impl CompositorHandler for LotusWaylandState {
                 };
                 let wake = if is_primary {
                     crate::pacing::note_primary_game_commit();
-                    // Constraint may have been destroyed without motion — refresh shoes.
-                    if let Some(focus) = self.last_pointer_focus.clone() {
-                        self.sync_pointer_lock_for_surface(&focus);
+                    // Constraint may have been destroyed without motion — refresh
+                    // shoes from the primary surface (not Discord hover focus).
+                    if let Some(primary) = {
+                        let panes = self.pane_registrations.lock();
+                        panes
+                            .iter()
+                            .find(|p| p.is_primary)
+                            .map(|p| p.pane_id.clone())
+                    } {
+                        if let Some(surface) = self.surface_for_pane(&primary) {
+                            self.sync_pointer_lock_for_surface(&surface);
+                        }
                     }
                     true
                 } else if !self.host_game_mode {

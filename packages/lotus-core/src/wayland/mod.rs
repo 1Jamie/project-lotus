@@ -78,6 +78,8 @@ pub enum WaylandCommand {
     ClearKeyboardFocus,
     /// Drop pointer focus so overlay clients get wl_pointer.leave (Electron blur).
     ClearPointerFocus,
+    /// Restore pointer focus on the primary game without forcing constraints.
+    ReseatPrimaryPointerFocus,
     /// xdg_toplevel Activated / X11 set_activated for a pane's surfaces.
     SetPaneActivated { pane_id: String, activated: bool },
     /// Host atrium game-mode flag — nested clients must not steal Activated while true.
@@ -108,6 +110,11 @@ pub struct PaneRegistration {
 /// Decouples game frametimes from Lotus DOM layout transactions.
 pub struct ExternalSurfaceSlot {
     pub current_texture: Option<glow::Texture>,
+    /// EGLImageKHR backing `current_texture` for DMA-BUF imports (0 = none).
+    /// Stored as usize so the slot stays `Send` across the nest threads.
+    /// Must be destroyed with the texture — each import used to leak both and
+    /// climb host anon RSS (~11MB/min under SoftFifo at game Hz).
+    pub current_egl_image: usize,
     pub target: u32,
     pub is_external_oes: bool,
     pub width: u32,
@@ -138,6 +145,7 @@ impl Default for ExternalSurfaceSlot {
     fn default() -> Self {
         Self {
             current_texture: None,
+            current_egl_image: 0,
             target: glow::TEXTURE_2D,
             is_external_oes: false,
             width: 0,
@@ -681,27 +689,23 @@ impl LotusWaylandServer {
                         };
                         if enabled {
                             // Deactivate overlays so Discord emits session-bus Notify.
+                            // Game nest seat stays independent — only plugins lose Activated.
                             for id in &overlay_ids {
                                 state.set_pane_activated(id, false);
                             }
                             state.clear_keyboard_focus();
-                            state.clear_pointer_focus();
-                            // F12 overlay→game: always re-enter the primary pointer.
-                            // Lock shoe → activate constraint (FPS aim, no click-to-recapture).
-                            // Hide-only soft-cursor (RoR2 menus) → enter so absolute motion
-                            // is not dropped on an empty seat until the first CursorMoved.
+                            // Affirm primary pointer (may already be seated from overlay).
                             state.reactivate_primary_pointer_constraints();
                         } else {
                             // Leaving game mode: clear Suspended so Chromium can paint again.
                             // App activates visible overlays; we only unstick Suspended here.
+                            // Do NOT clear primary pointer focus or deactivate game constraints —
+                            // the game keeps its own live seat so cursor/lock shoes stay in sync
+                            // while the host wears overlay shoes.
                             for id in &overlay_ids {
                                 state.unsuspend_pane(id);
                             }
-                            // Drop any active game pointer-constraint at the seat so overlay
-                            // input is not fighting a lock. Host sticky shoes in app.rs still
-                            // remember to re-wear grab/cursor when game mode returns.
-                            state.deactivate_primary_pointer_constraints();
-                            state.clear_pointer_focus();
+                            state.reseat_primary_pointer_focus();
                         }
                     }
                     WaylandCommand::AddPaneListener { pane_id, socket } => {
@@ -864,6 +868,9 @@ impl LotusWaylandServer {
                     }
                     WaylandCommand::ClearPointerFocus => {
                         state.clear_pointer_focus();
+                    }
+                    WaylandCommand::ReseatPrimaryPointerFocus => {
+                        state.reseat_primary_pointer_focus();
                     }
                     WaylandCommand::SetPaneActivated { pane_id, activated } => {
                         state.set_pane_activated(&pane_id, activated);
@@ -1083,6 +1090,12 @@ impl LotusWaylandServer {
         let _ = self.command_sender.send(WaylandCommand::ClearPointerFocus);
     }
 
+    pub fn reseat_primary_pointer_focus(&self) {
+        let _ = self
+            .command_sender
+            .send(WaylandCommand::ReseatPrimaryPointerFocus);
+    }
+
     pub fn set_host_game_mode(&self, enabled: bool) {
         let _ = self.command_sender.send(WaylandCommand::SetHostGameMode { enabled });
     }
@@ -1179,11 +1192,35 @@ impl LotusWaylandServer {
         if seq == 0 {
             return;
         }
+        let waiting_before = self
+            .vsync_latches
+            .get(&surface_id)
+            .map(|l| l.waiting())
+            .unwrap_or(0);
         let latch = self.vsync_latches.entry(surface_id).or_default();
         if !latch.push(seq, frame) {
             debug!(
                 "[lotus-nest] vsync dropped surface {surface_id} seq {seq} (not newer than the frame already accepted)"
             );
+            return;
+        }
+        let waiting_after = latch.waiting();
+        if std::env::var_os("ATRIUM_MEM_DIAG").is_some() && waiting_before >= 2 {
+            static LAST_LATCH_LOG: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let prev = LAST_LATCH_LOG.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(prev) >= 2 {
+                LAST_LATCH_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    "[lotus-mem] vsync_latch surface={surface_id} \
+                     waiting {waiting_before}->{waiting_after} surfaces={}",
+                    self.vsync_latches.len()
+                );
+            }
         }
     }
 
@@ -1399,6 +1436,7 @@ impl LotusWaylandServer {
                         }
                     };
 
+                    let mut applied = false;
                     if let Some((pane_id, is_primary, slot, active_sid)) = pane_info {
                         let mut apply = true;
                         if is_primary {
@@ -1422,17 +1460,27 @@ impl LotusWaylandServer {
                         }
 
                         if apply {
-                            let mut guard = slot.lock();
-                            guard.current_texture = Some(imported.texture);
-                            guard.target = imported.target;
-                            guard.is_external_oes = imported.is_external_oes;
-                            guard.width = imported.width;
-                            guard.height = imported.height;
-                            guard.y_inverted = imported.y_inverted;
+                            // Drop the previous DMA import once — pane slot and the
+                            // primary default slot share the same GL texture name.
+                            let image_bits = imported.egl_image as usize;
+                            let (old_tex, old_image) = {
+                                let mut guard = slot.lock();
+                                let old_tex = guard.current_texture.take();
+                                let old_image = guard.current_egl_image;
+                                guard.current_egl_image = image_bits;
+                                guard.current_texture = Some(imported.texture);
+                                guard.target = imported.target;
+                                guard.is_external_oes = imported.is_external_oes;
+                                guard.width = imported.width;
+                                guard.height = imported.height;
+                                guard.y_inverted = imported.y_inverted;
+                                (old_tex, old_image)
+                            };
 
                             if is_primary {
                                 let mut def_guard = self.slot.lock();
                                 def_guard.current_texture = Some(imported.texture);
+                                def_guard.current_egl_image = image_bits;
                                 def_guard.target = imported.target;
                                 def_guard.is_external_oes = imported.is_external_oes;
                                 def_guard.width = imported.width;
@@ -1443,6 +1491,17 @@ impl LotusWaylandServer {
                                 }
                             }
 
+                            unsafe {
+                                use glow::HasContext;
+                                if let Some(tex) = old_tex {
+                                    gl.delete_texture(tex);
+                                }
+                            }
+                            if old_image != 0 {
+                                self.importer
+                                    .destroy_image(old_image as *mut std::ffi::c_void);
+                            }
+
                             if !dirty_panes.contains(&pane_id) {
                                 dirty_panes.push(pane_id.clone());
                                 presented_slots.push((pane_id, is_primary, slot.clone()));
@@ -1450,7 +1509,15 @@ impl LotusWaylandServer {
                             self.note_vsync_frame(surface_id, commit_seq);
                             self.presentation_handoff.latch_surface(surface_id);
                             latched_feedback = true;
+                            applied = true;
                         }
+                    }
+                    if !applied {
+                        unsafe {
+                            use glow::HasContext;
+                            gl.delete_texture(imported.texture);
+                        }
+                        self.importer.destroy_image(imported.egl_image);
                     }
                 }
                 Err(e) => {
@@ -1464,6 +1531,14 @@ impl LotusWaylandServer {
         }
 
         for (surface_id, (commit_seq, width, height, _stride, data)) in latest_shms {
+            // Pointer images are ≤128px. A cursor commit that raced set_cursor
+            // must not replace the pane texture (it would scale to the window).
+            if width > 0 && height > 0 && width <= 128 && height <= 128 {
+                if commit_seq > 0 {
+                    self.presentation_handoff.discard_oldest(surface_id);
+                }
+                continue;
+            }
             let mut latched_feedback = false;
             let pane_info = {
                 let s2p = self.surface_to_pane.lock();

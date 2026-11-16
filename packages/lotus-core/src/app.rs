@@ -581,6 +581,8 @@ impl LotusApp {
                 if let Some(proxy) = EVENT_LOOP_PROXY.get() {
                     crate::evdev_pad::ensure_started(window_id.to_string(), proxy.clone());
                 }
+                // overlay = !game_mode. Closing must force EVIOCGRAB release so
+                // pad→game resumes; opening grabs for shell Nav.
                 crate::evdev_pad::set_overlay_mode(!next);
                 if next {
                     crate::evdev_pad::set_key_forward_pane(None);
@@ -610,6 +612,11 @@ impl LotusApp {
                 }),
             );
             return false;
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(instance) = self.windows.get_mut(window_id) {
+            nest_note_input_device(instance, &self.callback, window_id, "controller");
         }
 
         let spatial = crate::evdev_pad::spatial_focus_pane();
@@ -944,33 +951,45 @@ fn overlay_resize_handle_cursor(
             pane_accepts_pointer_input,
             |p| overlay_resize_pane_rect(instance, p, scale_factor),
         ) {
-            let was = instance.overlay_resize_hover.clone();
-            instance.overlay_resize_hover = Some((pid, edge));
-            // Entering a grip: host ColResize/RowResize must beat the nested client's
-            // last arrow. Clear the applied flag so leaving can re-sync the client cursor.
+            let entering = instance.overlay_resize_hover.as_ref().map(|(p, e)| (p.as_str(), *e))
+                != Some((pid.as_str(), edge));
+            instance.overlay_resize_hover = Some((pid.clone(), edge));
+            // Host ColResize/RowResize must beat any nested client arrow.
             #[cfg(target_os = "linux")]
             {
                 instance.nested_cursor_applied = false;
+                if entering {
+                    // Same flash class as overlay-open: wallpaper reseat leaves the
+                    // nest seat on primary, so the game soft-cursor keeps painting
+                    // inside the upscaled Fill (full-host tall) while we wear the
+                    // grip shoe. Clear primary, then seat the overlay pane under
+                    // the grip so leave→content never re-enters the game for a frame.
+                    if let Some(ref ws) = instance.nested_compositor {
+                        ws.lock().clear_pointer_focus();
+                    }
+                    if let Some(pane) = instance.panes.get(&pid) {
+                        if let Some(ref ws) = pane.external_wayland_server.clone() {
+                            let (tx, ty) =
+                                nest_pointer_coords(instance, pane, point, scale_factor);
+                            ws.lock().send_pointer_motion_to_pane(&pid, tx, ty);
+                            instance.hover_pane_id = Some(pid.clone());
+                            instance.last_overlay_pointer = Some((pid.clone(), tx, ty));
+                        }
+                    }
+                }
             }
             instance.window.set_cursor(cursor_for_edge(edge));
-            let _ = was;
             return true;
         }
         if instance.overlay_resize_hover.take().is_some() {
-            // Leave grip → drop host resize cursor immediately. Nested re-sync happens
-            // on the subsequent nest_route_cursor_moved / pane hit path.
+            // Leave grip → same shoe swap as nest_apply_game_mode(overlay).
             #[cfg(target_os = "linux")]
             {
+                nest_clear_nested_cursor(instance);
+                instance.nested_cursor = None;
                 instance.nested_cursor_applied = false;
-                // Don't let nest_sync re-paint a stale CSD ColResize from the grip edge.
-                if instance
-                    .nested_cursor
-                    .as_ref()
-                    .is_some_and(nest_cursor_is_resize_shape)
-                {
-                    instance.nested_cursor = None;
-                }
             }
+            instance.window.set_cursor_visible(true);
             instance.window.set_cursor(winit::window::CursorIcon::Default);
         }
     }
@@ -1066,11 +1085,33 @@ fn nest_set_keyboard_focus(instance: &mut WindowInstance, pane_id: &str) {
     }
 }
 
-/// Enter/leave game-only input. Overlay uses click-to-focus; game mode always focuses the game.
-///
-/// Game cursor/lock "shoes" (`game_cursor`, `game_pointer_constraint_active`, …) are a
-/// snapshot: overlay never wipes them, and never feeds the game pointer just to keep
-/// them "live". Mode switches only put those shoes on/off the host seat.
+/// Notify atrium chrome when the active input device class changes (footer hints /
+/// hide controller focus ring). Only emits on transition to avoid IPC spam.
+#[cfg(target_os = "linux")]
+fn nest_note_input_device(
+    instance: &mut WindowInstance,
+    callback: &ThreadsafeFunction<(String, Vec<napi::bindgen_prelude::Buffer>), ErrorStrategy::Fatal>,
+    window_id: &str,
+    device: &str,
+) {
+    if instance.last_input_device.as_deref() == Some(device) {
+        return;
+    }
+    instance.last_input_device = Some(device.to_string());
+    push_host_ipc(
+        callback,
+        window_id,
+        "nest-input-device",
+        serde_json::json!({ "device": device }),
+    );
+}
+
+/// Enter/leave game-only *host* input. Two independent shoe sets:
+/// - Game nest seat stays live (pointer focus + constraints + cursor) so OW/menu
+///   state keeps updating `game_*` shoes while chrome is open.
+/// - Host window wears either game shoes or overlay shoes; swap only the host.
+/// Overlay plugins (Discord) are the ones that lose xdg Activated in game mode
+/// so desktop Notify still fires — the game can keep thinking it is focused.
 #[cfg(target_os = "linux")]
 fn nest_apply_game_mode(
     instance: &mut WindowInstance,
@@ -1089,8 +1130,8 @@ fn nest_apply_game_mode(
         // grab Activated (which would silence session-bus Notify).
         ws.lock().set_host_game_mode(mode);
     }
-    // Leaving game: wl_keyboard::leave (via clear focus) so clients release held keys
-    // that may have been forwarded before a host hotkey flipped mode (EC1).
+    // Leaving game: drop nest keyboard so overlay/Servo can type. Pointer seat
+    // on the primary stays put — tearing it down desynced OW cursor/lock shoes.
     if leaving_game {
         if let Some(ref ws) = instance.nested_compositor {
             ws.lock().clear_keyboard_focus();
@@ -1118,7 +1159,7 @@ fn nest_apply_game_mode(
             // Keyboard off overlays before re-seating the game.
             server.clear_keyboard_focus();
         }
-            if let Some(ref gid) = game_id {
+        if let Some(ref gid) = game_id {
             if instance.active_pane_id != *gid
                 && overlay_ids.iter().any(|id| id == &instance.active_pane_id)
             {
@@ -1126,20 +1167,18 @@ fn nest_apply_game_mode(
             }
             nest_set_keyboard_focus(instance, gid);
             if let Some(ref ws) = instance.nested_compositor {
-                // Re-seat pointer on the game; constraints/cursor refresh from here.
+                // Affirm primary pointer seat (may already be there from overlay).
                 ws.lock().focus_pane(gid);
             }
         }
         instance.hover_pane_id = None;
-        // Overlay visual cache must not leak back onto the game seat.
+        // Overlay visual cache must not leak back onto the game host shoes.
         instance.nested_cursor = None;
         for id in &overlay_ids {
             crate::dbus_notify::set_source_pane_visible(id, false);
         }
-        // Cursor shoe now. Host grab waits for NestedPointerLock after nest
-        // SetHostGameMode reactivate — wearing grab here races ahead of seat enter
-        // and left OW/RoR2 unbound until click/pause.
-        nest_wear_game_cursor_shoe(instance, event_loop);
+        // Wear the live game shoes on the host (nest seat never went cold).
+        nest_wear_game_pointer_shoes(instance, event_loop);
     } else {
         let game_id = instance.primary_game_pane.clone();
         let overlay_ids: Vec<String> = instance
@@ -1154,12 +1193,11 @@ fn nest_apply_game_mode(
         if nest_is_primary_game(instance, &instance.active_pane_id) {
             instance.active_pane_id.clear();
         }
-        // Leave the game surface so it stops highlighting under the overlay cursor.
-        // Activate *visible* overlays so Chromium resumes painting (game mode keeps
-        // them deactivated for Notify — that left Discord frozen after a match).
+        // Activate *visible* overlays so Chromium resumes painting. Do NOT clear
+        // primary pointer focus or deactivate game constraints — game shoes stay
+        // authoritative on the nest seat while host wears overlay shoes.
         if let Some(ref ws) = instance.nested_compositor {
             let server = ws.lock();
-            server.clear_pointer_focus();
             for id in &overlay_ids {
                 let visible = instance
                     .panes
@@ -1169,22 +1207,17 @@ fn nest_apply_game_mode(
                 server.set_pane_activated(id, visible);
             }
         }
-        // Take host shoes off for Discord/HUD — game_* snapshot stays as-is.
+        // Host overlay shoes only — nest game seat untouched.
         nest_release_host_pointer_grab(instance);
         nest_clear_nested_cursor(instance);
-        // Drop overlay visual cache so we never re-paint the game's Hidden/crosshair
-        // onto Discord before its own CursorChanged arrives.
         instance.nested_cursor = None;
-        // Host Default immediately — avoid one frame of a stale Custom cursor
-        // (or game software cursor) stretching across the upscaled nest.
         instance.window.set_cursor_visible(true);
         instance.window.set_cursor(CursorIcon::Default);
         instance.nested_cursor_applied = false;
-        // Kick a present so any pending Discord wl_callbacks are released.
         instance.force_scene_repaint = true;
         instance.window.request_redraw();
-        // Immediate enter+motion on overlay externals only — never the primary
-        // game (that re-armed software cursors / locks for a 1–2 frame flash).
+        // Route host cursor onto overlay chrome / Discord. Primary nest seat is
+        // restored after leaving a Discord hit so the game stays "focused".
         if let Some(el) = event_loop {
             let scale = instance.window.scale_factor() as f32;
             let point = instance.last_mouse_pos;
@@ -1213,7 +1246,11 @@ fn nest_apply_game_mode(
                         instance.hover_pane_id = Some(pane_id.clone());
                         nest_set_keyboard_focus(instance, &pane_id);
                         nest_sync_nested_cursor_for_hover(instance, Some(el), true);
+                    } else if let Some(ref ws) = instance.nested_compositor {
+                        ws.lock().reseat_primary_pointer_focus();
                     }
+                } else if let Some(ref ws) = instance.nested_compositor {
+                    ws.lock().reseat_primary_pointer_focus();
                 }
             } else if let Some(ref id) = instance.hover_pane_id.clone() {
                 nest_set_keyboard_focus(instance, id);
@@ -1284,6 +1321,12 @@ fn nest_sync_pointer_grab(instance: &mut WindowInstance) {
 }
 
 /// Record primary-game cursor into sticky shoes (never touches overlay Discord state).
+///
+/// Cursor visual and pointer-constraint shoes are independent. Overwatch's flow is
+/// documented (Xwayland: confine + hidden cursor → relative lock): custom → lock
+/// (load) → custom buffer again (hero select) → lock + hide (match). Clearing the
+/// lock shoe on a visible custom cursor desynced host grab from nest: match then
+/// hid without a fresh NestedPointerLock, leaving hidden+unlocked (no aim).
 #[cfg(target_os = "linux")]
 fn nest_record_game_cursor(instance: &mut WindowInstance, cursor: &crate::wayland::NestedCursor) {
     instance.game_cursor = Some(cursor.clone());
@@ -1313,13 +1356,19 @@ fn nest_wear_game_cursor_shoe(
 ///
 /// Hide-without-lock: suppress the host cursor chrome but keep absolute
 /// CursorMoved flowing (soft-cursor games). Lock shoe: grab + relative-only.
+///
+/// Xwayland locks relative motion when confined *and* the cursor is hidden —
+/// always hide the host cursor while the constraint shoe is on (OW match /
+/// load). Unlocked + custom paints the hero-select / menu cursor.
 #[cfg(target_os = "linux")]
 fn nest_wear_game_pointer_shoes(
     instance: &mut WindowInstance,
     event_loop: Option<&ActiveEventLoop>,
 ) {
     nest_sync_pointer_grab(instance);
-    if instance.host_pointer_grabbed {
+    if instance.host_pointer_grabbed || instance.game_pointer_constraint_active {
+        // Constraint shoe owns visibility: do not paint a stale Custom over a
+        // lock (that undoes Xwayland's hide→relative upgrade).
         instance.window.set_cursor_visible(false);
         instance.nested_cursor_applied = true;
         return;
@@ -1403,30 +1452,6 @@ fn nest_is_window_chrome_resize_cursor(icon: CursorIcon) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn nest_cursor_is_resize_shape(cursor: &crate::wayland::NestedCursor) -> bool {
-    match cursor {
-        crate::wayland::NestedCursor::Named(name) => {
-            // Classify before chrome remapping — nest_named_cursor_icon forces Default.
-            let raw = name
-                .parse::<CursorIcon>()
-                .unwrap_or_else(|_| match name.as_str() {
-                    "sb_h_double_arrow" | "h_double_arrow" | "col-resize" | "ew-resize" => {
-                        CursorIcon::ColResize
-                    }
-                    "sb_v_double_arrow" | "v_double_arrow" | "row-resize" | "ns-resize" => {
-                        CursorIcon::RowResize
-                    }
-                    "nesw-resize" => CursorIcon::NeswResize,
-                    "nwse-resize" => CursorIcon::NwseResize,
-                    _ => CursorIcon::Default,
-                });
-            nest_is_window_chrome_resize_cursor(raw)
-        }
-        _ => false,
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn nest_named_cursor_icon(name: &str) -> CursorIcon {
     let icon = name.parse::<CursorIcon>().unwrap_or_else(|_| match name {
         "dnd-ask" => CursorIcon::Copy,
@@ -1481,6 +1506,12 @@ fn nest_paint_host_cursor(
             hotspot_x,
             hotspot_y,
         } => {
+            if *width == 0 || *height == 0 {
+                instance.window.set_cursor_visible(true);
+                instance.window.set_cursor(CursorIcon::Default);
+                instance.nested_cursor_applied = true;
+                return;
+            }
             match CustomCursor::from_rgba(
                 rgba.clone(),
                 *width,
@@ -1557,15 +1588,16 @@ fn nest_route_cursor_moved(
     else {
         instance.hover_pane_id = None;
         nest_clear_nested_cursor(instance);
-        // Over empty/game wallpaper — drop seat focus once. Do not reseat the game
-        // (that re-armed locks/Hidden cursors and stole Discord clicks).
+        // Over empty/game wallpaper — leave Discord, reseat primary so the game
+        // nest seat stays live (independent game shoes keep syncing).
         if prev_was_external {
             if let Some(ref ws) = instance.nested_compositor {
-                ws.lock().clear_pointer_focus();
+                ws.lock().reseat_primary_pointer_focus();
             }
         }
         return;
     };
+    let entered = prev_hover.as_deref() != Some(hover_id.as_str());
     instance.hover_pane_id = Some(hover_id.clone());
     let hovering_primary = instance.primary_game_pane.as_deref() == Some(hover_id.as_str());
     let external_motion = instance.panes.get(&hover_id).and_then(|pane| {
@@ -1577,29 +1609,32 @@ fn nest_route_cursor_moved(
         Some((ws, tx, ty))
     });
     if let Some((ws, tx, ty)) = external_motion {
-        // Overlay must never feed the primary game — a leave-mode hit on the
-        // Fill wallpaper re-entered OW/etc and flashed a software cursor scaled
-        // to the full host for 1–2 frames.
+        // Overlay must never feed host motion into the primary game — nest seat
+        // stays on primary unless Discord (or another overlay external) needs it.
         if hovering_primary {
             instance.hover_pane_id = None;
             nest_clear_nested_cursor(instance);
-            if prev_was_external {
-                if let Some(ref nest) = instance.nested_compositor {
-                    nest.lock().clear_pointer_focus();
-                }
+            if let Some(ref nest) = instance.nested_compositor {
+                nest.lock().reseat_primary_pointer_focus();
             }
             return;
+        }
+        // Seat WL keyboard when the pointer enters an external TUI (Ghostty) so
+        // typing works without an extra click after dock focus / F9.
+        if entered {
+            nest_set_keyboard_focus(instance, &hover_id);
         }
         ws.lock().send_pointer_motion_to_pane(&hover_id, tx, ty);
         instance.last_overlay_pointer = Some((hover_id.clone(), tx, ty));
         nest_sync_nested_cursor_for_hover(instance, Some(event_loop), true);
         return;
     }
-    // Left nested overlay surface → Servo/HUD owns the cursor. Keep the game off-seat.
+    // Left nested overlay surface → Servo/HUD owns the host cursor. Reseat the
+    // game nest pointer so OW cursor/lock shoes keep updating under chrome.
     nest_clear_nested_cursor(instance);
     if prev_was_external {
         if let Some(ref ws) = instance.nested_compositor {
-            ws.lock().clear_pointer_focus();
+            ws.lock().reseat_primary_pointer_focus();
         }
     }
     let (px, py, pw, ph, is_external, wayland, translated) =
@@ -2682,9 +2717,17 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             }
             #[cfg(target_os = "linux")]
             if window.force_scene_repaint && viewable {
-                // Host upscale / mode changes must not wait on SoftFifo idle.
-                any_needs_repaint = true;
-                reason = "force_scene_repaint".into();
+                // Host upscale / mode changes piggyback on SoftFifo gate — never
+                // free-run presents between deadlines (mailbox hitch rewind).
+                if soft_fifo_active {
+                    if crate::pacing::soft_fifo_gate_due() {
+                        any_needs_repaint = true;
+                        reason = "force_scene_repaint (soft_fifo gate)".into();
+                    }
+                } else {
+                    any_needs_repaint = true;
+                    reason = "force_scene_repaint".into();
+                }
             } else if window.overlay_dirty && viewable {
                 // Under SoftFifo+GameActive, piggyback on the gate — do not let
                 // overlay_dirty free-run presents at panel Hz (60→120 regression).
@@ -3348,6 +3391,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     #[cfg(target_os = "linux")]
                     nested_cursor_applied: false,
                     #[cfg(target_os = "linux")]
+                    last_input_device: None,
+                    #[cfg(target_os = "linux")]
                     nested_compositor: None,
                     #[cfg(target_os = "linux")]
                     pacing_policy: crate::pacing::resolve_pacing_policy(),
@@ -3750,24 +3795,19 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         if instance.game_mode {
                             nest_wear_game_pointer_shoes(instance, Some(event_loop));
                         }
-                    } else if !instance.game_mode {
-                        // Host owns overlay grip cursor — stash only, don't clobber ColResize.
-                        if instance.overlay_resize_hover.is_some()
-                            || instance.active_overlay_resize.is_some()
-                        {
-                            instance.nested_cursor = Some(cursor);
-                        } else {
-                            // Discord/overlay visual only — never clobber game shoes.
-                            nest_paint_host_cursor(instance, event_loop, &cursor);
-                        }
+                    } else if !instance.game_mode
+                        && instance.overlay_resize_hover.is_none()
+                        && instance.active_overlay_resize.is_none()
+                    {
+                        nest_paint_host_cursor(instance, event_loop, &cursor);
                     }
                 }
             }
             #[cfg(target_os = "linux")]
             EngineCommand::NestedPointerLock { window_id, active } => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
-                    // Sticky game shoe — survives overlay; host grab only in game mode.
-                    // Overlay never arms host grab from this (seat constraints are suspended).
+                    // Lock shoe is independent of cursor visual (OW: custom under
+                    // load lock, then hide for match). Host grab only in game mode.
                     instance.game_pointer_constraint_active = active;
                     if instance.game_mode {
                         nest_wear_game_pointer_shoes(instance, Some(event_loop));
@@ -4512,6 +4552,11 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // overlay = !game_mode — always re-assert so a JS mode
                         // desync cannot leave EVIOCGRAB stuck after "return to game".
                         crate::evdev_pad::set_overlay_mode(!mode);
+                        if !mode {
+                            // Overlay: retry EVIOCGRAB so Proton/SDL cannot keep
+                            // reading pads if the first grab raced Steam Input.
+                            crate::evdev_pad::retry_overlay_grabs();
+                        }
                         if mode {
                             crate::evdev_pad::set_key_forward_pane(None);
                         }
@@ -5052,7 +5097,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
             },
             EngineCommand::FocusPane(window_id, pane_id) => {
                 if let Some(instance) = self.windows.get_mut(&window_id) {
-                    instance.active_pane_id = pane_id;
+                    // External nest panes (Ghostty/Discordo) need WL keyboard seat
+                    // focus, not just sticky active_pane_id — otherwise clicks work
+                    // but keystrokes never reach the client after dock F9 / focus().
+                    #[cfg(target_os = "linux")]
+                    nest_set_keyboard_focus(instance, &pane_id);
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        instance.active_pane_id = pane_id;
+                    }
                 }
             },
             #[cfg(target_os = "linux")]
@@ -5498,21 +5551,24 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             #[cfg(target_os = "linux")]
                             nest_finish_nested_redraw(instance, nested_gen_at_start);
                         } else {
-                        // SoftFifo not due yet: skip paint/composite/swap so nest
-                        // commits cannot free-run the mailbox at panel Hz. Never
-                        // drop force_scene_repaint (host upscale swaps) or overlay
-                        // chrome dirty — those must reach composite; SoftFifo still
-                        // gates the actual eglSwapBuffers.
+                        // SoftFifo not due yet: skip paint/composite/swap entirely.
+                        // Leave NESTED_REDRAW_PENDING set so commits coalesce; about_to_wait
+                        // WaitUntil requests redraw when the gate is due. force_scene_repaint
+                        // / overlay_dirty piggyback on that same gate — bypassing it here
+                        // free-ran the mailbox (hitch / one-frame rewind).
                         #[cfg(target_os = "linux")]
                         if crate::pacing::fixed_software_fifo(instance)
                             && crate::pacing::present_activity(instance)
                                 == crate::pacing::PresentActivity::GameActive
                             && !crate::pacing::soft_fifo_gate_due()
-                            && !instance.force_scene_repaint
-                            && !instance.overlay_dirty
                         {
-                            if let Some(servo) = &self.servo {
-                                servo.spin_event_loop();
+                            // ATRIUM_NO_SOFT_SPIN=1 — leak A/B: skip Servo spin on
+                            // early SoftFifo wakes (MozJS arenas climbed ~11MB/min
+                            // with no plugins when spinning every spare redraw).
+                            if std::env::var_os("ATRIUM_NO_SOFT_SPIN").is_none() {
+                                if let Some(servo) = &self.servo {
+                                    servo.spin_event_loop();
+                                }
                             }
                             return;
                         }
@@ -5693,30 +5749,41 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 }
                             }
 
-                            // Overlay chrome dirty: skip nest DMA-BUF import this turn so
-                            // Servo focus/paint can present without waiting on nest. Nest
-                            // events stay queued and catch up on the next non-chrome redraw.
+                            // Always import nest DMA-BUFs before composite. Skipping while
+                            // overlay_dirty left the mailbox on a stale sample then jumped
+                            // on the next gate (hitch / one-frame rewind feel).
                             #[cfg(target_os = "linux")]
-                            if instance.game_mode || !instance.overlay_dirty {
-                                if let Some(ref ws) = instance.nested_compositor {
-                                    let mut server = ws.lock();
-                                    let dirty_panes = server.pump_frames(&instance.gl);
-                                    for pid in dirty_panes {
-                                        if let Some(p) = instance.panes.get_mut(&pid) {
-                                            p.is_dirty = true;
-                                            // scene_needs_present keys off frame_seq — without
-                                            // this, imported DMA-BUFs update the slot texture but
-                                            // the host skips composite/present until a resize.
-                                            p.frame_seq = p.frame_seq.wrapping_add(1);
-                                        }
+                            if let Some(ref ws) = instance.nested_compositor {
+                                let mut server = ws.lock();
+                                let dirty_panes = server.pump_frames(&instance.gl);
+                                for pid in dirty_panes {
+                                    if let Some(p) = instance.panes.get_mut(&pid) {
+                                        p.is_dirty = true;
+                                        // scene_needs_present keys off frame_seq — without
+                                        // this, imported DMA-BUFs update the slot texture but
+                                        // the host skips composite/present until a resize.
+                                        p.frame_seq = p.frame_seq.wrapping_add(1);
                                     }
                                 }
                             }
 
                             #[cfg(target_os = "linux")]
                             {
-                                let should_send_stats = instance.last_stats_send
-                                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(100))
+                                // ATRIUM_NO_GAME_STATS=1 — leak A/B: skip host stats push.
+                                // (ATRIUM_NO_STATS_IPC is JS-only: skips plugin executeScript.)
+                                let stats_disabled =
+                                    std::env::var_os("ATRIUM_NO_GAME_STATS").is_some();
+                                // 250ms matches plugin HUD flush; 100ms host push was
+                                // enough traffic to climb anon RSS on its own (~13MB/min).
+                                let stats_interval_ms: u64 = std::env::var("ATRIUM_STATS_INTERVAL_MS")
+                                    .ok()
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(250);
+                                let should_send_stats = !stats_disabled
+                                    && instance.last_stats_send.map(|t| {
+                                        t.elapsed()
+                                            >= std::time::Duration::from_millis(stats_interval_ms)
+                                    })
                                     .unwrap_or(true);
                                 if should_send_stats {
                                     instance.last_stats_send = Some(std::time::Instant::now());
@@ -5770,9 +5837,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                                 instance.refresh_rate_millihertz as f32 / 1000.0;
                                             let activity =
                                                 crate::pacing::present_activity(instance);
-                                            push_renderer_ipc(
+                                            // Host IPC — not Servo WS. Routing stats through
+                                            // the shell renderer (~10Hz) climbed anon RSS
+                                            // (~15MB/min) via MozJS; nest-hotkey already
+                                            // uses this path. Node listens on
+                                            // atrium-forward-stats (same as the old shell hop).
+                                            push_host_ipc(
+                                                &self.callback,
                                                 &uuid,
-                                                "atrium-game-stats",
+                                                "atrium-forward-stats",
                                                 serde_json::json!({
                                                     "fps": fps,
                                                     "frametime_ms": frametime_ms,
@@ -6281,6 +6354,12 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
 
                         #[cfg(target_os = "linux")]
                         if nest_in_overlay_input_mode(instance) {
+                            nest_note_input_device(
+                                instance,
+                                &self.callback,
+                                &uuid,
+                                "mouse",
+                            );
                             nest_route_cursor_moved(
                                 instance,
                                 event_loop,
@@ -7564,6 +7643,15 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                         // Overlay / normal lotus: sticky click focus only. Never follow
                         // hover onto the game (that was sending keys into the game whenever
                         // the cursor left Discord onto the wallpaper).
+                        #[cfg(target_os = "linux")]
+                        if nest_in_overlay_input_mode(instance) {
+                            nest_note_input_device(
+                                instance,
+                                &self.callback,
+                                &uuid,
+                                "keyboard",
+                            );
+                        }
                         #[cfg(target_os = "linux")]
                         let keyboard_pane_id = {
                             let id = instance.active_pane_id.clone();

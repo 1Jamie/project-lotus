@@ -349,11 +349,11 @@ impl RemotePaneConsumer {
 
         // 3. Upload verified frame to OpenGL texture.
         //
-        // NEVER set GL_UNPACK_ROW_LENGTH here. LotusPaneContext / Servo / WebRender share
-        // this window GL context; a non-zero unpack row length makes Webrender's next
-        // texture upload compute src_size with our SHM stride and assert:
-        //   src_size <= len * size_of::<T>()  (webrender gl.rs).
-        // Instead, tightly pack RGBA rows when SHM stride has padding.
+        // LotusPaneContext / Servo / WebRender share this window GL context. A
+        // leaked non-zero GL_UNPACK_ROW_LENGTH makes Webrender assert on its next
+        // upload (src_size vs len). We set ROW_LENGTH only for this upload when
+        // SHM pitch > tight RGBA stride, then always restore 0 before returning —
+        // avoiding a full-frame pack Vec that drove anonymous RSS under SoftFifo.
         //
         // While preserve_display: upload to staging so composite keeps last-good.
         // Steady state: upload straight to display (and drop stale staging).
@@ -399,26 +399,24 @@ impl RemotePaneConsumer {
             }
 
             // Ensure default unpack state before upload (in case a prior caller leaked).
-            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            // Prefer UNPACK_ROW_LENGTH over packing a full-frame Vec every upload —
+            // that copy was a major anonymous-RSS climb under SoftFifo (~HUD Hz).
+            // Always restore ROW_LENGTH to 0 before returning (Servo/WebRender share
+            // this GL context — see note above about never leaving it set).
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-
-            let packed: Vec<u8>;
-            let upload_slice: &[u8] = if validated.stride == tight_stride {
-                std::slice::from_raw_parts(pixel_ptr, tight_stride.saturating_mul(height))
+            let row_pixels = (validated.stride / 4) as i32;
+            if validated.stride != tight_stride {
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, row_pixels);
             } else {
-                packed = {
-                    let mut buf = Vec::with_capacity(tight_stride.saturating_mul(height));
-                    for y in 0..height {
-                        let row = std::slice::from_raw_parts(
-                            pixel_ptr.add(y.saturating_mul(validated.stride)),
-                            tight_stride,
-                        );
-                        buf.extend_from_slice(row);
-                    }
-                    buf
-                };
-                packed.as_slice()
-            };
+                gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+            }
+            // Last row may omit trailing pitch padding — size covers height rows of stride.
+            let upload_bytes = validated
+                .stride
+                .saturating_mul(height.saturating_sub(1))
+                .saturating_add(tight_stride);
+            let upload_slice =
+                std::slice::from_raw_parts(pixel_ptr, upload_bytes);
 
             // Reallocate texture surface if dimensions changed or if this is the first upload.
             if is_new || prev_w != validated.width || prev_h != validated.height {
@@ -446,6 +444,7 @@ impl RemotePaneConsumer {
                     glow::PixelUnpackData::Slice(Some(upload_slice)),
                 );
             }
+            gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
             gl.bind_texture(glow::TEXTURE_2D, None);
 
             if hold {

@@ -946,6 +946,9 @@ pub struct WindowInstance {
     /// True while the host cursor is showing a nested visual (vs Servo/HUD default).
     #[cfg(target_os = "linux")]
     pub nested_cursor_applied: bool,
+    /// Last host input class for atrium chrome (`mouse` | `keyboard` | `controller`).
+    #[cfg(target_os = "linux")]
+    pub last_input_device: Option<String>,
     #[cfg(target_os = "linux")]
     pub nested_compositor: Option<Arc<parking_lot::Mutex<crate::wayland::LotusWaylandServer>>>,
     /// Output-scoped VRR vs fixed-VSync presentation clock.

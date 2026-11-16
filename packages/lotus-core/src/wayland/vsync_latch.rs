@@ -40,14 +40,22 @@ impl<T> VsyncFrameLatch<T> {
         self.pending.len()
     }
 
+    /// SoftFifo may enqueue every commit; without a cap a fast client (or a
+    /// stalled presenter) retains unbounded SHM/DMA frames in anonymous RAM.
+    const MAX_PENDING: usize = 3;
+
     /// Queue `frame` if `seq` is strictly newer than the accepted frame and not
     /// already pending. Returns false when the frame would roll backward.
+    /// When the queue is full, the oldest pending frame is dropped (skip-ahead).
     pub fn push(&mut self, seq: u64, frame: T) -> bool {
         if seq == 0 || seq <= self.accepted_seq {
             return false;
         }
         if self.pending.iter().any(|(existing, _)| *existing == seq) {
             return false;
+        }
+        while self.pending.len() >= Self::MAX_PENDING {
+            let _ = self.pending.pop_front();
         }
         let idx = self
             .pending
@@ -120,10 +128,18 @@ impl<T> VsyncBufferHolds<T> {
             .unwrap_or(self.displayed_seq)
     }
 
+    /// Cap in-flight holds. SoftFifo pins the scanned-out buffer plus at most
+    /// a couple queued; without a bound, missed `release_before` calls retain
+    /// every wl_buffer forever.
+    const MAX_HOLDS: usize = 4;
+
     pub fn push_new(&mut self, frame: T) -> u64 {
         self.next_seq = self.next_seq.saturating_add(1);
         let seq = self.next_seq;
         self.holds.push_back((seq, frame));
+        while self.holds.len() > Self::MAX_HOLDS {
+            let _ = self.holds.pop_front();
+        }
         seq
     }
 
@@ -155,7 +171,8 @@ mod tests {
     #[test]
     fn presents_in_order_and_holds_when_the_next_frame_is_late() {
         let mut latch = VsyncFrameLatch::new();
-        for seq in 1..=5 {
+        // Cap drops the oldest when the queue is deep — push within the cap.
+        for seq in 1..=3 {
             assert!(latch.push(seq, seq));
         }
         let mut shown = Vec::new();
@@ -175,7 +192,20 @@ mod tests {
                 assert_eq!(latch.accepted_seq(), *shown.last().unwrap());
             }
         }
-        assert_eq!(shown, vec![1, 2, 3, 4, 5]);
+        assert_eq!(shown, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn drops_oldest_when_pending_cap_is_hit() {
+        let mut latch = VsyncFrameLatch::new();
+        for seq in 1..=5 {
+            assert!(latch.push(seq, seq));
+        }
+        assert_eq!(latch.waiting(), 3);
+        assert_eq!(latch.pop_next(), Some((3, 3)));
+        assert_eq!(latch.pop_next(), Some((4, 4)));
+        assert_eq!(latch.pop_next(), Some((5, 5)));
+        assert_eq!(latch.pop_next(), None);
     }
 
     #[test]
