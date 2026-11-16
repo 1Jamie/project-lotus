@@ -2038,6 +2038,78 @@ class Pane extends EventEmitter {
     }
 
     /**
+     * Move the dock quad. `durationMs: 0` (default) snaps via setRect and configures
+     * Servo / nested clients. A non-zero duration tweens visually (texture scales into
+     * the animating quad) and configures once at the destination.
+     * @param {number} x
+     * @param {number} y
+     * @param {number} width
+     * @param {number} height
+     * @param {{ durationMs?: number }} [opts]
+     * @returns {Promise<void>}
+     */
+    movePane(x, y, width, height, opts = {}) {
+        const durationMs = Math.max(0, Number(opts.durationMs) || 0);
+        const tx = Number(x) || 0;
+        const ty = Number(y) || 0;
+        const tw = Math.max(1, Number(width) || 1);
+        const th = Math.max(1, Number(height) || 1);
+
+        if (durationMs <= 0) {
+            this.setRect(tx, ty, tw, th);
+            return Promise.resolve();
+        }
+
+        if (this._movePaneTimer) {
+            clearTimeout(this._movePaneTimer);
+            this._movePaneTimer = null;
+        }
+
+        const from = {
+            x: this._layout?.x ?? tx,
+            y: this._layout?.y ?? ty,
+            width: this._layout?.width ?? tw,
+            height: this._layout?.height ?? th,
+        };
+        const start = Date.now();
+        const handle = this.window && this.window.handle;
+        const hasVisual =
+            handle && typeof handle.setPaneRectVisual === 'function';
+
+        return new Promise((resolve) => {
+            const tick = () => {
+                const t = Math.min(1, (Date.now() - start) / durationMs);
+                // Ease-out quad.
+                const e = 1 - (1 - t) * (1 - t);
+                const cx = from.x + (tx - from.x) * e;
+                const cy = from.y + (ty - from.y) * e;
+                const cw = from.width + (tw - from.width) * e;
+                const ch = from.height + (th - from.height) * e;
+                if (this._layout) {
+                    this._layout.x = cx;
+                    this._layout.y = cy;
+                    this._layout.width = cw;
+                    this._layout.height = ch;
+                    this._layout.anchor = Anchor.None;
+                }
+                if (t >= 1) {
+                    this._movePaneTimer = null;
+                    this.setRect(tx, ty, tw, th);
+                    resolve();
+                    return;
+                }
+                if (hasVisual) {
+                    handle.setPaneRectVisual(this.id, cx, cy, cw, ch);
+                } else {
+                    this.setRect(cx, cy, cw, ch);
+                }
+                this._movePaneTimer = setTimeout(tick, 16);
+            };
+            tick();
+        });
+    }
+
+    /**
      * Fixed client resolution for decoupled external panes (`clientSizing: { width, height }`).
      * No-op when the pane follows the dock.
      */

@@ -260,7 +260,7 @@ program
     .command('build')
     .description('Build the application for production')
     .option('--platform <platform>', 'Target platform (linux, win32)', process.platform)
-    .option('--target <target>', 'Target format (deb, rpm, appimage, pacman, flatpak, msi, exe)', 'deb')
+    .option('--target <target>', 'Target format (dir, deb, rpm, appimage, pacman, flatpak, msi, exe)', 'deb')
     .option('--encrypt', 'Enable application encryption and VFS')
     .action(async (cmdOptions) => {
         const platform = cmdOptions.platform;
@@ -566,6 +566,11 @@ globalThis.__LOTUS_ENCRYPTED_BUILD__ = ${encrypt ? 'true' : 'false'};
             fs.unlinkSync(bundlePath);
             fs.unlinkSync(seaConfig.output);
             fs.unlinkSync(seaConfigPath);
+
+            if (target === 'dir') {
+                console.log(`SEA directory ready: ${appDir}`);
+                return;
+            }
         } catch (err) {
             console.error('SEA generation failed', err);
             process.exit(1);

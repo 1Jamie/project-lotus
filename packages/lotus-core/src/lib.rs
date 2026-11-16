@@ -713,6 +713,30 @@ impl WindowHandle {
         }
     }
 
+    /// Update dock quad without configuring Servo / nested clients (animation frames).
+    /// Commit with [`set_pane_rect`] at the destination.
+    #[napi]
+    pub fn set_pane_rect_visual(
+        &self,
+        pane_id: String,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) {
+        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+            let rect: euclid::Rect<f32, servo::DeviceIndependentPixel> = euclid::Rect::new(
+                euclid::Point2D::new(x as f32, y as f32),
+                euclid::Size2D::new(width as f32, height as f32),
+            );
+            let _ = proxy.send_event(EngineCommand::SetPaneRectVisual(
+                self.id.clone(),
+                pane_id,
+                rect,
+            ));
+        }
+    }
+
     /// Update dock thickness for an anchored pane without clearing its anchor.
     /// Left/Right use `width`; Top/Bottom use `height`; Fill/None are ignored.
     #[napi]

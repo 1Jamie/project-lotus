@@ -196,6 +196,9 @@ pub enum EngineCommand {
     },
     RemovePane(String, String), // window_id, pane_id
     SetPaneRect(String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>), // window_id, pane_id, rect
+    /// Move dock quad without Servo/external configure — texture scales into the new rect.
+    /// Final size/position commit still uses SetPaneRect.
+    SetPaneRectVisual(String, String, euclid::Rect<f32, servo::DeviceIndependentPixel>),
     /// Update dock thickness without clearing the pane's anchor.
     /// Left/Right consume `width`; Top/Bottom consume `height`; Fill/None are no-ops.
     SetPaneSize(String, String, f32, f32), // window_id, pane_id, width, height
@@ -4766,6 +4769,45 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     if let Some(pane) = instance.panes.get_mut(&pane_id) {
                         pane.is_dirty = true;
                     }
+                    instance.window.request_redraw();
+                }
+            }
+            EngineCommand::SetPaneRectVisual(window_id, pane_id, rect) => {
+                // Dock-only move: scale existing buffer into the new quad. No Servo
+                // resize and no nested xdg configure until a later SetPaneRect.
+                if let Some(instance) = self.windows.get_mut(&window_id) {
+                    if pane_id == "main" {
+                        instance.auto_resize_main = false;
+                    }
+                    if let Some(pane) = instance.panes.get_mut(&pane_id) {
+                        if !pane.is_dirty && pane.last_notified_rect == Some(rect) {
+                            return;
+                        }
+                        let scale_factor = instance.window.scale_factor() as f32;
+                        pane.rect = rect;
+                        pane.last_notified_rect = Some(rect);
+                        let pane_phys = euclid::default::Rect::new(
+                            euclid::default::Point2D::new(
+                                (rect.origin.x * scale_factor).round() as i32,
+                                (rect.origin.y * scale_factor).round() as i32,
+                            ),
+                            euclid::default::Size2D::new(
+                                (rect.size.width * scale_factor).round() as i32,
+                                (rect.size.height * scale_factor).round() as i32,
+                            ),
+                        );
+                        // Keep the previous buffer; compositor scales into last_physical_rect.
+                        pane.last_physical_rect = pane_phys;
+                        pane.pending_physical_rect = None;
+                        pane.pending_servo_size = None;
+                        pane.is_resizing = false;
+                        pane.anchor = PaneAnchor::None;
+                        pane.is_dirty = true;
+                    }
+                    instance.layout_root.set_leaf_detached(&pane_id, true);
+                    let physical_size = instance.window.inner_size();
+                    let scale_factor = instance.window.scale_factor() as f32;
+                    instance.recalculate_layout(physical_size, scale_factor);
                     instance.window.request_redraw();
                 }
             }
