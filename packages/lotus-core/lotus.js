@@ -20,7 +20,13 @@ if (process.platform === 'linux') {
     if (!alreadyFixed && !currentTunables.includes('optional_static_tls=')) {
         console.log(`[LOTUS] Detected Linux. Respawning with ${requiredTunable} to prevent TLS allocation issues...`);
         const { spawnSync } = require('child_process');
-        const childArgs = process.execArgv.concat(process.argv.slice(1));
+        // Node: [node, main.js, ...user]. SEA: [host, host, ...user].
+        // slice(1) on SEA feeds the host path back in as the game command.
+        let userArgs = process.argv.slice(1);
+        while (userArgs.length && (userArgs[0] === process.execPath || userArgs[0] === process.argv[0] || String(userArgs[0]).endsWith('/atrium-host') || String(userArgs[0]).endsWith('/main.js'))) {
+            userArgs = userArgs.slice(1);
+        }
+        const childArgs = process.execArgv.concat(userArgs);
         const result = spawnSync(process.execPath, childArgs, {
             stdio: 'inherit',
             env: {

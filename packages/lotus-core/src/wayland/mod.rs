@@ -687,6 +687,9 @@ impl LotusWaylandServer {
                                 .map(|p| p.pane_id.clone())
                                 .collect()
                         };
+                        if !enabled && state.last_emitted_pointer_lock {
+                            state.restore_pointer_lock = true;
+                        }
                         if enabled {
                             // Deactivate overlays so Discord emits session-bus Notify.
                             // Game nest seat stays independent — only plugins lose Activated.
@@ -1387,6 +1390,13 @@ impl LotusWaylandServer {
                 }
                 WaylandEvent::ClientDisconnected => {
                     debug!("[lotus-nest] client disconnected from nested sub-compositor");
+                    if self.primary_ever_presented.load(Ordering::SeqCst)
+                        && self.count_primary_surfaces() == 0
+                    {
+                        if let Some(primary_id) = self.primary_pane_id() {
+                            self.on_primary_surface_closed(&primary_id, u32::MAX);
+                        }
+                    }
                 }
                 WaylandEvent::SurfaceConfigured { .. } => {}
                 WaylandEvent::WindowCreated { pane_id, surface_id, title, app_id: _, role, width, height } => {
@@ -1747,8 +1757,10 @@ impl LotusWaylandServer {
                 None => return,
             }
         };
-        const DEBOUNCE: Duration = Duration::from_millis(1200);
-        if since.elapsed() < DEBOUNCE {
+        // A new present clears this timer, so a Steam helper window that dies
+        // before the game maps does not close the host. Once the real window
+        // is gone, tear down promptly even if a launcher pid is still alive.
+        if since.elapsed() < Duration::from_millis(1200) {
             return;
         }
         // A new real present clears empty_since via note_primary_presented.

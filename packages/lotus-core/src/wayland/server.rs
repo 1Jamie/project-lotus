@@ -193,6 +193,10 @@ pub struct LotusWaylandState {
     pub host_game_mode: bool,
     /// Last NestedPointerLock state we told the host about (debounce).
     pub last_emitted_pointer_lock: bool,
+    /// Oneshot lock was active when overlay took the pointer. A destroyed
+    /// constraint on the way back must not clear the shoe; the client recreates
+    /// it after a focus bounce.
+    pub restore_pointer_lock: bool,
     /// Last pointer location delivered to the primary/game surface (nest logical).
     /// Used to re-enter after F12 instead of warping to output center.
     pub last_primary_pointer_pos: Option<Point<f64, Logical>>,
@@ -386,6 +390,7 @@ impl LotusWaylandState {
             // Atrium windows start in game mode.
             host_game_mode: false,
             last_emitted_pointer_lock: false,
+            restore_pointer_lock: false,
             last_primary_pointer_pos: None,
         }
     }
@@ -612,20 +617,23 @@ impl LotusWaylandState {
         match status {
             1 => self.emit_pointer_lock(true),
             0 => {
-                // Real client unlock — always update game shoes, even while the
-                // host wears overlay shoes (OW menu/character select under chrome).
+                // Real client unlock. Overlay pointer-leave also reports inactive
+                // for a persistent confine; that one is marked restore_pointer_lock
+                // and must not drop the match shoe.
+                if !self.host_game_mode && self.restore_pointer_lock {
+                    return;
+                }
+                self.restore_pointer_lock = false;
                 self.emit_pointer_lock(false);
             }
             -1 => {
-                // Oneshot destroyed. Two cases:
-                // - Overlay (!host_game_mode): pointer leave often destroys oneshot;
-                //   keep the sticky shoe so F12 return can reactivate without
-                //   inventing a lock the client never asked for again.
-                // - Game mode + still focused: client tore down the constraint
-                //   while seated (OW load→hero-select / leave match). Emitting
-                //   false clears the host grab so absolute motion + custom
-                //   cursor can return — sticky-true here left the cursor dead
-                //   until process restart.
+                // Oneshot destroyed. Overlay pointer leave does this while the
+                // match is still locked; keep the shoe so F12 can re-grab.
+                // A real teardown (hero select, leave match) happens in game
+                // mode with no restore pending.
+                if self.restore_pointer_lock || !self.host_game_mode {
+                    return;
+                }
                 if self.host_game_mode && self.last_pointer_focus.as_ref() == Some(surface) {
                     self.emit_pointer_lock(false);
                 }
@@ -941,6 +949,36 @@ impl LotusWaylandState {
         pointer.frame(self);
         if activated {
             // Force host shoe re-wear after seat enter (grab after focus).
+            self.restore_pointer_lock = false;
+            self.last_emitted_pointer_lock = false;
+            self.emit_pointer_lock(true);
+        } else if self.restore_pointer_lock {
+            // Oneshot was destroyed when the overlay took the pointer. Bounce
+            // focus so the client asks again, and re-grab the host now.
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            let now_ms = self.now_ms();
+            pointer.motion(
+                self,
+                None,
+                &smithay::input::pointer::MotionEvent {
+                    location,
+                    serial,
+                    time: now_ms,
+                },
+            );
+            pointer.frame(self);
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            pointer.motion(
+                self,
+                Some((surface.clone(), surface_origin)),
+                &smithay::input::pointer::MotionEvent {
+                    location,
+                    serial,
+                    time: now_ms,
+                },
+            );
+            pointer.frame(self);
+            self.last_pointer_focus = Some(surface);
             self.last_emitted_pointer_lock = false;
             self.emit_pointer_lock(true);
         } else {
@@ -1947,6 +1985,7 @@ impl PointerConstraintsHandler for LotusWaylandState {
         // may already hold the PointerHandle (same deadlock class as cursor_image).
         // Overlay never arms locks — only the game seat in host game mode.
         let focused = self.last_pointer_focus.as_ref() == Some(surface);
+        self.restore_pointer_lock = false;
         if focused && self.host_game_mode && self.surface_is_primary(surface) {
             with_pointer_constraint(surface, pointer, |constraint| {
                 if let Some(c) = constraint {

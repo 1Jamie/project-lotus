@@ -783,30 +783,17 @@ pub fn composite_panes_to_scene(
         instance.gl.viewport(0, 0, active_w as i32, active_h as i32);
 
         instance.gl.color_mask(true, true, true, true);
-        // Game mode + primary covering the viewport: skip clear (opaque blit replaces all).
-        // Nest external surfaces exist only on Linux; keep Windows compiling as a noop.
-        #[cfg(target_os = "linux")]
-        let skip_clear = instance.game_mode
-            && instance.primary_game_pane.as_ref().is_some_and(|pid| {
-                instance
-                    .panes
-                    .get(pid)
-                    .and_then(|p| p.external_surface_slot.as_ref())
-                    .is_some_and(|s| s.lock().current_texture.is_some())
-            });
-        #[cfg(not(target_os = "linux"))]
-        let skip_clear = false;
-        if !skip_clear {
-            if instance.transparent {
-                instance.gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            } else {
-                // Match normal gamescope/Steam black splash (no diagnostic navy flash).
-                instance.gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            }
-            instance
-                .gl
-                .clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
+        // Always clear. A letterboxed game blit does not cover the HUD, and
+        // the next translucent pill would blend on top of the previous one.
+        if instance.transparent {
+            instance.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        } else {
+            // Match normal gamescope/Steam black splash (no diagnostic navy flash).
+            instance.gl.clear_color(0.0, 0.0, 0.0, 1.0);
         }
+        instance
+            .gl
+            .clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT);
 
         // Prefer pending rect for same-window reflows (weights/dock/gutter) so the
         // slot snaps while the old texture stretches until nuclear flip.

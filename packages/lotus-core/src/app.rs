@@ -4427,26 +4427,50 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 let _ = std::thread::Builder::new()
                                     .name(format!("atrium-wait-{}", pid))
                                     .spawn(move || {
-                                        let status = child.wait();
-                                        let code = status
-                                            .as_ref()
-                                            .ok()
-                                            .and_then(|s| s.code())
-                                            .unwrap_or(-1);
+                                        // Steam's launch wrapper can exit as soon as it hands off.
+                                        // Stay up for that. If Proton was in the process group,
+                                        // wait until the group is gone, then tear the host down.
+                                        let pgid = pid as i32;
+                                        let mut direct = Some(child);
+                                        let mut status = None;
+                                        loop {
+                                            if let Some(ch) = direct.as_mut() {
+                                                match ch.try_wait() {
+                                                    Ok(Some(st)) => {
+                                                        status = Some(st);
+                                                        direct = None;
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(_) => direct = None,
+                                                }
+                                            }
+                                            let group_alive = unsafe { libc::kill(-pgid, 0) == 0 };
+                                            if direct.is_none() && !group_alive {
+                                                break;
+                                            }
+                                            std::thread::sleep(Duration::from_millis(200));
+                                        }
+                                        let code = status.as_ref().and_then(|s| s.code()).unwrap_or(-1);
                                         let lifetime_ms = spawned_at.elapsed().as_millis() as u64;
                                         info!(
-                                            "[lotus-nest] external child pid {} exited ({:?}) pane='{}' primary={}",
+                                            "[lotus-nest] external child pid {} group gone ({:?}) pane='{}' primary={} lifetime_ms={}",
                                             pid,
                                             status,
                                             exit_pane_id,
-                                            close_on_exit
+                                            close_on_exit,
+                                            lifetime_ms
                                         );
-                                        if close_on_exit {
+                                        if close_on_exit && lifetime_ms >= 3000 {
                                             if let Some(proxy) = EVENT_LOOP_PROXY.get() {
                                                 let _ = proxy.send_event(
                                                     EngineCommand::CloseWindow(exit_window_id.clone()),
                                                 );
                                             }
+                                        } else if close_on_exit {
+                                            info!(
+                                                "[lotus-nest] primary child exited after {}ms — leaving host up",
+                                                lifetime_ms
+                                            );
                                         } else {
                                             push_renderer_ipc(
                                                 &exit_window_id,
