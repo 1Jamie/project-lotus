@@ -21,12 +21,19 @@ if (process.platform === 'linux') {
         console.log(`[LOTUS] Detected Linux. Respawning with ${requiredTunable} to prevent TLS allocation issues...`);
         const { spawnSync } = require('child_process');
         // Node: [node, main.js, ...user]. SEA: [host, host, ...user].
-        // slice(1) on SEA feeds the host path back in as the game command.
-        let userArgs = process.argv.slice(1);
-        while (userArgs.length && (userArgs[0] === process.execPath || userArgs[0] === process.argv[0] || String(userArgs[0]).endsWith('/atrium-host') || String(userArgs[0]).endsWith('/main.js'))) {
-            userArgs = userArgs.slice(1);
+        // SEA spawns the host binary directly (no script arg needed);
+        // Node requires the entry script (process.argv[1]) to know what to run.
+        const isNode = path.basename(process.execPath).toLowerCase().startsWith('node');
+        let childArgs;
+        if (isNode) {
+            childArgs = process.execArgv.concat(process.argv.slice(1));
+        } else {
+            let userArgs = process.argv.slice(1);
+            while (userArgs.length && (userArgs[0] === process.execPath || userArgs[0] === process.argv[0] || String(userArgs[0]).endsWith('/atrium-host') || String(userArgs[0]).endsWith('/main.js'))) {
+                userArgs = userArgs.slice(1);
+            }
+            childArgs = process.execArgv.concat(userArgs);
         }
-        const childArgs = process.execArgv.concat(userArgs);
         const result = spawnSync(process.execPath, childArgs, {
             stdio: 'inherit',
             env: {

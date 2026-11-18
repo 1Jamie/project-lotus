@@ -35,6 +35,7 @@ use servo::{
     MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent,
     MouseLeftViewportEvent,
     WheelEvent, WheelDelta, WheelMode,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType,
     UserContentManager,
     DeviceIndependentPixel, DevicePixel,
 };
@@ -3263,6 +3264,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     active_pane_id: primary_pane_id.clone(),
                     primary_pane_id,
                     last_mouse_down_pane_id: None,
+                    active_touches: HashMap::new(),
                     rendering_context,
                     gl,
                     window: window.clone(),
@@ -7429,6 +7431,234 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                             }
                         }
                     },
+                    WindowEvent::Touch(touch) => {
+                        let scale_factor = instance.window.scale_factor() as f32;
+                        let point = Point2D::new(touch.location.x as f32, touch.location.y as f32);
+                        instance.last_mouse_pos = point;
+
+                        #[cfg(target_os = "linux")]
+                        if nest_in_overlay_input_mode(instance) {
+                            nest_note_input_device(
+                                instance,
+                                &self.callback,
+                                &uuid,
+                                "touch",
+                            );
+                        }
+
+                        if touch.phase == winit::event::TouchPhase::Started {
+                            if let Some(_) = &instance.active_select {
+                                let overlay_pane = instance.panes.get("__lotus_select_overlay");
+                                let is_inside_overlay = overlay_pane.map(|p| {
+                                    if !pane_accepts_pointer_input(p) { return false; }
+                                    let (px, py, pw, ph) = p.input_physical_rect(scale_factor);
+                                    let rect = euclid::Rect::new(euclid::Point2D::new(px, py), euclid::Size2D::new(pw, ph));
+                                    rect.contains(point)
+                                }).unwrap_or(false);
+
+                                if !is_inside_overlay {
+                                    let mut active = instance.active_select.take().unwrap();
+                                    instance.active_pane_id = active.previous_active_pane_id;
+                                    if active.allow_multiple {
+                                        active.prompt.submit();
+                                    } else {
+                                        active.prompt.select(active.initial_selected_options.clone());
+                                        active.prompt.submit();
+                                    }
+                                    if let Some(overlay) = instance.panes.get_mut("__lotus_select_overlay") {
+                                        overlay.pending_visible = false;
+                                        overlay.is_dirty = true;
+                                        let physical_size = instance.window.inner_size();
+                                        instance.recalculate_layout(physical_size, scale_factor);
+                                        instance.window.request_redraw();
+                                    }
+                                    if let Ok(msg) = rmp_serde::encode::to_vec(&serde_json::json!({
+                                        "event": "select-element-close",
+                                        "window_id": uuid,
+                                    })) {
+                                        if let Some(proxy) = EVENT_LOOP_PROXY.get() {
+                                            let _ = proxy.send_event(EngineCommand::IpcMessage(uuid.clone(), msg));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let target_id = if touch.phase == winit::event::TouchPhase::Started {
+                            let tid = {
+                                #[cfg(target_os = "linux")]
+                                {
+                                    if instance.game_mode {
+                                        instance.primary_game_pane.clone()
+                                    } else {
+                                        hit_test_pointer_pane(
+                                            instance,
+                                            point,
+                                            scale_factor,
+                                            true,
+                                        )
+                                        .map(|p| p.id.clone())
+                                        .or_else(|| {
+                                            hit_test_pointer_pane(
+                                                instance,
+                                                point,
+                                                scale_factor,
+                                                false,
+                                            )
+                                            .map(|p| p.id.clone())
+                                        })
+                                    }
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let mut sorted_panes: Vec<_> = instance.panes.values().collect();
+                                    sorted_panes.sort_by_key(|p| -p.z_index);
+                                    sorted_panes.into_iter().find_map(|pane| {
+                                        if !pane_accepts_pointer_input(pane) {
+                                            return None;
+                                        }
+                                        let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
+                                        let rect = euclid::Rect::new(
+                                            euclid::Point2D::new(px, py),
+                                            euclid::Size2D::new(pw, ph),
+                                        );
+                                        if rect.contains(point) {
+                                            Some(pane.id.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                }
+                            };
+                            if let Some(ref pid) = tid {
+                                instance.active_touches.insert(touch.id, pid.clone());
+                                #[cfg(target_os = "linux")]
+                                if !instance.game_mode {
+                                    nest_set_keyboard_focus(instance, pid);
+                                }
+                            }
+                            tid
+                        } else {
+                            instance.active_touches.get(&touch.id).cloned()
+                        };
+
+                        if touch.phase == winit::event::TouchPhase::Ended
+                            || touch.phase == winit::event::TouchPhase::Cancelled
+                        {
+                            instance.active_touches.remove(&touch.id);
+                        }
+
+                        if let Some(pane_id) = target_id {
+                            #[cfg(target_os = "linux")]
+                            let touch_layout = instance.panes.get(&pane_id).map(|p| {
+                                (
+                                    nest_pane_hit_rect(instance, p, scale_factor),
+                                    p.external_wayland_server.as_ref().map(|ws| {
+                                        let (mx, my) = nest_pointer_coords(
+                                            instance,
+                                            p,
+                                            point,
+                                            scale_factor,
+                                        );
+                                        (ws.clone(), mx, my)
+                                    }),
+                                )
+                            });
+
+                            if let Some(pane) = instance.panes.get_mut(&pane_id) {
+                                #[cfg(target_os = "linux")]
+                                let (px, py, pw, ph) = touch_layout
+                                    .as_ref()
+                                    .map(|(r, _)| *r)
+                                    .unwrap_or_else(|| pane.input_physical_rect(scale_factor));
+                                #[cfg(not(target_os = "linux"))]
+                                let (px, py, pw, ph) = pane.input_physical_rect(scale_factor);
+
+                                let mut translated_point: Point2D<f32, DevicePixel> =
+                                    Point2D::new(point.x - px, point.y - py);
+
+                                #[cfg(target_os = "linux")]
+                                if let Some((ws, mx, my)) =
+                                    touch_layout.as_ref().and_then(|(_, ext)| ext.clone())
+                                {
+                                    let is_down = touch.phase == winit::event::TouchPhase::Started;
+                                    let is_up = touch.phase == winit::event::TouchPhase::Ended
+                                        || touch.phase == winit::event::TouchPhase::Cancelled;
+                                    ws.lock().send_pointer_motion_to_pane(&pane_id, mx, my);
+                                    const BTN_LEFT: u32 = 0x110;
+                                    if is_down {
+                                        ws.lock().send_pointer_button_to_pane(
+                                            &pane_id,
+                                            mx,
+                                            my,
+                                            BTN_LEFT,
+                                            true,
+                                        );
+                                    } else if is_up {
+                                        ws.lock().send_pointer_button_to_pane(
+                                            &pane_id,
+                                            mx,
+                                            my,
+                                            BTN_LEFT,
+                                            false,
+                                        );
+                                    }
+                                    instance.window.request_redraw();
+                                    return;
+                                }
+
+                                if pane.is_remote {
+                                    if let Some(ref consumer) = pane.remote_consumer {
+                                        if consumer.tex_width > 0 && consumer.tex_height > 0 && pw > 0.0 && ph > 0.0 {
+                                            translated_point.x *= consumer.tex_width as f32 / pw;
+                                            translated_point.y *= consumer.tex_height as f32 / ph;
+                                        }
+                                    }
+                                    if let Some(fd) = pane.remote_input_fd {
+                                        let surface_id = format!("{}:{}", uuid, pane.id);
+                                        let (kind, action) = match touch.phase {
+                                            winit::event::TouchPhase::Started => ("TouchDown", 0),
+                                            winit::event::TouchPhase::Moved => ("TouchMove", 1),
+                                            winit::event::TouchPhase::Ended => ("TouchUp", 2),
+                                            winit::event::TouchPhase::Cancelled => ("TouchCancel", 3),
+                                        };
+                                        let msg = serde_json::json!({
+                                            "type": "Input",
+                                            "event": {
+                                                "kind": kind,
+                                                "action": action,
+                                                "surface_id": surface_id,
+                                                "touch_id": touch.id,
+                                                "x": translated_point.x,
+                                                "y": translated_point.y,
+                                                "modifiers": instance.modifiers.bits(),
+                                            }
+                                        }).to_string();
+                                        forward_remote_input(fd, &msg);
+                                    }
+                                } else {
+                                    let event_type = match touch.phase {
+                                        winit::event::TouchPhase::Started => TouchEventType::Down,
+                                        winit::event::TouchPhase::Moved => TouchEventType::Move,
+                                        winit::event::TouchPhase::Ended => TouchEventType::Up,
+                                        winit::event::TouchPhase::Cancelled => TouchEventType::Cancel,
+                                    };
+                                    pane.webview.notify_input_event(InputEvent::Touch(TouchEvent::new(
+                                        event_type,
+                                        TouchId(touch.id as i32),
+                                        servo::WebViewPoint::Device(translated_point),
+                                        TouchPointerType::Touch,
+                                    )));
+                                    pane.needs_repaint = true;
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let _ = (pw, ph);
+                                }
+                                instance.window.request_redraw();
+                            }
+                        }
+                    },
                     WindowEvent::Moved(position) => {
                         let mut msg = Vec::new();
                         if rmp_serde::encode::write(&mut msg, &serde_json::json!({
@@ -7467,6 +7697,7 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                                 // Keep current dragged geometry; drop capture so a missed
                                 // mouse-up cannot leave the seam stuck.
                                 instance.cancel_gutter_drag_keep();
+                                instance.active_touches.clear();
                             }
                             // Kick a redraw so focused remotes resume at full rate immediately.
                             // Gamescope often never delivers Focused(true) to X11 clients.

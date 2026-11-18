@@ -778,6 +778,7 @@ pub struct WindowInstance {
     pub active_pane_id: String,
     pub primary_pane_id: String,
     pub last_mouse_down_pane_id: Option<String>,
+    pub active_touches: HashMap<u64, String>,
     pub rendering_context: Rc<WindowRenderingContext>,
     pub gl: Arc<glow::Context>,
     pub window: Arc<Window>,
