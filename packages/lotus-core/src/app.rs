@@ -3337,6 +3337,8 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     upscale_temp_tex: None,
                     #[cfg(target_os = "linux")]
                     upscale_temp_size: None,
+                    #[cfg(target_os = "linux")]
+                    anime4k_pipeline: None,
                     comp_fbo: None,
                     comp_tex: None,
                     comp_vao: None,
@@ -4646,13 +4648,16 @@ impl ApplicationHandler<EngineCommand> for LotusApp {
                     Ok(cfg) => {
                         let applied = crate::window::set_host_upscale_config(cfg);
                         info!(
-                            "[lotus-upscale] apply mode={} rcas={} sgsr_thr={:.5} sgsr_sharp={:.3} edge_dir={} rcas_stops={:.3}",
+                            "[lotus-upscale] apply mode={} rcas={} sgsr_thr={:.5} sgsr_sharp={:.3} edge_dir={} rcas_stops={:.3} a4k_mode={} a4k_tier={} a4k_plus_a={}",
                             applied.mode.as_str(),
                             applied.sharpen_rcas,
                             applied.sgsr_edge_threshold,
                             applied.sgsr_edge_sharpness,
                             applied.sgsr_use_edge_direction,
-                            applied.rcas_sharpness_stops
+                            applied.rcas_sharpness_stops,
+                            applied.anime4k_mode,
+                            applied.anime4k_tier,
+                            applied.anime4k_plus_a
                         );
                         if let Some(instance) = self.windows.get_mut(&window_id) {
                             // GL must be current to link FSR/SGSR/RCAS; SoftFifo

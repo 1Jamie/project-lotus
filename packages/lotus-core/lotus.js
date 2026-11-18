@@ -2872,6 +2872,9 @@ class ServoWindow extends EventEmitter {
                 sgsrEdgeSharpness: 2,
                 sgsrUseEdgeDirection: true,
                 rcasSharpnessStops: 0.2,
+                anime4kMode: 'a',
+                anime4kTier: 'm',
+                anime4kPlusA: false,
             };
         }
         try {
@@ -2885,6 +2888,9 @@ class ServoWindow extends EventEmitter {
                 sgsrEdgeSharpness: 2,
                 sgsrUseEdgeDirection: true,
                 rcasSharpnessStops: 0.2,
+                anime4kMode: 'a',
+                anime4kTier: 'm',
+                anime4kPlusA: false,
             };
         }
     }
@@ -2892,15 +2898,25 @@ class ServoWindow extends EventEmitter {
     /**
      * Apply host upscaler / RCAS (shaders link lazily on first use).
      * @param {object} cfg
-     * @param {'off'|'sgsr'|'fsr1'} [cfg.mode]
+     * @param {'off'|'sgsr'|'fsr1'|'anime4k'} [cfg.mode]
      * @param {boolean} [cfg.sharpenRcas]
      * @param {number} [cfg.sgsrEdgeThreshold] 0–1 (or >1 as /255)
      * @param {number} [cfg.sgsrEdgeSharpness]
      * @param {boolean} [cfg.sgsrUseEdgeDirection]
      * @param {number} [cfg.rcasSharpnessStops]
+     * @param {'a'|'b'|'c'} [cfg.anime4kMode]
+     * @param {'s'|'m'|'l'|'vl'|'ul'} [cfg.anime4kTier]
+     * @param {boolean} [cfg.anime4kPlusA]
      */
     setHostUpscale(cfg = {}) {
         if (!this.handle || typeof this.handle.setHostUpscale !== 'function') return;
+        if (typeof cfg === 'string') {
+            try {
+                cfg = JSON.parse(cfg);
+            } catch (_) {
+                cfg = {};
+            }
+        }
         const cur = this.getHostUpscale();
         let threshold = cfg.sgsrEdgeThreshold != null ? Number(cfg.sgsrEdgeThreshold) : cur.sgsrEdgeThreshold;
         if (Number.isFinite(threshold) && threshold > 1) threshold = threshold / 255;
@@ -2917,8 +2933,7 @@ class ServoWindow extends EventEmitter {
             rcasSharpnessStops:
                 cfg.rcasSharpnessStops != null ? Number(cfg.rcasSharpnessStops) : cur.rcasSharpnessStops,
         };
-        // Rust HostUpscaleConfig uses snake_case via serde rename? We used camel in JSON
-        // from get — Apply expects HostUpscaleConfig with serde fields. Map to snake.
+        // Rust HostUpscaleConfig uses snake_case and serde aliases. Map all fields cleanly.
         const rustPayload = {
             mode: payload.mode,
             sharpen_rcas: payload.sharpenRcas,
@@ -2926,6 +2941,9 @@ class ServoWindow extends EventEmitter {
             sgsr_edge_sharpness: payload.sgsrEdgeSharpness,
             sgsr_use_edge_direction: payload.sgsrUseEdgeDirection,
             rcas_sharpness_stops: payload.rcasSharpnessStops,
+            anime4k_mode: cfg.anime4kMode != null ? String(cfg.anime4kMode) : (cur.anime4kMode || 'a'),
+            anime4k_tier: cfg.anime4kTier != null ? String(cfg.anime4kTier) : (cur.anime4kTier || 'm'),
+            anime4k_plus_a: cfg.anime4kPlusA != null ? !!cfg.anime4kPlusA : !!cur.anime4kPlusA,
         };
         this.handle.setHostUpscale(JSON.stringify(rustPayload));
     }

@@ -506,6 +506,9 @@ impl WindowHandle {
                 "sgsrEdgeSharpness": 2.0,
                 "sgsrUseEdgeDirection": true,
                 "rcasSharpnessStops": 0.2,
+                "anime4kMode": "a",
+                "anime4kTier": "m",
+                "anime4kPlusA": false,
             })
             .to_string();
         }
@@ -520,6 +523,9 @@ impl WindowHandle {
                 "sgsrEdgeSharpness": c.sgsr_edge_sharpness,
                 "sgsrUseEdgeDirection": c.sgsr_use_edge_direction,
                 "rcasSharpnessStops": c.rcas_sharpness_stops,
+                "anime4kMode": c.anime4k_mode,
+                "anime4kTier": c.anime4k_tier,
+                "anime4kPlusA": c.anime4k_plus_a,
             })
             .to_string()
         }

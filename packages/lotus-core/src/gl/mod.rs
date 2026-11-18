@@ -1,6 +1,8 @@
 pub mod compositor;
 #[cfg(target_os = "linux")]
 pub mod fsr1;
+#[cfg(target_os = "linux")]
+pub mod anime4k;
 pub mod pane_context;
 #[cfg(target_os = "linux")]
 pub mod shm_consumer;

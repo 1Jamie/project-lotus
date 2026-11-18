@@ -321,9 +321,10 @@ void main() {{
 // Host upscaler config lives in host_upscale.rs (mutable + lazy shader ensure).
 #[cfg(target_os = "linux")]
 pub use crate::host_upscale::{
-    fsr1_upscale_enabled, host_sharpen_rcas, host_upscale, host_upscale_config,
-    rcas_sharpness_stops, set_host_upscale_config, sgsr_edge_sharpness, sgsr_edge_threshold,
-    sgsr_upscale_enabled, sgsr_use_edge_direction, HostUpscale, HostUpscaleConfig,
+    anime4k_upscale_enabled, fsr1_upscale_enabled, host_anime4k_mode, host_anime4k_plus_a,
+    host_anime4k_tier, host_sharpen_rcas, host_upscale, host_upscale_config, rcas_sharpness_stops,
+    set_host_upscale_config, sgsr_edge_sharpness, sgsr_edge_threshold, sgsr_upscale_enabled,
+    sgsr_use_edge_direction, HostUpscale, HostUpscaleConfig,
 };
 
 #[cfg(not(target_os = "linux"))]
@@ -333,6 +334,7 @@ pub enum HostUpscale {
     Off,
     Sgsr,
     Fsr1,
+    Anime4k,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -859,6 +861,8 @@ pub struct WindowInstance {
     pub upscale_temp_tex: Option<glow::NativeTexture>,
     #[cfg(target_os = "linux")]
     pub upscale_temp_size: Option<(u32, u32)>,
+    #[cfg(target_os = "linux")]
+    pub anime4k_pipeline: Option<crate::gl::anime4k::Anime4kPipeline>,
     pub comp_fbo: Option<glow::NativeFramebuffer>,
     pub comp_tex: Option<glow::NativeTexture>,
     pub comp_vao: Option<glow::VertexArray>,
@@ -1398,11 +1402,25 @@ impl WindowInstance {
         match cfg.mode {
             HostUpscale::Sgsr => self.ensure_sgsr_programs(),
             HostUpscale::Fsr1 => self.ensure_fsr1_programs(),
+            HostUpscale::Anime4k => self.ensure_anime4k_pipeline(),
             HostUpscale::Off => {}
         }
         if cfg.sharpen_rcas {
             // RCAS lives with FSR1 program set.
             self.ensure_fsr1_programs();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn ensure_anime4k_pipeline(&mut self) {
+        if self.anime4k_pipeline.is_none() {
+            if let (Some(vs), Some(vao)) = (self.comp_vs, self.comp_vao) {
+                self.anime4k_pipeline = Some(crate::gl::anime4k::Anime4kPipeline::new(
+                    self.gl.clone(),
+                    vs,
+                    vao,
+                ));
+            }
         }
     }
 

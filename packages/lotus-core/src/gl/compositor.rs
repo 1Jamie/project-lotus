@@ -296,7 +296,7 @@ fn draw_pane_texture_ext_clipped(
     let want_rcas = false;
 
     #[cfg(target_os = "linux")]
-    if want_rcas {
+    if want_rcas && upscale != crate::window::HostUpscale::Anime4k {
         ensure_upscale_temp(instance, viewport_pw.max(1) as u32, viewport_ph.max(1) as u32);
         // Pass 1: source → upright temp (apply Y-flip here).
         draw_upscale_pass(
@@ -362,6 +362,169 @@ fn draw_pane_texture_ext_clipped(
                 instance.gl.disable(glow::SCISSOR_TEST);
             }
             return;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if upscale == crate::window::HostUpscale::Anime4k {
+        let (sw, sh) = src_buf.unwrap_or((viewport_pw as u32, viewport_ph as u32));
+        let key = crate::gl::anime4k::Anime4kPresetKey {
+            mode: crate::window::host_anime4k_mode(),
+            tier: crate::window::host_anime4k_tier(),
+            plus_a: crate::window::host_anime4k_plus_a(),
+        };
+        instance.ensure_anime4k_pipeline();
+
+        let use_oes = target == GL_TEXTURE_EXTERNAL_OES;
+        // INVARIANT 4: Normalize source_tex into upright GL_TEXTURE_2D temp FBO
+        // whenever Y-flipped OR backed by GL_TEXTURE_EXTERNAL_OES (DMA-BUF).
+        let effective_source_tex = if flip_y != 0 || use_oes {
+            ensure_upscale_temp(instance, sw, sh);
+            let copy_prog = if use_oes {
+                instance.comp_program_oes.or(instance.comp_program)
+            } else {
+                instance.comp_program
+            };
+            let (size_loc, radius_loc, flip_loc) = if use_oes && instance.comp_program_oes.is_some() {
+                (
+                    instance.u_comp_oes_size_loc.as_ref(),
+                    instance.u_comp_oes_radius_loc.as_ref(),
+                    instance.u_comp_oes_flip_loc.as_ref(),
+                )
+            } else {
+                (
+                    instance.u_comp_size_loc.as_ref(),
+                    instance.u_comp_radius_loc.as_ref(),
+                    instance.u_comp_flip_loc.as_ref(),
+                )
+            };
+            if let (Some(temp_fbo), Some(comp), Some(temp_tex)) = (
+                instance.upscale_temp_fbo,
+                copy_prog,
+                instance.upscale_temp_tex,
+            ) {
+                unsafe {
+                    instance.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(temp_fbo));
+                    instance.gl.viewport(0, 0, sw as i32, sh as i32);
+                    instance.gl.disable(glow::BLEND);
+                    instance.gl.disable(glow::SCISSOR_TEST);
+                    instance.gl.use_program(Some(comp));
+                    instance.gl.bind_vertex_array(instance.comp_vao);
+                    instance.gl.active_texture(glow::TEXTURE0);
+                    instance.gl.bind_texture(target, Some(tex));
+                    instance.gl.uniform_2_f32(size_loc, sw as f32, sh as f32);
+                    instance.gl.uniform_1_f32(radius_loc, 0.0);
+                    instance.gl.uniform_1_i32(flip_loc, flip_y);
+                    instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                    instance.gl.bind_texture(target, None);
+                    instance.gl.bind_vertex_array(None);
+                    instance.gl.use_program(None);
+                    instance.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                }
+                temp_tex
+            } else {
+                tex
+            }
+        } else {
+            tex
+        };
+
+        let mut anime_out: Option<glow::NativeTexture> = None;
+        if let Some(ref mut pipeline) = instance.anime4k_pipeline {
+            match pipeline.execute(
+                effective_source_tex,
+                sw,
+                sh,
+                viewport_pw.max(1) as u32,
+                viewport_ph.max(1) as u32,
+                &key,
+            ) {
+                Ok(out_tex) => {
+                    anime_out = Some(out_tex);
+                }
+                Err(e) => {
+                    log::warn!("[lotus-anime4k] pipeline error: {} — falling back", e);
+                }
+            }
+        }
+
+        if let Some(a4k_tex) = anime_out {
+            if want_rcas {
+                if let Some(rcas) = instance.fsr1_rcas_program {
+                    unsafe {
+                        instance.gl.bind_framebuffer(glow::FRAMEBUFFER, instance.scene_fbo);
+                        instance
+                            .gl
+                            .viewport(viewport_px, viewport_py, viewport_pw, viewport_ph);
+                        instance.gl.enable(glow::SCISSOR_TEST);
+                        instance.gl.scissor(clip_px, clip_py, clip_pw, clip_ph);
+                        if opaque {
+                            instance.gl.disable(glow::BLEND);
+                        } else {
+                            instance.gl.enable(glow::BLEND);
+                            instance.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                        }
+                        instance.gl.use_program(Some(rcas));
+                        instance.gl.bind_vertex_array(instance.comp_vao);
+                        instance.gl.active_texture(glow::TEXTURE0);
+                        instance.gl.bind_texture(glow::TEXTURE_2D, Some(a4k_tex));
+                        let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
+                        let locs = &instance.fsr1_locs;
+                        instance
+                            .gl
+                            .uniform_2_f32(locs.rcas_size.as_ref(), viewport_pw as f32, viewport_ph as f32);
+                        instance.gl.uniform_1_f32(locs.rcas_radius.as_ref(), radius);
+                        instance.gl.uniform_2_f32(
+                            locs.rcas_origin.as_ref(),
+                            viewport_px as f32,
+                            viewport_py as f32,
+                        );
+                        let con = crate::gl::fsr1::rcas_con(crate::window::rcas_sharpness_stops());
+                        instance
+                            .gl
+                            .uniform_4_f32(locs.rcas_con.as_ref(), con[0], con[1], con[2], con[3]);
+                        instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                        instance.gl.bind_texture(glow::TEXTURE_2D, None);
+                        instance.gl.bind_vertex_array(None);
+                        instance.gl.use_program(None);
+                        instance.gl.disable(glow::SCISSOR_TEST);
+                    }
+                    return;
+                }
+            } else {
+                unsafe {
+                    instance.gl.bind_framebuffer(glow::FRAMEBUFFER, instance.scene_fbo);
+                    instance
+                        .gl
+                        .viewport(viewport_px, viewport_py, viewport_pw, viewport_ph);
+                    instance.gl.enable(glow::SCISSOR_TEST);
+                    instance.gl.scissor(clip_px, clip_py, clip_pw, clip_ph);
+                    if opaque {
+                        instance.gl.disable(glow::BLEND);
+                    } else {
+                        instance.gl.enable(glow::BLEND);
+                        instance.gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                    }
+                    if let Some(comp) = instance.comp_program {
+                        instance.gl.use_program(Some(comp));
+                        instance.gl.bind_vertex_array(instance.comp_vao);
+                        instance.gl.active_texture(glow::TEXTURE0);
+                        instance.gl.bind_texture(glow::TEXTURE_2D, Some(a4k_tex));
+                        let radius = instance.corner_radius.unwrap_or(0.0) as f32 * scale_factor;
+                        instance
+                            .gl
+                            .uniform_2_f32(instance.u_comp_size_loc.as_ref(), viewport_pw as f32, viewport_ph as f32);
+                        instance.gl.uniform_1_f32(instance.u_comp_radius_loc.as_ref(), radius);
+                        instance.gl.uniform_1_i32(instance.u_comp_flip_loc.as_ref(), 0);
+                        instance.gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+                        instance.gl.bind_texture(glow::TEXTURE_2D, None);
+                        instance.gl.bind_vertex_array(None);
+                        instance.gl.use_program(None);
+                    }
+                    instance.gl.disable(glow::SCISSOR_TEST);
+                }
+                return;
+            }
         }
     }
 
@@ -808,7 +971,7 @@ pub fn composite_panes_to_scene(
             let cfg = crate::window::host_upscale_config();
             let need = matches!(
                 cfg.mode,
-                crate::window::HostUpscale::Sgsr | crate::window::HostUpscale::Fsr1
+                crate::window::HostUpscale::Sgsr | crate::window::HostUpscale::Fsr1 | crate::window::HostUpscale::Anime4k
             ) || cfg.sharpen_rcas;
             if need {
                 instance.ensure_host_upscale_shaders();
@@ -1128,6 +1291,7 @@ pub fn composite_panes_to_scene(
                             crate::window::HostUpscale::Off => 0,
                             crate::window::HostUpscale::Sgsr => 1,
                             crate::window::HostUpscale::Fsr1 => 2,
+                            crate::window::HostUpscale::Anime4k => 3,
                         };
                         let sig = (mode_bits << 48)
                             | ((sharpen as u64) << 40)
@@ -1139,6 +1303,13 @@ pub fn composite_panes_to_scene(
                         if prev != sig {
                             LAST_UPSCALE_LOG.store(sig, Ordering::Relaxed);
                             let path = match upscale {
+                                crate::window::HostUpscale::Anime4k => {
+                                    if sharpen {
+                                        "anime4k+rcas"
+                                    } else {
+                                        "anime4k"
+                                    }
+                                }
                                 crate::window::HostUpscale::Fsr1 => {
                                     if sharpen {
                                         "fsr1+rcas"

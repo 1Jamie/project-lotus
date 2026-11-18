@@ -15,6 +15,7 @@ pub enum HostUpscale {
     Off,
     Sgsr,
     Fsr1,
+    Anime4k,
 }
 
 impl HostUpscale {
@@ -23,6 +24,7 @@ impl HostUpscale {
             "0" | "off" | "none" | "bilinear" => Some(Self::Off),
             "1" | "on" | "sgsr" => Some(Self::Sgsr),
             "fsr1" | "fsr" | "easu" => Some(Self::Fsr1),
+            "anime4k" | "a4k" => Some(Self::Anime4k),
             _ => None,
         }
     }
@@ -32,6 +34,7 @@ impl HostUpscale {
             Self::Off => "off",
             Self::Sgsr => "sgsr",
             Self::Fsr1 => "fsr1",
+            Self::Anime4k => "anime4k",
         }
     }
 }
@@ -53,6 +56,23 @@ pub struct HostUpscaleConfig {
     /// RCAS stops: 0 = max sharpen, higher = softer. Default 0.2.
     #[serde(alias = "rcasSharpnessStops")]
     pub rcas_sharpness_stops: f32,
+    /// Anime4K mode: "a" (restore), "b" (restore soft), "c" (upscale denoise).
+    #[serde(alias = "anime4kMode", default = "default_anime4k_mode")]
+    pub anime4k_mode: String,
+    /// Anime4K tier: "s" (Fast), "m" (Balanced), "l" (High), "vl", "ul".
+    #[serde(alias = "anime4kTier", default = "default_anime4k_tier")]
+    pub anime4k_tier: String,
+    /// Anime4K +A secondary pass.
+    #[serde(alias = "anime4kPlusA", default)]
+    pub anime4k_plus_a: bool,
+}
+
+fn default_anime4k_mode() -> String {
+    "a".to_string()
+}
+
+fn default_anime4k_tier() -> String {
+    "m".to_string()
 }
 
 impl Default for HostUpscaleConfig {
@@ -64,6 +84,9 @@ impl Default for HostUpscaleConfig {
             sgsr_edge_sharpness: 2.0,
             sgsr_use_edge_direction: true,
             rcas_sharpness_stops: 0.2,
+            anime4k_mode: "a".to_string(),
+            anime4k_tier: "m".to_string(),
+            anime4k_plus_a: false,
         }
     }
 }
@@ -102,6 +125,22 @@ impl HostUpscaleConfig {
                 }
             }
         }
+        if let Ok(v) = std::env::var("ATRIUM_ANIME4K_MODE") {
+            let s = v.trim().to_ascii_lowercase();
+            if ["a", "b", "c"].contains(&s.as_str()) {
+                cfg.anime4k_mode = s;
+            }
+        }
+        if let Ok(v) = std::env::var("ATRIUM_ANIME4K_TIER") {
+            let s = v.trim().to_ascii_lowercase();
+            if ["s", "m", "l", "vl", "ul"].contains(&s.as_str()) {
+                cfg.anime4k_tier = s;
+            }
+        }
+        if let Ok(v) = std::env::var("ATRIUM_ANIME4K_PLUS_A") {
+            let s = v.trim().to_ascii_lowercase();
+            cfg.anime4k_plus_a = matches!(s.as_str(), "1" | "true" | "on" | "yes");
+        }
         cfg
     }
 
@@ -115,6 +154,18 @@ impl HostUpscaleConfig {
             self.rcas_sharpness_stops = 0.2;
         }
         self.rcas_sharpness_stops = self.rcas_sharpness_stops.clamp(0.0, 2.0);
+        let m = self.anime4k_mode.trim().to_ascii_lowercase();
+        self.anime4k_mode = if ["a", "b", "c"].contains(&m.as_str()) {
+            m
+        } else {
+            "a".to_string()
+        };
+        let t = self.anime4k_tier.trim().to_ascii_lowercase();
+        self.anime4k_tier = if ["s", "m", "l", "vl", "ul"].contains(&t.as_str()) {
+            t
+        } else {
+            "m".to_string()
+        };
         self
     }
 }
@@ -168,6 +219,22 @@ pub fn fsr1_upscale_enabled() -> bool {
     host_upscale() == HostUpscale::Fsr1
 }
 
+pub fn anime4k_upscale_enabled() -> bool {
+    host_upscale() == HostUpscale::Anime4k
+}
+
+pub fn host_anime4k_mode() -> String {
+    with_cfg(|c| c.anime4k_mode.clone())
+}
+
+pub fn host_anime4k_tier() -> String {
+    with_cfg(|c| c.anime4k_tier.clone())
+}
+
+pub fn host_anime4k_plus_a() -> bool {
+    with_cfg(|c| c.anime4k_plus_a)
+}
+
 pub fn host_sharpen_rcas() -> bool {
     with_cfg(|c| c.sharpen_rcas)
 }
@@ -188,7 +255,7 @@ pub fn rcas_sharpness_stops() -> f32 {
     with_cfg(|c| c.rcas_sharpness_stops)
 }
 
-/// True if any ATRIUM_UPSCALE / ATRIUM_SHARPEN / SGSR / RCAS env was set at process start.
+/// True if any ATRIUM_UPSCALE / ATRIUM_SHARPEN / SGSR / RCAS / ANIME4K env was set at process start.
 pub fn env_overrides_present() -> bool {
     const KEYS: &[&str] = &[
         "ATRIUM_UPSCALE",
@@ -197,6 +264,11 @@ pub fn env_overrides_present() -> bool {
         "ATRIUM_SGSR_SHARPNESS",
         "ATRIUM_SGSR_EDGE_DIRECTION",
         "ATRIUM_RCAS_SHARPNESS",
+        "ATRIUM_ANIME4K_MODE",
+        "ATRIUM_ANIME4K_TIER",
+        "ATRIUM_ANIME4K_PLUS_A",
+        "ATRIUM_INTERNAL_WIDTH",
+        "ATRIUM_INTERNAL_HEIGHT",
     ];
     KEYS.iter().any(|k| std::env::var_os(k).is_some())
 }
